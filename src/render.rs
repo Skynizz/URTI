@@ -55,7 +55,7 @@ pub fn reference(scene: &Scene, gb: &[Px]) -> Vec<V3> {
             let mut rng = Rng::new(mix64(k as u64 ^ 0xabcdef));
             let mut acc = V3::default();
             for _ in 0..REF_SPP {
-                acc += radiance(scene, p, n, albedo, &mut rng, &mut NoRec);
+                acc += radiance(scene, p, n, albedo, &mut rng, &mut NoRec, false);
             }
             acc / REF_SPP as f64
         }

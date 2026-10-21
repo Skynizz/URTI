@@ -9,6 +9,7 @@ const MISS_LEN: f64 = 30.0;
 pub trait Rec {
     fn segment(&mut self, a: V3, b: V3);
     fn object(&mut self, id: usize);
+    fn light_selected(&mut self, _j: usize) {}
 }
 
 pub struct NoRec;
@@ -17,11 +18,12 @@ impl Rec for NoRec {
     fn object(&mut self, _: usize) {}
 }
 
-/// Dépendances d'un chemin : régions traversées (H*) et objets touchés (H0).
+/// Dépendances d'un chemin : régions traversées (H*), objets touchés (H0), lampes choisies par NEE.
 #[derive(Default)]
 pub struct DepRec {
     pub regions: Bits,
     pub objs: u64,
+    pub lights: u64,
 }
 impl Rec for DepRec {
     fn segment(&mut self, a: V3, b: V3) {
@@ -30,16 +32,22 @@ impl Rec for DepRec {
     fn object(&mut self, id: usize) {
         self.objs |= 1 << id;
     }
+    fn light_selected(&mut self, j: usize) {
+        self.lights |= 1 << j;
+    }
 }
 
-fn sample_light(scene: &Scene, rng: &mut Rng) -> Option<(usize, f64)> {
-    let total: f64 = (0..scene.lights.len()).map(|j| scene.light_power(j)).sum();
+/// Choix de lampe ∝ puissance. En mode `union`, la pmf ignore l'état allumé/éteint : deux scènes
+/// qui ne diffèrent que par une lampe consomment alors les mêmes nombres aléatoires (chemins corrélés).
+fn sample_light(scene: &Scene, rng: &mut Rng, union: bool) -> Option<(usize, f64)> {
+    let power = |j: usize| if union { scene.light_power_if_on(j) } else { scene.light_power(j) };
+    let total: f64 = (0..scene.lights.len()).map(power).sum();
     if total <= 0.0 {
         return None;
     }
     let mut u = rng.f64() * total;
     for j in 0..scene.lights.len() {
-        let p = scene.light_power(j);
+        let p = power(j);
         if p > 0.0 && (u < p || j == scene.lights.len() - 1) {
             return Some((j, p / total));
         }
@@ -49,14 +57,16 @@ fn sample_light(scene: &Scene, rng: &mut Rng) -> Option<(usize, f64)> {
 }
 
 /// Estimateur à un échantillon de la radiance sortante (diffuse) au point p de normale n.
-pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rng, rec: &mut R) -> V3 {
+/// La consommation de nombres aléatoires par sommet est fixe, pour l'échantillonnage corrélé.
+pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rng, rec: &mut R, union: bool) -> V3 {
     let (mut p, mut n, mut albedo) = (p0, n0, albedo0);
     let mut beta = V3::splat(1.0);
     let mut l = V3::default();
     for depth in 0..MAX_DEPTH {
         let origin = p + n * 1e-6;
         // NEE
-        if let Some((j, pmf)) = sample_light(scene, rng) {
+        if let Some((j, pmf)) = sample_light(scene, rng, union) {
+            rec.light_selected(j);
             let li = &scene.lights[j];
             let q = li.center + crate::math::v3((2.0 * rng.f64() - 1.0) * li.hx, 0.0, (2.0 * rng.f64() - 1.0) * li.hz);
             let w = q - origin;
@@ -64,11 +74,17 @@ pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rn
             let dist = dist2.sqrt();
             let wd = w / dist;
             let (cos_x, cos_l) = (n.dot(wd), wd.y);
-            rec.segment(origin, q);
-            if cos_x > 0.0 && cos_l > 0.0 {
+            if cos_x > 0.0 && cos_l > 0.0 && !li.on {
+                rec.segment(origin, q); // lampe éteinte (mode union) : dépendance conservatrice
+            } else if cos_x > 0.0 && cos_l > 0.0 {
+                // un rayon d'ombre bloqué ne dépend que de l'espace jusqu'à l'occulteur
                 match scene.occluder(origin, wd, dist - 1e-6) {
-                    Some(o) => rec.object(o),
+                    Some((o, t)) => {
+                        rec.segment(origin, origin + wd * t);
+                        rec.object(o);
+                    }
                     None => {
+                        rec.segment(origin, q);
                         rec.object(LIGHT_ID_BASE + j);
                         let g = cos_x * cos_l / dist2 * li.area() / pmf / std::f64::consts::PI;
                         l += beta.mul(albedo).mul(li.emission) * g;

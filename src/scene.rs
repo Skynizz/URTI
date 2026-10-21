@@ -191,22 +191,28 @@ impl Scene {
         })
     }
 
-    /// Renvoie l'objet qui bloque le segment [o, o + d·tmax], s'il y en a un.
-    pub fn occluder(&self, o: V3, d: V3, tmax: f64) -> Option<usize> {
+    /// Renvoie le premier objet qui bloque le segment [o, o + d·tmax] et sa distance.
+    pub fn occluder(&self, o: V3, d: V3, tmax: f64) -> Option<(usize, f64)> {
         let inv = v3(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
+        let mut best = None;
+        let mut tb = tmax;
         for (i, ob) in self.objects.iter().enumerate() {
             if let Some((t0, t1, _)) = slab(&ob.aabb, o, inv) {
-                if t0 > EPS && t0 < tmax && t1 > 0.0 {
-                    return Some(i);
+                if t0 > EPS && t0 < tb && t1 > 0.0 {
+                    tb = t0;
+                    best = Some((i, t0));
                 }
             }
         }
-        None
+        best
     }
 
     pub fn light_power(&self, j: usize) -> f64 {
+        if self.lights[j].on { self.light_power_if_on(j) } else { 0.0 }
+    }
+    pub fn light_power_if_on(&self, j: usize) -> f64 {
         let l = &self.lights[j];
-        if l.on { l.emission.lum() * l.area() } else { 0.0 }
+        l.emission.lum() * l.area()
     }
 }
 
