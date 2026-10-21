@@ -96,10 +96,13 @@ pub struct GpuKrc<'a> {
     cell_cap: u32,
     table_mask: u32,
     seed: u32,
+    /// relire l'image à chaque frame (évaluation) ; le banc de vitesse s'en passe
+    pub readback: bool,
 }
 
-const ENTRIES: [&str; 25] = [
+const ENTRIES: [&str; 26] = [
     "reset_ctr",
+    "prep_cells",
     "gbuffer",
     "insert",
     "lookup",
@@ -131,7 +134,8 @@ impl<'a> GpuKrc<'a> {
     pub fn new(gpu: &'a Gpu, world: World, sharc: bool, seed: u32) -> GpuKrc<'a> {
         let dev = &gpu.device;
         let len = world.len();
-        let cell_cap = (len * K / 2).next_power_of_two().max(1 << 14) as u32;
+        // une cellule couvre 2 à 4 pixels de large ; avec le jitter, ≈ len/6 cellules distinctes
+        let cell_cap = (len / 2).next_power_of_two().max(1 << 14) as u32;
         let table = (cell_cap as usize * 2).next_power_of_two();
         let task_cap = cell_cap as usize * 10 + len * 2;
         let storage = |read_only: bool| wgpu::BindingType::Buffer {
@@ -140,7 +144,7 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..17u32 {
+        for b in 0..18u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -176,7 +180,7 @@ impl<'a> GpuKrc<'a> {
             });
         }
         let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
-        let sizes: [(usize, wgpu::BufferUsages); 17] = [
+        let sizes: [(usize, wgpu::BufferUsages); 18] = [
             (std::mem::size_of::<FrameU>(), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST),
             (MAX_BOXES * std::mem::size_of::<GBox>(), st),
             (MAX_LIGHTS * std::mem::size_of::<GLight>(), st),
@@ -193,7 +197,8 @@ impl<'a> GpuKrc<'a> {
             (len * 16, st),
             (162 * 4, st),
             (32, st),
-            (36, st | wgpu::BufferUsages::INDIRECT),
+            (48, st | wgpu::BufferUsages::INDIRECT),
+            (cell_cap as usize * 16, st),
         ];
         let bufs: Vec<wgpu::Buffer> = sizes
             .iter()
@@ -239,6 +244,7 @@ impl<'a> GpuKrc<'a> {
             cell_cap,
             table_mask: table as u32 - 1,
             seed,
+            readback: true,
         }
     }
 
@@ -293,12 +299,13 @@ impl<'a> GpuKrc<'a> {
 
         let mut plan: Vec<(&'static str, Dispatch)> = Vec::new();
         let px = Dispatch::Direct(len.div_ceil(64));
-        let slots = Dispatch::Direct((len * K as u32).div_ceil(64));
-        let cells = Dispatch::Direct(self.cell_cap.div_ceil(64));
+        let slots = Dispatch::Direct((len * K as u32).div_ceil(256));
+        let cells = Dispatch::Indirect(36);
         plan.push(("reset_ctr", Dispatch::Direct((CTR as u32).div_ceil(64))));
         plan.push(("gbuffer", px));
         plan.push(("insert", slots));
         plan.push(("lookup", slots));
+        plan.push(("prep_cells", Dispatch::Direct(1)));
         if flags & F_EVENT != 0 {
             plan.push(("event_mark", cells));
             plan.push(("prep_d1", Dispatch::Direct(1)));
@@ -347,22 +354,30 @@ impl<'a> GpuKrc<'a> {
         let np = plan.len() as u32;
         enc.resolve_query_set(&self.ts, 0..2 * np, &self.ts_resolve, 0);
         enc.copy_buffer_to_buffer(&self.ts_resolve, 0, &self.ts_read, 0, np as u64 * 16);
-        enc.copy_buffer_to_buffer(&self.bufs[13], 0, &self.read_img, 0, len as u64 * 16);
+        if self.readback {
+            enc.copy_buffer_to_buffer(&self.bufs[13], 0, &self.read_img, 0, len as u64 * 16);
+        }
         enc.copy_buffer_to_buffer(&self.bufs[9], 0, &self.read_ctr, 0, (CTR * 4) as u64);
         q.submit(Some(enc.finish()));
-        for b in [&self.read_img, &self.read_ctr, &self.ts_read] {
+        let reads: Vec<&wgpu::Buffer> =
+            if self.readback { vec![&self.read_img, &self.read_ctr, &self.ts_read] } else { vec![&self.read_ctr, &self.ts_read] };
+        for b in &reads {
             b.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("lecture GPU"));
         }
         dev.poll(wgpu::Maintain::Wait);
-        let img: Vec<f32> = bytemuck::cast_slice(&self.read_img.slice(..).get_mapped_range()).to_vec();
+        let img: Vec<f32> = if self.readback {
+            bytemuck::cast_slice(&self.read_img.slice(..).get_mapped_range()).to_vec()
+        } else {
+            Vec::new()
+        };
         let ctr: Vec<u32> = bytemuck::cast_slice(&self.read_ctr.slice(..).get_mapped_range()).to_vec();
         let ts: Vec<u64> = bytemuck::cast_slice(&self.ts_read.slice(..).get_mapped_range()).to_vec();
-        for b in [&self.read_img, &self.read_ctr, &self.ts_read] {
+        for b in &reads {
             b.unmap();
         }
         let ms = self.period_ns as f64 * 1e-6;
         GpuFrame {
-            image: (0..len as usize).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
+            image: (0..img.len() / 4).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
             cells: ctr[C_CELLS],
             visible: ctr[C_VISIBLE],
             surf: ctr[C_SURF],
@@ -381,6 +396,72 @@ impl<'a> GpuKrc<'a> {
                 .collect(),
         }
     }
+}
+
+/// `krc gpubench` : temps GPU par frame du pipeline complet, en montant en résolution.
+pub fn bench(gpu: &Gpu) {
+    use crate::methods::event;
+    use crate::scene::{build, state_at, FRAMES};
+    let mut csv = String::from("scale,width,height,method,phase,mean_ms,max_ms,paths_per_frame
+");
+    for s in [1usize, 2, 5, 10] {
+        let world = World::scaled(2, s);
+        for sharc in [false, true] {
+            let name = if sharc { "gpu_sharc" } else { "gpu_krc" };
+            let mut krc = GpuKrc::new(gpu, world, sharc, 1);
+            krc.readback = false;
+            let mut prev_state = state_at(0);
+            let mut prev_scene = build(&prev_state, 2);
+            let mut per_frame: Vec<(u32, f64, u32)> = Vec::new();
+            let mut passes: Vec<(&'static str, f64, usize)> = Vec::new();
+            // une séquence de chauffe (fréquences GPU, caches), puis la séquence mesurée
+            for t in 0..2 * FRAMES {
+                let warm = t < FRAMES;
+                let t = t % FRAMES;
+                let state = state_at(t);
+                let scene = build(&state, 2);
+                let ev = event(&prev_state, &state, &prev_scene, &scene, t);
+                let f = krc.frame(&scene, &prev_scene, ev.as_ref(), t);
+                assert_eq!(f.overflow, 0, "table saturée ({} cellules)", f.cells);
+                prev_state = state;
+                prev_scene = scene;
+                if warm {
+                    continue;
+                }
+                per_frame.push((t, f.gpu_ms(), f.regular_paths + f.delta_paths));
+                for (n, ms) in &f.passes {
+                    match passes.iter_mut().find(|p| p.0 == *n) {
+                        Some(p) => {
+                            p.1 += ms;
+                            p.2 += 1;
+                        }
+                        None => passes.push((n, *ms, 1)),
+                    }
+                }
+            }
+            let mut line = format!("{}×{} {name:<9}", world.w, world.h);
+            for (phase, a, b) in [("statique", 20u32, 40u32), ("boite", 40, 64), ("lampe_on", 80, 81), ("lampe_off", 100, 101), ("tout", 0, 120)] {
+                let sel: Vec<&(u32, f64, u32)> = per_frame.iter().filter(|p| p.0 >= a && p.0 < b).collect();
+                // médiane : robuste aux fluctuations de fréquence du GPU
+                let mut v: Vec<f64> = sel.iter().map(|p| p.1).collect();
+                v.sort_by(|x, y| x.total_cmp(y));
+                let mean = v[v.len() / 2];
+                let max = sel.iter().map(|p| p.1).fold(0.0, f64::max);
+                let paths = sel.iter().map(|p| p.2 as f64).sum::<f64>() / sel.len() as f64;
+                csv += &format!("{s},{},{},{name},{phase},{mean:.4},{max:.4},{paths:.0}
+", world.w, world.h);
+                line += &format!(" | {phase} {mean:6.3} ms");
+            }
+            println!("{line}");
+            if s == 10 {
+                let mut p: Vec<String> = passes.iter().map(|(n, ms, c)| format!("{n} {:.3}", ms / *c as f64)).collect();
+                p.sort();
+                println!("   passes (ms, moyenne sur les frames où elles tournent) : {}", p.join(", "));
+            }
+        }
+    }
+    std::fs::create_dir_all("results/gpu").unwrap();
+    std::fs::write("results/gpu/bench_pipeline.csv", csv).unwrap();
 }
 
 #[derive(Clone, Copy)]

@@ -118,6 +118,8 @@ struct Cell {
 @group(0) @binding(14) var<storage, read> ev: array<u32>;
 @group(0) @binding(15) var<storage, read_write> scal: array<f32>; // 0 : λ, 1 : a priori, 2 : budget, 3-4 : bornes log2 λ
 @group(0) @binding(16) var<storage, read_write> ind: array<u32>; // arguments de dispatch indirect
+// résumé compact par cellule pour l'allocation : (empreinte, n, variance relative, tirage)
+@group(0) @binding(17) var<storage, read_write> qbuf: array<vec4<f32>>;
 
 // ---------------------------------------------------------------- outils
 var<private> rng: u32;
@@ -181,12 +183,21 @@ fn mark_vertex(p: vec3<f32>) {
     if (rec_on) { m_vsup = set2(m_vsup, super_of(cell_of(p))); }
 }
 
-// DDA : super-régions traversées (dépendances L2) et contact avec les régions fines de l'événement
+// Grille des super-régions (dépendances stockées) : 18 × 1 × 2 blocs de 2,4 × 3,6 × 2,4 m.
+const SUP: vec3<f32> = vec3<f32>(2.4, 3.6, 2.4);
+const SDIMS: vec3<i32> = vec3<i32>(18, 1, 2);
+var<private> fine_dda: bool;
+
+// DDA : super-régions traversées (dépendances L2). Sur la grille fine (0,6 m) seulement quand il faut
+// aussi le test exact de contact avec l'événement (chemins corrélés) ; sinon sur la grille grossière,
+// ~4× moins de pas.
 fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
     if (!rec_on) { return; }
     let d = b - a;
+    let cs = select(SUP, vec3<f32>(REGION), fine_dda);
+    let dims = select(SDIMS, DIMS, fine_dda);
     let lo = ORIGIN;
-    let hi = ORIGIN + vec3<f32>(DIMS) * REGION;
+    let hi = ORIGIN + vec3<f32>(dims) * cs;
     var t0 = 0.0;
     var t1 = 1.0;
     for (var ax = 0; ax < 3; ax++) {
@@ -201,7 +212,7 @@ fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
     }
     if (t0 > t1) { return; }
     let p = a + d * t0;
-    var c = cell_of(p);
+    var c = clamp(vec3<i32>(floor((p - ORIGIN) / cs)), vec3<i32>(0), dims - vec3<i32>(1));
     var stp = vec3<i32>(0);
     var tmax = vec3<f32>(1e30);
     var tdelta = vec3<f32>(1e30);
@@ -209,14 +220,14 @@ fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
         if (abs(d[ax]) >= 1e-12) {
             let pos = d[ax] > 0.0;
             stp[ax] = select(-1, 1, pos);
-            let boundary = ORIGIN[ax] + f32(c[ax] + select(0, 1, pos)) * REGION;
+            let boundary = ORIGIN[ax] + f32(c[ax] + select(0, 1, pos)) * cs[ax];
             tmax[ax] = t0 + (boundary - p[ax]) / d[ax];
-            tdelta[ax] = REGION / abs(d[ax]);
+            tdelta[ax] = cs[ax] / abs(d[ax]);
         }
     }
-    let test_ev = (fr.flags & F_EVENT) != 0u;
+    let test_ev = fine_dda && (fr.flags & F_EVENT) != 0u;
     for (var it = 0; it < 256; it++) {
-        m_trav = set2(m_trav, super_of(c));
+        m_trav = set2(m_trav, select(u32(c.z * SUPER_X + c.x), super_of(c), fine_dda));
         if (test_ev && !m_aff) {
             let idx = index_of(c);
             if ((ev[idx >> 5u] >> (idx & 31u) & 1u) == 1u) { m_aff = true; }
@@ -229,7 +240,7 @@ fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
         }
         if (tmax[ax] > t1) { break; }
         c[ax] += stp[ax];
-        if (c[ax] < 0 || c[ax] >= DIMS[ax]) { break; }
+        if (c[ax] < 0 || c[ax] >= dims[ax]) { break; }
         tmax[ax] += tdelta[ax];
     }
 }
@@ -425,12 +436,23 @@ fn commit_deps(c: u32) {
     if (m_trav.x != 0u) { atomicOr(&acc[b + A_DEPS], m_trav.x); }
     if (m_trav.y != 0u) { atomicOr(&acc[b + A_DEPS + 1u], m_trav.y); }
     atomicAdd(&acc[b + A_NS], 1u);
-    for (var s = 0u; s < 36u; s++) {
-        let bit = select((m_vsup.y >> (s - 32u)) & 1u, (m_vsup.x >> s) & 1u, s < 32u);
-        if (bit == 1u) {
+    // seulement les bits allumés (≈ 2 par chemin)
+    for (var h = 0u; h < 2u; h++) {
+        var m = m_vsup[h];
+        while (m != 0u) {
+            let s = h * 32u + countTrailingZeros(m);
+            m &= m - 1u;
             atomicAdd(&acc[b + A_FREQ + (s >> 1u)], select(1u, 65536u, (s & 1u) == 1u));
         }
     }
+}
+
+// Entrelacement des tâches : les tâches d'une même cellule sont consécutives ; un warp qui les
+// traiterait ensemble se battrait sur les mêmes atomiques. Le thread g prend la tâche
+// (g mod 8)·S + g/8, avec S = ⌈N/8⌉.
+fn stride_task(g: u32, n: u32) -> u32 {
+    let s = (n + 7u) / 8u;
+    return (g % 8u) * s + g / 8u;
 }
 
 fn reset_rec() {
@@ -499,7 +521,7 @@ fn cell_key(k: u32, slot: u32) -> u32 {
 }
 
 // 1er temps : réserver les clés nouvelles (sans attente active)
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn insert(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x / K;
     let slot = gid.x % K;
@@ -526,7 +548,7 @@ fn insert(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // 2e temps : retrouver la cellule, empreinte, pixel de référence tiré uniformément
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x / K;
     let slot = gid.x % K;
@@ -642,9 +664,18 @@ fn prep_indirect(round: u32) {
         lo = atomicLoad(&ctr[C_REG0]);
     }
     let n = cur - lo;
-    ind[round * 3u] = (n + 63u) / 64u;
+    ind[round * 3u] = (8u * ((n + 7u) / 8u) + 63u) / 64u;
     ind[round * 3u + 1u] = 1u;
     ind[round * 3u + 2u] = 1u;
+}
+
+// passes « par cellule » : autant de groupes que de cellules réelles, pas que de capacité
+@compute @workgroup_size(1)
+fn prep_cells() {
+    let n = min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap);
+    ind[9] = (n + 63u) / 64u;
+    ind[10] = 1u;
+    ind[11] = 1u;
 }
 
 @compute @workgroup_size(1)
@@ -664,13 +695,14 @@ fn delta_trace(gid: vec3<u32>, round: u32) {
     var lo = 0u;
     var hi = atomicLoad(&ctr[C_D1]);
     if (round == 1u) { lo = hi; hi = atomicLoad(&ctr[C_D2]); }
-    let i = lo + gid.x;
+    let i = lo + stride_task(gid.x, hi - lo);
     if (i >= hi) { return; }
     let t = tasks[i];
     let c = t.x;
     let g = gbuf[t.y];
     let geometry = (fr.flags & F_GEOMETRY) != 0u;
     reset_rec();
+    fine_dda = true;
     rec_on = true;
     uni = true;
     split = !geometry;
@@ -796,7 +828,10 @@ fn rel_var(c: u32) -> f32 {
 fn alloc_hist(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
-    if (atomicLoad(&acc[c * ACC + A_FOOT]) == 0u) { return; }
+    let foot = atomicLoad(&acc[c * ACC + A_FOOT]);
+    let u = f32(pcg(c ^ pcg(fr.frame * 7u + fr.seed)) >> 8u) * (1.0 / 16777216.0);
+    qbuf[c] = vec4<f32>(f32(foot) / f32(K), cells[c].n, rel_var(c), u);
+    if (foot == 0u) { return; }
     atomicAdd(&ctr[C_VISIBLE], 1u);
     let ex = explore(c);
     if (ex > 0u) { atomicAdd(&ctr[C_EXPLORE], ex); }
@@ -814,14 +849,14 @@ fn post_var(n: f32, rel: f32, prior: f32) -> f32 {
 
 // nombre d'échantillons pour un seuil λ de gain marginal f·pv/((n+k)(n+k+1)) ≥ λ
 fn quota(c: u32, lambda: f32, prior: f32) -> u32 {
-    let foot = f32(atomicLoad(&acc[c * ACC + A_FOOT])) / f32(K);
+    let q = qbuf[c];
+    let foot = q.x;
     if (foot == 0.0) { return 0u; }
-    let n = cells[c].n;
-    let pv = post_var(n, rel_var(c), prior);
+    let n = q.y;
+    let pv = post_var(n, q.z, prior);
     let t = (-1.0 + sqrt(1.0 + 4.0 * foot * pv / lambda)) * 0.5;
     // arrondi stochastique (même tirage au balayage et à l'émission) : Σ quotas suit la solution continue
-    let u = f32(pcg(c ^ pcg(fr.frame * 7u + fr.seed)) >> 8u) * (1.0 / 16777216.0);
-    var k = max(floor(t - n + u), 0.0);
+    var k = max(floor(t - n + q.w), 0.0);
     if (n < 1.0) { k = max(k, 1.0); }
     return min(u32(k), MAX_PER_CELL);
 }
@@ -883,7 +918,7 @@ fn alloc_scan(gid: vec3<u32>, lid: vec3<u32>, base: u32) {
     if (lid.x < NCAND) { atomicStore(&wsum[lid.x], 0u); }
     workgroupBarrier();
     let c = gid.x;
-    if (c < min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap) && atomicLoad(&acc[c * ACC + A_FOOT]) != 0u) {
+    if (c < min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) {
         let prior = scal[1];
         for (var i = 0u; i < NCAND; i++) {
             let q = quota(c, cand(i), prior);
@@ -941,12 +976,15 @@ fn sharc_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = atomicLoad(&ctr[C_REG0]) + gid.x;
-    if (i >= atomicLoad(&ctr[C_TASKS])) { return; }
+    let lo = atomicLoad(&ctr[C_REG0]);
+    let hi = atomicLoad(&ctr[C_TASKS]);
+    let i = lo + stride_task(gid.x, hi - lo);
+    if (i >= hi) { return; }
     let t = tasks[i];
     let c = t.x;
     let g = gbuf[t.y];
     reset_rec();
+    fine_dda = false;
     rec_on = (fr.flags & F_SHARC) == 0u;
     uni = false;
     split = false;

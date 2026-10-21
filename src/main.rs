@@ -183,6 +183,10 @@ fn main() {
         }
         Some("scale") => scale(&tracer),
         Some("bench") => bench::bench(&tracer),
+        Some("gpubench") => match gpu::Gpu::new() {
+            Some(g) => gpu_krc::bench(&g),
+            None => eprintln!("pas de GPU"),
+        },
         _ => eprintln!("usage : krc refs | run [méthodes...] | all | scale | bench"),
     }
 }

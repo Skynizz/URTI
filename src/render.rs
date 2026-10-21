@@ -18,7 +18,11 @@ pub struct World {
 
 impl World {
     pub fn new(rooms: usize) -> World {
-        World { rooms, w: 96 * rooms, h: 96 }
+        World::scaled(rooms, 1)
+    }
+    /// Même cadrage, résolution multipliée par `s` (s = 10 et 2 pièces : 1920×960).
+    pub fn scaled(rooms: usize, s: usize) -> World {
+        World { rooms, w: 96 * rooms * s, h: 96 * s }
     }
     pub fn len(&self) -> usize {
         self.w * self.h

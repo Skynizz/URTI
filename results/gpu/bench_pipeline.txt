@@ -1,0 +1,10 @@
+192×96 gpu_krc   | statique  0.158 ms | boite  0.376 ms | lampe_on  0.311 ms | lampe_off  0.307 ms | tout  0.159 ms
+192×96 gpu_sharc | statique  0.086 ms | boite  0.086 ms | lampe_on  0.086 ms | lampe_off  0.086 ms | tout  0.086 ms
+384×192 gpu_krc   | statique  0.277 ms | boite  0.513 ms | lampe_on  0.589 ms | lampe_off  0.596 ms | tout  0.277 ms
+384×192 gpu_sharc | statique  0.168 ms | boite  0.168 ms | lampe_on  0.171 ms | lampe_off  0.169 ms | tout  0.168 ms
+960×480 gpu_krc   | statique  1.172 ms | boite  1.855 ms | lampe_on  2.716 ms | lampe_off  2.713 ms | tout  1.165 ms
+960×480 gpu_sharc | statique  0.910 ms | boite  0.909 ms | lampe_on  0.917 ms | lampe_off  0.920 ms | tout  0.910 ms
+1920×960 gpu_krc   | statique  4.581 ms | boite  7.044 ms | lampe_on 10.616 ms | lampe_off 11.195 ms | tout  4.569 ms
+   passes (ms, moyenne sur les frames où elles tournent) : alloc_emit 0.141, alloc_hist 0.115, alloc_pick1 0.004, alloc_pick2 0.004, alloc_pick3 0.004, alloc_prep 0.006, alloc_scan1 0.036, alloc_scan2 0.037, alloc_scan3 0.038, delta_apply 0.292, delta_more 0.084, delta_trace1 2.403, delta_trace2 1.711, display 0.341, event_mark 0.200, gbuffer 0.195, insert 0.335, lookup 0.546, prep_cells 0.002, prep_d1 0.002, prep_d2 0.002, prep_reg 0.002, reset_ctr 0.002, resolve 1.166, trace 1.337
+1920×960 gpu_sharc | statique  3.787 ms | boite  3.770 ms | lampe_on  3.747 ms | lampe_off  3.815 ms | tout  3.778 ms
+   passes (ms, moyenne sur les frames où elles tournent) : display 0.336, gbuffer 0.199, insert 0.343, lookup 0.549, prep_cells 0.002, prep_reg 0.002, reset_ctr 0.002, resolve 1.016, sharc_emit 0.213, trace 1.131
