@@ -505,3 +505,118 @@ pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
     }
     std::fs::write(format!("results/cornell_{size}/summary.csv"), summary).unwrap();
 }
+
+/// `krc pareto [taille]` : erreur contre temps GPU, KRC et SHaRC, pour plusieurs budgets
+/// (chemins par pixel et par frame). Erreur : un passage avec relecture d'image ; temps : deux
+/// passages sans relecture (chauffe, puis mesure ; médiane par frame).
+pub fn pareto(gpu: &Gpu, size: usize) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    use crate::scene::{state_at, FRAMES};
+    let view = cornell_view(size);
+    let base = cornell_at(0);
+    let grid = Grid::fit(&base.bounds);
+    let dir = format!("results/ref_cornell_{size}");
+    let refs: std::collections::HashMap<String, Vec<V3>> = (0..FRAMES)
+        .map(|f| state_at(f).id())
+        .map(|id| {
+            let img = load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes : lancer `krc cornell <taille>`");
+            (id, img)
+        })
+        .collect();
+    let mut csv = String::from("method,ppp,relmse,relmse_static,relmse_dynamic,ms_median,ms_mean,ms_p95\n");
+    let variants = [
+        ("tri_krc", false, false, vec![0.25f32, 0.5, 1.0, 2.0, 4.0]),
+        ("tri_krc_amort", false, true, vec![0.25f32, 0.5, 1.0, 2.0, 4.0]),
+        ("tri_sharc", true, false, vec![0.5f32, 1.0, 2.0, 4.0, 8.0]),
+    ];
+    for (name, sharc, amortize, ppps) in variants {
+        for ppp in ppps {
+            let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 3);
+            k.ppp = ppp;
+            k.amortize = amortize;
+            let mut prev = cornell_at(0);
+            let (mut rel, mut rel_s, mut rel_d) = (Vec::new(), Vec::new(), Vec::new());
+            let mut ms = Vec::new();
+            for pass in 0..3 {
+                k.readback = pass == 0;
+                for t in 0..FRAMES {
+                    let scene = cornell_at(t);
+                    let f = k.frame_tri(&scene, &prev, t);
+                    prev = scene;
+                    if pass == 0 {
+                        let r = &refs[&state_at(t).id()];
+                        let (mut e, mut n) = (0.0, 0.0);
+                        for i in 0..view.len() {
+                            if f.kinds[i] == 2 {
+                                for c in 0..3 {
+                                    let (x, y) = (f.image[i].get(c), r[i].get(c));
+                                    e += (x - y) * (x - y) / (y * y + 0.01);
+                                }
+                                n += 3.0;
+                            }
+                        }
+                        rel.push(e / n);
+                        if (30..40).contains(&t) {
+                            rel_s.push(e / n);
+                        }
+                        if t >= 40 {
+                            rel_d.push(e / n);
+                        }
+                    }
+                    if pass == 2 {
+                        ms.push(f.gpu_ms());
+                    }
+                }
+            }
+            let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+            ms.sort_by(|a, b| a.total_cmp(b));
+            let (med, p95) = (ms[ms.len() / 2], ms[ms.len() * 95 / 100]);
+            println!(
+                "{name:<14} {ppp:>5} chemin/px : relMSE {:.3e} (statique {:.2e}, dynamique {:.2e}) | GPU médiane {med:.2} ms, moyenne {:.2} ms, p95 {p95:.2} ms",
+                mean(&rel),
+                mean(&rel_s),
+                mean(&rel_d),
+                mean(&ms)
+            );
+            csv += &format!("{name},{ppp},{:.6e},{:.6e},{:.6e},{med:.4},{:.4},{p95:.4}\n", mean(&rel), mean(&rel_s), mean(&rel_d), mean(&ms));
+        }
+    }
+    std::fs::create_dir_all(format!("results/cornell_{size}")).unwrap();
+    std::fs::write(format!("results/cornell_{size}/pareto.csv"), csv).unwrap();
+}
+
+/// `krc spikes [taille]` : composition du temps GPU des frames d'événement (KRC, 1 chemin/px).
+pub fn spikes(gpu: &Gpu, size: usize) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::scene::FRAMES;
+    let view = cornell_view(size);
+    let base = cornell_at(0);
+    let mut k = GpuKrc::with(gpu, view, Grid::fit(&base.bounds), Some(&base), false, 3);
+    k.readback = false;
+    k.amortize = std::env::var("KRC_AMORT").is_ok();
+    let mut prev = cornell_at(0);
+    for pass in 0..2 {
+        for t in 0..FRAMES {
+            let scene = cornell_at(t);
+            let f = k.frame_tri(&scene, &prev, t);
+            prev = scene;
+            if pass == 1 && [38u32, 40, 41, 80, 81, 82, 83, 100, 101, 102].contains(&t) {
+                let mut p: Vec<String> = f.passes.iter().filter(|x| x.1 > 0.05).map(|(n, ms)| format!("{n} {ms:.2}")).collect();
+                p.sort();
+                println!(
+                    "frame {t:>3} : {:.2} ms | suspects {} | en attente {} | chemins corrélés {} (retracés {}) | ordinaires {} | {}",
+                    f.gpu_ms(),
+                    f.suspects,
+                    f.pending,
+                    f.delta_paths,
+                    f.delta_old,
+                    f.regular_paths,
+                    p.join(", ")
+                );
+            }
+        }
+    }
+}

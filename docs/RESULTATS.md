@@ -25,12 +25,16 @@ remboursés sur les frames suivantes. Reproduire : `cargo run --release -- all`,
 5. **Les changements de lumière deviennent locaux grâce aux dépendances pondérées par
    l'énergie** (§3 bis). À 8 pièces, allumer une lampe coûte 28 k chemins au lieu de 56 k,
    et ce coût ne croît plus avec la scène au-delà des pièces réellement éclairées.
-6. **Le traceur tourne sur GPU** (RTX 4070), validé contre le CPU. Le goulot pour le temps
-   réel n'est plus le traçage mais l'aller-retour CPU↔GPU des dépendances (§7).
-7. **Échecs documentés** : le z-test de vérification (sous-puissant), les dépendances
+6. **Tout le pipeline tourne sur GPU** (RTX 4070), validé contre le CPU, stable sur
+   12 000 frames (§7, §8).
+7. **Sur de vrais triangles avec ray tracing matériel** (Cornell box), à temps GPU égal,
+   KRC a **2,4 à 2,9× moins d'erreur** que le cache SHaRC-like, et à erreur égale il est
+   ~2× plus rapide. Contrepartie : des pics de 12 à 16 ms les frames d'événement (§9).
+8. **Échecs documentés** : le z-test de vérification (sous-puissant), les dépendances
    « objets touchés » de l'idée initiale (faux négatifs à l'allumage d'une lampe), le
-   graphe binaire face à la lumière (il sature au fil des portes), et deux tentatives de
-   pondération (sketch haché, fréquences de traversée).
+   graphe binaire face à la lumière (il sature au fil des portes), deux tentatives de
+   pondération (sketch haché, fréquences de traversée), et l'amortissement simple des
+   événements de lampe.
 
 ## 1. Séquence principale (2 pièces, 120 frames)
 
@@ -155,6 +159,7 @@ contre 1,61e-3 à N = 8. Mémoire : 72 octets de compteurs par cellule.
 | Affirmation de départ | Verdict |
 |---|---|
 | Une scène statique converge et finit par ne plus rien coûter | ✅ ~0,01 chemin/pixel/frame (plancher d'exploration) |
+| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ✅ 2,4–2,9× moins d'erreur à temps moyen égal ; ⚠️ pics de 12–16 ms les frames d'événement |
 | Le coût d'une scène dynamique suit ce qui change, pas la taille de la scène | ✅ pour les objets ; ✅ pour la lumière avec la pondération par l'énergie (le coût suit la zone réellement éclairée) |
 | Le graphe de dépendances par objets touchés suffit | ❌ faux négatifs (lampe allumée, nouvelle ombre) ; les régions traversées le battent |
 | Invalider les cellules dépendantes | ⚠️ invalider coûte cher ; **mesurer le delta par chemins corrélés et corriger** est 2 à 5× meilleur |
@@ -203,3 +208,44 @@ contre 1,61e-3 à N = 8. Mémoire : 72 octets de compteurs par cellule.
 Le calcul pur ferait tenir 2 M chemins en ~4 ms. Ce qui coûte, ce sont les transferts :
 avec dépendances, chaque chemin renvoie ~450 octets au CPU. D'où la prochaine étape :
 le cache doit vivre sur le GPU.
+
+## 8. Pipeline entièrement GPU
+
+Tout vit sur le GPU : G-buffer, table de hachage des cellules, événement, chemins
+corrélés, allocation, traçage, résolution, affichage. Le CPU envoie la scène et
+l'événement, puis relit l'image pour l'évaluation seulement, hors chronométrage.
+
+| Pièces en enfilade, 1 chemin/px, temps GPU médian | Statique | Boîte qui bouge | Pic d'allumage |
+|---|---|---|---|
+| `gpu_sharc` 1920×960 | 3,8 ms | 3,8 ms | 3,8 ms |
+| `gpu_krc` 1920×960 | 4,6 ms | 7,0 ms | 10,7 ms |
+
+- Qualité identique au CPU : `gpu_krc` 4,19e-3 contre 4,11e-3 pour `krc_energy_l2`.
+- **Dérive longue** (12 000 frames) : aucune dérive mesurable après deux correctifs
+  (poids max d'une estimation corrigée, historique plafonné à 1 024), `results/gpu/drift.txt`.
+
+## 9. Triangles et ray tracing matériel : comparaison en ms contre SHaRC
+
+Cornell box en triangles, ray query Vulkan sur la RTX 4070, même séquence de 120 frames.
+
+| 256×256, 5 graines | Séquence | Statique | Boîte | Lampe allumée | Lampe éteinte |
+|---|---|---|---|---|---|
+| `tri_sharc` | 3,91e-2 | 2,02e-3 | 8,80e-3 | 3,86e-2 | 1,66e-1 |
+| **`tri_krc`** | **5,03e-3** | **1,38e-3** | **2,48e-3** | **8,75e-3** | **7,01e-3** |
+
+![Erreur contre temps GPU](../results/plots/pareto_cornell.svg)
+
+| 1024×1024 | Budget | relMSE | GPU moyen | GPU médian | p95 |
+|---|---|---|---|---|---|
+| SHaRC | 4 chemins/px | 1,35e-2 | 5,8 ms | 5,8 ms | 6,4 ms |
+| SHaRC | 8 chemins/px | 6,7e-3 | 9,1 ms | 9,0 ms | 9,7 ms |
+| **KRC** | 1 chemin/px | **4,7e-3** | **5,2 ms** | 4,2 ms | 13,1 ms |
+| **KRC** | 2 chemins/px | **2,8e-3** | 6,3 ms | 5,4 ms | 13,7 ms |
+
+- **À temps moyen égal, KRC a 2,4 à 2,9× moins d'erreur ; à erreur égale, il est ~2×
+  plus rapide.**
+- **Mais le temps de KRC n'est pas constant.** Les frames d'événement coûtent 12 ms (pas
+  de boîte) à 16 ms (lampe), parce que dans une seule pièce tout change vraiment et que
+  chaque cellule reçoit ses chemins corrélés dans la frame. SHaRC a un coût plat.
+- Amortir les événements de lampe sur plusieurs frames divise bien le pic par deux, mais
+  l'erreur augmente de 2,5× (cellules périmées affichées) : résultat négatif.

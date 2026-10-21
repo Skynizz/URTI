@@ -54,6 +54,8 @@ const C_MATURE: u32 = 14u;
 const C_OVERFLOW: u32 = 15u;
 const C_EXPLORE: u32 = 16u;
 const C_MAXN: u32 = 17u;     // max des n des cellules (bits f32 positifs : ordre préservé)
+const C_PENDING: u32 = 18u;  // cellules encore en attente de leurs chemins corrélés
+const C_DUSED: u32 = 19u;    // chemins corrélés réservés dans la frame (plafond d'amortissement)
 const C_HIST: u32 = 32u;     // 64 cases
 const C_SCAN: u32 = 96u;     // 3 × 32 sommes de quotas candidates (trois balayages)
 
@@ -84,6 +86,9 @@ const A_SUSP: u32 = 43u;
 const F_EVENT: u32 = 1u;
 const F_GEOMETRY: u32 = 2u;
 const F_SHARC: u32 = 4u;
+const F_PENDING: u32 = 8u;   // frame sans nouvel événement, mais avec des cellules en attente
+const F_AMORTIZE: u32 = 16u; // chemins corrélés plafonnés à DELTA_CAP chemin/pixel par frame
+const DELTA_CAP: f32 = 1.0;
 
 struct Frame {
     w: u32, h: u32, n_boxes: u32, n_lights: u32,
@@ -92,7 +97,7 @@ struct Frame {
     eye: vec3<f32>, px_angle: f32,
     fwd: vec3<f32>, th: f32,
     right: vec3<f32>, tv: f32,
-    up: vec3<f32>, pad1: f32,
+    up: vec3<f32>, ppp: f32,  // budget : chemins par pixel de surface et par frame
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -463,6 +468,10 @@ fn commit_deps(c: u32) {
 // Entrelacement des tâches : les tâches d'une même cellule sont consécutives ; un warp qui les
 // traiterait ensemble se battrait sur les mêmes atomiques. Le thread g prend la tâche
 // (g mod 8)·S + g/8, avec S = ⌈N/8⌉.
+fn flat_id(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
+    return gid.y * nwg.x * 64u + gid.x;
+}
+
 fn stride_task(g: u32, n: u32) -> u32 {
     let s = (n + 7u) / 8u;
     return (g % 8u) * s + g / 8u;
@@ -635,13 +644,60 @@ fn reset_ctr(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&ctr[i], 0u);
 }
 
+// Amortissement : réserve m chemins corrélés sous le plafond de la frame.
+fn try_reserve(m: u32) -> bool {
+    if ((fr.flags & F_AMORTIZE) == 0u) { return true; }
+    let cap = u32(f32(atomicLoad(&ctr[C_SURF])) * fr.ppp * DELTA_CAP);
+    let prev = atomicAdd(&ctr[C_DUSED], m);
+    if (prev + m > cap) {
+        atomicSub(&ctr[C_DUSED], m);
+        return false;
+    }
+    return true;
+}
+
+// lance les chemins corrélés d'une cellule suspecte visible, ou la met en attente
+fn start_delta(c: u32, m: u32) {
+    let b = c * ACC;
+    if (try_reserve(m)) {
+        atomicStore(&acc[b + A_SUSP], 1u);
+        push_tasks(c, m, 1u);
+    } else {
+        atomicStore(&acc[b + A_SUSP], 2u);
+        atomicAdd(&ctr[C_PENDING], 1u);
+    }
+}
+
+// cellules en attente (événement de lampe amorti) : on retente sous le plafond de cette frame
+@compute @workgroup_size(64)
+fn pending_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
+    let b = c * ACC;
+    if (atomicLoad(&acc[b + A_SUSP]) != 2u) { return; }
+    if (atomicLoad(&acc[b + A_FOOT]) == 0u) {
+        clear_cell(c);
+        atomicStore(&acc[b + A_SUSP], 0u);
+        atomicAdd(&ctr[C_HARD], 1u);
+        return;
+    }
+    start_delta(c, M_DELTA);
+}
+
 // suspects : dépendances L2 ET (géométrie, ou effet énergétique attendu > 1 %)
 @compute @workgroup_size(64)
 fn event_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
-    if (cells[c].n == 0.0) { return; }
     let b = c * ACC;
+    // une cellule encore en attente d'un événement précédent perd son historique
+    if (atomicLoad(&acc[b + A_SUSP]) == 2u) {
+        clear_cell(c);
+        atomicStore(&acc[b + A_SUSP], 0u);
+        atomicAdd(&ctr[C_HARD], 1u);
+        return;
+    }
+    if (cells[c].n == 0.0) { return; }
     let deps = vec2<u32>(atomicLoad(&acc[b + A_DEPS]), atomicLoad(&acc[b + A_DEPS + 1u])) | cells[c].deps_prev;
     let evl2 = vec2<u32>(ev[108], ev[109]);
     if (all((deps & evl2) == vec2<u32>(0u))) { return; }
@@ -660,8 +716,12 @@ fn event_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicAdd(&ctr[C_HARD], 1u);
         return;
     }
-    atomicStore(&acc[b + A_SUSP], 1u);
-    push_tasks(c, select(M_DELTA, M_DELTA0, geometry), 1u);
+    if (geometry) {
+        atomicStore(&acc[b + A_SUSP], 1u);
+        push_tasks(c, M_DELTA0, 1u);
+    } else {
+        start_delta(c, M_DELTA);
+    }
 }
 
 // arguments de dispatch indirect : round 0 = delta tour 1, 1 = delta tour 2, 2 = ordinaires
@@ -677,8 +737,11 @@ fn prep_indirect(round: u32) {
         lo = atomicLoad(&ctr[C_REG0]);
     }
     let n = cur - lo;
-    ind[round * 3u] = (8u * ((n + 7u) / 8u) + 63u) / 64u;
-    ind[round * 3u + 1u] = 1u;
+    // au-delà de 65 535 groupes par dimension : grille 2D (index reconstruit par flat_id)
+    let groups = (8u * ((n + 7u) / 8u) + 63u) / 64u;
+    let gx = min(groups, 32768u);
+    ind[round * 3u] = max(gx, 1u);
+    ind[round * 3u + 1u] = (groups + gx - 1u) / max(gx, 1u);
     ind[round * 3u + 2u] = 1u;
 }
 
@@ -700,19 +763,24 @@ fn prep_reg() { prep_indirect(2u); }
 
 // chemins corrélés : même graine dans la scène courante et la précédente
 @compute @workgroup_size(64)
-fn delta_trace1(@builtin(global_invocation_id) gid: vec3<u32>) { delta_trace(gid, 0u); }
+fn delta_trace1(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    delta_trace(flat_id(gid, nwg), 0u);
+}
 @compute @workgroup_size(64)
-fn delta_trace2(@builtin(global_invocation_id) gid: vec3<u32>) { delta_trace(gid, 1u); }
+fn delta_trace2(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    delta_trace(flat_id(gid, nwg), 1u);
+}
 
-fn delta_trace(gid: vec3<u32>, round: u32) {
+fn delta_trace(g: u32, round: u32) {
     var lo = 0u;
     var hi = atomicLoad(&ctr[C_D1]);
     if (round == 1u) { lo = hi; hi = atomicLoad(&ctr[C_D2]); }
-    let i = lo + stride_task(gid.x, hi - lo);
+    if (g >= 8u * ((hi - lo + 7u) / 8u)) { return; }
+    let i = lo + stride_task(g, hi - lo);
     if (i >= hi) { return; }
     let t = tasks[i];
     let c = t.x;
-    let g = gbuf[t.y];
+    let gx = gbuf[t.y];
     let geometry = (fr.flags & F_GEOMETRY) != 0u;
     reset_rec();
     fine_dda = true;
@@ -722,7 +790,7 @@ fn delta_trace(gid: vec3<u32>, round: u32) {
     sel = 0u;
     seed_rng(t.z, i, fr.frame);
     let s0 = rng;
-    let r = radiance(g.p, g.n, g.albedo);
+    let r = radiance(gx.p, gx.n, gx.albedo);
     var x = r.l;
     var y = r.l + r.dl;
     var affected = (m_lights & fr.ev_lights) != 0u;
@@ -737,7 +805,7 @@ fn delta_trace(gid: vec3<u32>, round: u32) {
             split = false;
             sel = 1u;
             rng = s0;
-            y = radiance(g.p, g.n, g.albedo).l;
+            y = radiance(gx.p, gx.n, gx.albedo).l;
             sel = 0u;
             rec_on = true;
             m_trav = keep_trav;
@@ -783,7 +851,7 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
     let b = c * ACC;
-    if (atomicLoad(&acc[b + A_SUSP]) == 0u) { return; }
+    if (atomicLoad(&acc[b + A_SUSP]) != 1u) { return; }
     let m = f32(atomicLoad(&acc[b + A_PM]));
     let xr = vec3<f32>(ld_f32(b + A_PX), ld_f32(b + A_PX + 1u), ld_f32(b + A_PX + 2u)) / m;
     let yr = vec3<f32>(ld_f32(b + A_PY), ld_f32(b + A_PY + 1u), ld_f32(b + A_PY + 2u)) / m;
@@ -842,7 +910,8 @@ fn rel_var(c: u32) -> f32 {
 fn alloc_hist(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
-    let foot = atomicLoad(&acc[c * ACC + A_FOOT]);
+    // une cellule en attente ne reçoit pas d'échantillons ordinaires (historique périmé)
+    let foot = select(atomicLoad(&acc[c * ACC + A_FOOT]), 0u, atomicLoad(&acc[c * ACC + A_SUSP]) == 2u);
     let u = f32(pcg(c ^ pcg(fr.frame * 7u + fr.seed)) >> 8u) * (1.0 / 16777216.0);
     qbuf[c] = vec4<f32>(f32(foot) / f32(K), cells[c].n, rel_var(c), u);
     if (foot == 0u) { return; }
@@ -877,6 +946,7 @@ fn quota(c: u32, lambda: f32, prior: f32) -> u32 {
 
 fn explore(c: u32) -> u32 {
     if (atomicLoad(&acc[c * ACC + A_FOOT]) == 0u || cells[c].n == 0.0) { return 0u; }
+    if (atomicLoad(&acc[c * ACC + A_SUSP]) == 2u) { return 0u; }
     return select(0u, 1u, fr.frame - cells[c].last >= EXPLORE_PERIOD);
 }
 
@@ -902,10 +972,11 @@ fn alloc_prep() {
     }
     let surf = atomicLoad(&ctr[C_SURF]);
     let debt = atomicLoad(&ctr[C_DEBT]) + atomicLoad(&ctr[C_DPATHS]);
-    let pay = min(debt, u32(f32(surf) * DEBT_RATE));
+    let budget = f32(surf) * fr.ppp;
+    let pay = min(debt, u32(budget * DEBT_RATE));
     atomicStore(&ctr[C_DEBT], debt - pay);
     scal[1] = prior;
-    scal[2] = max(f32(surf - pay) - f32(atomicLoad(&ctr[C_EXPLORE])), 0.0);
+    scal[2] = max(budget - f32(pay) - f32(atomicLoad(&ctr[C_EXPLORE])), 0.0);
     scal[3] = -40.0; // bornes de log2 λ
     scal[4] = 30.0;
 }
@@ -981,22 +1052,29 @@ fn alloc_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn sharc_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x;
     if (k >= fr.w * fr.h || gbuf[k].kind != 2u) { return; }
-    let slot = pcg(k ^ pcg(fr.frame + fr.seed)) % K;
-    let c = pix_cells[k * K + slot];
-    if (c == 0xffffffffu) { return; }
-    let i = atomicAdd(&ctr[C_TASKS], 1u);
-    tasks[i] = vec4<u32>(c, k, pcg(i + fr.frame * 0x9e3779b9u), 0u);
+    // ppp chemins par pixel (arrondi stochastique), chacun vers une de ses K cellules au hasard
+    var h = pcg(k ^ pcg(fr.frame + fr.seed));
+    let n = u32(floor(fr.ppp + f32(h >> 8u) * (1.0 / 16777216.0)));
+    for (var j = 0u; j < n; j++) {
+        h = pcg(h);
+        let c = pix_cells[k * K + h % K];
+        if (c == 0xffffffffu) { continue; }
+        let i = atomicAdd(&ctr[C_TASKS], 1u);
+        tasks[i] = vec4<u32>(c, k, pcg(i + fr.frame * 0x9e3779b9u), 0u);
+    }
 }
 
 @compute @workgroup_size(64)
-fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let lo = atomicLoad(&ctr[C_REG0]);
     let hi = atomicLoad(&ctr[C_TASKS]);
-    let i = lo + stride_task(gid.x, hi - lo);
+    let g = flat_id(gid, nwg);
+    if (g >= 8u * ((hi - lo + 7u) / 8u)) { return; }
+    let i = lo + stride_task(g, hi - lo);
     if (i >= hi) { return; }
     let t = tasks[i];
     let c = t.x;
-    let g = gbuf[t.y];
+    let gx = gbuf[t.y];
     reset_rec();
     fine_dda = false;
     rec_on = (fr.flags & F_SHARC) == 0u;
@@ -1004,7 +1082,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     split = false;
     sel = 0u;
     seed_rng(t.z, i, fr.frame);
-    let v = radiance(g.p, g.n, g.albedo).l;
+    let v = radiance(gx.p, gx.n, gx.albedo).l;
     let b = c * ACC;
     if (rec_on) { commit_deps(c); }
     atomicAdd(&acc[b + A_FN], 1u);
@@ -1072,7 +1150,8 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         cell.last = fr.frame;
     }
-    if (atomicLoad(&acc[b + A_SUSP]) != 0u) { cell.last = fr.frame; }
+    let susp = atomicLoad(&acc[b + A_SUSP]);
+    if (susp == 1u) { cell.last = fr.frame; }
     // vieillissement des dépendances (fenêtres alternées de DEP_WINDOW échantillons)
     let ns = atomicLoad(&acc[b + A_NS]);
     if (ns >= DEP_WINDOW) {
@@ -1093,7 +1172,8 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&acc[b + A_REF], 0u);
     atomicStore(&acc[b + A_FN], 0u);
     for (var w = A_FR; w <= A_FL2; w++) { atomicStore(&acc[b + w], 0u); }
-    for (var w = A_PM; w <= A_SUSP; w++) { atomicStore(&acc[b + w], 0u); }
+    for (var w = A_PM; w < A_SUSP; w++) { atomicStore(&acc[b + w], 0u); }
+    if (susp == 1u) { atomicStore(&acc[b + A_SUSP], 0u); } // 2 (en attente) persiste
 }
 
 @compute @workgroup_size(64)

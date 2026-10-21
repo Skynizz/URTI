@@ -11,7 +11,7 @@ use crate::rt::{Accel, TriScene};
 use crate::scene::{cosine_dir, Scene};
 
 /// Caméra et résolution.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct View {
     pub w: usize,
     pub h: usize,
@@ -37,6 +37,7 @@ impl View {
 }
 
 /// Description d'un événement pour le GPU (mots de `ev`), si la scène a changé.
+#[derive(Clone)]
 pub struct GpuEvent {
     pub words: Vec<u32>,
     pub geometry: bool,
@@ -88,12 +89,14 @@ struct FrameU {
     right: [f32; 3],
     tv: f32,
     up: [f32; 3],
-    pad1: f32,
+    ppp: f32,
 }
 
 const F_EVENT: u32 = 1;
 const F_GEOMETRY: u32 = 2;
 const F_SHARC: u32 = 4;
+const F_PENDING: u32 = 8;
+const F_AMORTIZE: u32 = 16;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -109,6 +112,8 @@ pub struct GpuFrame {
     pub hard: u32,
     pub safety: u32,
     pub overflow: u32,
+    /// cellules encore en attente de leurs chemins corrélés (événement amorti)
+    pub pending: u32,
     pub max_n: f32,
     pub debt: u32,
     /// genre de chaque pixel (0 vide, 1 lampe, 2 surface), si l'image a été relue
@@ -148,9 +153,15 @@ pub struct GpuKrc<'a> {
     seed: u32,
     /// relire l'image à chaque frame (évaluation) ; le banc de vitesse s'en passe
     pub readback: bool,
+    /// budget : chemins par pixel de surface et par frame
+    pub ppp: f32,
+    /// amortir les événements de lampe (chemins corrélés plafonnés par frame)
+    pub amortize: bool,
+    pending: Option<GpuEvent>,
 }
 
-const ENTRIES: [&str; 28] = [
+const ENTRIES: [&str; 29] = [
+    "pending_mark",
     "probe_trace",
     "reference_acc",
     "reset_ctr",
@@ -195,7 +206,7 @@ impl<'a> GpuKrc<'a> {
         // une cellule couvre 2 à 4 pixels de large ; avec le jitter, ≈ len/6 cellules distinctes
         let cell_cap = (len / 2).next_power_of_two().max(1 << 14) as u32;
         let table = (cell_cap as usize * 2).next_power_of_two();
-        let task_cap = cell_cap as usize * 10 + len * 2;
+        let task_cap = cell_cap as usize * 10 + len * 9;
         let storage = |read_only: bool| wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
@@ -329,6 +340,9 @@ impl<'a> GpuKrc<'a> {
             table_mask: table as u32 - 1,
             seed,
             readback: true,
+            ppp: 1.0,
+            amortize: false,
+            pending: None,
         }
     }
 
@@ -354,7 +368,7 @@ impl<'a> GpuKrc<'a> {
             right: f3(v.right),
             tv: v.tv as f32,
             up: f3(v.up),
-            pad1: 0.0,
+            ppp: self.ppp,
         }
     }
 
@@ -367,7 +381,7 @@ impl<'a> GpuKrc<'a> {
             light_w: e.light_w.clone(),
             probe_rays: e.probe_rays,
         });
-        let w_ev: Vec<f64> = ev.map(|e| e.light_w.clone()).unwrap_or_default();
+        let w_ev: Vec<f64> = ev.map(|e| e.light_w.clone()).or(self.pending.as_ref().map(|e| e.light_w.clone())).unwrap_or_default();
         let (b, l) = scene_to_gpu(scene, &w_ev);
         let (bp, lp) = scene_to_gpu(prev, &w_ev);
         let q = &self.gpu.queue;
@@ -383,7 +397,7 @@ impl<'a> GpuKrc<'a> {
         self.bind_idx = 1 - self.bind_idx;
         accel.build_tlas(self.gpu, scene, self.bind_idx);
         let ev = if self.sharc { None } else { self.tri_event(prev, scene, t) };
-        let w_ev: Vec<f64> = ev.as_ref().map(|e| e.light_w.clone()).unwrap_or_default();
+        let w_ev: Vec<f64> = ev.as_ref().or(self.pending.as_ref()).map(|e| e.light_w.clone()).unwrap_or_default();
         let l = lights_to_gpu(&scene.lights, &w_ev);
         let lp = lights_to_gpu(&prev.lights, &w_ev);
         self.run_frame(0, &l, &lp, ev.as_ref(), t)
@@ -550,6 +564,9 @@ impl<'a> GpuKrc<'a> {
         let len = self.view.len() as u32;
         let mut flags = if self.sharc { F_SHARC } else { 0 };
         let mut ev_lights = 0;
+        if self.amortize {
+            flags |= F_AMORTIZE;
+        }
         if let Some(e) = ev {
             if !self.sharc {
                 flags |= F_EVENT;
@@ -559,6 +576,10 @@ impl<'a> GpuKrc<'a> {
                 ev_lights = e.lights;
                 q.write_buffer(&self.bufs[14], 0, bytemuck::cast_slice(&e.words));
             }
+        } else if let Some(p) = &self.pending {
+            // pas de nouvel événement : on continue l'événement de lampe amorti (mots déjà sur le GPU)
+            flags |= F_PENDING;
+            ev_lights = p.lights;
         }
         let fu = self.uniform(n_boxes, l.len(), t, flags, 0, ev_lights, 0);
         q.write_buffer(&self.bufs[0], 0, bytemuck::bytes_of(&fu));
@@ -583,6 +604,11 @@ impl<'a> GpuKrc<'a> {
                 plan.push(("prep_d2", Dispatch::Direct(1)));
                 plan.push(("delta_trace2", Dispatch::Indirect(12)));
             }
+            plan.push(("delta_apply", cells));
+        } else if flags & F_PENDING != 0 {
+            plan.push(("pending_mark", cells));
+            plan.push(("prep_d1", Dispatch::Direct(1)));
+            plan.push(("delta_trace1", Dispatch::Indirect(0)));
             plan.push(("delta_apply", cells));
         }
         if self.sharc {
@@ -644,6 +670,8 @@ impl<'a> GpuKrc<'a> {
             b.unmap();
         }
         let ms = self.period_ns as f64 * 1e-6;
+        // événement de lampe dont il reste des cellules à traiter : on le garde pour la frame suivante
+        self.pending = if ctr[18] > 0 { ev.cloned().or(self.pending.take()) } else { None };
         GpuFrame {
             image: (0..img.len() / 4).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
             kinds: (0..img.len() / 4).map(|k| img[4 * k + 3] as u8).collect(),
@@ -659,6 +687,7 @@ impl<'a> GpuKrc<'a> {
             hard: ctr[C_HARD],
             safety: ctr[C_SAFETY],
             overflow: ctr[C_OVERFLOW],
+            pending: ctr[18],
             max_n: f32::from_bits(ctr[17]),
             debt: ctr[9],
             passes: plan

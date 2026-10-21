@@ -127,3 +127,53 @@
 - **Leçon d'architecture** : avec dépendances, le gain n'est que de ×1,6, parce que
   relire les dépendances de chaque chemin coûte plus que les tracer. Pour du temps
   réel, le cache doit vivre sur le GPU et rien ne doit revenir au CPU par chemin.
+
+## v7 — profilage, tout le pipeline sur GPU (commits 3bfd29d → 5a5bbac)
+
+- **Profil d'un lot 1080p** (timestamps GPU + chronomètres par phase) : sans dépendances,
+  le noyau prend 2,6 ms sur 113 ms. Plus de 97 % du temps est de la plomberie CPU↔GPU
+  (préparation, envoi, relecture, conversion). D'où le portage complet.
+- **Mémoire** : bitset binaire par cellule à 0,6 / 1,2 / 2,4 m (864 / 108 / 16 octets). La
+  pondération par l'énergie fait le gros du tri : L2 (16 octets) ne coûte que +14 à
+  +33 % de chemins par événement, et l'erreur reste dans les barres. L2 est retenu.
+- **Pipeline entièrement GPU** (`krc_gpu.wgsl`, ~20 passes) : G-buffer, table de hachage
+  (CAS en deux temps, sans attente active), événement, chemins corrélés en 2 tours,
+  allocation, traçage avec fusion atomique, résolution, affichage. Le CPU n'envoie que la
+  scène et l'événement.
+- Bugs trouvés en route : remise à zéro des compteurs incomplète (2 groupes au lieu de 4),
+  budget sous-consommé à 69 % (arrondi des quotas, puis sensibilité extrême de Σquota(λ) à
+  l'état convergé : 3 balayages de 32 candidats), dispatch > 65 535 groupes.
+- Optimisations mesurées : allocation par balayages parallèles (12× plus rapide qu'une
+  bisection à un seul groupe), dispatch indirect sur le nombre réel de cellules, DDA
+  grossier hors chemins corrélés, entrelacement des tâches contre la contention des
+  atomiques.
+- Validation : `gpu_krc` 4,19e-3 contre 4,11e-3 pour `krc_energy_l2` CPU ; `gpu_sharc`
+  égal à `cache_ema` CPU.
+
+## v8 — dérive longue (commits 9705364, 39ad338)
+
+- 12 000 frames (100 cycles de la séquence). Aucune saturation, aucune croissance de la
+  table, dette revenue à 0.
+- Deux défauts trouvés et corrigés :
+  1. Après un gros changement combiné (redémarrage de cycle : boîte + 2 lampes),
+     l'erreur restait 3× plus haute pendant ~40 frames : le n_eff d'une estimation
+     corrigée était trop optimiste. Plafond N_POST = 64 (balayage 32/64/128/sans).
+  2. Une dérive lente (+3,1 % ± 1,3 % sur 100 cycles, t = 2,4) : historique plafonné à
+     1 024 échantillons, ce qui la ramène à −0,8 % ± 1,4 %.
+
+## v9 — triangles et ray tracing matériel, comparaison en ms (commits 6d2ae3f → …)
+
+- wgpu 24 expose le ray query Vulkan (BLAS/TLAS) sur la RTX 4070.
+- Shader en gabarit : grille propre à la scène et bloc de géométrie interchangeable
+  (boîtes, ou triangles par ray query sur la TLAS courante et la précédente).
+  Sondes de lampe et références calculées sur GPU (~1 G chemins/s).
+- Cornell box en triangles, même séquence : `tri_krc` 5,03e-3 ± 4e-5 contre
+  `tri_sharc` 3,91e-2 (7,8×).
+- **Comparaison erreur/temps (1024×1024)** : à temps GPU moyen égal, KRC a 2,4 à 2,9×
+  moins d'erreur que SHaRC ; à erreur égale, il est ~2× plus rapide. Mais ses frames
+  d'événement montent à 12–16 ms (p95 ~13 ms), contre un coût constant pour SHaRC.
+- **Résultat négatif : amortir les événements de lampe** (chemins corrélés plafonnés à
+  1 chemin/px, cellules en attente) réduit bien le pic (16,3 → 8,7 ms), mais l'erreur
+  monte de 4,7e-3 à 1,19e-2 : des cellules très fausses restent affichées pendant
+  2 frames. Le p95 reste de toute façon fixé par les pas de la boîte. Option conservée,
+  désactivée.

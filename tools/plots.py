@@ -123,6 +123,7 @@ def bar_chart(path, title, subtitle, rows, xlabel):
 def main():
     out = os.path.join(ROOT, "plots")
     os.makedirs(out, exist_ok=True)
+    pareto_plot(out)
     fixed = ["pt_reset", "cache_reset", "krc_hard", "krc"]
     line_chart(os.path.join(out, "erreur_par_frame.svg"), "Erreur par frame à budget égal (1 chemin/pixel/frame)",
                "relMSE moyenne sur 5 graines, échelle log ; plus bas = mieux",
@@ -174,6 +175,63 @@ def main():
                    "relMSE à budget égal (1 chemin/pixel/frame), échelle log",
                    [(m, [val(m, n, ev, "relmse_mean") for n in rooms]) for m in fixed_s], "relMSE",
                    logy=True, events=False, xlabel="nombre de pièces (96 px de large par pièce)", xs=rooms)
+
+
+def scatter_lines(path, title, subtitle, series, xlabel, ylabel):
+    """Courbes erreur/temps (log-log), un point par budget, étiqueté."""
+    W, H, L, R, T, B = 760, 400, 80, 170, 58, 50
+    pw, ph = W - L - R, H - T - B
+    xs = [x for _, pts in series for x, _, _ in pts]
+    ys = [y for _, pts in series for _, y, _ in pts]
+    xlo, xhi = 10 ** math.floor(math.log10(min(xs))), 10 ** math.ceil(math.log10(max(xs)))
+    ylo, yhi = 10 ** math.floor(math.log10(min(ys))), 10 ** math.ceil(math.log10(max(ys)))
+    gx = lambda x: L + pw * (math.log10(x) - math.log10(xlo)) / (math.log10(xhi) - math.log10(xlo))
+    gy = lambda y: T + ph * (1 - (math.log10(y) - math.log10(ylo)) / (math.log10(yhi) - math.log10(ylo)))
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui, sans-serif" font-size="12">',
+         f'<rect width="{W}" height="{H}" fill="{SURFACE}"/>',
+         f'<text x="{L}" y="22" font-size="15" font-weight="600" fill="{INK}">{esc(title)}</text>',
+         f'<text x="{L}" y="40" fill="{INK2}">{esc(subtitle)}</text>']
+    for e in range(int(math.log10(ylo)), int(math.log10(yhi)) + 1):
+        y = gy(10 ** e)
+        o.append(f'<line x1="{L}" x2="{L + pw}" y1="{y:.1f}" y2="{y:.1f}" stroke="{GRID}"/>')
+        o.append(f'<text x="{L - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{INK2}">1e{e}</text>')
+    for v in [1, 2, 3, 5, 10, 20, 30]:
+        if xlo <= v <= xhi:
+            x = gx(v)
+            o.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{T}" y2="{T + ph}" stroke="{GRID}"/>')
+            o.append(f'<text x="{x:.1f}" y="{T + ph + 18}" text-anchor="middle" fill="{INK2}">{v}</text>')
+    o.append(f'<text x="{L + pw / 2}" y="{H - 8}" text-anchor="middle" fill="{INK2}">{esc(xlabel)}</text>')
+    o.append(f'<text transform="translate(18 {T + ph / 2}) rotate(-90)" text-anchor="middle" fill="{INK2}">{esc(ylabel)}</text>')
+    ends = []
+    for i, (name, pts) in enumerate(series):
+        c = SERIES[i]
+        pts = sorted(pts)
+        o.append('<polyline points="' + " ".join(f"{gx(x):.1f},{gy(y):.1f}" for x, y, _ in pts) + f'" fill="none" stroke="{c}" stroke-width="2"/>')
+        for x, y, lab in pts:
+            o.append(f'<circle cx="{gx(x):.1f}" cy="{gy(y):.1f}" r="4" fill="{c}" stroke="{SURFACE}" stroke-width="2"/>')
+            o.append(f'<text x="{gx(x) + 7:.1f}" y="{gy(y) - 6:.1f}" fill="{INK2}" font-size="10">{esc(lab)}</text>')
+        ends.append([gy(pts[-1][1]), name, c])
+    ends.sort()
+    for k in range(1, len(ends)):
+        ends[k][0] = max(ends[k][0], ends[k - 1][0] + 14)
+    for y, name, c in ends:
+        o.append(f'<rect x="{L + pw + 8}" y="{y - 5:.1f}" width="10" height="10" rx="2" fill="{c}"/>')
+        o.append(f'<text x="{L + pw + 22}" y="{y + 4:.1f}" fill="{INK}">{esc(name)}</text>')
+    o.append("</svg>")
+    with open(path, "w", encoding="utf8") as fh:
+        fh.write("\n".join(o))
+
+
+def pareto_plot(out):
+    p = os.path.join(ROOT, "cornell_1024", "pareto.csv")
+    if not os.path.exists(p):
+        return
+    rows = read_csv(p)
+    names = ["tri_sharc", "tri_krc"]
+    series = [(n, [(float(r["ms_mean"]), float(r["relmse"]), r["ppp"] + " ch/px") for r in rows if r["method"] == n]) for n in names]
+    scatter_lines(os.path.join(out, "pareto_cornell.svg"), "Erreur contre temps GPU : Cornell box en triangles, 1024×1024",
+                  "ray tracing matériel (RTX 4070) ; budget variable en chemins par pixel ; en bas à gauche = mieux",
+                  series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
 
 
 if __name__ == "__main__":

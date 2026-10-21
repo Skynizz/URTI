@@ -8,10 +8,11 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Brique | État |
 |---|---|
 | Algorithme (cache + incertitude + delta corrélé + dépendances pondérées) | validé sur scène jouet, CPU |
-| Traçage des chemins sur GPU | validé (identique au CPU statistiquement), 466 M chemins/s en calcul pur |
-| Cache sur GPU | **à faire** : c'est le goulot actuel (relecture CPU des dépendances) |
-| Rayons matériels (cœurs RT) | à faire ; wgpu expose `ray_query` sur Vulkan |
-| Géométrie réelle (triangles, BVH) | à faire ; aujourd'hui, des boîtes alignées |
+| Traçage des chemins sur GPU | ✅ validé (identique au CPU statistiquement) |
+| Cache, allocation, événements sur GPU | ✅ pipeline entièrement GPU, stable sur 12 000 frames |
+| Rayons matériels (cœurs RT) | ✅ ray query Vulkan, BLAS/TLAS, deux TLAS (avant/après) |
+| Géométrie réelle (triangles, BVH) | ✅ Cornell box ; Sponza à faire |
+| Comparaison en ms contre un cache standard | ✅ 2,4–2,9× moins d'erreur à temps égal ; pics d'événement à résoudre |
 | Caméra mobile, spéculaire | à faire |
 
 ## Étapes, dans l'ordre

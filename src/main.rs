@@ -199,6 +199,14 @@ fn main() {
             }
             None => eprintln!("pas de GPU"),
         },
+        Some("pareto") => match gpu::Gpu::new() {
+            Some(g) => rt::pareto(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024)),
+            None => eprintln!("pas de GPU"),
+        },
+        Some("spikes") => match gpu::Gpu::new() {
+            Some(g) => rt::spikes(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024)),
+            None => eprintln!("pas de GPU"),
+        },
         Some("rtsmoke") => match gpu::Gpu::new() {
             Some(g) => rt::smoke(&g),
             None => eprintln!("pas de GPU"),
