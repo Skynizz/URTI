@@ -77,11 +77,44 @@ struct Bufs {
 const MAX_BOXES: usize = 64;
 const MAX_LIGHTS: usize = 16;
 
+/// Profil cumulé des appels (ms) : où passe le temps d'un lot.
+#[derive(Default, Clone, Debug)]
+pub struct Prof {
+    pub calls: usize,
+    /// préparation des tâches et de la scène côté CPU
+    pub build: f64,
+    /// write_buffer (copie vers la zone de transfert)
+    pub upload: f64,
+    /// submit → fin du travail GPU (noyau + copies + synchronisation)
+    pub wait: f64,
+    /// noyau seul (timestamps GPU)
+    pub kernel: f64,
+    /// lecture des buffers mappés
+    pub read: f64,
+    /// conversion en structures CPU (V3 f64, DepRec)
+    pub convert: f64,
+}
+
+impl Prof {
+    pub fn total(&self) -> f64 {
+        self.build + self.upload + self.wait + self.read + self.convert
+    }
+}
+
+struct Timestamps {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    period_ns: f32,
+}
+
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bufs: std::sync::Mutex<Option<Bufs>>,
+    ts: Option<Timestamps>,
+    pub prof: std::sync::Mutex<Prof>,
     pub name: String,
 }
 
@@ -100,10 +133,11 @@ impl Gpu {
         if info.device_type == wgpu::DeviceType::Cpu {
             return None;
         }
+        let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("krc"),
-                required_features: wgpu::Features::empty(),
+                required_features: features,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -122,7 +156,31 @@ impl Gpu {
             compilation_options: Default::default(),
             cache: None,
         });
-        Some(Gpu { device, queue, pipeline, bufs: Default::default(), name: format!("{} ({:?})", info.name, info.backend) })
+        let ts = features.contains(wgpu::Features::TIMESTAMP_QUERY).then(|| Timestamps {
+            set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("ts"), ty: wgpu::QueryType::Timestamp, count: 2 }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            read: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            period_ns: queue.get_timestamp_period(),
+        });
+        Some(Gpu {
+            device,
+            queue,
+            pipeline,
+            bufs: Default::default(),
+            ts,
+            prof: Default::default(),
+            name: format!("{} ({:?})", info.name, info.backend),
+        })
     }
 
     fn alloc(&self, cap: usize) -> Bufs {
@@ -196,6 +254,9 @@ impl Gpu {
             return;
         }
         let dev = &self.device;
+        let clock = std::time::Instant::now();
+        let ms = |c: &std::time::Instant| c.elapsed().as_secs_f64() * 1e3;
+        let mut prof = Prof { calls: 1, ..Default::default() };
         assert!(scene.objects.len() <= MAX_BOXES && scene.lights.len() <= MAX_LIGHTS);
         let boxes: Vec<GBox> = scene
             .objects
@@ -239,6 +300,8 @@ impl Gpu {
             spp,
             pad: [0; 3],
         };
+        prof.build = ms(&clock);
+        let clock = std::time::Instant::now();
         let mut guard = self.bufs.lock().unwrap();
         if guard.as_ref().is_none_or(|b| b.cap < n) {
             *guard = Some(self.alloc(n.next_power_of_two().max(4096)));
@@ -256,9 +319,16 @@ impl Gpu {
             if o.record { (n * MASKS * 4) as u64 } else { 0 },
             if o.record { (n * REGION_WORDS * 4) as u64 } else { 0 },
         ];
+        prof.upload = ms(&clock);
+        let clock = std::time::Instant::now();
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("trace") });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("trace"), timestamp_writes: None });
+            let timestamp_writes = self.ts.as_ref().map(|t| wgpu::ComputePassTimestampWrites {
+                query_set: &t.set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("trace"), timestamp_writes });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bufs.bind, &[]);
             pass.dispatch_workgroups((n as u32).div_ceil(WG), 1, 1);
@@ -268,13 +338,27 @@ impl Gpu {
                 enc.copy_buffer_to_buffer(&bufs.outs[k], 0, &bufs.read[k], 0, sizes[k]);
             }
         }
+        if let Some(t) = &self.ts {
+            enc.resolve_query_set(&t.set, 0..2, &t.resolve, 0);
+            enc.copy_buffer_to_buffer(&t.resolve, 0, &t.read, 0, 16);
+        }
         q.submit(Some(enc.finish()));
         for k in 0..4 {
             if sizes[k] > 0 {
                 bufs.read[k].slice(..sizes[k]).map_async(wgpu::MapMode::Read, |r| r.expect("lecture GPU"));
             }
         }
+        if let Some(t) = &self.ts {
+            t.read.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("lecture timestamps"));
+        }
         dev.poll(wgpu::Maintain::Wait);
+        prof.wait = ms(&clock);
+        if let Some(t) = &self.ts {
+            let v: Vec<u64> = bytemuck::cast_slice::<u8, u64>(&t.read.slice(..).get_mapped_range()).to_vec();
+            t.read.unmap();
+            prof.kernel = v[1].saturating_sub(v[0]) as f64 * t.period_ns as f64 * 1e-6;
+        }
+        let clock = std::time::Instant::now();
         let data: Vec<Vec<u32>> = (0..4)
             .map(|k| {
                 if sizes[k] == 0 {
@@ -285,6 +369,8 @@ impl Gpu {
                 v
             })
             .collect();
+        prof.read = ms(&clock);
+        let clock = std::time::Instant::now();
         let fl = |x: u32| f32::from_bits(x) as f64 * w;
         for i in 0..n {
             out.l.push(v3(fl(data[0][4 * i]), fl(data[0][4 * i + 1]), fl(data[0][4 * i + 2])));
@@ -304,5 +390,14 @@ impl Gpu {
                 });
             }
         }
+        prof.convert = ms(&clock);
+        let mut p = self.prof.lock().unwrap();
+        p.calls += 1;
+        p.build += prof.build;
+        p.upload += prof.upload;
+        p.wait += prof.wait;
+        p.kernel += prof.kernel;
+        p.read += prof.read;
+        p.convert += prof.convert;
     }
 }

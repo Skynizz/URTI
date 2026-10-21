@@ -106,6 +106,29 @@ pub fn bench(tracer: &Tracer) {
         println!("  GPU 262144 requêtes × {spp:>2} spp : {tg:7.1} ms ({:7.1} M chemins/s)", 262_144.0 * spp as f64 / tg / 1e3);
     }
 
+    // 2 ter. profil d'un lot 1080p : où passent les millisecondes
+    if let Tracer::Gpu(gg) = g {
+        let r = reqs_for(&gb, 1920 * 1080, 7);
+        for record in [false, true] {
+            let o = Opts { record, ..Opts::plain() };
+            let _ = g.trace(&scene, &r, &o);
+            *gg.prof.lock().unwrap() = Default::default();
+            let (_, total) = timed(|| g.trace(&scene, &r, &o));
+            let p = gg.prof.lock().unwrap().clone();
+            println!(
+                "profil 1080p, dépendances {:<3} : total {total:6.1} ms = préparation {:5.1} + envoi {:5.1} + attente GPU {:5.1} (dont noyau {:5.1}) + relecture {:5.1} + conversion {:5.1} + hors lot {:5.1}",
+                if record { "oui" } else { "non" },
+                p.build,
+                p.upload,
+                p.wait,
+                p.kernel,
+                p.read,
+                p.convert,
+                total - p.total()
+            );
+        }
+    }
+
     // 3. débit
     println!("débit (scène 2 pièces, 1 chemin par requête, transferts compris) :");
     for &n in &[n_surf, 262_144, 1920 * 1080] {
