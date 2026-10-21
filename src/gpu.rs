@@ -158,7 +158,11 @@ impl Gpu {
         if info.device_type == wgpu::DeviceType::Cpu {
             return None;
         }
-        let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        // timestamps, et ray tracing matériel si l'adaptateur le propose (Vulkan sur RTX)
+        let features = adapter.features()
+            & (wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::EXPERIMENTAL_RAY_TRACING_ACCELERATION_STRUCTURE
+                | wgpu::Features::EXPERIMENTAL_RAY_QUERY);
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("krc"),

@@ -6,6 +6,7 @@ mod methods;
 mod par;
 mod pt;
 mod render;
+mod rt;
 mod bench;
 mod gpu;
 mod gpu_krc;
@@ -188,6 +189,10 @@ fn main() {
                 let cycles = args.get(1).and_then(|c| c.parse().ok()).unwrap_or(100);
                 gpu_krc::drift(&g, cycles, &ensure_refs(&w2, "results/ref", &tracer));
             }
+            None => eprintln!("pas de GPU"),
+        },
+        Some("rtsmoke") => match gpu::Gpu::new() {
+            Some(g) => rt::smoke(&g),
             None => eprintln!("pas de GPU"),
         },
         Some("gpubench") => match gpu::Gpu::new() {
