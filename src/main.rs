@@ -96,6 +96,7 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, worl
 
 /// Passage à l'échelle : N pièces, mêmes événements (pièces 0 et 1), densité de pixels constante.
 fn scale() {
+    let only: Option<Vec<String>> = std::env::var("KRC_METHODS").ok().map(|v| v.split(',').map(String::from).collect());
     let names: Vec<String> = [
         "cache_reset",
         "krc_hard",
@@ -107,12 +108,18 @@ fn scale() {
         "krc_all_target",
         "krc_noage_target",
         "krc_target",
+        "krc_energy",
+        "krc_energy_target",
     ]
         .iter()
         .map(|s| s.to_string())
+        .filter(|s| only.as_ref().map_or(true, |o| o.contains(s)))
         .collect();
     let mut all = String::from("rooms,method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame\n");
-    for rooms in [2usize, 4, 8] {
+    let rooms_list: Vec<usize> = std::env::var("KRC_ROOMS")
+        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|_| vec![2, 4, 8]);
+    for rooms in rooms_list {
         let world = World::new(rooms);
         let refs = ensure_refs(&world, &format!("results/ref_n{rooms}"));
         eprintln!("--- {rooms} pièces");
@@ -121,7 +128,9 @@ fn scale() {
             all += &format!("{rooms},{line}\n");
         }
     }
-    std::fs::write("results/scale/summary.csv", all).unwrap();
+    if only.is_none() {
+        std::fs::write("results/scale/summary.csv", all).unwrap();
+    }
 }
 
 /// Nombre de graines indépendantes par méthode (variable d'environnement KRC_SEEDS, 5 par défaut).

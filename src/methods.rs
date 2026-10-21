@@ -1,6 +1,6 @@
 //! Les méthodes comparées et la boucle de séquence.
 use crate::cache::{cell_key, zscore, Cache, Cell, Stat};
-use crate::deps::{mark_aabb, mark_point, Bits};
+use crate::deps::{mark_aabb, region_of, Bits};
 use crate::math::{mix64, v3, Rng, V3};
 use crate::par::par_map;
 use crate::pt::{radiance, radiance_split, DepRec, NoRec};
@@ -14,6 +14,7 @@ const N_VERIFY: f64 = 8.0; // z-test : échantillons frais avant de confirmer
 const Z_VERIFY: f64 = 3.0;
 const M_DELTA0: usize = 2; // chemins corrélés par cellule suspecte, 1er tour
 const M_DELTA: usize = 8; // total si l'un des chemins du 1er tour est affecté
+const EPS_ENERGY: f64 = 0.01; // changement relatif attendu minimal pour suspecter une cellule
 const DEP_WINDOW: u32 = 64; // vieillissement des dépendances, en échantillons
 const DEBT_RATE: f64 = 0.5; // part max du budget d'une frame servant à rembourser les chemins différentiels
 const SAFETY_WINDOW: f64 = 32.0;
@@ -37,6 +38,9 @@ pub enum Deps {
     Objects,
     /// toutes les cellules (pas de graphe)
     All,
+    /// pondérées par l'énergie : géométrie comme Spatial ; pour un changement de lampe, la cellule
+    /// est suspecte si Σ_S fréquence_sommets(S) · magnitude(S) dépasse EPS_ENERGY × sa radiance
+    Energy,
 }
 
 /// Que fait-on d'une cellule suspecte.
@@ -93,13 +97,14 @@ pub fn all_methods() -> Vec<Cfg> {
         cache("krc_ztest", true, false, Invalidate(Spatial, ZTest), true),
         cache("krc_delta", true, false, Invalidate(Spatial, Delta { cv: false }), true),
         cache("krc", true, false, Invalidate(Spatial, Delta { cv: true }), true),
+        cache("krc_energy", true, false, Invalidate(Energy, Delta { cv: true }), true),
         Cfg {
             name: "krc_noage".into(),
             kind: Kind::Cache { neyman: true, ema: false, on_event: Invalidate(Spatial, Delta { cv: true }), safety: true, age: false },
             target: None,
         },
     ];
-    for base in ["krc", "krc_noage", "krc_all", "krc_hard", "cache_reset"] {
+    for base in ["krc", "krc_energy", "krc_noage", "krc_all", "krc_hard", "cache_reset"] {
         let mut c = v.iter().find(|c| c.name == base).unwrap().clone();
         c.name = format!("{base}_target");
         c.target = Some(0.03);
@@ -118,21 +123,32 @@ pub struct Event {
     pub light_w: Vec<f64>,
     /// un objet a bougé (sinon seules des lampes ont changé)
     pub geometry: bool,
+    /// changements de lampe : variation de radiance estimée (luminance) à la surface de
+    /// chaque région touchée par les sondes
+    pub mag: Vec<(usize, f64)>,
     pub probe_rays: usize,
 }
 
-/// Rayons-sondes depuis une lampe : régions de leurs premiers impacts.
-fn light_probes(scene: &Scene, j: usize, seed: u64, bits: &mut Bits) {
+/// Rayons-sondes depuis une lampe : régions de leurs premiers impacts, avec une magnitude.
+/// Chaque sonde transporte Φ/P (Φ = π·L·A pour un émetteur lambertien) ; une région qui en
+/// reçoit k voit sa radiance de surface changer d'environ ρ·kΦ/(P·π·A_R), avec A_R ≈ REGION².
+fn light_probes(scene: &Scene, j: usize, seed: u64, bits: &mut Bits, mag: &mut Vec<(usize, f64)>) {
     let l = &scene.lights[j];
     mark_aabb(bits, &l.aabb());
     let mut rng = Rng::new(seed);
+    let mut hits: HashMap<usize, f64> = HashMap::new();
+    let flux_per_probe = std::f64::consts::PI * l.emission.lum() * l.area() / PROBES as f64;
+    let area = crate::deps::REGION * crate::deps::REGION;
     for _ in 0..PROBES {
         let o = l.center + v3((2.0 * rng.f64() - 1.0) * l.hx, -1e-4, (2.0 * rng.f64() - 1.0) * l.hz);
         let d = cosine_dir(v3(0.0, -1.0, 0.0), &mut rng);
         if let Some(h) = scene.intersect(o, d, f64::INFINITY) {
-            mark_point(bits, h.p);
+            let r = region_of(h.p);
+            bits.set(r);
+            *hits.entry(r).or_default() += h.albedo.lum() * flux_per_probe / (std::f64::consts::PI * area);
         }
     }
+    mag.extend(hits);
 }
 
 pub fn event(prev: &State, cur: &State, prev_scene: &Scene, cur_scene: &Scene, frame: u32) -> Option<Event> {
@@ -152,7 +168,7 @@ pub fn event(prev: &State, cur: &State, prev_scene: &Scene, cur_scene: &Scene, f
             ev.light_w[j] = was as u8 as f64 - is as u8 as f64;
             // on sonde depuis l'état où la lampe est allumée
             let scene = if is { cur_scene } else { prev_scene };
-            light_probes(scene, j, mix64(frame as u64 * 31 + j as u64), &mut ev.regions);
+            light_probes(scene, j, mix64(frame as u64 * 31 + j as u64), &mut ev.regions, &mut ev.mag);
             ev.objs |= 1u128 << (LIGHT_ID_BASE + j);
             ev.lights |= 1 << j;
             ev.probe_rays += PROBES;
@@ -287,7 +303,7 @@ fn task_rng(seed: u64, frame: u32, i: usize) -> Rng {
 }
 
 fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool, window: Option<u32>) {
-    c.add_deps(&rec.regions, window);
+    c.add_deps(rec, window);
     c.objs |= rec.objs;
     if ema {
         c.main.add_ema(v, EMA_CACHE);
@@ -385,9 +401,17 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 };
 
                 // 2. événement
+                let debug_rooms = std::env::var("KRC_DEBUG_ROOMS").is_ok() && ev.is_some();
+                let mut room_suspects = [0usize; 8];
                 let mut delta_tasks: Vec<(u32, u32)> = Vec::new();
                 if let Some(e) = &ev {
                     fs.probes = e.probe_rays;
+                    // magnitude par super-région : max des régions qu'elle contient
+                    let mut mag_super = [0.0f64; crate::deps::SUPER];
+                    for &(r, m) in &e.mag {
+                        let s = crate::deps::super_of(r);
+                        mag_super[s] = mag_super[s].max(m);
+                    }
                     for (ci, c) in cache.cells.iter_mut().enumerate() {
                         let deps = match on_event {
                             OnEvent::Nothing => continue,
@@ -401,11 +425,23 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                             Deps::Spatial => c.depends_on(&e.regions),
                             Deps::Objects => c.objs & e.objs != 0,
                             Deps::All => true,
+                            Deps::Energy if e.geometry => c.depends_on(&e.regions),
+                            // il faut pouvoir être touchée (régions traversées) ET que l'effet attendu compte
+                            Deps::Energy => {
+                                c.depends_on(&e.regions) && {
+                                    let dl: f64 =
+                                        (0..crate::deps::SUPER).map(|s| c.freq_of(s) * mag_super[s]).sum();
+                                    dl > EPS_ENERGY * c.main.lmean.max(0.1)
+                                }
+                            }
                         };
                         if !suspect || c.main.n == 0.0 {
                             continue;
                         }
                         fs.suspects += 1;
+                        if debug_rooms {
+                            room_suspects[((c.cx / 5.2) as usize).min(7)] += 1;
+                        }
                         let OnEvent::Invalidate(_, action) = on_event else { unreachable!() };
                         match action {
                             Action::Hard => {
@@ -429,6 +465,13 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                             }
                         }
                     }
+                }
+                if debug_rooms && !ev.as_ref().unwrap().geometry {
+                    let mut room_cells = [0usize; 8];
+                    for &c in &visible {
+                        room_cells[((cache.cells[c].cx / 5.2) as usize).min(7)] += 1;
+                    }
+                    eprintln!("{} frame {frame} suspects/visibles par pièce : {:?} / {:?}", cfg.name, room_suspects, room_cells);
                 }
                 // 2b. chemins corrélés : même graine dans l'ancienne et la nouvelle scène.
                 // Si le nouveau chemin ne touche ni la zone changée ni une lampe changée, l'ancien
@@ -486,7 +529,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                         for &i in &idx {
                             let r = &results[i];
                             if changed {
-                                c.add_deps(&r.4.regions, window);
+                                c.add_deps(&r.4, window);
                                 c.objs |= r.4.objs;
                             } else {
                                 add_sample(c, r.1, &r.4, ema, safety, window);

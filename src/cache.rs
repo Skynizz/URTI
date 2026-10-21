@@ -1,5 +1,5 @@
 //! Cellules du cache spatial : statistiques, état de vérification, dépendances.
-use crate::deps::Bits;
+use crate::deps::{Bits, Freq};
 use crate::math::{mix64, V3};
 use std::collections::HashMap;
 
@@ -70,6 +70,9 @@ pub struct Cell {
     pub deps: Bits,
     pub deps_prev: Bits,
     pub dep_count: u32,
+    /// Fréquences des sommets de chemin par super-région, mêmes fenêtres alternées que `deps`.
+    pub freq: Freq,
+    pub freq_prev: Freq,
     pub objs: u128,
     pub last: i64,
     pub cx: f64,
@@ -83,18 +86,32 @@ impl Cell {
         self.deps = Bits::default();
         self.deps_prev = Bits::default();
         self.dep_count = 0;
+        self.freq = Freq::default();
+        self.freq_prev = Freq::default();
         self.objs = 0;
     }
-    pub fn add_deps(&mut self, b: &Bits, window: Option<u32>) {
+    pub fn add_deps(&mut self, rec: &crate::pt::DepRec, window: Option<u32>) {
+        let b = &rec.regions;
         self.deps.or(b);
+        self.freq.add(&rec.verts);
         if let Some(k) = window {
             self.dep_count += 1;
             if self.dep_count >= k {
                 self.deps_prev = self.deps;
                 self.deps = Bits::default();
+                self.freq_prev = self.freq;
+                self.freq = Freq::default();
                 self.dep_count = 0;
             }
         }
+    }
+    /// Fraction des échantillons récents qui ont un sommet dans la super-région.
+    pub fn freq_of(&self, s: usize) -> f64 {
+        let n = self.freq.n as f64 + self.freq_prev.n as f64;
+        if n == 0.0 {
+            return 0.0;
+        }
+        ((self.freq.cnt[s] as f64 + self.freq_prev.cnt[s] as f64) / n).min(1.0)
     }
     pub fn depends_on(&self, regions: &Bits) -> bool {
         self.deps.intersects(regions) || self.deps_prev.intersects(regions)

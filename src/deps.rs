@@ -30,6 +30,57 @@ impl Bits {
     pub fn intersects(&self, o: &Bits) -> bool {
         (0..WORDS).any(|k| self.0[k] & o.0[k] != 0)
     }
+    pub fn ones(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..WORDS).flat_map(move |k| {
+            let w = self.0[k];
+            (0..64).filter(move |b| w >> b & 1 == 1).map(move |b| k * 64 + b)
+        })
+    }
+}
+
+/// Super-régions pour les fréquences : blocs de 4 × 6 × 4 régions (2,4 m × toute la hauteur ×
+/// 2,4 m). Un hachage sur 256 compteurs a échoué : une cellule traverse 100 à 300 régions par
+/// fenêtre, les collisions rendaient toutes les fréquences élevées.
+const SUPER_DIV: [i64; 3] = [4, 6, 4];
+const SUPER_DIMS: [usize; 3] = [18, 1, 2];
+pub const SUPER: usize = SUPER_DIMS[0] * SUPER_DIMS[1] * SUPER_DIMS[2];
+
+pub fn super_of(region: usize) -> usize {
+    let r = region as i64;
+    let (x, y, z) = (r % DIMS[0], r / DIMS[0] % DIMS[1], r / (DIMS[0] * DIMS[1]));
+    let (sx, sy, sz) = ((x / SUPER_DIV[0]) as usize, (y / SUPER_DIV[1]) as usize, (z / SUPER_DIV[2]) as usize);
+    (sz * SUPER_DIMS[1] + sy) * SUPER_DIMS[0] + sx
+}
+
+/// Fréquences exactes par super-région : nombre d'échantillons de la fenêtre qui y ont un sommet
+/// (compteurs saturants).
+#[derive(Clone, Copy)]
+pub struct Freq {
+    pub cnt: [u8; SUPER],
+    pub n: u16,
+}
+
+impl Default for Freq {
+    fn default() -> Freq {
+        Freq { cnt: [0; SUPER], n: 0 }
+    }
+}
+
+impl Freq {
+    pub fn add(&mut self, regions: &Bits) {
+        let mut seen = [false; SUPER];
+        for r in regions.ones() {
+            seen[super_of(r)] = true;
+        }
+        for (c, s) in self.cnt.iter_mut().zip(seen) {
+            *c = c.saturating_add(s as u8);
+        }
+        self.n = self.n.saturating_add(1);
+    }
+}
+
+pub fn region_of(p: V3) -> usize {
+    index(cell_of(p))
 }
 
 fn index(c: [i64; 3]) -> usize {
@@ -42,10 +93,6 @@ fn cell_of(p: V3) -> [i64; 3] {
         c[a] = (((p.get(a) - ORIGIN.get(a)) / REGION).floor() as i64).clamp(0, DIMS[a] - 1);
     }
     c
-}
-
-pub fn mark_point(bits: &mut Bits, p: V3) {
-    bits.set(index(cell_of(p)));
 }
 
 pub fn mark_aabb(bits: &mut Bits, b: &Aabb) {

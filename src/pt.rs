@@ -10,6 +10,8 @@ pub trait Rec {
     fn segment(&mut self, a: V3, b: V3);
     fn object(&mut self, id: usize);
     fn light_selected(&mut self, _j: usize) {}
+    /// sommet du chemin (point où il rebondit) : c'est là qu'un changement de lumière est capté
+    fn vertex(&mut self, _p: V3) {}
 }
 
 pub struct NoRec;
@@ -24,6 +26,8 @@ pub struct DepRec {
     pub regions: Bits,
     pub objs: u128,
     pub lights: u64,
+    /// régions contenant les sommets du chemin
+    pub verts: Bits,
 }
 impl Rec for DepRec {
     fn segment(&mut self, a: V3, b: V3) {
@@ -34,6 +38,9 @@ impl Rec for DepRec {
     }
     fn light_selected(&mut self, j: usize) {
         self.lights |= 1 << j;
+    }
+    fn vertex(&mut self, p: V3) {
+        self.verts.set(crate::deps::region_of(p));
     }
 }
 
@@ -81,6 +88,7 @@ pub fn radiance_split<R: Rec>(
     let mut beta = V3::splat(1.0);
     let mut l = V3::default();
     let mut dl = V3::default();
+    rec.vertex(p0);
     for depth in 0..MAX_DEPTH {
         let origin = p + n * 1e-6;
         // NEE
@@ -131,6 +139,7 @@ pub fn radiance_split<R: Rec>(
                 if h.light.is_some() {
                     break; // émission déjà comptée par NEE
                 }
+                rec.vertex(h.p);
                 p = h.p;
                 n = h.n;
                 albedo = h.albedo;
