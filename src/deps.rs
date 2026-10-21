@@ -30,12 +30,6 @@ impl Bits {
     pub fn intersects(&self, o: &Bits) -> bool {
         (0..WORDS).any(|k| self.0[k] & o.0[k] != 0)
     }
-    pub fn ones(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..WORDS).flat_map(move |k| {
-            let w = self.0[k];
-            (0..64).filter(move |b| w >> b & 1 == 1).map(move |b| k * 64 + b)
-        })
-    }
 }
 
 /// Super-régions pour les fréquences : blocs de 4 × 6 × 4 régions (2,4 m × toute la hauteur ×
@@ -67,13 +61,9 @@ impl Default for Freq {
 }
 
 impl Freq {
-    pub fn add(&mut self, regions: &Bits) {
-        let mut seen = [false; SUPER];
-        for r in regions.ones() {
-            seen[super_of(r)] = true;
-        }
-        for (c, s) in self.cnt.iter_mut().zip(seen) {
-            *c = c.saturating_add(s as u8);
+    pub fn add(&mut self, vsup: u64) {
+        for (s, c) in self.cnt.iter_mut().enumerate() {
+            *c = c.saturating_add((vsup >> s & 1) as u8);
         }
         self.n = self.n.saturating_add(1);
     }

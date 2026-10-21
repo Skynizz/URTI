@@ -93,7 +93,7 @@ impl Cell {
     pub fn add_deps(&mut self, rec: &crate::pt::DepRec, window: Option<u32>) {
         let b = &rec.regions;
         self.deps.or(b);
-        self.freq.add(&rec.verts);
+        self.freq.add(rec.vsup);
         if let Some(k) = window {
             self.dep_count += 1;
             if self.dep_count >= k {

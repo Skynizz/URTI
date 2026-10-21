@@ -26,8 +26,8 @@ pub struct DepRec {
     pub regions: Bits,
     pub objs: u128,
     pub lights: u64,
-    /// régions contenant les sommets du chemin
-    pub verts: Bits,
+    /// super-régions contenant les sommets du chemin (bit s = super-région s)
+    pub vsup: u64,
 }
 impl Rec for DepRec {
     fn segment(&mut self, a: V3, b: V3) {
@@ -40,7 +40,7 @@ impl Rec for DepRec {
         self.lights |= 1 << j;
     }
     fn vertex(&mut self, p: V3) {
-        self.verts.set(crate::deps::region_of(p));
+        self.vsup |= 1 << crate::deps::super_of(crate::deps::region_of(p));
     }
 }
 
@@ -65,11 +65,7 @@ fn sample_light(scene: &Scene, rng: &mut Rng, union: bool) -> Option<(usize, f64
 
 /// Estimateur à un échantillon de la radiance sortante (diffuse) au point p de normale n.
 /// La consommation de nombres aléatoires par sommet est fixe, pour l'échantillonnage corrélé.
-pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rng, rec: &mut R, union: bool) -> V3 {
-    radiance_split(scene, p0, n0, albedo0, rng, rec, union, &[]).0
-}
-
-/// Comme `radiance`, et renvoie aussi Σ_j w_j · C_j, où C_j est la contribution NEE qu'aurait la
+/// Renvoie aussi Σ_j w_j · C_j, où C_j est la contribution NEE qu'aurait la
 /// lampe j si elle était allumée (géométrie identique). Pour un changement qui ne touche que des
 /// lampes, avec w_j = allumée_avant − allumée_après, l'ancienne radiance vaut L + Σ w_j C_j :
 /// le chemin de l'ancienne scène n'a pas besoin d'être retracé.

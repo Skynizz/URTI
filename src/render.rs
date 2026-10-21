@@ -1,7 +1,7 @@
 //! Caméra, G-buffer, références et métriques.
-use crate::math::{mix64, v3, Rng, V3};
+use crate::math::{mix64, v3, V3};
 use crate::par::par_map;
-use crate::pt::{radiance, NoRec};
+use crate::tracer::{Opts, Req, Tracer};
 use crate::scene::Scene;
 
 pub const REF_SPP: usize = 4096;
@@ -68,19 +68,21 @@ pub fn gbuffer(scene: &Scene, world: &World) -> Vec<Px> {
 }
 
 /// Image de référence : moyenne de REF_SPP chemins par pixel au point visible.
-pub fn reference(scene: &Scene, gb: &[Px]) -> Vec<V3> {
-    par_map(gb.len(), |k| match gb[k] {
-        Px::Miss => V3::default(),
-        Px::Light(e) => e,
-        Px::Surf { p, n, albedo, .. } => {
-            let mut rng = Rng::new(mix64(k as u64 ^ 0xabcdef));
-            let mut acc = V3::default();
-            for _ in 0..REF_SPP {
-                acc += radiance(scene, p, n, albedo, &mut rng, &mut NoRec, false);
-            }
-            acc / REF_SPP as f64
-        }
-    })
+pub fn reference(scene: &Scene, gb: &[Px], tracer: &Tracer) -> Vec<V3> {
+    let surf: Vec<usize> = (0..gb.len()).filter(|&k| matches!(gb[k], Px::Surf { .. })).collect();
+    let reqs: Vec<Req> = surf
+        .iter()
+        .map(|&k| {
+            let Px::Surf { p, n, albedo, .. } = gb[k] else { unreachable!() };
+            Req { p, n, albedo, seed: mix64(k as u64 ^ 0xabcdef) }
+        })
+        .collect();
+    let o = Opts { spp: REF_SPP as u32, ..Opts::plain() };
+    let mut img: Vec<V3> = gb.iter().map(|px| if let Px::Light(e) = px { *e } else { V3::default() }).collect();
+    for (k, l) in surf.iter().zip(tracer.trace(scene, &reqs, &o).l) {
+        img[*k] = l;
+    }
+    img
 }
 
 /// (RMSE, relMSE) sur les pixels de surface.

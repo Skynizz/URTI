@@ -6,14 +6,17 @@ mod methods;
 mod par;
 mod pt;
 mod render;
+mod bench;
+mod gpu;
 mod scene;
+mod tracer;
 
 use render::{gbuffer, load_raw, reference, save_raw, World};
 use scene::{build, state_at, FRAMES};
 use std::collections::HashMap;
 use std::time::Instant;
 
-fn ensure_refs(world: &World, dir: &str) -> HashMap<String, Vec<math::V3>> {
+fn ensure_refs(world: &World, dir: &str, tracer: &tracer::Tracer) -> HashMap<String, Vec<math::V3>> {
     std::fs::create_dir_all(dir).unwrap();
     let mut refs = HashMap::new();
     for f in 0..FRAMES {
@@ -26,7 +29,7 @@ fn ensure_refs(world: &World, dir: &str) -> HashMap<String, Vec<math::V3>> {
         let img = load_raw(&path, world.len()).unwrap_or_else(|| {
             let t = Instant::now();
             let scene = build(&s, world.rooms);
-            let img = reference(&scene, &gbuffer(&scene, world));
+            let img = reference(&scene, &gbuffer(&scene, world), tracer);
             save_raw(&path, &img);
             image::save(&format!("{dir}/{id}.png"), world.w, world.h, &img);
             eprintln!("référence {dir}/{id} : {:.1} s", t.elapsed().as_secs_f64());
@@ -54,7 +57,15 @@ fn mean_std(v: &[f64]) -> (f64, f64) {
     (m, var.sqrt())
 }
 
-fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, world: &World, root: &str, warmup: u32) -> String {
+fn run(
+    names: &[String],
+    seeds: u64,
+    refs: &HashMap<String, Vec<math::V3>>,
+    world: &World,
+    root: &str,
+    warmup: u32,
+    tracer: &tracer::Tracer,
+) -> String {
     let mut all = methods::all_methods();
     if !names.is_empty() {
         all.retain(|c| names.contains(&c.name));
@@ -65,7 +76,7 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, worl
         let dir = format!("{root}/{}", cfg.name);
         let mut runs = Vec::new();
         for seed in 0..seeds {
-            let stats = methods::run(cfg, refs, &dir, seed, world, warmup);
+            let stats = methods::run(cfg, refs, &dir, seed, world, warmup, tracer);
             let mut csv = String::from(methods::FrameStats::HEADER);
             csv.push('\n');
             for s in &stats {
@@ -95,7 +106,7 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, worl
 }
 
 /// Passage à l'échelle : N pièces, mêmes événements (pièces 0 et 1), densité de pixels constante.
-fn scale() {
+fn scale(tracer: &tracer::Tracer) {
     let only: Option<Vec<String>> = std::env::var("KRC_METHODS").ok().map(|v| v.split(',').map(String::from).collect());
     let names: Vec<String> = [
         "cache_reset",
@@ -121,15 +132,15 @@ fn scale() {
         .unwrap_or_else(|_| vec![2, 4, 8]);
     for rooms in rooms_list {
         let world = World::new(rooms);
-        let refs = ensure_refs(&world, &format!("results/ref_n{rooms}"));
+        let refs = ensure_refs(&world, &format!("results/ref_n{rooms}"), tracer);
         eprintln!("--- {rooms} pièces");
-        let summary = run(&names, seeds(), &refs, &world, &format!("results/scale/n{rooms}"), warmup());
+        let summary = run(&names, seeds(), &refs, &world, &format!("{}/scale/n{rooms}", out_root(tracer)), warmup(), tracer);
         for line in summary.lines().skip(1) {
             all += &format!("{rooms},{line}\n");
         }
     }
     if only.is_none() {
-        std::fs::write("results/scale/summary.csv", all).unwrap();
+        std::fs::write(format!("{}/scale/summary.csv", out_root(tracer)), all).unwrap();
     }
 }
 
@@ -144,19 +155,27 @@ fn warmup() -> u32 {
     std::env::var("KRC_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(150)
 }
 
+/// Dossier des résultats : `results` (CPU), `results/gpu` (GPU), ou KRC_OUT.
+fn out_root(tracer: &tracer::Tracer) -> String {
+    std::env::var("KRC_OUT").unwrap_or_else(|_| if tracer.is_gpu() { "results/gpu".into() } else { "results".into() })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let tracer = tracer::Tracer::from_env();
+    let w2 = World::new(2);
     match args.first().map(String::as_str) {
         Some("refs") => {
-            ensure_refs(&World::new(2), "results/ref");
+            ensure_refs(&w2, "results/ref", &tracer);
         }
         Some("run") => {
-            run(&args[1..], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results", 0);
+            run(&args[1..], seeds(), &ensure_refs(&w2, "results/ref", &tracer), &w2, &out_root(&tracer), 0, &tracer);
         }
         Some("all") => {
-            run(&[], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results", 0);
+            run(&[], seeds(), &ensure_refs(&w2, "results/ref", &tracer), &w2, &out_root(&tracer), 0, &tracer);
         }
-        Some("scale") => scale(),
-        _ => eprintln!("usage : krc refs | run [méthodes...] | all | scale"),
+        Some("scale") => scale(&tracer),
+        Some("bench") => bench::bench(&tracer),
+        _ => eprintln!("usage : krc refs | run [méthodes...] | all | scale | bench"),
     }
 }

@@ -2,8 +2,9 @@
 use crate::cache::{cell_key, zscore, Cache, Cell, Stat};
 use crate::deps::{mark_aabb, region_of, Bits};
 use crate::math::{mix64, v3, Rng, V3};
-use crate::par::par_map;
-use crate::pt::{radiance, radiance_split, DepRec, NoRec};
+use crate::pt::DepRec;
+use crate::tracer::{Opts, Req, Tracer};
+use std::time::Instant;
 use crate::render::{errors, gbuffer, Px, World};
 use crate::scene::{build, cosine_dir, moving_box_aabb, state_at, Scene, State, FRAMES, LIGHT_ID_BASE, MOVING_BOX};
 use std::collections::{BinaryHeap, HashMap};
@@ -200,14 +201,16 @@ pub struct FrameStats {
     pub relmse_b: f64,
     pub bias_a: f64,
     pub bias_b: f64,
+    /// temps passé à tracer des chemins (CPU ou GPU, transferts compris)
+    pub trace_ms: f64,
 }
 
 impl FrameStats {
     pub const HEADER: &'static str = "frame,paths,paths_a,paths_b,probes,suspects,hard_resets,rejected,confirmed,\
-delta_paths,delta_old_paths,delta_zero,safety,cells,rmse,relmse,relmse_a,relmse_b,bias_a,bias_b";
+delta_paths,delta_old_paths,delta_zero,safety,cells,rmse,relmse,relmse_a,relmse_b,bias_a,bias_b,trace_ms";
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.3}",
             self.frame,
             self.paths,
             self.paths_a,
@@ -227,7 +230,8 @@ delta_paths,delta_old_paths,delta_zero,safety,cells,rmse,relmse,relmse_a,relmse_
             self.relmse_a,
             self.relmse_b,
             self.bias_a,
-            self.bias_b
+            self.bias_b,
+            self.trace_ms
         )
     }
 }
@@ -298,8 +302,13 @@ fn apply_pairs(main: &mut Stat, pairs: &[(V3, V3)], cv: bool) -> bool {
     true
 }
 
-fn task_rng(seed: u64, frame: u32, i: usize) -> Rng {
-    Rng::new(mix64(seed ^ mix64((frame as u64) << 32 | i as u64)))
+fn task_seed(seed: u64, frame: u32, i: usize) -> u64 {
+    mix64(seed ^ mix64((frame as u64) << 32 | i as u64))
+}
+
+fn surf_req(px: &Px, seed: u64) -> Req {
+    let Px::Surf { p, n, albedo, .. } = *px else { unreachable!() };
+    Req { p, n, albedo, seed }
 }
 
 fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool, window: Option<u32>) {
@@ -318,7 +327,16 @@ fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool, window
 }
 
 /// `warmup` : frames statiques (état initial) simulées avant la séquence, non enregistrées.
-pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: u64, world: &World, warmup: u32) -> Vec<FrameStats> {
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    cfg: &Cfg,
+    refs: &HashMap<String, Vec<V3>>,
+    out_dir: &str,
+    run_seed: u64,
+    world: &World,
+    warmup: u32,
+    tracer: &Tracer,
+) -> Vec<FrameStats> {
     std::fs::create_dir_all(out_dir).unwrap();
     let seed = mix64(cfg.name.bytes().fold(7u64, |h, b| h.wrapping_mul(131) ^ b as u64) ^ mix64(run_seed));
     let mut stats = Vec::new();
@@ -350,11 +368,10 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 if matches!(cfg.kind, Kind::PixelReset) && ev.is_some() {
                     pixels.iter_mut().for_each(|s| *s = Stat::default());
                 }
-                let samples = par_map(surf.len(), |i| {
-                    let Px::Surf { p, n, albedo, .. } = gb[surf[i]] else { unreachable!() };
-                    let mut r = task_rng(seed, t, i);
-                    radiance(&scene, p, n, albedo, &mut r, &mut NoRec, false)
-                });
+                let reqs: Vec<Req> = (0..surf.len()).map(|i| surf_req(&gb[surf[i]], task_seed(seed, t, i))).collect();
+                let clock = Instant::now();
+                let samples: Vec<V3> = tracer.trace(&scene, &reqs, &Opts::plain()).l;
+                fs.trace_ms += clock.elapsed().as_secs_f64() * 1e3;
                 for (i, v) in samples.into_iter().enumerate() {
                     let s = &mut pixels[surf[i]];
                     match cfg.kind {
@@ -480,27 +497,51 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 if !delta_tasks.is_empty() {
                     let e = ev.as_ref().unwrap();
                     let cv = matches!(on_event, OnEvent::Invalidate(_, Action::Delta { cv: true }));
-                    let trace = |tasks: &[(u32, u32)], round: u64| {
-                        par_map(tasks.len(), |i| {
-                            let Px::Surf { p, n, albedo, .. } = gb[tasks[i].1 as usize] else { unreachable!() };
-                            let s = mix64(seed ^ 0xde17a ^ mix64((t as u64) << 32 | round << 24 | i as u64));
-                            let mut rec = DepRec::default();
-                            if !e.geometry {
-                                // lampes seules : l'ancienne radiance se déduit du même chemin
-                                let (new, d) =
-                                    radiance_split(&scene, p, n, albedo, &mut Rng::new(s), &mut rec, true, &e.light_w);
-                                let affected = rec.lights & e.lights != 0;
-                                return (tasks[i].0, new, new + d, affected, rec, false);
+                    let mut trace_ms = 0.0;
+                    let mut trace = |tasks: &[(u32, u32)], round: u64| {
+                        let clock = Instant::now();
+                        let reqs: Vec<Req> = (0..tasks.len())
+                            .map(|i| {
+                                let s = mix64(seed ^ 0xde17a ^ mix64((t as u64) << 32 | round << 24 | i as u64));
+                                surf_req(&gb[tasks[i].1 as usize], s)
+                            })
+                            .collect();
+                        let res: Vec<(u32, V3, V3, bool, DepRec, bool)> = if !e.geometry {
+                            // lampes seules : l'ancienne radiance se déduit du même chemin
+                            let o = Opts { union: true, record: true, toggle_w: &e.light_w, spp: 1 };
+                            let tr = tracer.trace(&scene, &reqs, &o);
+                            tr.recs
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, rec)| {
+                                    let affected = rec.lights & e.lights != 0;
+                                    (tasks[i].0, tr.l[i], tr.l[i] + tr.dl[i], affected, rec, false)
+                                })
+                                .collect()
+                        } else {
+                            let o = Opts { union: true, record: true, toggle_w: &[], spp: 1 };
+                            let new = tracer.trace(&scene, &reqs, &o);
+                            let affected: Vec<bool> = new
+                                .recs
+                                .iter()
+                                .map(|r| r.regions.intersects(&e.regions) || r.lights & e.lights != 0)
+                                .collect();
+                            // l'ancien chemin n'est retracé que s'il peut différer
+                            let idx: Vec<usize> = (0..reqs.len()).filter(|&i| affected[i]).collect();
+                            let old_reqs: Vec<Req> = idx.iter().map(|&i| reqs[i]).collect();
+                            let o = Opts { union: true, record: false, toggle_w: &[], spp: 1 };
+                            let mut old: Vec<V3> = new.l.clone();
+                            for (k, l) in idx.iter().zip(tracer.trace(&prev_scene, &old_reqs, &o).l) {
+                                old[*k] = l;
                             }
-                            let new = radiance(&scene, p, n, albedo, &mut Rng::new(s), &mut rec, true);
-                            let affected = rec.regions.intersects(&e.regions) || rec.lights & e.lights != 0;
-                            let old = if affected {
-                                radiance(&prev_scene, p, n, albedo, &mut Rng::new(s), &mut NoRec, true)
-                            } else {
-                                new
-                            };
-                            (tasks[i].0, new, old, affected, rec, affected)
-                        })
+                            new.recs
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, rec)| (tasks[i].0, new.l[i], old[i], affected[i], rec, affected[i]))
+                                .collect()
+                        };
+                        trace_ms += clock.elapsed().as_secs_f64() * 1e3;
+                        res
                     };
                     let mut results = trace(&delta_tasks, 0);
                     let mut second: Vec<(u32, u32)> = Vec::new();
@@ -515,6 +556,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                         }
                     }
                     results.extend(trace(&second, 1));
+                    fs.trace_ms += trace_ms;
                     let mut per_cell: HashMap<u32, Vec<usize>> = HashMap::new();
                     for (i, r) in results.iter().enumerate() {
                         per_cell.entry(r.0).or_default().push(i);
@@ -619,13 +661,15 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                     }
                 }
                 // 4. tracé (parallèle)
-                let results = par_map(tasks.len(), |i| {
-                    let Px::Surf { p, n, albedo, .. } = gb[tasks[i].1 as usize] else { unreachable!() };
-                    let mut r = task_rng(seed, t, i);
-                    let mut rec = DepRec::default();
-                    let v = radiance(&scene, p, n, albedo, &mut r, &mut rec, false);
-                    (v, rec)
-                });
+                let reqs: Vec<Req> =
+                    (0..tasks.len()).map(|i| surf_req(&gb[tasks[i].1 as usize], task_seed(seed, t, i))).collect();
+                let clock = Instant::now();
+                let o = Opts { union: false, record: true, toggle_w: &[], spp: 1 };
+                let results: Vec<(V3, DepRec)> = {
+                    let tr = tracer.trace(&scene, &reqs, &o);
+                    tr.l.into_iter().zip(tr.recs).collect()
+                };
+                fs.trace_ms += clock.elapsed().as_secs_f64() * 1e3;
                 // 5. mise à jour
                 let mut touched = Vec::new();
                 for (i, (v, rec)) in results.iter().enumerate() {
