@@ -94,3 +94,36 @@
 - Préchauffage de 150 frames pour le passage à l'échelle. Sans lui, les coûts mesurés
   en mode qualité cible à N = 8 étaient dominés par la convergence initiale.
 - Résultats consolidés : voir [RESULTATS.md](RESULTATS.md).
+
+## v5 — dépendances pondérées par l'énergie (commit 711c5d9)
+
+- **Vérité terrain d'abord** : changement signé agrégé par pièce entre références
+  (N = 8). Lampe B allumée : pièces 0 à 3 = +4,1 %, +153 %, +165 %, +1,1 % ; pièces 4 à 7
+  < 0,1 %. Le graphe binaire rendait suspectes ~78 % des cellules *partout*. (Un
+  premier calcul en |Δ| moyen par pixel donnait 2 à 5 % partout : c'était le bruit des
+  références.)
+- Sondes de lampe avec magnitude : ΔL_R ≈ ρ·kΦ/(P·π·A_R).
+- **Impasse 1** : sketch haché sur 256 compteurs. Une cellule traverse 100 à 300
+  régions par fenêtre, les collisions rendent toutes les fréquences élevées, donc tout
+  devient suspect.
+- **Impasse 2** : fréquences de *traversée* sur super-régions exactes. Les rayons qui
+  s'échappent par la façade ouverte longent les autres pièces sans y rebondir.
+- **Ce qui marche** : fréquences des *sommets* de chemin (là où la lumière est captée)
+  par super-région (36 compteurs u8 par fenêtre), et critère « régions traversées ET
+  Σ f_S·M_S > 1 % de la radiance ». Suspects par pièce : 100/100/94/53/8/1,5/0,3/0,6 %,
+  ce qui colle à la physique.
+- N = 8, lampe B allumée : 7 016 → 3 466 suspects, 56 k → 28 k chemins (−51 %), erreur
+  équivalente.
+
+## v6 — traceur GPU (commit b3660fe)
+
+- RTX 4070, wgpu 24 sur Vulkan (ray query matériel disponible, pas encore utilisé).
+- `trace.wgsl` : portage fidèle de `pt.rs`, interface `Tracer` commune CPU/GPU.
+- Validation : relMSE GPU/CPU = bruit CPU/CPU ; chemins corrélés exacts sur GPU
+  (≤ 2e-7) ; mêmes statistiques de dépendances.
+- Débit : le calcul pur atteint 466 M chemins/s. Deux surcoûts trouvés et corrigés :
+  recréer les buffers à chaque appel (~85 ms), et fabriquer un DepRec de 450 octets
+  par résultat même sans dépendances (900 Mo pour 2 M chemins).
+- **Leçon d'architecture** : avec dépendances, le gain n'est que de ×1,6, parce que
+  relire les dépendances de chaque chemin coûte plus que les tracer. Pour du temps
+  réel, le cache doit vivre sur le GPU et rien ne doit revenir au CPU par chemin.

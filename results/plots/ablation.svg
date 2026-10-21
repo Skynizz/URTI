@@ -1,50 +1,53 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 410" font-family="system-ui, sans-serif" font-size="12">
-<rect width="760" height="410" fill="#fcfcfb"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 436" font-family="system-ui, sans-serif" font-size="12">
+<rect width="760" height="436" fill="#fcfcfb"/>
 <text x="20" y="22" font-size="15" font-weight="600" fill="#0b0b0b">Ablation : erreur moyenne sur la séquence de 120 frames</text>
 <text x="20" y="40" fill="#52514e">relMSE moyenne ± écart-type (5 graines), budget égal, échelle log ; plus court = mieux</text>
-<line x1="150.0" x2="150.0" y1="58" y2="370" stroke="#e4e3df"/>
-<text x="150.0" y="386" text-anchor="middle" fill="#52514e">1e-3</text>
-<line x1="323.3" x2="323.3" y1="58" y2="370" stroke="#e4e3df"/>
-<text x="323.3" y="386" text-anchor="middle" fill="#52514e">1e-2</text>
-<line x1="496.7" x2="496.7" y1="58" y2="370" stroke="#e4e3df"/>
-<text x="496.7" y="386" text-anchor="middle" fill="#52514e">1e-1</text>
-<line x1="670.0" x2="670.0" y1="58" y2="370" stroke="#e4e3df"/>
-<text x="670.0" y="386" text-anchor="middle" fill="#52514e">1e0</text>
-<text x="142" y="75" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_delta</text>
-<rect x="150" y="62" width="105.2" height="18" rx="4" fill="#9fb9d9"/>
-<text x="261.2" y="75" fill="#52514e">4.04e-03 ± 1e-04</text>
-<text x="142" y="101" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_all</text>
-<rect x="150" y="88" width="105.5" height="18" rx="4" fill="#9fb9d9"/>
-<text x="261.5" y="101" fill="#52514e">4.06e-03 ± 9e-05</text>
-<text x="142" y="127" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_noage</text>
-<rect x="150" y="114" width="106.1" height="18" rx="4" fill="#9fb9d9"/>
-<text x="262.1" y="127" fill="#52514e">4.10e-03 ± 3e-05</text>
-<text x="142" y="153" text-anchor="end" fill="#0b0b0b" font-weight="600">krc</text>
-<rect x="150" y="140" width="106.3" height="18" rx="4" fill="#2a78d6"/>
-<text x="262.3" y="153" fill="#52514e">4.11e-03 ± 2e-04</text>
-<text x="142" y="179" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_obj</text>
-<rect x="150" y="166" width="132.5" height="18" rx="4" fill="#9fb9d9"/>
-<text x="288.5" y="179" fill="#52514e">5.81e-03 ± 2e-04</text>
-<text x="142" y="205" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_hard</text>
-<rect x="150" y="192" width="155.5" height="18" rx="4" fill="#9fb9d9"/>
-<text x="311.5" y="205" fill="#52514e">7.89e-03 ± 1e-04</text>
-<text x="142" y="231" text-anchor="end" fill="#0b0b0b" font-weight="400">cache_reset</text>
-<rect x="150" y="218" width="190.2" height="18" rx="4" fill="#9fb9d9"/>
-<text x="346.2" y="231" fill="#52514e">1.25e-02 ± 1e-04</text>
-<text x="142" y="257" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_ztest</text>
-<rect x="150" y="244" width="237.7" height="18" rx="4" fill="#9fb9d9"/>
-<text x="393.7" y="257" fill="#52514e">2.35e-02 ± 7e-04</text>
-<text x="142" y="283" text-anchor="end" fill="#0b0b0b" font-weight="400">cache_ema</text>
-<rect x="150" y="270" width="287.9" height="18" rx="4" fill="#9fb9d9"/>
-<text x="443.9" y="283" fill="#52514e">4.58e-02 ± 2e-04</text>
-<text x="142" y="309" text-anchor="end" fill="#0b0b0b" font-weight="400">pt_ema</text>
-<rect x="150" y="296" width="309.8" height="18" rx="4" fill="#9fb9d9"/>
-<text x="465.8" y="309" fill="#52514e">6.13e-02 ± 4e-04</text>
-<text x="142" y="335" text-anchor="end" fill="#0b0b0b" font-weight="400">pt_reset</text>
-<rect x="150" y="322" width="338.0" height="18" rx="4" fill="#9fb9d9"/>
-<text x="494.0" y="335" fill="#52514e">8.91e-02 ± 1e-03</text>
-<text x="142" y="361" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_nodep</text>
-<rect x="150" y="348" width="358.3" height="18" rx="4" fill="#9fb9d9"/>
-<text x="514.3" y="361" fill="#52514e">1.17e-01 ± 9e-04</text>
-<text x="410.0" y="404" text-anchor="middle" fill="#52514e">relMSE</text>
+<line x1="150.0" x2="150.0" y1="58" y2="396" stroke="#e4e3df"/>
+<text x="150.0" y="412" text-anchor="middle" fill="#52514e">1e-3</text>
+<line x1="323.3" x2="323.3" y1="58" y2="396" stroke="#e4e3df"/>
+<text x="323.3" y="412" text-anchor="middle" fill="#52514e">1e-2</text>
+<line x1="496.7" x2="496.7" y1="58" y2="396" stroke="#e4e3df"/>
+<text x="496.7" y="412" text-anchor="middle" fill="#52514e">1e-1</text>
+<line x1="670.0" x2="670.0" y1="58" y2="396" stroke="#e4e3df"/>
+<text x="670.0" y="412" text-anchor="middle" fill="#52514e">1e0</text>
+<text x="142" y="75" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_energy</text>
+<rect x="150" y="62" width="104.2" height="18" rx="4" fill="#9fb9d9"/>
+<text x="260.2" y="75" fill="#52514e">3.99e-03 ± 4e-05</text>
+<text x="142" y="101" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_delta</text>
+<rect x="150" y="88" width="105.2" height="18" rx="4" fill="#9fb9d9"/>
+<text x="261.2" y="101" fill="#52514e">4.04e-03 ± 1e-04</text>
+<text x="142" y="127" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_all</text>
+<rect x="150" y="114" width="105.5" height="18" rx="4" fill="#9fb9d9"/>
+<text x="261.5" y="127" fill="#52514e">4.06e-03 ± 9e-05</text>
+<text x="142" y="153" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_noage</text>
+<rect x="150" y="140" width="106.1" height="18" rx="4" fill="#9fb9d9"/>
+<text x="262.1" y="153" fill="#52514e">4.10e-03 ± 3e-05</text>
+<text x="142" y="179" text-anchor="end" fill="#0b0b0b" font-weight="600">krc</text>
+<rect x="150" y="166" width="106.3" height="18" rx="4" fill="#2a78d6"/>
+<text x="262.3" y="179" fill="#52514e">4.11e-03 ± 2e-04</text>
+<text x="142" y="205" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_obj</text>
+<rect x="150" y="192" width="132.5" height="18" rx="4" fill="#9fb9d9"/>
+<text x="288.5" y="205" fill="#52514e">5.81e-03 ± 2e-04</text>
+<text x="142" y="231" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_hard</text>
+<rect x="150" y="218" width="155.5" height="18" rx="4" fill="#9fb9d9"/>
+<text x="311.5" y="231" fill="#52514e">7.89e-03 ± 1e-04</text>
+<text x="142" y="257" text-anchor="end" fill="#0b0b0b" font-weight="400">cache_reset</text>
+<rect x="150" y="244" width="190.2" height="18" rx="4" fill="#9fb9d9"/>
+<text x="346.2" y="257" fill="#52514e">1.25e-02 ± 1e-04</text>
+<text x="142" y="283" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_ztest</text>
+<rect x="150" y="270" width="237.7" height="18" rx="4" fill="#9fb9d9"/>
+<text x="393.7" y="283" fill="#52514e">2.35e-02 ± 7e-04</text>
+<text x="142" y="309" text-anchor="end" fill="#0b0b0b" font-weight="400">cache_ema</text>
+<rect x="150" y="296" width="287.9" height="18" rx="4" fill="#9fb9d9"/>
+<text x="443.9" y="309" fill="#52514e">4.58e-02 ± 2e-04</text>
+<text x="142" y="335" text-anchor="end" fill="#0b0b0b" font-weight="400">pt_ema</text>
+<rect x="150" y="322" width="309.8" height="18" rx="4" fill="#9fb9d9"/>
+<text x="465.8" y="335" fill="#52514e">6.13e-02 ± 4e-04</text>
+<text x="142" y="361" text-anchor="end" fill="#0b0b0b" font-weight="400">pt_reset</text>
+<rect x="150" y="348" width="338.0" height="18" rx="4" fill="#9fb9d9"/>
+<text x="494.0" y="361" fill="#52514e">8.91e-02 ± 1e-03</text>
+<text x="142" y="387" text-anchor="end" fill="#0b0b0b" font-weight="400">krc_nodep</text>
+<rect x="150" y="374" width="358.3" height="18" rx="4" fill="#9fb9d9"/>
+<text x="514.3" y="387" fill="#52514e">1.17e-01 ± 9e-04</text>
+<text x="410.0" y="430" text-anchor="middle" fill="#52514e">relMSE</text>
 </svg>

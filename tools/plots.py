@@ -139,7 +139,7 @@ def main():
     if os.path.exists(sp):
         sc = read_csv(sp)
         rooms = sorted({int(r["rooms"]) for r in sc})
-        ms = ["cache_reset_target", "krc_hard_target", "krc_all_target", "krc_noage_target", "krc_target"]
+        ms = ["cache_reset_target", "krc_hard_target", "krc_all_target", "krc_target", "krc_energy_target"]
 
         def val(m, n, phases, col):
             v = [float(r[col]) for r in sc if r["method"] == m and int(r["rooms"]) == n and r["phase"] in phases]
@@ -160,7 +160,7 @@ def main():
                             vals.append(int(r["delta_paths"]))
             return sum(vals) / max(len(vals), 1)
 
-        dm = ["krc_all", "krc_noage", "krc"]
+        dm = ["krc_all", "krc_noage", "krc", "krc_energy"]
         line_chart(os.path.join(out, "echelle_evt_lampe.svg"), "Coût d'un changement de lampe selon la taille de la scène",
                    "chemins corrélés tracés à l'événement (lampe B allumée, lampe A éteinte), moyenne sur graines",
                    [(m, [event_cost(m, n, {80, 100}) for n in rooms]) for m in dm], "chemins / événement",

@@ -1,6 +1,7 @@
 # Résultats
 
-Prototype CPU (Rust), scène diffuse de boîtes, 192×96 px. Tous les chiffres sont des
+Prototype Rust, traceur CPU ou GPU (wgpu/Vulkan, résultats identiques statistiquement),
+scène diffuse de boîtes, 192×96 px. Tous les chiffres sont des
 **relMSE** contre une référence à 4096 spp par pixel, en moyenne ± écart-type sur
 **5 graines** (3 pour le passage à l'échelle). Budget égal pour toutes les méthodes :
 1 chemin par pixel de surface et par frame. Les chemins différentiels sont comptés et
@@ -21,9 +22,15 @@ remboursés sur les frames suivantes. Reproduire : `cargo run --release -- all`,
 4. **Ce qui fait la différence n'est pas le graphe de dépendances** : c'est la
    **mise à jour différentielle par chemins corrélés**. Le graphe ne réduit que le coût,
    et seulement pour les changements localisés.
-5. **Échecs documentés** : le z-test de vérification (sous-puissant), les dépendances
-   « objets touchés » de l'idée initiale (faux négatifs à l'allumage d'une lampe), et
-   le graphe binaire face aux changements de lumière (il sature au fil des portes).
+5. **Les changements de lumière deviennent locaux grâce aux dépendances pondérées par
+   l'énergie** (§3 bis). À 8 pièces, allumer une lampe coûte 28 k chemins au lieu de 56 k,
+   et ce coût ne croît plus avec la scène au-delà des pièces réellement éclairées.
+6. **Le traceur tourne sur GPU** (RTX 4070), validé contre le CPU. Le goulot pour le temps
+   réel n'est plus le traçage mais l'aller-retour CPU↔GPU des dépendances (§7).
+7. **Échecs documentés** : le z-test de vérification (sous-puissant), les dépendances
+   « objets touchés » de l'idée initiale (faux négatifs à l'allumage d'une lampe), le
+   graphe binaire face à la lumière (il sature au fil des portes), et deux tentatives de
+   pondération (sketch haché, fréquences de traversée).
 
 ## 1. Séquence principale (2 pièces, 120 frames)
 
@@ -119,20 +126,44 @@ Lecture :
   donc raison qualitativement : ces cellules changent bien. Mais il ne sait pas que le
   changement y est minuscule. Il manque une **propagation pondérée par l'énergie**.
 
+## 3 bis. Dépendances pondérées par l'énergie
+
+Vérité terrain (références, N = 8, changement signé agrégé par pièce) quand la lampe B
+s'allume : pièces 0 à 3 = +4,1 %, +153 %, +165 %, +1,1 % ; pièces 4 à 7 < 0,1 %.
+
+Le critère : une cellule est suspecte si ses chemins traversent la zone changée **et** si
+Σ_S f_S · M_S > 1 % de sa radiance, où f_S est la fraction de ses échantillons récents
+ayant un **sommet** dans la super-région S (là où la lumière est captée), et M_S la
+variation de radiance déposée par les sondes de la lampe.
+
+| N = 8, suspects par pièce (lampe B allumée) | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| Graphe binaire (`krc`) | 85 % | 83 % | 82 % | 78 % | 77 % | 74 % | 76 % | 78 % |
+| **Pondéré (`krc_energy`)** | 100 % | 100 % | 94 % | 53 % | 8 % | 1,5 % | 0,3 % | 0,6 % |
+
+| Chemins corrélés par allumage | N = 2 | N = 4 | N = 8 |
+|---|---|---|---|
+| `krc_all` (sans graphe) | 23,6 k | 41,3 k | 71,2 k |
+| `krc` (binaire) | 20,1 k | 34,9 k | 56,1 k |
+| **`krc_energy`** | 20,1 k | 32,8 k | **27,7 k** |
+
+L'erreur reste équivalente : 3,99e-3 contre 4,11e-3 en séquence principale, et 1,57e-3
+contre 1,61e-3 à N = 8. Mémoire : 72 octets de compteurs par cellule.
+
 ## 4. Verdict sur l'hypothèse
 
 | Affirmation de départ | Verdict |
 |---|---|
 | Une scène statique converge et finit par ne plus rien coûter | ✅ ~0,01 chemin/pixel/frame (plancher d'exploration) |
-| Le coût d'une scène dynamique suit ce qui change, pas la taille de la scène | ✅ pour les objets ; ❌ pas encore pour la lumière |
+| Le coût d'une scène dynamique suit ce qui change, pas la taille de la scène | ✅ pour les objets ; ✅ pour la lumière avec la pondération par l'énergie (le coût suit la zone réellement éclairée) |
 | Le graphe de dépendances par objets touchés suffit | ❌ faux négatifs (lampe allumée, nouvelle ombre) ; les régions traversées le battent |
 | Invalider les cellules dépendantes | ⚠️ invalider coûte cher ; **mesurer le delta par chemins corrélés et corriger** est 2 à 5× meilleur |
 | Allouer les rayons vers l'incertitude | ✅ Neyman + a priori bayésien ; l'a priori doit avoir un plancher (bug de famine trouvé) |
 
 ## 5. Limites du prototype
 
-- Scène jouet : boîtes alignées sur les axes, matériaux diffus uniquement, CPU, basse
-  résolution. Rien n'est encore mesuré en ms sur GPU.
+- Scène jouet : boîtes alignées sur les axes, matériaux diffus uniquement, basse
+  résolution. Le traçage tourne sur GPU, mais le cache et l'allocation restent sur CPU.
 - Caméra fixe : pas de reprojection ni de désocclusion par la caméra.
 - Le cache affiche une radiance moyennée par cellule (biais de discrétisation d'environ
   6e-4 relMSE) ; un rendu final ajouterait l'éclairage direct par pixel.
@@ -142,16 +173,33 @@ Lecture :
 
 ## 6. Pistes suivantes, par ordre de valeur attendue
 
-1. **Dépendances pondérées par l'énergie** : stocker, par région, la fraction des
-   échantillons qui la traversent (ou le débit transporté), et donner une magnitude au
-   changement (énergie des sondes d'une lampe). On n'invalide plus que si
-   fréquence × magnitude dépasse le bruit de la cellule. C'est le critère de
-   *Selective Photon Tracing* transposé côté caméra. Objectif : faire passer les lampes
-   du ❌ au ✅.
-2. **Choisir entre delta et redémarrage avant de payer** : quand l'historique devient
+1. ~~Dépendances pondérées par l'énergie~~ : fait (§3 bis).
+2. **Cache résident GPU** : voir [FEUILLE_DE_ROUTE.md](FEUILLE_DE_ROUTE.md).
+3. **Choisir entre delta et redémarrage avant de payer** : quand l'historique devient
    inutile (lampe dominante éteinte), les chemins corrélés coûtent plus cher qu'un
    redémarrage. Le β de la variable de contrôle se prédit à partir des m₀ premiers
    chemins.
-3. **Spéculaire** : tracer à travers les surfaces brillantes jusqu'au premier sommet
+4. **Spéculaire** : tracer à travers les surfaces brillantes jusqu'au premier sommet
    diffus (comme NRC/SHaRC), et mesurer ce que cela coûte à la promesse.
-4. **Caméra mobile et port GPU** pour mesurer des millisecondes.
+5. **Caméra mobile**, puis rayons matériels (cœurs RT).
+
+## 7. GPU (RTX 4070, wgpu sur Vulkan)
+
+`cargo run --release -- bench` ; séquence complète : `KRC_GPU=1 cargo run --release -- all`
+(résultats dans `results/gpu`).
+
+- **Exactitude** : à 256 spp, l'écart GPU/CPU (relMSE 2,315e-3) égale le bruit CPU/CPU
+  (2,306e-3) ; la luminance moyenne est à 0,14 % près.
+- **Chemins corrélés exacts sur GPU** : |L + ΔL − L_ancien| ≤ 2e-7 (précision f32).
+- **Séquence complète sur GPU** : mêmes conclusions que sur CPU, dans les barres d'erreur
+  (`krc_energy` 3,96e-3, `cache_reset` 1,25e-2, `pt_reset` 8,96e-2).
+
+| Débit (transferts compris) | CPU 16 cœurs | GPU | Gain |
+|---|---|---|---|
+| 2,07 M chemins (1080p, 1 spp), sans dépendances | 1 129 ms | 107 ms | ×10,5 |
+| 2,07 M chemins, avec dépendances | 1 400 ms | 919 ms | ×1,5 |
+| Calcul pur (64 spp par requête) | — | 523 M chemins/s | — |
+
+Le calcul pur ferait tenir 2 M chemins en ~4 ms. Ce qui coûte, ce sont les transferts :
+avec dépendances, chaque chemin renvoie ~450 octets au CPU. D'où la prochaine étape :
+le cache doit vivre sur le GPU.
