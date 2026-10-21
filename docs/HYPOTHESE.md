@@ -140,6 +140,32 @@ Méthodes :
 | `krc_hard` | H* avec dépendances spatiales mais invalidation dure |
 | `krc` | **H\*** complet |
 
+## 3 bis. Hypothèse révisée après expérience (H\*\*)
+
+La brique 2 de H\* (vérifier un suspect par un z-test sur des échantillons frais) a
+**échoué** : avec la variance d'un path tracer, 8 échantillons indépendants ne
+détectent même pas une pièce qui s'éteint (voir JOURNAL v1). D'où le remplacement :
+
+> **Ne pas tester si une cellule a changé : mesurer de combien, avec des chemins
+> corrélés.** Pour une cellule suspecte, on trace m chemins avec la même graine dans la
+> scène d'avant et celle d'après :
+>
+> - un chemin qui ne touche ni la zone changée ni une lampe changée est *identique* dans
+>   les deux scènes, donc Δ = 0 exactement et on ne retrace pas ;
+> - pour un changement de lampes seules, la géométrie est la même, et
+>   L_avant = L_après + Σ w_j C_j se calcule dans *le même* chemin ;
+> - l'historique du cache sert de **variable de contrôle** :
+>   μ = x̄ − β(ȳ − μ_cache), avec β ∈ [0, 1] optimal. β = 1 corrige par Δ̂, β = 0 repart
+>   des échantillons frais.
+>
+> Le graphe de dépendances spatiales ne décide plus de rien : il **choisit sur quelles
+> cellules dépenser ces chemins corrélés**. Le coût d'un changement devient
+> O(cellules dont les chemins traversent la zone), au lieu de O(cellules visibles).
+
+C'est l'analogue exact de la compilation incrémentale : le graphe trouve les unités
+potentiellement touchées, et le « recompilateur » (chemins corrélés) produit un diff
+qu'on applique, au lieu de tout reconstruire.
+
 ## 4. Travaux voisins
 
 - Ward et al. 1988, *irradiance caching* : cache de surface et interpolation.
@@ -153,8 +179,12 @@ Méthodes :
   Caching*.
 - Majercik et al. 2019, *DDGI* (sondes + hystérésis) ; NVIDIA SHaRC (cache par
   hachage spatial).
-- Schied et al. 2018, *A-SVGF* : rejet d'historique par gradients temporels, l'analogue
-  écran de notre test de vérification.
+- Schied et al. 2018, *A-SVGF* : rejet d'historique par gradients temporels calculés en
+  réutilisant les graines de la frame précédente. C'est l'analogue en espace écran de
+  nos chemins corrélés ; nous l'appliquons à un cache monde, comme correction et non
+  comme simple rejet.
+- *Gradient-domain rendering* et *correlated sampling* (variables de contrôle,
+  rendu de différences entre deux scènes) : base théorique de H\*\*.
 - Brouillat et al. 2009, Marques et al. 2013, *Bayesian Monte Carlo* pour l'illumination
   globale.
 - Lumen (Unreal Engine 5) : *surface cache* avec mises à jour budgétées.

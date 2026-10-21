@@ -64,7 +64,12 @@ pub struct Cell {
     pub fresh: Option<Stat>,
     /// Fenêtre récente du filet de sécurité.
     pub recent: Stat,
+    /// Régions traversées par les échantillons récents. Avec vieillissement, deux ensembles
+    /// alternés couvrent les K à 2K derniers échantillons : une région traversée avec une
+    /// fréquence ≪ 1/K est oubliée (son influence est bornée par cette fréquence).
     pub deps: Bits,
+    pub deps_prev: Bits,
+    pub dep_count: u32,
     pub objs: u128,
     pub last: i64,
     pub cx: f64,
@@ -76,7 +81,23 @@ impl Cell {
         self.fresh = None;
         self.recent = Stat::default();
         self.deps = Bits::default();
+        self.deps_prev = Bits::default();
+        self.dep_count = 0;
         self.objs = 0;
+    }
+    pub fn add_deps(&mut self, b: &Bits, window: Option<u32>) {
+        self.deps.or(b);
+        if let Some(k) = window {
+            self.dep_count += 1;
+            if self.dep_count >= k {
+                self.deps_prev = self.deps;
+                self.deps = Bits::default();
+                self.dep_count = 0;
+            }
+        }
+    }
+    pub fn depends_on(&self, regions: &Bits) -> bool {
+        self.deps.intersects(regions) || self.deps_prev.intersects(regions)
     }
     pub fn display(&self) -> Option<V3> {
         if self.main.n > 0.0 {

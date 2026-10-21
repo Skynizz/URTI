@@ -54,7 +54,7 @@ fn mean_std(v: &[f64]) -> (f64, f64) {
     (m, var.sqrt())
 }
 
-fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, world: &World, root: &str) -> String {
+fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, world: &World, root: &str, warmup: u32) -> String {
     let mut all = methods::all_methods();
     if !names.is_empty() {
         all.retain(|c| names.contains(&c.name));
@@ -65,7 +65,7 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, worl
         let dir = format!("{root}/{}", cfg.name);
         let mut runs = Vec::new();
         for seed in 0..seeds {
-            let stats = methods::run(cfg, refs, &dir, seed, world);
+            let stats = methods::run(cfg, refs, &dir, seed, world, warmup);
             let mut csv = String::from(methods::FrameStats::HEADER);
             csv.push('\n');
             for s in &stats {
@@ -96,7 +96,18 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, worl
 
 /// Passage à l'échelle : N pièces, mêmes événements (pièces 0 et 1), densité de pixels constante.
 fn scale() {
-    let names: Vec<String> = ["cache_reset", "krc_hard", "krc_all", "krc", "cache_reset_target", "krc_hard_target", "krc_all_target", "krc_target"]
+    let names: Vec<String> = [
+        "cache_reset",
+        "krc_hard",
+        "krc_all",
+        "krc_noage",
+        "krc",
+        "cache_reset_target",
+        "krc_hard_target",
+        "krc_all_target",
+        "krc_noage_target",
+        "krc_target",
+    ]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -105,7 +116,7 @@ fn scale() {
         let world = World::new(rooms);
         let refs = ensure_refs(&world, &format!("results/ref_n{rooms}"));
         eprintln!("--- {rooms} pièces");
-        let summary = run(&names, seeds(), &refs, &world, &format!("results/scale/n{rooms}"));
+        let summary = run(&names, seeds(), &refs, &world, &format!("results/scale/n{rooms}"), warmup());
         for line in summary.lines().skip(1) {
             all += &format!("{rooms},{line}\n");
         }
@@ -118,6 +129,12 @@ fn seeds() -> u64 {
     std::env::var("KRC_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5)
 }
 
+/// Frames de préchauffage avant la séquence de passage à l'échelle (KRC_WARMUP, 150 par défaut) :
+/// les coûts mesurés sont alors ceux des événements, pas de la convergence initiale.
+fn warmup() -> u32 {
+    std::env::var("KRC_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(150)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -125,10 +142,10 @@ fn main() {
             ensure_refs(&World::new(2), "results/ref");
         }
         Some("run") => {
-            run(&args[1..], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results");
+            run(&args[1..], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results", 0);
         }
         Some("all") => {
-            run(&[], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results");
+            run(&[], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results", 0);
         }
         Some("scale") => scale(),
         _ => eprintln!("usage : krc refs | run [méthodes...] | all | scale"),

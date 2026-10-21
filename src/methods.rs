@@ -14,6 +14,7 @@ const N_VERIFY: f64 = 8.0; // z-test : échantillons frais avant de confirmer
 const Z_VERIFY: f64 = 3.0;
 const M_DELTA0: usize = 2; // chemins corrélés par cellule suspecte, 1er tour
 const M_DELTA: usize = 8; // total si l'un des chemins du 1er tour est affecté
+const DEP_WINDOW: u32 = 64; // vieillissement des dépendances, en échantillons
 const DEBT_RATE: f64 = 0.5; // part max du budget d'une frame servant à rembourser les chemins différentiels
 const SAFETY_WINDOW: f64 = 32.0;
 const Z_SAFETY: f64 = 4.0;
@@ -61,7 +62,7 @@ pub enum OnEvent {
 pub enum Kind {
     PixelReset,
     PixelEma,
-    Cache { neyman: bool, ema: bool, on_event: OnEvent, safety: bool },
+    Cache { neyman: bool, ema: bool, on_event: OnEvent, safety: bool, age: bool },
 }
 
 #[derive(Clone)]
@@ -73,7 +74,7 @@ pub struct Cfg {
 }
 
 fn cache(name: &str, neyman: bool, ema: bool, on_event: OnEvent, safety: bool) -> Cfg {
-    Cfg { name: name.into(), kind: Kind::Cache { neyman, ema, on_event, safety }, target: None }
+    Cfg { name: name.into(), kind: Kind::Cache { neyman, ema, on_event, safety, age: true }, target: None }
 }
 
 pub fn all_methods() -> Vec<Cfg> {
@@ -92,8 +93,13 @@ pub fn all_methods() -> Vec<Cfg> {
         cache("krc_ztest", true, false, Invalidate(Spatial, ZTest), true),
         cache("krc_delta", true, false, Invalidate(Spatial, Delta { cv: false }), true),
         cache("krc", true, false, Invalidate(Spatial, Delta { cv: true }), true),
+        Cfg {
+            name: "krc_noage".into(),
+            kind: Kind::Cache { neyman: true, ema: false, on_event: Invalidate(Spatial, Delta { cv: true }), safety: true, age: false },
+            target: None,
+        },
     ];
-    for base in ["krc", "krc_all", "krc_hard", "cache_reset"] {
+    for base in ["krc", "krc_noage", "krc_all", "krc_hard", "cache_reset"] {
         let mut c = v.iter().find(|c| c.name == base).unwrap().clone();
         c.name = format!("{base}_target");
         c.target = Some(0.03);
@@ -280,8 +286,8 @@ fn task_rng(seed: u64, frame: u32, i: usize) -> Rng {
     Rng::new(mix64(seed ^ mix64((frame as u64) << 32 | i as u64)))
 }
 
-fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool) {
-    c.deps.or(&rec.regions);
+fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool, window: Option<u32>) {
+    c.add_deps(&rec.regions, window);
     c.objs |= rec.objs;
     if ema {
         c.main.add_ema(v, EMA_CACHE);
@@ -295,7 +301,8 @@ fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool) {
     }
 }
 
-pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: u64, world: &World) -> Vec<FrameStats> {
+/// `warmup` : frames statiques (état initial) simulées avant la séquence, non enregistrées.
+pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: u64, world: &World, warmup: u32) -> Vec<FrameStats> {
     std::fs::create_dir_all(out_dir).unwrap();
     let seed = mix64(cfg.name.bytes().fold(7u64, |h, b| h.wrapping_mul(131) ^ b as u64) ^ mix64(run_seed));
     let mut stats = Vec::new();
@@ -306,11 +313,12 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
     let mut rng = Rng::new(seed);
     let mut debt = 0usize; // chemins différentiels à rembourser sur le budget des frames suivantes
 
-    for frame in 0..FRAMES {
+    for t in 0..warmup + FRAMES {
+        let frame = t.saturating_sub(warmup);
         let state = state_at(frame);
         let scene = build(&state, world.rooms);
         let mut fs = FrameStats { frame, ..Default::default() };
-        let ev = if frame > 0 { event(&prev_state, &state, &prev_scene, &scene, frame) } else { None };
+        let ev = if t > 0 { event(&prev_state, &state, &prev_scene, &scene, frame) } else { None };
         let gb = gbuffer(&scene, world);
         let surf: Vec<usize> = (0..world.len()).filter(|&k| matches!(gb[k], Px::Surf { .. })).collect();
         let budget = surf.len();
@@ -328,7 +336,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 }
                 let samples = par_map(surf.len(), |i| {
                     let Px::Surf { p, n, albedo, .. } = gb[surf[i]] else { unreachable!() };
-                    let mut r = task_rng(seed, frame, i);
+                    let mut r = task_rng(seed, t, i);
                     radiance(&scene, p, n, albedo, &mut r, &mut NoRec, false)
                 });
                 for (i, v) in samples.into_iter().enumerate() {
@@ -348,7 +356,8 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 }
                 fs.paths = surf.len();
             }
-            Kind::Cache { neyman, ema, on_event, safety } => {
+            Kind::Cache { neyman, ema, on_event, safety, age } => {
+                let window = if age { Some(DEP_WINDOW) } else { None };
                 // 1. cellules visibles
                 let mut pix_cells = vec![[u32::MAX; K]; world.len()];
                 for &k in &surf {
@@ -389,7 +398,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                             OnEvent::Invalidate(deps, _) => deps,
                         };
                         let suspect = match deps {
-                            Deps::Spatial => c.deps.intersects(&e.regions),
+                            Deps::Spatial => c.depends_on(&e.regions),
                             Deps::Objects => c.objs & e.objs != 0,
                             Deps::All => true,
                         };
@@ -431,7 +440,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                     let trace = |tasks: &[(u32, u32)], round: u64| {
                         par_map(tasks.len(), |i| {
                             let Px::Surf { p, n, albedo, .. } = gb[tasks[i].1 as usize] else { unreachable!() };
-                            let s = mix64(seed ^ 0xde17a ^ mix64((frame as u64) << 32 | round << 24 | i as u64));
+                            let s = mix64(seed ^ 0xde17a ^ mix64((t as u64) << 32 | round << 24 | i as u64));
                             let mut rec = DepRec::default();
                             if !e.geometry {
                                 // lampes seules : l'ancienne radiance se déduit du même chemin
@@ -477,16 +486,16 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                         for &i in &idx {
                             let r = &results[i];
                             if changed {
-                                c.deps.or(&r.4.regions);
+                                c.add_deps(&r.4.regions, window);
                                 c.objs |= r.4.objs;
                             } else {
-                                add_sample(c, r.1, &r.4, ema, safety);
+                                add_sample(c, r.1, &r.4, ema, safety, window);
                             }
                         }
                         if !changed {
                             fs.delta_zero += 1;
                         }
-                        c.last = frame as i64;
+                        c.last = t as i64;
                     }
                 }
                 if cfg.target.is_none() {
@@ -523,7 +532,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                     };
                     // plancher d'exploration
                     for &c in &visible {
-                        if frame as i64 - cache.cells[c].last >= EXPLORE_PERIOD && cache.cells[c].main.n > 0.0 {
+                        if t as i64 - cache.cells[c].last >= EXPLORE_PERIOD && cache.cells[c].main.n > 0.0 {
                             tasks.push(pick(c, &mut rng));
                         }
                     }
@@ -569,7 +578,7 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 // 4. tracé (parallèle)
                 let results = par_map(tasks.len(), |i| {
                     let Px::Surf { p, n, albedo, .. } = gb[tasks[i].1 as usize] else { unreachable!() };
-                    let mut r = task_rng(seed, frame, i);
+                    let mut r = task_rng(seed, t, i);
                     let mut rec = DepRec::default();
                     let v = radiance(&scene, p, n, albedo, &mut r, &mut rec, false);
                     (v, rec)
@@ -579,16 +588,16 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                 for (i, (v, rec)) in results.iter().enumerate() {
                     let ci = tasks[i].0 as usize;
                     let c = &mut cache.cells[ci];
-                    if c.last != frame as i64 {
+                    if c.last != t as i64 {
                         touched.push(ci);
                     }
-                    c.last = frame as i64;
+                    c.last = t as i64;
                     if c.cx < 5.2 {
                         fs.paths_a += 1;
                     } else {
                         fs.paths_b += 1;
                     }
-                    add_sample(c, *v, rec, ema, safety);
+                    add_sample(c, *v, rec, ema, safety, window);
                 }
                 fs.paths = tasks.len() + fs.delta_paths + fs.probes;
                 // 6. vérification (z-test) et filet de sécurité
@@ -646,6 +655,11 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
         fs.relmse_b = acc[1] / cnt[1].max(1.0);
         fs.bias_a = acc[2] / cnt[0].max(1.0);
         fs.bias_b = acc[3] / cnt[1].max(1.0);
+        if t < warmup {
+            prev_state = state;
+            prev_scene = scene;
+            continue;
+        }
         if run_seed == 0 && SAVE_FRAMES.contains(&frame) {
             crate::image::save(&format!("{out_dir}/f{frame:03}.png"), world.w, world.h, &img);
             // carte d'erreur relative (racine du relMSE par pixel, 1.0 = 100 %)
