@@ -67,6 +67,8 @@ pub enum OnEvent {
 pub enum Kind {
     PixelReset,
     PixelEma,
+    /// pipeline entièrement GPU (krc_gpu.wgsl) ; `sharc` : variante cache à hystérésis
+    Gpu { sharc: bool },
     Cache { neyman: bool, ema: bool, on_event: OnEvent, safety: bool, age: bool },
 }
 
@@ -108,6 +110,8 @@ pub fn all_methods() -> Vec<Cfg> {
             dep_level: 0,
         },
     ];
+    v.push(Cfg { name: "gpu_krc".into(), kind: Kind::Gpu { sharc: false }, target: None, dep_level: 2 });
+    v.push(Cfg { name: "gpu_sharc".into(), kind: Kind::Gpu { sharc: true }, target: None, dep_level: 0 });
     for level in [1u8, 2] {
         let mut c = v.iter().find(|c| c.name == "krc_energy").unwrap().clone();
         c.name = format!("krc_energy_l{level}");
@@ -348,6 +352,9 @@ pub fn run(
 ) -> Vec<FrameStats> {
     std::fs::create_dir_all(out_dir).unwrap();
     let seed = mix64(cfg.name.bytes().fold(7u64, |h, b| h.wrapping_mul(131) ^ b as u64) ^ mix64(run_seed));
+    if let Kind::Gpu { sharc } = cfg.kind {
+        return run_gpu(refs, out_dir, run_seed, world, warmup, tracer, sharc, seed);
+    }
     let mut stats = Vec::new();
     let mut prev_state = state_at(0);
     let mut prev_scene = build(&prev_state, world.rooms);
@@ -398,6 +405,7 @@ pub fn run(
                 }
                 fs.paths = surf.len();
             }
+            Kind::Gpu { .. } => unreachable!(),
             Kind::Cache { neyman, ema, on_event, safety, age } => {
                 let window = if age { Some(DEP_WINDOW) } else { None };
                 // 1. cellules visibles
@@ -773,6 +781,104 @@ pub fn run(
         stats.push(fs);
         prev_state = state;
         prev_scene = scene;
+    }
+    stats
+}
+
+/// Métriques d'une image contre la référence, et sauvegarde des images choisies.
+fn evaluate(fs: &mut FrameStats, img: &[V3], refs: &HashMap<String, Vec<V3>>, state: &State, gb: &[Px], world: &World) {
+    let r = &refs[&state.id()];
+    let (rmse, relmse) = errors(img, r, gb);
+    fs.rmse = rmse;
+    fs.relmse = relmse;
+    let (mut acc, mut cnt) = ([0.0f64; 4], [0.0f64; 2]);
+    for k in 0..world.len() {
+        if !matches!(gb[k], Px::Surf { .. }) {
+            continue;
+        }
+        let side = if gb[k].is_surf_a() { 0 } else { 1 };
+        for c in 0..3 {
+            let (x, y) = (img[k].get(c), r[k].get(c));
+            acc[side] += (x - y) * (x - y) / (y * y + 0.01);
+            acc[2 + side] += (x - y) / (y + 0.1);
+        }
+        cnt[side] += 3.0;
+    }
+    fs.relmse_a = acc[0] / cnt[0].max(1.0);
+    fs.relmse_b = acc[1] / cnt[1].max(1.0);
+    fs.bias_a = acc[2] / cnt[0].max(1.0);
+    fs.bias_b = acc[3] / cnt[1].max(1.0);
+}
+
+/// Même séquence, pipeline entièrement GPU. `trace_ms` = somme des passes GPU (timestamps).
+#[allow(clippy::too_many_arguments)]
+fn run_gpu(
+    refs: &HashMap<String, Vec<V3>>,
+    out_dir: &str,
+    run_seed: u64,
+    world: &World,
+    warmup: u32,
+    tracer: &Tracer,
+    sharc: bool,
+    seed: u64,
+) -> Vec<FrameStats> {
+    let Tracer::Gpu(g) = tracer else { panic!("méthode GPU : lancer avec KRC_GPU=1") };
+    let mut krc = crate::gpu_krc::GpuKrc::new(g, *world, sharc, seed as u32);
+    let mut stats = Vec::new();
+    let mut prev_state = state_at(0);
+    let mut prev_scene = build(&prev_state, world.rooms);
+    let mut pass_ms: Vec<(&'static str, f64, usize)> = Vec::new();
+    for t in 0..warmup + FRAMES {
+        let frame = t.saturating_sub(warmup);
+        let state = state_at(frame);
+        let scene = build(&state, world.rooms);
+        let ev = if t > 0 { event(&prev_state, &state, &prev_scene, &scene, frame) } else { None };
+        let f = krc.frame(&scene, &prev_scene, ev.as_ref(), t);
+        if t >= warmup {
+            let gb = gbuffer(&scene, world);
+            let mut fs = FrameStats { frame, ..Default::default() };
+            fs.probes = ev.as_ref().map_or(0, |e| e.probe_rays);
+            fs.paths = (f.regular_paths + f.delta_paths) as usize + fs.probes;
+            fs.suspects = f.suspects as usize;
+            fs.hard_resets = f.hard as usize;
+            fs.delta_paths = f.delta_paths as usize;
+            fs.delta_old_paths = f.delta_old as usize;
+            fs.delta_zero = f.delta_zero as usize;
+            fs.safety = f.safety as usize;
+            fs.cells = f.visible as usize;
+            fs.trace_ms = f.gpu_ms();
+            assert_eq!(f.overflow, 0, "table de cellules GPU saturée ({} cellules)", f.cells);
+            debug_assert!(f.surf as usize <= world.len());
+            let mut img = f.image;
+            for k in 0..world.len() {
+                if let Px::Light(e) = gb[k] {
+                    img[k] = e;
+                }
+            }
+            evaluate(&mut fs, &img, refs, &state, &gb, world);
+            if run_seed == 0 && SAVE_FRAMES.contains(&frame) {
+                crate::image::save(&format!("{out_dir}/f{frame:03}.png"), world.w, world.h, &img);
+            }
+            for (name, ms) in &f.passes {
+                match pass_ms.iter_mut().find(|p| p.0 == *name) {
+                    Some(p) => {
+                        p.1 += ms;
+                        p.2 += 1;
+                    }
+                    None => pass_ms.push((name, *ms, 1)),
+                }
+            }
+            stats.push(fs);
+        }
+        prev_state = state;
+        prev_scene = scene;
+    }
+    if run_seed == 0 {
+        let mut csv = String::from("pass,mean_ms,frames\n");
+        for (name, ms, n) in &pass_ms {
+            csv += &format!("{name},{:.4},{n}\n", ms / *n as f64);
+        }
+        std::fs::write(format!("{out_dir}/passes.csv"), csv).unwrap();
     }
     stats
 }

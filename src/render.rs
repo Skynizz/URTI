@@ -31,6 +31,14 @@ impl World {
     pub fn px_angle(&self) -> f64 {
         2.0 * (HFOV_DEG.to_radians() * 0.5).tan() / self.w as f64
     }
+    /// (œil, avant, droite, haut, tan demi-angle horizontal, vertical)
+    pub fn camera(&self) -> (V3, V3, V3, V3, f64, f64) {
+        let (eye, look) = self.eye_look();
+        let f = (look - eye).norm();
+        let r = f.cross(v3(0.0, 1.0, 0.0)).norm();
+        let th = (HFOV_DEG.to_radians() * 0.5).tan();
+        (eye, f, r, r.cross(f), th, th * self.h as f64 / self.w as f64)
+    }
     pub fn camera_ray(&self, i: usize, j: usize) -> (V3, V3) {
         let (eye, look) = self.eye_look();
         let f = (look - eye).norm();

@@ -8,6 +8,7 @@ mod pt;
 mod render;
 mod bench;
 mod gpu;
+mod gpu_krc;
 mod scene;
 mod tracer;
 
@@ -69,6 +70,9 @@ fn run(
     let mut all = methods::all_methods();
     if !names.is_empty() {
         all.retain(|c| names.contains(&c.name));
+    }
+    if !tracer.is_gpu() {
+        all.retain(|c| !c.name.starts_with("gpu_"));
     }
     let mut summary = String::from("method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame\n");
     for cfg in &all {

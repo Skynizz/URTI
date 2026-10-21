@@ -14,7 +14,7 @@ const REGION_WORDS: usize = WORDS * 2; // u64 -> u32
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GBox {
+pub(crate) struct GBox {
     mn: [f32; 3],
     p0: f32,
     mx: [f32; 3],
@@ -25,7 +25,7 @@ struct GBox {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GLight {
+pub(crate) struct GLight {
     center: [f32; 3],
     hx: f32,
     hz: f32,
@@ -58,7 +58,32 @@ struct Params {
     pad: [u32; 3],
 }
 
-fn f3(v: V3) -> [f32; 3] {
+/// Scène au format GPU ; `toggle_w` : poids allumée_avant − allumée_après par lampe.
+pub(crate) fn scene_to_gpu(scene: &Scene, toggle_w: &[f64]) -> (Vec<GBox>, Vec<GLight>) {
+    let boxes = scene
+        .objects
+        .iter()
+        .map(|b| GBox { mn: f3(b.aabb.min), p0: 0.0, mx: f3(b.aabb.max), p1: 0.0, albedo: f3(b.albedo), p2: 0.0 })
+        .collect();
+    let lights = scene
+        .lights
+        .iter()
+        .enumerate()
+        .map(|(j, l)| GLight {
+            center: f3(l.center),
+            hx: l.hx as f32,
+            hz: l.hz as f32,
+            on: l.on as u8 as f32,
+            power: scene.light_power_if_on(j) as f32,
+            toggle_w: toggle_w.get(j).copied().unwrap_or(0.0) as f32,
+            emission: f3(l.emission),
+            p0: 0.0,
+        })
+        .collect();
+    (boxes, lights)
+}
+
+pub(crate) fn f3(v: V3) -> [f32; 3] {
     [v.x as f32, v.y as f32, v.z as f32]
 }
 
@@ -74,8 +99,8 @@ struct Bufs {
     bind: wgpu::BindGroup,
 }
 
-const MAX_BOXES: usize = 64;
-const MAX_LIGHTS: usize = 16;
+pub(crate) const MAX_BOXES: usize = 64;
+pub(crate) const MAX_LIGHTS: usize = 16;
 
 /// Profil cumulé des appels (ms) : où passe le temps d'un lot.
 #[derive(Default, Clone, Debug)]
@@ -109,8 +134,8 @@ struct Timestamps {
 }
 
 pub struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bufs: std::sync::Mutex<Option<Bufs>>,
     ts: Option<Timestamps>,
@@ -258,26 +283,7 @@ impl Gpu {
         let ms = |c: &std::time::Instant| c.elapsed().as_secs_f64() * 1e3;
         let mut prof = Prof { calls: 1, ..Default::default() };
         assert!(scene.objects.len() <= MAX_BOXES && scene.lights.len() <= MAX_LIGHTS);
-        let boxes: Vec<GBox> = scene
-            .objects
-            .iter()
-            .map(|b| GBox { mn: f3(b.aabb.min), p0: 0.0, mx: f3(b.aabb.max), p1: 0.0, albedo: f3(b.albedo), p2: 0.0 })
-            .collect();
-        let lights: Vec<GLight> = scene
-            .lights
-            .iter()
-            .enumerate()
-            .map(|(j, l)| GLight {
-                center: f3(l.center),
-                hx: l.hx as f32,
-                hz: l.hz as f32,
-                on: l.on as u8 as f32,
-                power: scene.light_power_if_on(j) as f32,
-                toggle_w: o.toggle_w.get(j).copied().unwrap_or(0.0) as f32,
-                emission: f3(l.emission),
-                p0: 0.0,
-            })
-            .collect();
+        let (boxes, lights) = scene_to_gpu(scene, o.toggle_w);
         let tasks: Vec<GTask> = reqs
             .iter()
             .map(|r| {
