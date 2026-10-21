@@ -29,6 +29,7 @@ const DEBT_RATE: f32 = 0.5;
 const CELL_PX: f32 = 4.0;
 const EMA_MIN: f32 = 0.015625;
 const MAX_PER_CELL: u32 = 64u;
+const N_MAX: f32 = 1024.0; // historique maximal d'une cellule (test de dérive)
 const N_POST: f32 = 64.0;  // poids max d'une estimation corrigée (sa variance vient de 8 tirages) ; réglé par le test de dérive
 
 // compteurs (ctr)
@@ -1029,6 +1030,12 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
             cell.m2 += fm2 + dl * dl * cell.n * fn_ / n;
             cell.lmean += dl * (fn_ / n);
             cell.n = n;
+            // historique plafonné : au-delà, moyenne glissante (les petites erreurs résiduelles des
+            // corrections ne s'accumulent pas indéfiniment)
+            if (cell.n > N_MAX) {
+                cell.m2 *= (N_MAX - 1.0) / (cell.n - 1.0);
+                cell.n = N_MAX;
+            }
             // fenêtre récente du filet de sécurité
             let rn = cell.rn + fn_;
             let rdl = fl - cell.rl;
