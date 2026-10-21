@@ -65,8 +65,11 @@ pub(crate) fn scene_to_gpu(scene: &Scene, toggle_w: &[f64]) -> (Vec<GBox>, Vec<G
         .iter()
         .map(|b| GBox { mn: f3(b.aabb.min), p0: 0.0, mx: f3(b.aabb.max), p1: 0.0, albedo: f3(b.albedo), p2: 0.0 })
         .collect();
-    let lights = scene
-        .lights
+    (boxes, lights_to_gpu(&scene.lights, toggle_w))
+}
+
+pub(crate) fn lights_to_gpu(lights: &[crate::scene::Light], toggle_w: &[f64]) -> Vec<GLight> {
+    lights
         .iter()
         .enumerate()
         .map(|(j, l)| GLight {
@@ -74,13 +77,12 @@ pub(crate) fn scene_to_gpu(scene: &Scene, toggle_w: &[f64]) -> (Vec<GBox>, Vec<G
             hx: l.hx as f32,
             hz: l.hz as f32,
             on: l.on as u8 as f32,
-            power: scene.light_power_if_on(j) as f32,
+            power: (l.emission.lum() * l.area()) as f32,
             toggle_w: toggle_w.get(j).copied().unwrap_or(0.0) as f32,
             emission: f3(l.emission),
             p0: 0.0,
         })
-        .collect();
-    (boxes, lights)
+        .collect()
 }
 
 pub(crate) fn f3(v: V3) -> [f32; 3] {

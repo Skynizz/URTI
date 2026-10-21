@@ -2,11 +2,50 @@
 //! scène (quelques centaines d'octets) et, s'il y a lieu, la description de l'événement ; il ne
 //! relit que l'image et quelques compteurs, pour l'évaluation (hors chronométrage GPU).
 use crate::deps::{Coarse, SUPER, WORDS};
-use crate::gpu::{f3, scene_to_gpu, GBox, GLight, Gpu, MAX_BOXES, MAX_LIGHTS};
-use crate::math::{v3, V3};
+use crate::gpu::{f3, lights_to_gpu, scene_to_gpu, GBox, GLight, Gpu, MAX_BOXES, MAX_LIGHTS};
+use crate::grid::Grid;
+use crate::math::{v3, Rng, V3};
 use crate::methods::Event;
 use crate::render::World;
-use crate::scene::Scene;
+use crate::rt::{Accel, TriScene};
+use crate::scene::{cosine_dir, Scene};
+
+/// Caméra et résolution.
+#[derive(Clone, Copy)]
+pub struct View {
+    pub w: usize,
+    pub h: usize,
+    pub eye: V3,
+    pub fwd: V3,
+    pub right: V3,
+    pub up: V3,
+    pub th: f64,
+    pub tv: f64,
+}
+
+impl View {
+    pub fn of(world: &World) -> View {
+        let (eye, fwd, right, up, th, tv) = world.camera();
+        View { w: world.w, h: world.h, eye, fwd, right, up, th, tv }
+    }
+    pub fn len(&self) -> usize {
+        self.w * self.h
+    }
+    pub fn px_angle(&self) -> f64 {
+        2.0 * self.th / self.w as f64
+    }
+}
+
+/// Description d'un événement pour le GPU (mots de `ev`), si la scène a changé.
+pub struct GpuEvent {
+    pub words: Vec<u32>,
+    pub geometry: bool,
+    pub lights: u32,
+    pub light_w: Vec<f64>,
+    pub probe_rays: usize,
+}
+
+const PROBES: usize = 1024;
 
 const K: usize = 4;
 const ACC: usize = 44;
@@ -72,6 +111,9 @@ pub struct GpuFrame {
     pub overflow: u32,
     pub max_n: f32,
     pub debt: u32,
+    /// genre de chaque pixel (0 vide, 1 lampe, 2 surface), si l'image a été relue
+    pub kinds: Vec<u8>,
+    pub probe_rays: usize,
     /// durée GPU de chaque passe (timestamps), en ms
     pub passes: Vec<(&'static str, f64)>,
 }
@@ -84,11 +126,17 @@ impl GpuFrame {
 
 pub struct GpuKrc<'a> {
     gpu: &'a Gpu,
-    world: World,
+    view: View,
+    grid: Grid,
     sharc: bool,
     pipes: std::collections::HashMap<&'static str, wgpu::ComputePipeline>,
     bufs: Vec<wgpu::Buffer>,
-    bind: wgpu::BindGroup,
+    /// un groupe de liaisons (boîtes) ; deux en triangles (TLAS courante/précédente alternées)
+    binds: Vec<wgpu::BindGroup>,
+    bind_idx: usize,
+    accel: Option<Accel>,
+    probe_buf: wgpu::Buffer,
+    probe_read: wgpu::Buffer,
     read_img: wgpu::Buffer,
     read_ctr: wgpu::Buffer,
     ts: wgpu::QuerySet,
@@ -102,7 +150,9 @@ pub struct GpuKrc<'a> {
     pub readback: bool,
 }
 
-const ENTRIES: [&str; 26] = [
+const ENTRIES: [&str; 28] = [
+    "probe_trace",
+    "reference_acc",
     "reset_ctr",
     "prep_cells",
     "gbuffer",
@@ -133,9 +183,15 @@ const ENTRIES: [&str; 26] = [
 const MAX_PASSES: u32 = 32;
 
 impl<'a> GpuKrc<'a> {
+    /// Pièces en enfilade (boîtes alignées), grille fixe.
     pub fn new(gpu: &'a Gpu, world: World, sharc: bool, seed: u32) -> GpuKrc<'a> {
+        GpuKrc::with(gpu, View::of(&world), Grid::boxes(), None, sharc, seed)
+    }
+
+    /// Cas général : `tri` = scène en triangles (ray query matériel) ou None pour les boîtes.
+    pub fn with(gpu: &'a Gpu, view: View, grid: Grid, tri: Option<&TriScene>, sharc: bool, seed: u32) -> GpuKrc<'a> {
         let dev = &gpu.device;
-        let len = world.len();
+        let len = view.len();
         // une cellule couvre 2 à 4 pixels de large ; avec le jitter, ≈ len/6 cellules distinctes
         let cell_cap = (len / 2).next_power_of_two().max(1 << 14) as u32;
         let table = (cell_cap as usize * 2).next_power_of_two();
@@ -146,14 +202,16 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..18u32 {
+        for b in 0..22u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
-                1..=4 | 14 => storage(true),
+                1 | 3 if tri.is_some() => wgpu::BindingType::AccelerationStructure,
+                18..=20 if tri.is_none() => continue,
+                1..=4 | 14 | 18..=20 => storage(true),
                 _ => storage(false),
             };
             entries.push(wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None });
@@ -164,9 +222,14 @@ impl<'a> GpuKrc<'a> {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
+        let mut src = grid.template(include_str!("krc_gpu.wgsl"));
+        if tri.is_some() {
+            let (a, b) = (src.find("// <geometrie>").unwrap(), src.find("// </geometrie>").unwrap());
+            src = format!("{}{}{}", &src[..a], crate::rt::TRI_GEOMETRY, &src[b..]);
+        }
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("krc_gpu"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("krc_gpu.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
         });
         let mut pipes = std::collections::HashMap::new();
         for e in ENTRIES {
@@ -214,24 +277,44 @@ impl<'a> GpuKrc<'a> {
                 })
             })
             .collect();
-        let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("krc"),
-            layout: &layout,
-            entries: &bufs
-                .iter()
-                .enumerate()
-                .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
-                .collect::<Vec<_>>(),
-        });
         let mk = |size: u64, usage: wgpu::BufferUsages| {
             dev.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage, mapped_at_creation: false })
         };
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
+        let probe_buf = mk((PROBES * 32) as u64, st);
+        let accel = tri.map(|t| Accel::new(gpu, t));
+        let n_binds = if accel.is_some() { 2 } else { 1 };
+        let binds = (0..n_binds)
+            .map(|k| {
+                let mut e: Vec<wgpu::BindGroupEntry> = Vec::new();
+                for (i, b) in bufs.iter().enumerate() {
+                    let resource = match (&accel, i) {
+                        (Some(a), 1) => a.tlas[k].as_binding(),
+                        (Some(a), 3) => a.tlas[1 - k].as_binding(),
+                        _ => b.as_entire_binding(),
+                    };
+                    e.push(wgpu::BindGroupEntry { binding: i as u32, resource });
+                }
+                if let Some(a) = &accel {
+                    e.push(wgpu::BindGroupEntry { binding: 18, resource: a.verts.as_entire_binding() });
+                    e.push(wgpu::BindGroupEntry { binding: 19, resource: a.idx.as_entire_binding() });
+                    e.push(wgpu::BindGroupEntry { binding: 20, resource: a.mesh_table.as_entire_binding() });
+                }
+                e.push(wgpu::BindGroupEntry { binding: 21, resource: probe_buf.as_entire_binding() });
+                dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("krc"), layout: &layout, entries: &e })
+            })
+            .collect();
         GpuKrc {
             gpu,
-            world,
+            view,
+            grid,
             sharc,
             pipes,
+            probe_read: mk((PROBES * 32) as u64, read),
+            probe_buf,
+            accel,
+            binds,
+            bind_idx: 0,
             read_img: mk((len * 16) as u64, read),
             read_ctr: mk((CTR * 4) as u64, read),
             ts: dev.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: MAX_PASSES * 2 }),
@@ -242,7 +325,6 @@ impl<'a> GpuKrc<'a> {
             ts_read: mk(MAX_PASSES as u64 * 16, read),
             period_ns: gpu.queue.get_timestamp_period(),
             bufs,
-            bind,
             cell_cap,
             table_mask: table as u32 - 1,
             seed,
@@ -250,12 +332,222 @@ impl<'a> GpuKrc<'a> {
         }
     }
 
-    /// Une frame complète. `t` : indice de frame (graines, exploration).
+    fn uniform(&self, n_boxes: usize, n_lights: usize, t: u32, flags: u32, round: u32, ev_lights: u32, pad0: u32) -> FrameU {
+        let v = &self.view;
+        FrameU {
+            w: v.w as u32,
+            h: v.h as u32,
+            n_boxes: n_boxes as u32,
+            n_lights: n_lights as u32,
+            frame: t,
+            seed: self.seed,
+            flags,
+            table_mask: self.table_mask,
+            cell_cap: self.cell_cap,
+            round,
+            ev_lights,
+            pad0,
+            eye: f3(v.eye),
+            px_angle: v.px_angle() as f32,
+            fwd: f3(v.fwd),
+            th: v.th as f32,
+            right: f3(v.right),
+            tv: v.tv as f32,
+            up: f3(v.up),
+            pad1: 0.0,
+        }
+    }
+
+    /// Une frame complète, scène de boîtes. `t` : indice de frame (graines, exploration).
     pub fn frame(&mut self, scene: &Scene, prev: &Scene, ev: Option<&Event>, t: u32) -> GpuFrame {
+        let gev = ev.map(|e| GpuEvent {
+            words: event_words(e),
+            geometry: e.geometry,
+            lights: e.lights as u32,
+            light_w: e.light_w.clone(),
+            probe_rays: e.probe_rays,
+        });
+        let w_ev: Vec<f64> = ev.map(|e| e.light_w.clone()).unwrap_or_default();
+        let (b, l) = scene_to_gpu(scene, &w_ev);
+        let (bp, lp) = scene_to_gpu(prev, &w_ev);
         let q = &self.gpu.queue;
-        let w = &self.world;
-        let len = w.len() as u32;
-        let (eye, fwd, right, up, th, tv) = w.camera();
+        q.write_buffer(&self.bufs[1], 0, bytemuck::cast_slice(&b));
+        q.write_buffer(&self.bufs[3], 0, bytemuck::cast_slice(&bp));
+        self.run_frame(b.len(), &l, &lp, gev.as_ref(), t)
+    }
+
+    /// Une frame complète, scène en triangles : TLAS de la frame reconstruite (la précédente
+    /// est gardée pour les chemins corrélés), événement détecté et décrit sur place.
+    pub fn frame_tri(&mut self, scene: &TriScene, prev: &TriScene, t: u32) -> GpuFrame {
+        let accel = self.accel.as_mut().expect("scène en triangles");
+        self.bind_idx = 1 - self.bind_idx;
+        accel.build_tlas(self.gpu, scene, self.bind_idx);
+        let ev = if self.sharc { None } else { self.tri_event(prev, scene, t) };
+        let w_ev: Vec<f64> = ev.as_ref().map(|e| e.light_w.clone()).unwrap_or_default();
+        let l = lights_to_gpu(&scene.lights, &w_ev);
+        let lp = lights_to_gpu(&prev.lights, &w_ev);
+        self.run_frame(0, &l, &lp, ev.as_ref(), t)
+    }
+
+    /// Événement entre deux états d'une scène en triangles : instances déplacées (AABB balayée),
+    /// lampes commutées (sondes tracées sur GPU depuis la scène où la lampe est allumée).
+    fn tri_event(&mut self, prev: &TriScene, cur: &TriScene, t: u32) -> Option<GpuEvent> {
+        let g = self.grid;
+        let mut words = vec![0u32; 162];
+        let mut geometry = false;
+        for i in 0..cur.instances.len() {
+            if (cur.instances[i].offset - prev.instances[i].offset).len() > 0.0 {
+                geometry = true;
+                let swept = prev.instance_aabb(i).union(cur.instance_aabb(i)).expand(0.05);
+                g.mark_aabb(&mut words[..108], &swept);
+            }
+        }
+        let mut lights = 0u32;
+        let mut light_w = vec![0.0; cur.lights.len()];
+        let mut mag = [0.0f32; 36];
+        let mut probe_rays = 0;
+        for j in 0..cur.lights.len() {
+            let (was, is) = (prev.lights[j].on, cur.lights[j].on);
+            if was == is {
+                continue;
+            }
+            lights |= 1 << j;
+            light_w[j] = was as u8 as f64 - is as u8 as f64;
+            let l = if is { &cur.lights[j] } else { &prev.lights[j] };
+            let hits = self.probes(l, if is { 0 } else { 1 }, mix_seed(t, j));
+            probe_rays += PROBES;
+            let flux = std::f64::consts::PI * l.emission.lum() * l.area() / PROBES as f64;
+            let area = g.region * g.region;
+            g.mark_aabb(&mut words[..108], &l.aabb());
+            for (p, albedo) in hits {
+                let c = g.cell_of(p);
+                let i = g.index(c);
+                words[i >> 5] |= 1 << (i & 31);
+                let s = g.super_of(c);
+                mag[s] = mag[s].max((albedo * flux / (std::f64::consts::PI * area)) as f32);
+            }
+        }
+        if !geometry && lights == 0 {
+            return None;
+        }
+        let l2 = g.supers_of_bits(&words[..108]);
+        words[108] = l2 as u32;
+        words[109] = (l2 >> 32) as u32;
+        for s in 0..36 {
+            words[110 + s] = mag[s].to_bits();
+        }
+        for (j, &w) in light_w.iter().enumerate().take(16) {
+            words[146 + j] = (w as f32).to_bits();
+        }
+        Some(GpuEvent { words, geometry, lights, light_w, probe_rays })
+    }
+
+    /// Rayons-sondes depuis une lampe, tracés sur GPU (`sel` 0 : scène courante, 1 : précédente).
+    /// Renvoie (point d'impact, luminance de l'albédo) des sondes qui touchent la géométrie.
+    fn probes(&mut self, l: &crate::scene::Light, sel: u32, seed: u64) -> Vec<(V3, f64)> {
+        let mut rng = Rng::new(seed);
+        let mut rays = Vec::with_capacity(PROBES * 2);
+        for _ in 0..PROBES {
+            let o = l.center + v3((2.0 * rng.f64() - 1.0) * l.hx, -1e-3, (2.0 * rng.f64() - 1.0) * l.hz);
+            let d = cosine_dir(v3(0.0, -1.0, 0.0), &mut rng);
+            rays.push([o.x as f32, o.y as f32, o.z as f32, 0.0]);
+            rays.push([d.x as f32, d.y as f32, d.z as f32, 0.0]);
+        }
+        let q = &self.gpu.queue;
+        q.write_buffer(&self.probe_buf, 0, bytemuck::cast_slice(&rays));
+        let fu = self.uniform(0, 0, 0, 0, sel, 0, 0);
+        q.write_buffer(&self.bufs[0], 0, bytemuck::bytes_of(&fu));
+        let dev = &self.gpu.device;
+        let mut enc = dev.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.pipes["probe_trace"]);
+            pass.set_bind_group(0, &self.binds[self.bind_idx], &[]);
+            pass.dispatch_workgroups((PROBES as u32).div_ceil(64), 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&self.probe_buf, 0, &self.probe_read, 0, (PROBES * 32) as u64);
+        q.submit(Some(enc.finish()));
+        self.probe_read.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("lecture sondes"));
+        dev.poll(wgpu::Maintain::Wait);
+        let v: Vec<[f32; 4]> = bytemuck::cast_slice(&self.probe_read.slice(..).get_mapped_range()).to_vec();
+        self.probe_read.unmap();
+        (0..PROBES)
+            .filter(|&i| v[2 * i][3] > 0.5)
+            .map(|i| {
+                let a = v[2 * i + 1];
+                (v3(v[2 * i][0] as f64, v[2 * i][1] as f64, v[2 * i][2] as f64), v3(a[0] as f64, a[1] as f64, a[2] as f64).lum())
+            })
+            .collect()
+    }
+
+    /// Image de référence (triangles) : `spp` chemins par pixel, sans cache.
+    pub fn reference_tri(&mut self, scene: &TriScene, spp: u32) -> (Vec<V3>, Vec<u8>) {
+        let accel = self.accel.as_mut().expect("scène en triangles");
+        accel.build_tlas(self.gpu, scene, self.bind_idx);
+        let l = lights_to_gpu(&scene.lights, &[]);
+        let q = &self.gpu.queue;
+        let dev = &self.gpu.device;
+        q.write_buffer(&self.bufs[2], 0, bytemuck::cast_slice(&l));
+        let len = self.view.len() as u32;
+        let chunk = 64u32;
+        for pass in 0..spp.div_ceil(chunk) {
+            let fu = self.uniform(0, l.len(), pass, 0, 0, 0, chunk.min(spp - pass * chunk));
+            q.write_buffer(&self.bufs[0], 0, bytemuck::bytes_of(&fu));
+            let mut enc = dev.create_command_encoder(&Default::default());
+            if pass == 0 {
+                enc.clear_buffer(&self.bufs[13], 0, None);
+            }
+            for name in if pass == 0 { vec!["gbuffer", "reference_acc"] } else { vec!["reference_acc"] } {
+                let mut p = enc.begin_compute_pass(&Default::default());
+                p.set_pipeline(&self.pipes[name]);
+                p.set_bind_group(0, &self.binds[self.bind_idx], &[]);
+                p.dispatch_workgroups(len.div_ceil(64), 1, 1);
+            }
+            q.submit(Some(enc.finish()));
+            dev.poll(wgpu::Maintain::Wait);
+        }
+        // genre des pixels : passe d'affichage sur un cache vide (lampes : émission)
+        let fu = self.uniform(0, l.len(), 0, 0, 0, 0, 0);
+        q.write_buffer(&self.bufs[0], 0, bytemuck::bytes_of(&fu));
+        let mut enc = dev.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.bufs[13], 0, &self.read_img, 0, len as u64 * 16);
+        q.submit(Some(enc.finish()));
+        self.read_img.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("lecture"));
+        dev.poll(wgpu::Maintain::Wait);
+        let img: Vec<f32> = bytemuck::cast_slice(&self.read_img.slice(..).get_mapped_range()).to_vec();
+        self.read_img.unmap();
+        let gb = self.read_gbuffer_kinds();
+        let px = (0..len as usize)
+            .map(|k| match gb[k] {
+                2 => v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64) / spp as f64,
+                _ => V3::default(),
+            })
+            .collect();
+        (px, gb)
+    }
+
+    /// Genre des pixels du G-buffer courant (0 vide, 1 lampe, 2 surface).
+    fn read_gbuffer_kinds(&self) -> Vec<u8> {
+        let dev = &self.gpu.device;
+        let len = self.view.len();
+        let rb = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (len * 48) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = dev.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.bufs[5], 0, &rb, 0, (len * 48) as u64);
+        self.gpu.queue.submit(Some(enc.finish()));
+        rb.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("lecture"));
+        dev.poll(wgpu::Maintain::Wait);
+        let v: Vec<u32> = bytemuck::cast_slice(&rb.slice(..).get_mapped_range()).to_vec();
+        (0..len).map(|k| v[12 * k + 3] as u8).collect()
+    }
+
+    fn run_frame(&mut self, n_boxes: usize, l: &[GLight], lp: &[GLight], ev: Option<&GpuEvent>, t: u32) -> GpuFrame {
+        let q = &self.gpu.queue;
+        let len = self.view.len() as u32;
         let mut flags = if self.sharc { F_SHARC } else { 0 };
         let mut ev_lights = 0;
         if let Some(e) = ev {
@@ -264,40 +556,14 @@ impl<'a> GpuKrc<'a> {
                 if e.geometry {
                     flags |= F_GEOMETRY;
                 }
-                ev_lights = e.lights as u32;
-                q.write_buffer(&self.bufs[14], 0, bytemuck::cast_slice(&event_words(e)));
+                ev_lights = e.lights;
+                q.write_buffer(&self.bufs[14], 0, bytemuck::cast_slice(&e.words));
             }
         }
-        let fu = FrameU {
-            w: w.w as u32,
-            h: w.h as u32,
-            n_boxes: scene.objects.len() as u32,
-            n_lights: scene.lights.len() as u32,
-            frame: t,
-            seed: self.seed,
-            flags,
-            table_mask: self.table_mask,
-            cell_cap: self.cell_cap,
-            round: 0,
-            ev_lights,
-            pad0: 0,
-            eye: f3(eye),
-            px_angle: w.px_angle() as f32,
-            fwd: f3(fwd),
-            th: th as f32,
-            right: f3(right),
-            tv: tv as f32,
-            up: f3(up),
-            pad1: 0.0,
-        };
+        let fu = self.uniform(n_boxes, l.len(), t, flags, 0, ev_lights, 0);
         q.write_buffer(&self.bufs[0], 0, bytemuck::bytes_of(&fu));
-        let w_ev: Vec<f64> = ev.map(|e| e.light_w.clone()).unwrap_or_default();
-        let (b, l) = scene_to_gpu(scene, &w_ev);
-        let (bp, lp) = scene_to_gpu(prev, &w_ev);
-        q.write_buffer(&self.bufs[1], 0, bytemuck::cast_slice(&b));
-        q.write_buffer(&self.bufs[2], 0, bytemuck::cast_slice(&l));
-        q.write_buffer(&self.bufs[3], 0, bytemuck::cast_slice(&bp));
-        q.write_buffer(&self.bufs[4], 0, bytemuck::cast_slice(&lp));
+        q.write_buffer(&self.bufs[2], 0, bytemuck::cast_slice(l));
+        q.write_buffer(&self.bufs[4], 0, bytemuck::cast_slice(lp));
 
         let mut plan: Vec<(&'static str, Dispatch)> = Vec::new();
         let px = Dispatch::Direct(len.div_ceil(64));
@@ -347,7 +613,7 @@ impl<'a> GpuKrc<'a> {
             };
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes: Some(tw) });
             pass.set_pipeline(&self.pipes[name]);
-            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_bind_group(0, &self.binds[self.bind_idx], &[]);
             match *d {
                 Dispatch::Direct(n) => pass.dispatch_workgroups(n, 1, 1),
                 Dispatch::Indirect(off) => pass.dispatch_workgroups_indirect(&self.bufs[16], off),
@@ -380,6 +646,8 @@ impl<'a> GpuKrc<'a> {
         let ms = self.period_ns as f64 * 1e-6;
         GpuFrame {
             image: (0..img.len() / 4).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
+            kinds: (0..img.len() / 4).map(|k| img[4 * k + 3] as u8).collect(),
+            probe_rays: ev.map_or(0, |e| e.probe_rays),
             cells: ctr[C_CELLS],
             visible: ctr[C_VISIBLE],
             surf: ctr[C_SURF],
@@ -538,6 +806,10 @@ enum Dispatch {
     Direct(u32),
     /// décalage (octets) des arguments dans le buffer indirect
     Indirect(u64),
+}
+
+fn mix_seed(t: u32, j: usize) -> u64 {
+    crate::math::mix64((t as u64) << 8 | j as u64)
 }
 
 /// Description d'un événement pour le GPU : régions fines, super-régions, magnitudes, poids des lampes.

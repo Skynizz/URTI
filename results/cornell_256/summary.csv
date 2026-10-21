@@ -1,0 +1,13 @@
+method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame
+tri_krc,tout,5.027887e-3,4.315113e-5,0.5375,64518
+tri_krc,statique,1.379505e-3,1.230911e-5,0.4591,64045
+tri_krc,boite,2.484690e-3,1.655211e-5,0.8749,107708
+tri_krc,apres_boite,2.345039e-3,3.198388e-5,0.3843,32020
+tri_krc,lampe_on,8.748408e-3,1.613097e-4,0.4699,41416
+tri_krc,lampe_off,7.011960e-3,8.805651e-5,0.5196,62219
+tri_sharc,tout,3.905412e-2,5.009829e-5,0.2591,64825
+tri_sharc,statique,2.023302e-3,2.159613e-5,0.2509,64825
+tri_sharc,boite,8.804765e-3,7.496809e-5,0.2565,64825
+tri_sharc,apres_boite,8.196186e-3,3.029232e-5,0.2677,64825
+tri_sharc,lampe_on,3.861552e-2,6.603124e-5,0.2606,64825
+tri_sharc,lampe_off,1.658516e-1,2.294579e-4,0.2609,64825

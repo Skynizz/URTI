@@ -3,10 +3,13 @@
 // documentées : allocation de Neyman par bisection du seuil de gain (équivalent continu du
 // glouton) et un pixel de référence par cellule et par frame (tiré uniformément).
 
+// <grille> (remplacée par la grille de la scène, cf. Grid::wgsl)
 const REGION: f32 = 0.6;
 const ORIGIN: vec3<f32> = vec3<f32>(-0.2, -0.2, -0.2);
 const DIMS: vec3<i32> = vec3<i32>(72, 6, 8);
-const SUPER_X: i32 = 18;
+const SDIV: vec3<i32> = vec3<i32>(4, 6, 4);
+const SDIMS: vec3<i32> = vec3<i32>(18, 1, 2);
+// </grille>
 const MAX_DEPTH: u32 = 8u;
 const MISS_LEN: f32 = 30.0;
 const EPS: f32 = 1e-4;
@@ -103,9 +106,7 @@ struct Cell {
 };
 
 @group(0) @binding(0) var<uniform> fr: Frame;
-@group(0) @binding(1) var<storage, read> boxes: array<Box>;
 @group(0) @binding(2) var<storage, read> lights: array<Light>;
-@group(0) @binding(3) var<storage, read> boxes_prev: array<Box>;
 @group(0) @binding(4) var<storage, read> lights_prev: array<Light>;
 @group(0) @binding(5) var<storage, read_write> gbuf: array<Gpx>;
 @group(0) @binding(6) var<storage, read_write> pix_cells: array<u32>;
@@ -166,9 +167,7 @@ fn ld_f32(i: u32) -> f32 {
     return bitcast<f32>(atomicLoad(&acc[i]));
 }
 
-fn n_boxes() -> u32 { return fr.n_boxes; }
 fn n_lights() -> u32 { return fr.n_lights; }
-fn box_at(i: u32) -> Box { if (sel == 0u) { return boxes[i]; } return boxes_prev[i]; }
 fn light_at(j: u32) -> Light { if (sel == 0u) { return lights[j]; } return lights_prev[j]; }
 
 // ---------------------------------------------------------------- régions
@@ -176,7 +175,9 @@ fn cell_of(p: vec3<f32>) -> vec3<i32> {
     return clamp(vec3<i32>(floor((p - ORIGIN) / REGION)), vec3<i32>(0), DIMS - vec3<i32>(1));
 }
 fn index_of(c: vec3<i32>) -> u32 { return u32((c.z * DIMS.y + c.y) * DIMS.x + c.x); }
-fn super_of(c: vec3<i32>) -> u32 { return u32((c.z / 4) * SUPER_X + c.x / 4); }
+fn super_of(c: vec3<i32>) -> u32 {
+    return u32(((c.z / SDIV.z) * SDIMS.y + c.y / SDIV.y) * SDIMS.x + c.x / SDIV.x);
+}
 fn set2(m: vec2<u32>, s: u32) -> vec2<u32> {
     if (s < 32u) { return vec2<u32>(m.x | (1u << s), m.y); }
     return vec2<u32>(m.x, m.y | (1u << (s - 32u)));
@@ -186,9 +187,8 @@ fn mark_vertex(p: vec3<f32>) {
     if (rec_on) { m_vsup = set2(m_vsup, super_of(cell_of(p))); }
 }
 
-// Grille des super-régions (dépendances stockées) : 18 × 1 × 2 blocs de 2,4 × 3,6 × 2,4 m.
-const SUP: vec3<f32> = vec3<f32>(2.4, 3.6, 2.4);
-const SDIMS: vec3<i32> = vec3<i32>(18, 1, 2);
+// Grille des super-régions (dépendances stockées) : blocs de SDIV régions.
+const SUP: vec3<f32> = vec3<f32>(SDIV) * REGION;
 var<private> fine_dda: bool;
 
 // DDA : super-régions traversées (dépendances L2). Sur la grille fine (0,6 m) seulement quand il faut
@@ -230,7 +230,7 @@ fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
     }
     let test_ev = fine_dda && (fr.flags & F_EVENT) != 0u;
     for (var it = 0; it < 256; it++) {
-        m_trav = set2(m_trav, select(u32(c.z * SUPER_X + c.x), super_of(c), fine_dda));
+        m_trav = set2(m_trav, select(u32((c.z * SDIMS.y + c.y) * SDIMS.x + c.x), super_of(c), fine_dda));
         if (test_ev && !m_aff) {
             let idx = index_of(c);
             if ((ev[idx >> 5u] >> (idx & 31u) & 1u) == 1u) { m_aff = true; }
@@ -250,6 +250,13 @@ fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
 
 // ---------------------------------------------------------------- géométrie
 struct Hit { found: bool, t: f32, p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, light: i32 };
+struct Occ { found: bool, t: f32 };
+
+// <geometrie> (boîtes alignées ; remplacé par la version triangles + ray query, cf. rt.rs)
+@group(0) @binding(1) var<storage, read> boxes: array<Box>;
+@group(0) @binding(3) var<storage, read> boxes_prev: array<Box>;
+
+fn box_at(i: u32) -> Box { if (sel == 0u) { return boxes[i]; } return boxes_prev[i]; }
 
 fn safe_dir(d: vec3<f32>) -> vec3<f32> {
     let s = select(vec3<f32>(1.0), vec3<f32>(-1.0), d < vec3<f32>(0.0));
@@ -268,7 +275,8 @@ fn slab(mn: vec3<f32>, mx: vec3<f32>, o: vec3<f32>, inv: vec3<f32>) -> vec3<f32>
     return vec3<f32>(t0, min(thi.x, min(thi.y, thi.z)), axis);
 }
 
-fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
+// premier impact sur la géométrie (sans les lampes)
+fn scene_hit(o: vec3<f32>, d: vec3<f32>) -> Hit {
     var h: Hit;
     h.found = false;
     h.t = 1e30;
@@ -276,7 +284,7 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
     let inv = 1.0 / safe_dir(d);
     var axis = 0u;
     var id = 0u;
-    for (var i = 0u; i < n_boxes(); i++) {
+    for (var i = 0u; i < fr.n_boxes; i++) {
         let b = box_at(i);
         let s = slab(b.mn, b.mx, o, inv);
         if (s.x <= s.y && s.x > EPS && s.x < h.t) {
@@ -286,6 +294,35 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
             h.found = true;
         }
     }
+    if (h.found) {
+        var nn = vec3<f32>(0.0);
+        nn[axis] = select(1.0, -1.0, d[axis] > 0.0);
+        h.n = nn;
+        h.albedo = box_at(id).albedo;
+    }
+    return h;
+}
+
+fn occluder(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Occ {
+    var r: Occ;
+    r.found = false;
+    r.t = tmax;
+    let inv = 1.0 / safe_dir(d);
+    for (var i = 0u; i < fr.n_boxes; i++) {
+        let b = box_at(i);
+        let s = slab(b.mn, b.mx, o, inv);
+        if (s.x <= s.y && s.x > EPS && s.x < r.t && s.y > 0.0) {
+            r.found = true;
+            r.t = s.x;
+        }
+    }
+    return r;
+}
+// </geometrie>
+
+// premier impact, lampes comprises
+fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
+    var h = scene_hit(o, d);
     for (var j = 0u; j < n_lights(); j++) {
         if (abs(d.y) < 1e-12) { continue; }
         let l = light_at(j);
@@ -296,40 +333,13 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
                 h.t = t;
                 h.light = i32(j);
                 h.found = true;
+                h.n = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), d.y > 0.0);
+                h.albedo = vec3<f32>(0.0);
             }
         }
     }
-    if (h.found) {
-        h.p = o + d * h.t;
-        if (h.light >= 0) {
-            h.n = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), d.y > 0.0);
-            h.albedo = vec3<f32>(0.0);
-        } else {
-            var nn = vec3<f32>(0.0);
-            nn[axis] = select(1.0, -1.0, d[axis] > 0.0);
-            h.n = nn;
-            h.albedo = box_at(id).albedo;
-        }
-    }
+    if (h.found) { h.p = o + d * h.t; }
     return h;
-}
-
-struct Occ { found: bool, t: f32 };
-
-fn occluder(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Occ {
-    var r: Occ;
-    r.found = false;
-    r.t = tmax;
-    let inv = 1.0 / safe_dir(d);
-    for (var i = 0u; i < n_boxes(); i++) {
-        let b = box_at(i);
-        let s = slab(b.mn, b.mx, o, inv);
-        if (s.x <= s.y && s.x > EPS && s.x < r.t && s.y > 0.0) {
-            r.found = true;
-            r.t = s.x;
-        }
-    }
-    return r;
 }
 
 fn cosine_dir(n: vec3<f32>) -> vec3<f32> {
@@ -1105,5 +1115,39 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (w > 0.0) { v /= w; }
     }
-    image[k] = vec4<f32>(v, 0.0);
+    image[k] = vec4<f32>(v, f32(g.kind));
+}
+
+// sondes de lampe : rayons fournis par le CPU (probe[2i] = origine, probe[2i+1] = direction),
+// premier impact écrit en retour (position, trouvé ; albédo). fr.round : scène 0 courante, 1 précédente.
+@group(0) @binding(21) var<storage, read_write> probe: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn probe_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&probe) / 2u) { return; }
+    sel = fr.round;
+    let h = scene_hit(probe[2u * i].xyz, probe[2u * i + 1u].xyz);
+    var p = h.p;
+    if (h.found) { p = probe[2u * i].xyz + probe[2u * i + 1u].xyz * h.t; }
+    probe[2u * i] = vec4<f32>(p, select(0.0, 1.0, h.found));
+    probe[2u * i + 1u] = vec4<f32>(h.albedo, 0.0);
+}
+
+// image de référence : fr.pad0 chemins par pixel ajoutés à image (graines selon fr.frame)
+@compute @workgroup_size(64)
+fn reference_acc(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    let g = gbuf[k];
+    if (g.kind != 2u) { return; }
+    reset_rec();
+    rec_on = false;
+    uni = false;
+    split = false;
+    sel = 0u;
+    seed_rng(k, 0x51u, fr.frame);
+    var acc3 = vec3<f32>(0.0);
+    for (var s = 0u; s < fr.pad0; s++) { acc3 += radiance(g.p, g.n, g.albedo).l; }
+    image[k] += vec4<f32>(acc3, 0.0);
 }

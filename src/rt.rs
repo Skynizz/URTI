@@ -68,8 +68,10 @@ impl TriScene {
     }
 }
 
-/// Cornell box (5,5 m), boîte haute fixe, boîte basse mobile (instance 1), plafonnier.
-pub fn cornell(step: u32, light_on: bool) -> TriScene {
+/// Cornell box (5,5 m), boîte haute fixe, boîte basse mobile (instance 1), plafonnier (lampe 0)
+/// et une seconde lampe chaude à l'avant gauche (lampe 1) : mêmes événements que la séquence
+/// des pièces (boîte qui bouge, lampe qui s'allume, lampe qui s'éteint).
+pub fn cornell(step: u32, light_on: bool, lamp2_on: bool) -> TriScene {
     let white = [0.73, 0.73, 0.73];
     let red = [0.65, 0.05, 0.05];
     let green = [0.12, 0.45, 0.15];
@@ -89,13 +91,17 @@ pub fn cornell(step: u32, light_on: bool) -> TriScene {
     let shift = v3(3.3 - step as f64 * 0.1, 0.0, 2.6);
     let mut instances: Vec<Instance> = (0..4).map(|m| Instance { mesh: m, offset: V3::default() }).collect();
     instances.insert(1, Instance { mesh: 4, offset: shift }); // instance 1 = boîte mobile
-    let lights = vec![Light { center: v3(2.75, s - 0.01, 2.75), hx: 0.65, hz: 0.55, emission: V3::splat(15.0), on: light_on }];
+    let lights = vec![
+        Light { center: v3(2.75, s - 0.01, 2.75), hx: 0.65, hz: 0.55, emission: V3::splat(15.0), on: light_on },
+        Light { center: v3(1.0, s - 0.01, 4.4), hx: 0.35, hz: 0.35, emission: v3(40.0, 30.0, 18.0), on: lamp2_on },
+    ];
     TriScene { meshes, instances, lights, bounds: Aabb { min: V3::splat(-0.1), max: V3::splat(s + 0.1) } }
 }
 
 /// Structures d'accélération GPU d'une scène : une BLAS par maillage, une TLAS d'instances.
 pub struct Accel {
-    pub tlas: wgpu::TlasPackage,
+    /// deux TLAS alternées : celle de la frame courante et celle de la précédente
+    pub tlas: [wgpu::TlasPackage; 2],
     pub blas: Vec<wgpu::Blas>,
     /// sommets (vec4 alignés) et indices de tous les maillages, pour les normales dans le shader
     pub verts: wgpu::Buffer,
@@ -167,15 +173,17 @@ impl Accel {
             ));
             sizes.push(size);
         }
-        let tlas = dev.create_tlas(&wgpu::CreateTlasDescriptor {
-            label: Some("tlas"),
-            max_instances: scene.instances.len() as u32,
-            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-        });
+        let tlas = || {
+            wgpu::TlasPackage::new(dev.create_tlas(&wgpu::CreateTlasDescriptor {
+                label: Some("tlas"),
+                max_instances: scene.instances.len() as u32,
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            }))
+        };
         let st = wgpu::BufferUsages::STORAGE;
         let mut a = Accel {
-            tlas: wgpu::TlasPackage::new(tlas),
+            tlas: [tlas(), tlas()],
             verts: dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("verts"),
                 contents: bytemuck::cast_slice(&all_v),
@@ -196,14 +204,19 @@ impl Accel {
             ibufs,
             sizes,
         };
-        a.build(gpu, scene, true);
+        a.build(gpu, scene, 0, true);
+        a.build(gpu, scene, 1, false);
         a
     }
 
-    /// (Re)construit la TLAS avec les positions courantes des instances ; les BLAS au premier appel.
-    pub fn build(&mut self, gpu: &Gpu, scene: &TriScene, with_blas: bool) {
+    /// Reconstruit la TLAS `k` avec les positions courantes des instances.
+    pub fn build_tlas(&mut self, gpu: &Gpu, scene: &TriScene, k: usize) {
+        self.build(gpu, scene, k, false);
+    }
+
+    fn build(&mut self, gpu: &Gpu, scene: &TriScene, k: usize, with_blas: bool) {
         for (i, inst) in scene.instances.iter().enumerate() {
-            self.tlas[i] = Some(wgpu::TlasInstance::new(&self.blas[inst.mesh], transform(inst.offset), inst.mesh as u32, 0xff));
+            self.tlas[k][i] = Some(wgpu::TlasInstance::new(&self.blas[inst.mesh], transform(inst.offset), inst.mesh as u32, 0xff));
         }
         let entries: Vec<wgpu::BlasBuildEntry> = if with_blas {
             (0..self.blas.len())
@@ -225,7 +238,7 @@ impl Accel {
             Vec::new()
         };
         let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("as build") });
-        enc.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas));
+        enc.build_acceleration_structures(entries.iter(), std::iter::once(&self.tlas[k]));
         gpu.queue.submit(Some(enc.finish()));
     }
 }
@@ -233,7 +246,7 @@ impl Accel {
 /// `krc rtsmoke` : normales d'une Cornell box vues par ray query matériel (validation de l'API).
 pub fn smoke(gpu: &Gpu) {
     use wgpu::util::DeviceExt;
-    let scene = cornell(0, true);
+    let scene = cornell(0, true, false);
     let accel = Accel::new(gpu, &scene);
     let (w, h) = (512u32, 512u32);
     let dev = &gpu.device;
@@ -299,7 +312,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         label: None,
         layout: &pipe.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: accel.tlas.as_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: accel.tlas[0].as_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: accel.verts.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: accel.idx.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: accel.mesh_table.as_entire_binding() },
@@ -323,4 +336,172 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     std::fs::create_dir_all("results/rt").unwrap();
     crate::image::save("results/rt/smoke_cornell.png", w as usize, h as usize, &px);
     println!("ray query OK : {} triangles, image results/rt/smoke_cornell.png", scene.triangles());
+}
+
+/// Bloc de géométrie du shader pour les triangles : ray query matériel sur la TLAS courante
+/// (binding 1) ou précédente (binding 3) ; normale du triangle, albédo du maillage.
+pub const TRI_GEOMETRY: &str = r#"// <geometrie> triangles : ray query matériel
+struct GMesh { first_vertex: u32, first_index: u32, p0: u32, p1: u32, albedo: vec3<f32>, p2: f32 };
+@group(0) @binding(1) var acc_cur: acceleration_structure;
+@group(0) @binding(3) var acc_prev: acceleration_structure;
+@group(0) @binding(18) var<storage, read> verts: array<vec4<f32>>;
+@group(0) @binding(19) var<storage, read> tidx: array<u32>;
+@group(0) @binding(20) var<storage, read> meshes: array<GMesh>;
+
+fn rq_trace(o: vec3<f32>, d: vec3<f32>, tmax: f32, flags: u32) -> RayIntersection {
+    var q: ray_query;
+    let desc = RayDesc(flags, 0xffu, EPS, tmax, o, d);
+    if (sel == 0u) { rayQueryInitialize(&q, acc_cur, desc); } else { rayQueryInitialize(&q, acc_prev, desc); }
+    rayQueryProceed(&q);
+    return rayQueryGetCommittedIntersection(&q);
+}
+
+fn scene_hit(o: vec3<f32>, d: vec3<f32>) -> Hit {
+    var h: Hit;
+    h.found = false;
+    h.t = 1e30;
+    h.light = -1;
+    let r = rq_trace(o, d, 1e30, 0u);
+    if (r.kind != RAY_QUERY_INTERSECTION_NONE) {
+        let m = meshes[r.instance_custom_index];
+        let ti = m.first_index + 3u * r.primitive_index;
+        let a = verts[m.first_vertex + tidx[ti]].xyz;
+        let b = verts[m.first_vertex + tidx[ti + 1u]].xyz;
+        let c = verts[m.first_vertex + tidx[ti + 2u]].xyz;
+        var n = normalize((r.object_to_world * vec4<f32>(cross(b - a, c - a), 0.0)).xyz);
+        if (dot(n, d) > 0.0) { n = -n; }
+        h.found = true;
+        h.t = r.t;
+        h.n = n;
+        h.albedo = m.albedo;
+    }
+    return h;
+}
+
+fn occluder(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Occ {
+    var r: Occ;
+    let i = rq_trace(o, d, tmax, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+    r.found = i.kind != RAY_QUERY_INTERSECTION_NONE;
+    r.t = select(tmax, i.t, r.found);
+    return r;
+}
+"#;
+
+/// Vue de la Cornell box (carrée).
+pub fn cornell_view(size: usize) -> crate::gpu_krc::View {
+    crate::gpu_krc::View {
+        w: size,
+        h: size,
+        eye: v3(2.75, 2.75, 13.0),
+        fwd: v3(0.0, 0.0, -1.0),
+        right: v3(1.0, 0.0, 0.0),
+        up: v3(0.0, 1.0, 0.0),
+        th: 0.36,
+        tv: 0.36,
+    }
+}
+
+pub fn cornell_at(frame: u32) -> TriScene {
+    let s = crate::scene::state_at(frame);
+    cornell(s.box_step, s.l0_on, s.l2_on)
+}
+
+/// `krc cornell` : la séquence de 120 frames (boîte qui bouge, lampe allumée, plafonnier éteint)
+/// sur la Cornell box en triangles, ray tracing matériel, pipeline entièrement GPU.
+pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::{load_raw, save_raw};
+    use crate::scene::{state_at, FRAMES};
+    use std::collections::HashMap;
+    let view = cornell_view(size);
+    let base = cornell_at(0);
+    let grid = Grid::fit(&base.bounds);
+    eprintln!(
+        "grille : régions {:.3} m, {:?} ({} régions), super-régions {:?}",
+        grid.region,
+        grid.dims,
+        grid.dims.iter().product::<i64>(),
+        grid.sdims()
+    );
+    let dir = format!("results/ref_cornell_{size}");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut refs: HashMap<String, Vec<V3>> = HashMap::new();
+    let mut rk = GpuKrc::with(gpu, view, grid, Some(&base), false, 0);
+    for f in 0..FRAMES {
+        let id = state_at(f).id();
+        if refs.contains_key(&id) {
+            continue;
+        }
+        let path = format!("{dir}/{id}.bin");
+        let img = load_raw(&path, view.len()).unwrap_or_else(|| {
+            let t = std::time::Instant::now();
+            let (img, _) = rk.reference_tri(&cornell_at(f), 4096);
+            save_raw(&path, &img);
+            crate::image::save(&format!("{dir}/{id}.png"), view.w, view.h, &img);
+            eprintln!("référence {id} : {:.1} s", t.elapsed().as_secs_f64());
+            img
+        });
+        refs.insert(id, img);
+    }
+    let phases: [(&str, u32, u32); 6] =
+        [("tout", 0, 120), ("statique", 30, 40), ("boite", 40, 64), ("apres_boite", 64, 80), ("lampe_on", 80, 100), ("lampe_off", 100, 120)];
+    let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame\n");
+    for (name, sharc) in [("tri_krc", false), ("tri_sharc", true)] {
+        let out = format!("results/cornell_{size}/{name}");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut runs: Vec<Vec<(f64, f64, u32)>> = Vec::new();
+        for seed in 0..seeds {
+            let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 1 + seed as u32);
+            let mut prev = cornell_at(0);
+            let mut rows = Vec::new();
+            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths\n");
+            for t in 0..FRAMES {
+                let scene = cornell_at(t);
+                let f = k.frame_tri(&scene, &prev, t);
+                assert_eq!(f.overflow, 0);
+                let r = &refs[&state_at(t).id()];
+                let (mut rel, mut n) = (0.0, 0.0);
+                for i in 0..view.len() {
+                    if f.kinds[i] != 2 {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        let (x, y) = (f.image[i].get(c), r[i].get(c));
+                        rel += (x - y) * (x - y) / (y * y + 0.01);
+                    }
+                    n += 3.0;
+                }
+                let rel = rel / n;
+                let paths = f.regular_paths + f.delta_paths + f.probe_rays as u32;
+                csv += &format!("{t},{rel:.6e},{:.4},{paths},{},{}\n", f.gpu_ms(), f.suspects, f.delta_paths);
+                if seed == 0 && crate::methods::SAVE_FRAMES.contains(&t) {
+                    crate::image::save(&format!("{out}/f{t:03}.png"), view.w, view.h, &f.image);
+                }
+                rows.push((rel, f.gpu_ms(), paths));
+                prev = scene;
+            }
+            let file = if seed == 0 { "metrics.csv".to_string() } else { format!("metrics_s{seed}.csv") };
+            std::fs::write(format!("{out}/{file}"), csv).unwrap();
+            runs.push(rows);
+        }
+        let mut line = format!("{name:<10}");
+        for (phase, a, b) in phases {
+            let per: Vec<f64> =
+                runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.0).sum::<f64>() / (b - a) as f64).collect();
+            let m = per.iter().sum::<f64>() / per.len() as f64;
+            let sd = (per.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (per.len().max(2) - 1) as f64).sqrt();
+            let ms: f64 = runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.1).sum::<f64>() / (b - a) as f64).sum::<f64>()
+                / runs.len() as f64;
+            let paths: f64 = runs
+                .iter()
+                .map(|r| r[a as usize..b as usize].iter().map(|x| x.2 as f64).sum::<f64>() / (b - a) as f64)
+                .sum::<f64>()
+                / runs.len() as f64;
+            summary += &format!("{name},{phase},{m:.6e},{sd:.6e},{ms:.4},{paths:.0}\n");
+            line += &format!(" | {phase} {m:.2e}±{sd:.0e} {ms:.2}ms");
+        }
+        println!("{line}");
+    }
+    std::fs::write(format!("results/cornell_{size}/summary.csv"), summary).unwrap();
 }

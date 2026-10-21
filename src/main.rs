@@ -10,6 +10,7 @@ mod rt;
 mod bench;
 mod gpu;
 mod gpu_krc;
+mod grid;
 mod scene;
 mod tracer;
 
@@ -188,6 +189,13 @@ fn main() {
             Some(g) => {
                 let cycles = args.get(1).and_then(|c| c.parse().ok()).unwrap_or(100);
                 gpu_krc::drift(&g, cycles, &ensure_refs(&w2, "results/ref", &tracer));
+            }
+            None => eprintln!("pas de GPU"),
+        },
+        Some("cornell") => match gpu::Gpu::new() {
+            Some(g) => {
+                let size = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(256);
+                rt::run_cornell(&g, seeds(), size);
             }
             None => eprintln!("pas de GPU"),
         },
