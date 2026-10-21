@@ -74,12 +74,14 @@ pub enum Kind {
 pub struct Cfg {
     pub name: String,
     pub kind: Kind,
+    /// résolution du bitset de dépendances stocké par cellule (0 : 0,6 m, 1 : 1,2 m, 2 : 2,4 m)
+    pub dep_level: u8,
     /// Mode qualité cible : erreur relative visée par cellule (sinon budget fixe).
     pub target: Option<f64>,
 }
 
 fn cache(name: &str, neyman: bool, ema: bool, on_event: OnEvent, safety: bool) -> Cfg {
-    Cfg { name: name.into(), kind: Kind::Cache { neyman, ema, on_event, safety, age: true }, target: None }
+    Cfg { name: name.into(), kind: Kind::Cache { neyman, ema, on_event, safety, age: true }, target: None, dep_level: 0 }
 }
 
 pub fn all_methods() -> Vec<Cfg> {
@@ -87,8 +89,8 @@ pub fn all_methods() -> Vec<Cfg> {
     use Deps::*;
     use OnEvent::*;
     let mut v = vec![
-        Cfg { name: "pt_reset".into(), kind: Kind::PixelReset, target: None },
-        Cfg { name: "pt_ema".into(), kind: Kind::PixelEma, target: None },
+        Cfg { name: "pt_reset".into(), kind: Kind::PixelReset, target: None, dep_level: 0 },
+        Cfg { name: "pt_ema".into(), kind: Kind::PixelEma, target: None, dep_level: 0 },
         cache("cache_ema", false, true, Nothing, false),
         cache("cache_reset", true, false, GlobalReset, false),
         cache("krc_nodep", true, false, Nothing, true),
@@ -103,9 +105,16 @@ pub fn all_methods() -> Vec<Cfg> {
             name: "krc_noage".into(),
             kind: Kind::Cache { neyman: true, ema: false, on_event: Invalidate(Spatial, Delta { cv: true }), safety: true, age: false },
             target: None,
+            dep_level: 0,
         },
     ];
-    for base in ["krc", "krc_energy", "krc_noage", "krc_all", "krc_hard", "cache_reset"] {
+    for level in [1u8, 2] {
+        let mut c = v.iter().find(|c| c.name == "krc_energy").unwrap().clone();
+        c.name = format!("krc_energy_l{level}");
+        c.dep_level = level;
+        v.push(c);
+    }
+    for base in ["krc", "krc_energy", "krc_energy_l2", "krc_noage", "krc_all", "krc_hard", "cache_reset"] {
         let mut c = v.iter().find(|c| c.name == base).unwrap().clone();
         c.name = format!("{base}_target");
         c.target = Some(0.03);
@@ -423,6 +432,7 @@ pub fn run(
                 let mut delta_tasks: Vec<(u32, u32)> = Vec::new();
                 if let Some(e) = &ev {
                     fs.probes = e.probe_rays;
+                    let ev_coarse = crate::deps::Coarse::from(&e.regions);
                     // magnitude par super-région : max des régions qu'elle contient
                     let mut mag_super = [0.0f64; crate::deps::SUPER];
                     for &(r, m) in &e.mag {
@@ -439,13 +449,13 @@ pub fn run(
                             OnEvent::Invalidate(deps, _) => deps,
                         };
                         let suspect = match deps {
-                            Deps::Spatial => c.depends_on(&e.regions),
+                            Deps::Spatial => c.depends_on(&e.regions, &ev_coarse, cfg.dep_level),
                             Deps::Objects => c.objs & e.objs != 0,
                             Deps::All => true,
-                            Deps::Energy if e.geometry => c.depends_on(&e.regions),
+                            Deps::Energy if e.geometry => c.depends_on(&e.regions, &ev_coarse, cfg.dep_level),
                             // il faut pouvoir être touchée (régions traversées) ET que l'effet attendu compte
                             Deps::Energy => {
-                                c.depends_on(&e.regions) && {
+                                c.depends_on(&e.regions, &ev_coarse, cfg.dep_level) && {
                                     let dl: f64 =
                                         (0..crate::deps::SUPER).map(|s| c.freq_of(s) * mag_super[s]).sum();
                                     dl > EPS_ENERGY * c.main.lmean.max(0.1)

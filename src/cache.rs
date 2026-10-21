@@ -1,5 +1,5 @@
 //! Cellules du cache spatial : statistiques, état de vérification, dépendances.
-use crate::deps::{Bits, Freq};
+use crate::deps::{Bits, Coarse, Freq};
 use crate::math::{mix64, V3};
 use std::collections::HashMap;
 
@@ -69,6 +69,9 @@ pub struct Cell {
     /// fréquence ≪ 1/K est oubliée (son influence est bornée par cette fréquence).
     pub deps: Bits,
     pub deps_prev: Bits,
+    /// mêmes dépendances à résolution grossière (niveaux 1 et 2), pour l'expérience mémoire
+    pub cdeps: Coarse,
+    pub cdeps_prev: Coarse,
     pub dep_count: u32,
     /// Fréquences des sommets de chemin par super-région, mêmes fenêtres alternées que `deps`.
     pub freq: Freq,
@@ -85,6 +88,8 @@ impl Cell {
         self.recent = Stat::default();
         self.deps = Bits::default();
         self.deps_prev = Bits::default();
+        self.cdeps = Coarse::default();
+        self.cdeps_prev = Coarse::default();
         self.dep_count = 0;
         self.freq = Freq::default();
         self.freq_prev = Freq::default();
@@ -93,12 +98,15 @@ impl Cell {
     pub fn add_deps(&mut self, rec: &crate::pt::DepRec, window: Option<u32>) {
         let b = &rec.regions;
         self.deps.or(b);
+        self.cdeps.or(&Coarse::from(b));
         self.freq.add(rec.vsup);
         if let Some(k) = window {
             self.dep_count += 1;
             if self.dep_count >= k {
                 self.deps_prev = self.deps;
                 self.deps = Bits::default();
+                self.cdeps_prev = self.cdeps;
+                self.cdeps = Coarse::default();
                 self.freq_prev = self.freq;
                 self.freq = Freq::default();
                 self.dep_count = 0;
@@ -113,8 +121,14 @@ impl Cell {
         }
         ((self.freq.cnt[s] as f64 + self.freq_prev.cnt[s] as f64) / n).min(1.0)
     }
-    pub fn depends_on(&self, regions: &Bits) -> bool {
-        self.deps.intersects(regions) || self.deps_prev.intersects(regions)
+    /// La cellule a-t-elle traversé ces régions récemment ? `level` 0 : bitset fin (0,6 m),
+    /// 1 : 1,2 m, 2 : super-régions (2,4 m). Grossier = plus de suspects, jamais moins.
+    pub fn depends_on(&self, regions: &Bits, coarse: &Coarse, level: u8) -> bool {
+        if level == 0 {
+            self.deps.intersects(regions) || self.deps_prev.intersects(regions)
+        } else {
+            self.cdeps.intersects(coarse, level) || self.cdeps_prev.intersects(coarse, level)
+        }
     }
     pub fn display(&self) -> Option<V3> {
         if self.main.n > 0.0 {

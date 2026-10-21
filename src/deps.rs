@@ -32,6 +32,51 @@ impl Bits {
     }
 }
 
+/// Niveau 1 : régions de 1,2 m (2×2×2 régions fines), 36×3×4 = 432 bits.
+pub const L1_WORDS: usize = 7;
+
+pub fn l1_of(region: usize) -> usize {
+    let r = region as i64;
+    let (x, y, z) = (r % DIMS[0], r / DIMS[0] % DIMS[1], r / (DIMS[0] * DIMS[1]));
+    (((z / 2) * 3 + y / 2) * 36 + x / 2) as usize
+}
+
+/// Ensembles grossiers dérivés d'un ensemble fin : niveau 1 (1,2 m) et super-régions (niveau 2).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Coarse {
+    pub l1: [u64; L1_WORDS],
+    pub l2: u64,
+}
+
+impl Coarse {
+    pub fn from(b: &Bits) -> Coarse {
+        let mut c = Coarse::default();
+        for (k, &w) in b.0.iter().enumerate() {
+            let mut w = w;
+            while w != 0 {
+                let r = k * 64 + w.trailing_zeros() as usize;
+                w &= w - 1;
+                let i = l1_of(r);
+                c.l1[i >> 6] |= 1 << (i & 63);
+                c.l2 |= 1 << super_of(r);
+            }
+        }
+        c
+    }
+    pub fn or(&mut self, o: &Coarse) {
+        for k in 0..L1_WORDS {
+            self.l1[k] |= o.l1[k];
+        }
+        self.l2 |= o.l2;
+    }
+    pub fn intersects(&self, o: &Coarse, level: u8) -> bool {
+        match level {
+            1 => (0..L1_WORDS).any(|k| self.l1[k] & o.l1[k] != 0),
+            _ => self.l2 & o.l2 != 0,
+        }
+    }
+}
+
 /// Super-régions pour les fréquences : blocs de 4 × 6 × 4 régions (2,4 m × toute la hauteur ×
 /// 2,4 m). Un hachage sur 256 compteurs a échoué : une cellule traverse 100 à 300 régions par
 /// fenêtre, les collisions rendaient toutes les fréquences élevées.

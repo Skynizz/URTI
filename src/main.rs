@@ -121,6 +121,9 @@ fn scale(tracer: &tracer::Tracer) {
         "krc_target",
         "krc_energy",
         "krc_energy_target",
+        "krc_energy_l1",
+        "krc_energy_l2",
+        "krc_energy_l2_target",
     ]
         .iter()
         .map(|s| s.to_string())
