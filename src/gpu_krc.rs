@@ -70,6 +70,8 @@ pub struct GpuFrame {
     pub hard: u32,
     pub safety: u32,
     pub overflow: u32,
+    pub max_n: f32,
+    pub debt: u32,
     /// durée GPU de chaque passe (timestamps), en ms
     pub passes: Vec<(&'static str, f64)>,
 }
@@ -389,6 +391,8 @@ impl<'a> GpuKrc<'a> {
             hard: ctr[C_HARD],
             safety: ctr[C_SAFETY],
             overflow: ctr[C_OVERFLOW],
+            max_n: f32::from_bits(ctr[17]),
+            debt: ctr[9],
             passes: plan
                 .iter()
                 .enumerate()
@@ -462,6 +466,71 @@ pub fn bench(gpu: &Gpu) {
     }
     std::fs::create_dir_all("results/gpu").unwrap();
     std::fs::write("results/gpu/bench_pipeline.csv", csv).unwrap();
+}
+
+/// `krc drift [cycles]` : la séquence de 120 frames répétée ; erreur mesurée aux mêmes instants
+/// de chaque cycle pour détecter une dérive (stagnation f32, saturation, dette, table).
+pub fn drift(gpu: &Gpu, cycles: u32, refs: &std::collections::HashMap<String, Vec<V3>>) {
+    use crate::methods::event;
+    use crate::render::{errors, gbuffer, Px};
+    use crate::scene::{build, state_at, FRAMES};
+    let world = World::new(2);
+    let probe_frames = [39u32, 63, 79, 81, 99, 101, 119];
+    let mut csv = String::from("method,cycle,frame,relmse,cells,max_n,debt,overflow
+");
+    for sharc in [false, true] {
+        let name = if sharc { "gpu_sharc" } else { "gpu_krc" };
+        let mut krc = GpuKrc::new(gpu, world, sharc, 7);
+        let mut prev_state = state_at(0);
+        let mut prev_scene = build(&prev_state, 2);
+        let mut first: Vec<f64> = Vec::new();
+        let mut last: Vec<f64> = Vec::new();
+        for cycle in 0..cycles {
+            let mut row = Vec::new();
+            for t in 0..FRAMES {
+                let state = state_at(t);
+                let scene = build(&state, 2);
+                let ev = event(&prev_state, &state, &prev_scene, &scene, t);
+                krc.readback = probe_frames.contains(&t);
+                let f = krc.frame(&scene, &prev_scene, ev.as_ref(), cycle * FRAMES + t);
+                if krc.readback {
+                    let gb = gbuffer(&scene, &world);
+                    let mut img = f.image;
+                    for k in 0..world.len() {
+                        if let Px::Light(e) = gb[k] {
+                            img[k] = e;
+                        }
+                    }
+                    let (_, rel) = errors(&img, &refs[&state.id()], &gb);
+                    csv += &format!("{name},{cycle},{t},{rel:.6e},{},{},{},{}
+", f.cells, f.max_n, f.debt, f.overflow);
+                    row.push(rel);
+                    if t == 119 && (cycle % 10 == 9 || cycle == 0) {
+                        println!(
+                            "{name} cycle {cycle:>3} : relMSE aux frames {probe_frames:?} = {} | cellules {} | n max {:.0} | dette {} | débordements {}",
+                            row.iter().map(|r| format!("{r:.2e}")).collect::<Vec<_>>().join(" "),
+                            f.cells,
+                            f.max_n,
+                            f.debt,
+                            f.overflow
+                        );
+                    }
+                }
+                prev_state = state;
+                prev_scene = scene;
+            }
+            if cycle < 10 {
+                first.push(row.iter().sum::<f64>() / row.len() as f64);
+            }
+            if cycle >= cycles.saturating_sub(10) {
+                last.push(row.iter().sum::<f64>() / row.len() as f64);
+            }
+        }
+        let m = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+        println!("{name} : relMSE moyen aux instants sondés, 10 premiers cycles {:.3e} -> 10 derniers {:.3e}", m(&first), m(&last));
+    }
+    std::fs::create_dir_all("results/gpu").unwrap();
+    std::fs::write("results/gpu/drift.csv", csv).unwrap();
 }
 
 #[derive(Clone, Copy)]

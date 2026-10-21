@@ -29,6 +29,7 @@ const DEBT_RATE: f32 = 0.5;
 const CELL_PX: f32 = 4.0;
 const EMA_MIN: f32 = 0.015625;
 const MAX_PER_CELL: u32 = 64u;
+const N_POST: f32 = 64.0;  // poids max d'une estimation corrigée (sa variance vient de 8 tirages) ; réglé par le test de dérive
 
 // compteurs (ctr)
 const C_CELLS: u32 = 0u;
@@ -48,6 +49,7 @@ const C_VISIBLE: u32 = 13u;
 const C_MATURE: u32 = 14u;
 const C_OVERFLOW: u32 = 15u;
 const C_EXPLORE: u32 = 16u;
+const C_MAXN: u32 = 17u;     // max des n des cellules (bits f32 positifs : ordre préservé)
 const C_HIST: u32 = 32u;     // 64 cases
 const C_SCAN: u32 = 96u;     // 3 × 32 sommes de quotas candidates (trois balayages)
 
@@ -807,6 +809,7 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cell.n > 1.0) { s2 = max(s2, cell.m2 / (cell.n - 1.0) * 1e-3); }
     var n_eff = cell.n + m;
     if (var_mu > 0.0) { n_eff = clamp(s2 / var_mu, min(m, 2.0), cell.n + m); }
+    n_eff = min(n_eff, N_POST);
     cell.n = n_eff;
     cell.mean = mu;
     cell.lmean = mu_l;
@@ -1067,6 +1070,7 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicStore(&acc[b + A_NS], 0u);
     }
     cells[c] = cell;
+    atomicMax(&ctr[C_MAXN], bitcast<u32>(cell.n));
     // remise à zéro des accumulateurs de frame
     atomicStore(&acc[b + A_FOOT], 0u);
     atomicStore(&acc[b + A_REF], 0u);
