@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" font-family="system-ui, sans-serif" font-size="12">
+<rect width="760" height="380" fill="#fcfcfb"/>
+<text x="70" y="22" font-size="15" font-weight="600" fill="#0b0b0b">Passage à l'échelle : coût pendant que la boîte bouge</text>
+<text x="70" y="40" fill="#52514e">chemins/frame en mode qualité cible (cache convergé) ; la boîte reste dans la pièce 0</text>
+<line x1="70" x2="590" y1="334.0" y2="334.0" stroke="#e4e3df"/>
+<text x="62" y="338.0" text-anchor="end" fill="#52514e">0</text>
+<line x1="70" x2="590" y1="303.3" y2="303.3" stroke="#e4e3df"/>
+<text x="62" y="307.3" text-anchor="end" fill="#52514e">20 000</text>
+<line x1="70" x2="590" y1="272.7" y2="272.7" stroke="#e4e3df"/>
+<text x="62" y="276.7" text-anchor="end" fill="#52514e">40 000</text>
+<line x1="70" x2="590" y1="242.0" y2="242.0" stroke="#e4e3df"/>
+<text x="62" y="246.0" text-anchor="end" fill="#52514e">60 000</text>
+<line x1="70" x2="590" y1="211.3" y2="211.3" stroke="#e4e3df"/>
+<text x="62" y="215.3" text-anchor="end" fill="#52514e">80 000</text>
+<line x1="70" x2="590" y1="180.7" y2="180.7" stroke="#e4e3df"/>
+<text x="62" y="184.7" text-anchor="end" fill="#52514e">100 000</text>
+<line x1="70" x2="590" y1="150.0" y2="150.0" stroke="#e4e3df"/>
+<text x="62" y="154.0" text-anchor="end" fill="#52514e">120 000</text>
+<line x1="70" x2="590" y1="119.3" y2="119.3" stroke="#e4e3df"/>
+<text x="62" y="123.3" text-anchor="end" fill="#52514e">140 000</text>
+<line x1="70" x2="590" y1="88.7" y2="88.7" stroke="#e4e3df"/>
+<text x="62" y="92.7" text-anchor="end" fill="#52514e">160 000</text>
+<line x1="70" x2="590" y1="58.0" y2="58.0" stroke="#e4e3df"/>
+<text x="62" y="62.0" text-anchor="end" fill="#52514e">180 000</text>
+<text x="70.0" y="352" text-anchor="middle" fill="#52514e">2</text>
+<text x="243.3" y="352" text-anchor="middle" fill="#52514e">4</text>
+<text x="590.0" y="352" text-anchor="middle" fill="#52514e">8</text>
+<text x="330.0" y="372" text-anchor="middle" fill="#52514e">nombre de pièces (96 px de large par pièce)</text>
+<text transform="translate(16 196.0) rotate(-90)" text-anchor="middle" fill="#52514e">chemins / frame</text>
+<polyline points="70.0,269.1 243.3,207.5 590.0,81.3" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="269.1" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="207.5" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="81.3" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,269.1 243.3,256.5 590.0,278.9" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="269.1" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="256.5" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="278.9" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,306.1 243.3,305.9 590.0,305.5" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="306.1" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="305.9" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="305.5" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,307.1 243.3,311.0 590.0,317.5" fill="none" stroke="#eda100" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="307.1" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="311.0" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="317.5" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,308.8 243.3,312.2 590.0,319.0" fill="none" stroke="#e87ba4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="308.8" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="312.2" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="319.0" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="598" y="76.3" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="612" y="85.3" fill="#0b0b0b">cache_reset_target</text>
+<rect x="598" y="273.9" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="612" y="282.9" fill="#0b0b0b">krc_hard_target</text>
+<rect x="598" y="300.5" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="612" y="309.5" fill="#0b0b0b">krc_all_target</text>
+<rect x="598" y="314.5" width="10" height="10" rx="2" fill="#eda100"/>
+<text x="612" y="323.5" fill="#0b0b0b">krc_noage_target</text>
+<rect x="598" y="328.5" width="10" height="10" rx="2" fill="#e87ba4"/>
+<text x="612" y="337.5" fill="#0b0b0b">krc_target</text>
+</svg>

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" font-family="system-ui, sans-serif" font-size="12">
+<rect width="760" height="380" fill="#fcfcfb"/>
+<text x="70" y="22" font-size="15" font-weight="600" fill="#0b0b0b">Passage à l'échelle : erreur pendant les phases dynamiques</text>
+<text x="70" y="40" fill="#52514e">relMSE à budget égal (1 chemin/pixel/frame), échelle log</text>
+<line x1="70" x2="590" y1="334.0" y2="334.0" stroke="#e4e3df"/>
+<text x="62" y="338.0" text-anchor="end" fill="#52514e">1e-3</text>
+<line x1="70" x2="590" y1="196.0" y2="196.0" stroke="#e4e3df"/>
+<text x="62" y="200.0" text-anchor="end" fill="#52514e">1e-2</text>
+<line x1="70" x2="590" y1="58.0" y2="58.0" stroke="#e4e3df"/>
+<text x="62" y="62.0" text-anchor="end" fill="#52514e">1e-1</text>
+<text x="70.0" y="352" text-anchor="middle" fill="#52514e">2</text>
+<text x="243.3" y="352" text-anchor="middle" fill="#52514e">4</text>
+<text x="590.0" y="352" text-anchor="middle" fill="#52514e">8</text>
+<text x="330.0" y="372" text-anchor="middle" fill="#52514e">nombre de pièces (96 px de large par pièce)</text>
+<text transform="translate(16 196.0) rotate(-90)" text-anchor="middle" fill="#52514e">relMSE</text>
+<polyline points="70.0,157.7 243.3,143.1 590.0,131.7" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="157.7" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="143.1" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="131.7" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,188.9 243.3,191.1 590.0,206.1" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="188.9" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="191.1" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="206.1" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,243.5 243.3,251.8 590.0,273.3" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="243.5" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="251.8" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="273.3" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="70.0,246.3 243.3,247.8 590.0,280.7" fill="none" stroke="#eda100" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="70.0" cy="246.3" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="243.3" cy="247.8" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="590.0" cy="280.7" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="598" y="126.7" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="612" y="135.7" fill="#0b0b0b">cache_reset</text>
+<rect x="598" y="201.1" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="612" y="210.1" fill="#0b0b0b">krc_hard</text>
+<rect x="598" y="268.3" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="612" y="277.3" fill="#0b0b0b">krc_all</text>
+<rect x="598" y="282.3" width="10" height="10" rx="2" fill="#eda100"/>
+<text x="612" y="291.3" fill="#0b0b0b">krc</text>
+</svg>

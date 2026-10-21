@@ -78,3 +78,19 @@
 - Erreur de méthode, de mon côté : mes agrégats rapides lisaient `metrics*.csv`, qui
   contenait des graines laissées par une version antérieure du code. J'ai nettoyé et
   tout relancé ; les chiffres de RESULTATS.md viennent d'un run propre.
+
+## v4 — vieillissement des dépendances, résultats consolidés (commit e307e72 et suivant)
+
+- **Cascades mesurées** : à 8 pièces, allumer la lampe B rendait 80 % des cellules
+  suspectes. Les dépendances binaires accumulées sur tout l'historique saturent : un
+  seul chemin passé par deux portes suffit.
+- **Vieillissement** : deux bitsets alternés couvrent les K à 2K derniers échantillons
+  (K = 64). Effet net pour la géométrie (suspects à N = 8 : 1 070 contre 1 837) et pour
+  l'extinction de A, mais pas pour l'allumage de B.
+- Diagnostic (debug des régions de l'événement) : les sondes de la lampe B traversent
+  réellement la porte et touchent les murs des pièces 0 et 2. Le graphe a raison
+  *qualitativement* ; il lui manque la *magnitude*. Prochaine étape : des dépendances
+  pondérées par l'énergie.
+- Préchauffage de 150 frames pour le passage à l'échelle. Sans lui, les coûts mesurés
+  en mode qualité cible à N = 8 étaient dominés par la convergence initiale.
+- Résultats consolidés : voir [RESULTATS.md](RESULTATS.md).

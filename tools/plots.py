@@ -139,16 +139,35 @@ def main():
     if os.path.exists(sp):
         sc = read_csv(sp)
         rooms = sorted({int(r["rooms"]) for r in sc})
-        ms = ["cache_reset_target", "krc_hard_target", "krc_all_target", "krc_target"]
+        ms = ["cache_reset_target", "krc_hard_target", "krc_all_target", "krc_noage_target", "krc_target"]
 
         def val(m, n, phases, col):
             v = [float(r[col]) for r in sc if r["method"] == m and int(r["rooms"]) == n and r["phase"] in phases]
             return sum(v) / len(v)
 
         ev = ("boite", "lampe_on", "lampe_off")
-        line_chart(os.path.join(out, "echelle_cout.svg"), "Passage à l'échelle : coût pendant les phases dynamiques",
-                   "chemins/frame en mode qualité cible ; les changements touchent toujours les pièces 0–1",
-                   [(m, [val(m, n, ev, "paths_per_frame") for n in rooms]) for m in ms], "chemins / frame",
+        line_chart(os.path.join(out, "echelle_cout.svg"), "Passage à l'échelle : coût pendant que la boîte bouge",
+                   "chemins/frame en mode qualité cible (cache convergé) ; la boîte reste dans la pièce 0",
+                   [(m, [val(m, n, ("boite",), "paths_per_frame") for n in rooms]) for m in ms], "chemins / frame",
+                   events=False, xlabel="nombre de pièces (96 px de large par pièce)", xs=rooms)
+        def event_cost(m, n, frames_sel):
+            vals = []
+            d = os.path.join(ROOT, "scale", f"n{n}", m)
+            for f in os.listdir(d):
+                if f.startswith("metrics"):
+                    for r in read_csv(os.path.join(d, f)):
+                        if int(r["frame"]) in frames_sel and int(r["delta_paths"]) > 0:
+                            vals.append(int(r["delta_paths"]))
+            return sum(vals) / max(len(vals), 1)
+
+        dm = ["krc_all", "krc_noage", "krc"]
+        line_chart(os.path.join(out, "echelle_evt_lampe.svg"), "Coût d'un changement de lampe selon la taille de la scène",
+                   "chemins corrélés tracés à l'événement (lampe B allumée, lampe A éteinte), moyenne sur graines",
+                   [(m, [event_cost(m, n, {80, 100}) for n in rooms]) for m in dm], "chemins / événement",
+                   events=False, xlabel="nombre de pièces (96 px de large par pièce)", xs=rooms)
+        line_chart(os.path.join(out, "echelle_evt_boite.svg"), "Coût d'un déplacement d'objet selon la taille de la scène",
+                   "chemins corrélés tracés par pas de la boîte (pièce 0), moyenne sur graines",
+                   [(m, [event_cost(m, n, set(range(40, 64))) for n in rooms]) for m in dm], "chemins / événement",
                    events=False, xlabel="nombre de pièces (96 px de large par pièce)", xs=rooms)
         fixed_s = ["cache_reset", "krc_hard", "krc_all", "krc"]
         line_chart(os.path.join(out, "echelle_erreur.svg"), "Passage à l'échelle : erreur pendant les phases dynamiques",

@@ -1,0 +1,7 @@
+method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame
+krc,tout,4.057022e-3,0.000000e0,1.095511e-2,10597.1
+krc,statique,1.443174e-3,0.000000e0,5.493377e-3,10580.0
+krc,boite,1.818756e-3,0.000000e0,6.178939e-3,10580.0
+krc,apres_boite,1.898482e-3,0.000000e0,6.197709e-3,10580.0
+krc,lampe_on,7.576441e-3,0.000000e0,2.175330e-2,10631.2
+krc,lampe_off,4.568336e-3,0.000000e0,1.501509e-2,10631.2
