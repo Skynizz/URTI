@@ -22,7 +22,7 @@ impl Rec for NoRec {
 #[derive(Default)]
 pub struct DepRec {
     pub regions: Bits,
-    pub objs: u64,
+    pub objs: u128,
     pub lights: u64,
 }
 impl Rec for DepRec {
@@ -30,7 +30,7 @@ impl Rec for DepRec {
         mark_segment(&mut self.regions, a, b);
     }
     fn object(&mut self, id: usize) {
-        self.objs |= 1 << id;
+        self.objs |= 1u128 << id;
     }
     fn light_selected(&mut self, j: usize) {
         self.lights |= 1 << j;
@@ -59,9 +59,28 @@ fn sample_light(scene: &Scene, rng: &mut Rng, union: bool) -> Option<(usize, f64
 /// Estimateur à un échantillon de la radiance sortante (diffuse) au point p de normale n.
 /// La consommation de nombres aléatoires par sommet est fixe, pour l'échantillonnage corrélé.
 pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rng, rec: &mut R, union: bool) -> V3 {
+    radiance_split(scene, p0, n0, albedo0, rng, rec, union, &[]).0
+}
+
+/// Comme `radiance`, et renvoie aussi Σ_j w_j · C_j, où C_j est la contribution NEE qu'aurait la
+/// lampe j si elle était allumée (géométrie identique). Pour un changement qui ne touche que des
+/// lampes, avec w_j = allumée_avant − allumée_après, l'ancienne radiance vaut L + Σ w_j C_j :
+/// le chemin de l'ancienne scène n'a pas besoin d'être retracé.
+#[allow(clippy::too_many_arguments)]
+pub fn radiance_split<R: Rec>(
+    scene: &Scene,
+    p0: V3,
+    n0: V3,
+    albedo0: V3,
+    rng: &mut Rng,
+    rec: &mut R,
+    union: bool,
+    toggle_w: &[f64],
+) -> (V3, V3) {
     let (mut p, mut n, mut albedo) = (p0, n0, albedo0);
     let mut beta = V3::splat(1.0);
     let mut l = V3::default();
+    let mut dl = V3::default();
     for depth in 0..MAX_DEPTH {
         let origin = p + n * 1e-6;
         // NEE
@@ -74,7 +93,8 @@ pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rn
             let dist = dist2.sqrt();
             let wd = w / dist;
             let (cos_x, cos_l) = (n.dot(wd), wd.y);
-            if cos_x > 0.0 && cos_l > 0.0 && !li.on {
+            let wj = toggle_w.get(j).copied().unwrap_or(0.0);
+            if cos_x > 0.0 && cos_l > 0.0 && !li.on && wj == 0.0 {
                 rec.segment(origin, q); // lampe éteinte (mode union) : dépendance conservatrice
             } else if cos_x > 0.0 && cos_l > 0.0 {
                 // un rayon d'ombre bloqué ne dépend que de l'espace jusqu'à l'occulteur
@@ -87,7 +107,11 @@ pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rn
                         rec.segment(origin, q);
                         rec.object(LIGHT_ID_BASE + j);
                         let g = cos_x * cos_l / dist2 * li.area() / pmf / std::f64::consts::PI;
-                        l += beta.mul(albedo).mul(li.emission) * g;
+                        let c = beta.mul(albedo).mul(li.emission) * g;
+                        if li.on {
+                            l += c;
+                        }
+                        dl += c * wj;
                     }
                 }
             }
@@ -120,5 +144,5 @@ pub fn radiance<R: Rec>(scene: &Scene, p0: V3, n0: V3, albedo0: V3, rng: &mut Rn
             beta = beta / q;
         }
     }
-    l
+    (l, dl)
 }

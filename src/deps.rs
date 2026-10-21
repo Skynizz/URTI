@@ -5,12 +5,18 @@ use crate::scene::Aabb;
 /// 0.6 m avec origine -0.2 : la cloison (x = 5.2) tombe sur une frontière de région.
 pub const REGION: f64 = 0.6;
 pub const ORIGIN: V3 = v3(-0.2, -0.2, -0.2);
-pub const DIMS: [i64; 3] = [18, 6, 8];
-pub const WORDS: usize = 14;
+pub const DIMS: [i64; 3] = [72, 6, 8]; // jusqu'à 8 pièces
+pub const WORDS: usize = 54;
 
-/// Ensemble exact de régions (jusqu'à 896).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// Ensemble exact de régions (jusqu'à 3456).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Bits(pub [u64; WORDS]);
+
+impl Default for Bits {
+    fn default() -> Bits {
+        Bits([0; WORDS])
+    }
+}
 
 impl Bits {
     pub fn set(&mut self, i: usize) {

@@ -65,7 +65,7 @@ pub struct Cell {
     /// Fenêtre récente du filet de sécurité.
     pub recent: Stat,
     pub deps: Bits,
-    pub objs: u64,
+    pub objs: u128,
     pub last: i64,
     pub cx: f64,
 }
@@ -103,12 +103,13 @@ impl Cache {
     }
 }
 
-/// Taille de cellule ∝ distance (≈ 2–4 pixels), quantifiée en puissances de 2.
-pub const CELL_K: f64 = 0.035;
+/// Taille de cellule visée en empreintes de pixel ; quantifiée en puissances de 2 (≈ 2–4 pixels).
+pub const CELL_PX: f64 = 4.0;
 
 /// Clé de hachage spatial jitteré (Binder et al.) : le jitter est tangent à la surface.
-pub fn cell_key(p: V3, n: V3, dist: f64, px: usize, slot: usize) -> u64 {
-    let level = (CELL_K * dist).log2().floor();
+/// `footprint` : taille d'un pixel projetée à la distance du point.
+pub fn cell_key(p: V3, n: V3, footprint: f64, px: usize, slot: usize) -> u64 {
+    let level = (CELL_PX * footprint).log2().floor();
     let s = level.exp2();
     let h = mix64(((px as u64) << 3 | slot as u64) ^ 0x5bd1e995);
     let j = [(h & 0xffff) as f64 / 65536.0 - 0.5, ((h >> 16) & 0xffff) as f64 / 65536.0 - 0.5];

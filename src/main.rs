@@ -8,13 +8,13 @@ mod pt;
 mod render;
 mod scene;
 
-use render::{gbuffer, load_raw, reference, save_raw, H, W};
+use render::{gbuffer, load_raw, reference, save_raw, World};
 use scene::{build, state_at, FRAMES};
 use std::collections::HashMap;
 use std::time::Instant;
 
-fn ensure_refs() -> HashMap<String, Vec<math::V3>> {
-    std::fs::create_dir_all("results/ref").unwrap();
+fn ensure_refs(world: &World, dir: &str) -> HashMap<String, Vec<math::V3>> {
+    std::fs::create_dir_all(dir).unwrap();
     let mut refs = HashMap::new();
     for f in 0..FRAMES {
         let s = state_at(f);
@@ -22,14 +22,14 @@ fn ensure_refs() -> HashMap<String, Vec<math::V3>> {
         if refs.contains_key(&id) {
             continue;
         }
-        let path = format!("results/ref/{id}.bin");
-        let img = load_raw(&path).unwrap_or_else(|| {
+        let path = format!("{dir}/{id}.bin");
+        let img = load_raw(&path, world.len()).unwrap_or_else(|| {
             let t = Instant::now();
-            let scene = build(&s);
-            let img = reference(&scene, &gbuffer(&scene));
+            let scene = build(&s, world.rooms);
+            let img = reference(&scene, &gbuffer(&scene, world));
             save_raw(&path, &img);
-            image::save(&format!("results/ref/{id}.png"), W, H, &img);
-            eprintln!("référence {id} : {:.1} s", t.elapsed().as_secs_f64());
+            image::save(&format!("{dir}/{id}.png"), world.w, world.h, &img);
+            eprintln!("référence {dir}/{id} : {:.1} s", t.elapsed().as_secs_f64());
             img
         });
         refs.insert(id, img);
@@ -54,7 +54,7 @@ fn mean_std(v: &[f64]) -> (f64, f64) {
     (m, var.sqrt())
 }
 
-fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>) {
+fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>, world: &World, root: &str) -> String {
     let mut all = methods::all_methods();
     if !names.is_empty() {
         all.retain(|c| names.contains(&c.name));
@@ -62,10 +62,10 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>) {
     let mut summary = String::from("method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame\n");
     for cfg in &all {
         let t = Instant::now();
-        let dir = format!("results/{}", cfg.name);
+        let dir = format!("{root}/{}", cfg.name);
         let mut runs = Vec::new();
         for seed in 0..seeds {
-            let stats = methods::run(cfg, refs, &dir, seed);
+            let stats = methods::run(cfg, refs, &dir, seed, world);
             let mut csv = String::from(methods::FrameStats::HEADER);
             csv.push('\n');
             for s in &stats {
@@ -89,8 +89,28 @@ fn run(names: &[String], seeds: u64, refs: &HashMap<String, Vec<math::V3>>) {
         }
         eprintln!("{line} | {:.1} s", t.elapsed().as_secs_f64());
     }
-    let path = if names.is_empty() { "results/summary.csv".to_string() } else { "results/summary_partial.csv".to_string() };
-    std::fs::write(path, summary).unwrap();
+    let path = if names.is_empty() { format!("{root}/summary.csv") } else { format!("{root}/summary_partial.csv") };
+    std::fs::write(path, &summary).unwrap();
+    summary
+}
+
+/// Passage à l'échelle : N pièces, mêmes événements (pièces 0 et 1), densité de pixels constante.
+fn scale() {
+    let names: Vec<String> = ["cache_reset", "krc_hard", "krc_all", "krc", "cache_reset_target", "krc_hard_target", "krc_all_target", "krc_target"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut all = String::from("rooms,method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame\n");
+    for rooms in [2usize, 4, 8] {
+        let world = World::new(rooms);
+        let refs = ensure_refs(&world, &format!("results/ref_n{rooms}"));
+        eprintln!("--- {rooms} pièces");
+        let summary = run(&names, seeds(), &refs, &world, &format!("results/scale/n{rooms}"));
+        for line in summary.lines().skip(1) {
+            all += &format!("{rooms},{line}\n");
+        }
+    }
+    std::fs::write("results/scale/summary.csv", all).unwrap();
 }
 
 /// Nombre de graines indépendantes par méthode (variable d'environnement KRC_SEEDS, 5 par défaut).
@@ -102,10 +122,15 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("refs") => {
-            ensure_refs();
+            ensure_refs(&World::new(2), "results/ref");
         }
-        Some("run") => run(&args[1..], seeds(), &ensure_refs()),
-        Some("all") => run(&[], seeds(), &ensure_refs()),
-        _ => eprintln!("usage : krc refs | run [méthodes...] | all"),
+        Some("run") => {
+            run(&args[1..], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results");
+        }
+        Some("all") => {
+            run(&[], seeds(), &ensure_refs(&World::new(2), "results/ref"), &World::new(2), "results");
+        }
+        Some("scale") => scale(),
+        _ => eprintln!("usage : krc refs | run [méthodes...] | all | scale"),
     }
 }

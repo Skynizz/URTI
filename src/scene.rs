@@ -40,7 +40,7 @@ impl Light {
 }
 
 /// Identifiants pour les empreintes « objets touchés » : objet i -> i, lampe j -> LIGHT_ID_BASE + j.
-pub const LIGHT_ID_BASE: usize = 32;
+pub const LIGHT_ID_BASE: usize = 64;
 pub const MOVING_BOX: usize = 0;
 
 pub struct Hit {
@@ -93,31 +93,45 @@ fn bx(min: V3, max: V3, albedo: V3) -> Object {
     Object { aabb: Aabb { min, max }, albedo }
 }
 
-/// Deux pièces vues en coupe (« maison de poupée »), reliées par une porte.
-/// Pièce A : x ∈ [0, 5.1], pièce B : x ∈ [5.3, 10.4], y ∈ [0, 3], z ∈ [0, 4], face avant ouverte.
-pub fn build(s: &State) -> Scene {
+/// Pièces en enfilade vues en coupe (« maison de poupée »), reliées par des portes.
+/// Pièce k : x ∈ [5.2k, 5.2(k+1)] (cloisons de 0.2 centrées sur 5.2k), y ∈ [0, 3], z ∈ [0, 4],
+/// face avant ouverte. Pièce 0 (A) : boîte mobile, colonne, plafonnier 0. Pièce 1 (B) : lampe 2
+/// commutée. Pièces k ≥ 1 : deux blocs et un plafonnier.
+pub fn build(s: &State, rooms: usize) -> Scene {
     let white = V3::splat(0.75);
     let red = v3(0.75, 0.2, 0.15);
     let green = v3(0.15, 0.6, 0.2);
-    let objects = vec![
-        bx(moving_box_aabb(s.box_step).min, moving_box_aabb(s.box_step).max, v3(0.2, 0.3, 0.8)),
-        bx(v3(-0.1, -0.1, -0.1), v3(10.5, 0.0, 4.0), white), // sol
-        bx(v3(-0.1, 3.0, -0.1), v3(10.5, 3.1, 4.0), white),  // plafond
-        bx(v3(-0.1, 0.0, -0.1), v3(10.5, 3.0, 0.0), white),  // fond
-        bx(v3(-0.1, 0.0, 0.0), v3(0.0, 3.0, 4.0), red),      // mur gauche
-        bx(v3(10.4, 0.0, 0.0), v3(10.5, 3.0, 4.0), green),   // mur droit
-        bx(v3(5.1, 0.0, 0.0), v3(5.3, 3.0, 1.5), white),     // cloison
-        bx(v3(5.1, 0.0, 2.5), v3(5.3, 3.0, 4.0), white),
-        bx(v3(5.1, 2.2, 1.5), v3(5.3, 3.0, 2.5), white),     // linteau de la porte
-        bx(v3(3.6, 0.0, 0.6), v3(4.2, 1.8, 1.2), white),     // colonne pièce A
-        bx(v3(6.2, 0.0, 1.0), v3(7.0, 0.7, 1.8), v3(0.8, 0.7, 0.3)),
-        bx(v3(8.8, 0.0, 2.6), v3(9.6, 1.2, 3.2), white),
+    let xe = 5.2 * rooms as f64;
+    let mb = moving_box_aabb(s.box_step);
+    let mut objects = vec![
+        bx(mb.min, mb.max, v3(0.2, 0.3, 0.8)),
+        bx(v3(-0.1, -0.1, -0.1), v3(xe + 0.1, 0.0, 4.0), white), // sol
+        bx(v3(-0.1, 3.0, -0.1), v3(xe + 0.1, 3.1, 4.0), white),  // plafond
+        bx(v3(-0.1, 0.0, -0.1), v3(xe + 0.1, 3.0, 0.0), white),  // fond
+        bx(v3(-0.1, 0.0, 0.0), v3(0.0, 3.0, 4.0), red),          // mur gauche
+        bx(v3(xe, 0.0, 0.0), v3(xe + 0.1, 3.0, 4.0), green),     // mur droit
     ];
-    let lights = vec![
+    for k in 1..rooms {
+        let x = 5.2 * k as f64;
+        objects.push(bx(v3(x - 0.1, 0.0, 0.0), v3(x + 0.1, 3.0, 1.5), white)); // cloison
+        objects.push(bx(v3(x - 0.1, 0.0, 2.5), v3(x + 0.1, 3.0, 4.0), white));
+        objects.push(bx(v3(x - 0.1, 2.2, 1.5), v3(x + 0.1, 3.0, 2.5), white)); // linteau de la porte
+    }
+    objects.push(bx(v3(3.6, 0.0, 0.6), v3(4.2, 1.8, 1.2), white)); // colonne pièce A
+    for k in 1..rooms {
+        let x = 5.2 * k as f64;
+        objects.push(bx(v3(x + 1.0, 0.0, 1.0), v3(x + 1.8, 0.7, 1.8), v3(0.8, 0.7, 0.3)));
+        objects.push(bx(v3(x + 3.6, 0.0, 2.6), v3(x + 4.4, 1.2, 3.2), white));
+    }
+    let ceiling = |x: f64| Light { center: v3(x, 2.98, 2.0), hx: 0.35, hz: 0.35, emission: V3::splat(5.0), on: true };
+    let mut lights = vec![
         Light { center: v3(2.55, 2.98, 1.8), hx: 0.5, hz: 0.5, emission: V3::splat(8.0), on: s.l0_on },
-        Light { center: v3(7.85, 2.98, 2.0), hx: 0.35, hz: 0.35, emission: V3::splat(5.0), on: true },
+        ceiling(7.85),
         Light { center: v3(9.2, 2.98, 1.0), hx: 0.3, hz: 0.3, emission: v3(40.0, 30.0, 18.0), on: s.l2_on },
     ];
+    for k in 2..rooms {
+        lights.push(ceiling(5.2 * k as f64 + 2.65));
+    }
     Scene { objects, lights }
 }
 

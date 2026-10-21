@@ -3,8 +3,8 @@ use crate::cache::{cell_key, zscore, Cache, Cell, Stat};
 use crate::deps::{mark_aabb, mark_point, Bits};
 use crate::math::{mix64, v3, Rng, V3};
 use crate::par::par_map;
-use crate::pt::{radiance, DepRec, NoRec};
-use crate::render::{errors, gbuffer, Px, H, W};
+use crate::pt::{radiance, radiance_split, DepRec, NoRec};
+use crate::render::{errors, gbuffer, Px, World};
 use crate::scene::{build, cosine_dir, moving_box_aabb, state_at, Scene, State, FRAMES, LIGHT_ID_BASE, MOVING_BOX};
 use std::collections::{BinaryHeap, HashMap};
 
@@ -93,7 +93,7 @@ pub fn all_methods() -> Vec<Cfg> {
         cache("krc_delta", true, false, Invalidate(Spatial, Delta { cv: false }), true),
         cache("krc", true, false, Invalidate(Spatial, Delta { cv: true }), true),
     ];
-    for base in ["krc", "krc_hard", "cache_reset"] {
+    for base in ["krc", "krc_all", "krc_hard", "cache_reset"] {
         let mut c = v.iter().find(|c| c.name == base).unwrap().clone();
         c.name = format!("{base}_target");
         c.target = Some(0.03);
@@ -106,9 +106,12 @@ pub fn all_methods() -> Vec<Cfg> {
 #[derive(Default)]
 pub struct Event {
     pub regions: Bits,
-    pub objs: u64,
-    /// lampes dont l'état a changé
+    pub objs: u128,
+    /// lampes dont l'état a changé, et poids allumée_avant − allumée_après
     pub lights: u64,
+    pub light_w: Vec<f64>,
+    /// un objet a bougé (sinon seules des lampes ont changé)
+    pub geometry: bool,
     pub probe_rays: usize,
 }
 
@@ -134,14 +137,17 @@ pub fn event(prev: &State, cur: &State, prev_scene: &Scene, cur_scene: &Scene, f
     if prev.box_step != cur.box_step {
         let swept = moving_box_aabb(prev.box_step).union(moving_box_aabb(cur.box_step)).expand(0.05);
         mark_aabb(&mut ev.regions, &swept);
-        ev.objs |= 1 << MOVING_BOX;
+        ev.objs |= 1u128 << MOVING_BOX;
+        ev.geometry = true;
     }
+    ev.light_w = vec![0.0; cur_scene.lights.len()];
     for (j, was, is) in [(0, prev.l0_on, cur.l0_on), (2, prev.l2_on, cur.l2_on)] {
         if was != is {
+            ev.light_w[j] = was as u8 as f64 - is as u8 as f64;
             // on sonde depuis l'état où la lampe est allumée
             let scene = if is { cur_scene } else { prev_scene };
             light_probes(scene, j, mix64(frame as u64 * 31 + j as u64), &mut ev.regions);
-            ev.objs |= 1 << (LIGHT_ID_BASE + j);
+            ev.objs |= 1u128 << (LIGHT_ID_BASE + j);
             ev.lights |= 1 << j;
             ev.probe_rays += PROBES;
         }
@@ -167,14 +173,19 @@ pub struct FrameStats {
     pub cells: usize,
     pub rmse: f64,
     pub relmse: f64,
+    /// relMSE et biais relatif signé, pièce 0 (A) et autres pièces
+    pub relmse_a: f64,
+    pub relmse_b: f64,
+    pub bias_a: f64,
+    pub bias_b: f64,
 }
 
 impl FrameStats {
     pub const HEADER: &'static str = "frame,paths,paths_a,paths_b,probes,suspects,hard_resets,rejected,confirmed,\
-delta_paths,delta_old_paths,delta_zero,safety,cells,rmse,relmse";
+delta_paths,delta_old_paths,delta_zero,safety,cells,rmse,relmse,relmse_a,relmse_b,bias_a,bias_b";
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6e},{:.6e}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
             self.frame,
             self.paths,
             self.paths_a,
@@ -190,7 +201,11 @@ delta_paths,delta_old_paths,delta_zero,safety,cells,rmse,relmse";
             self.safety,
             self.cells,
             self.rmse,
-            self.relmse
+            self.relmse,
+            self.relmse_a,
+            self.relmse_b,
+            self.bias_a,
+            self.bias_b
         )
     }
 }
@@ -280,27 +295,27 @@ fn add_sample(c: &mut Cell, v: V3, rec: &DepRec, ema: bool, safety: bool) {
     }
 }
 
-pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: u64) -> Vec<FrameStats> {
+pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: u64, world: &World) -> Vec<FrameStats> {
     std::fs::create_dir_all(out_dir).unwrap();
     let seed = mix64(cfg.name.bytes().fold(7u64, |h, b| h.wrapping_mul(131) ^ b as u64) ^ mix64(run_seed));
     let mut stats = Vec::new();
     let mut prev_state = state_at(0);
-    let mut prev_scene = build(&prev_state);
-    let mut pixels: Vec<Stat> = vec![Stat::default(); W * H];
+    let mut prev_scene = build(&prev_state, world.rooms);
+    let mut pixels: Vec<Stat> = vec![Stat::default(); world.len()];
     let mut cache = Cache::default();
     let mut rng = Rng::new(seed);
     let mut debt = 0usize; // chemins différentiels à rembourser sur le budget des frames suivantes
 
     for frame in 0..FRAMES {
         let state = state_at(frame);
-        let scene = build(&state);
+        let scene = build(&state, world.rooms);
         let mut fs = FrameStats { frame, ..Default::default() };
         let ev = if frame > 0 { event(&prev_state, &state, &prev_scene, &scene, frame) } else { None };
-        let gb = gbuffer(&scene);
-        let surf: Vec<usize> = (0..W * H).filter(|&k| matches!(gb[k], Px::Surf { .. })).collect();
+        let gb = gbuffer(&scene, world);
+        let surf: Vec<usize> = (0..world.len()).filter(|&k| matches!(gb[k], Px::Surf { .. })).collect();
         let budget = surf.len();
-        let mut img = vec![V3::default(); W * H];
-        for k in 0..W * H {
+        let mut img = vec![V3::default(); world.len()];
+        for k in 0..world.len() {
             if let Px::Light(e) = gb[k] {
                 img[k] = e;
             }
@@ -335,11 +350,11 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
             }
             Kind::Cache { neyman, ema, on_event, safety } => {
                 // 1. cellules visibles
-                let mut pix_cells = vec![[u32::MAX; K]; W * H];
+                let mut pix_cells = vec![[u32::MAX; K]; world.len()];
                 for &k in &surf {
                     let Px::Surf { p, n, dist, .. } = gb[k] else { unreachable!() };
                     for s in 0..K {
-                        pix_cells[k][s] = cache.get_or_create(cell_key(p, n, dist, k, s), p.x);
+                        pix_cells[k][s] = cache.get_or_create(cell_key(p, n, dist * world.px_angle(), k, s), p.x);
                     }
                 }
                 let nc = cache.cells.len();
@@ -418,6 +433,13 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                             let Px::Surf { p, n, albedo, .. } = gb[tasks[i].1 as usize] else { unreachable!() };
                             let s = mix64(seed ^ 0xde17a ^ mix64((frame as u64) << 32 | round << 24 | i as u64));
                             let mut rec = DepRec::default();
+                            if !e.geometry {
+                                // lampes seules : l'ancienne radiance se déduit du même chemin
+                                let (new, d) =
+                                    radiance_split(&scene, p, n, albedo, &mut Rng::new(s), &mut rec, true, &e.light_w);
+                                let affected = rec.lights & e.lights != 0;
+                                return (tasks[i].0, new, new + d, affected, rec, false);
+                            }
                             let new = radiance(&scene, p, n, albedo, &mut Rng::new(s), &mut rec, true);
                             let affected = rec.regions.intersects(&e.regions) || rec.lights & e.lights != 0;
                             let old = if affected {
@@ -425,14 +447,16 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                             } else {
                                 new
                             };
-                            (tasks[i].0, new, old, affected, rec)
+                            (tasks[i].0, new, old, affected, rec, affected)
                         })
                     };
                     let mut results = trace(&delta_tasks, 0);
                     let mut second: Vec<(u32, u32)> = Vec::new();
                     let mut seen = std::collections::HashSet::new();
+                    // Δ = 0 sur M_DELTA0 chemins ne prouve rien pour une lampe (sa sélection NEE est aléatoire,
+                    // indépendante de son importance pour la cellule) : changement de lampes => M_DELTA partout.
                     for r in &results {
-                        if r.3 && seen.insert(r.0) {
+                        if (r.3 || !e.geometry) && seen.insert(r.0) {
                             for _ in 0..M_DELTA - M_DELTA0 {
                                 second.push(pick(r.0 as usize, &mut rng));
                             }
@@ -442,8 +466,8 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
                     let mut per_cell: HashMap<u32, Vec<usize>> = HashMap::new();
                     for (i, r) in results.iter().enumerate() {
                         per_cell.entry(r.0).or_default().push(i);
-                        fs.delta_paths += 1 + r.3 as usize;
-                        fs.delta_old_paths += r.3 as usize;
+                        fs.delta_paths += 1 + r.5 as usize;
+                        fs.delta_old_paths += r.5 as usize;
                     }
                     for (ci, idx) in per_cell {
                         let c = &mut cache.cells[ci as usize];
@@ -607,8 +631,33 @@ pub fn run(cfg: &Cfg, refs: &HashMap<String, Vec<V3>>, out_dir: &str, run_seed: 
         let (rmse, relmse) = errors(&img, &refs[&state.id()], &gb);
         fs.rmse = rmse;
         fs.relmse = relmse;
+        let r = &refs[&state.id()];
+        let (mut acc, mut cnt) = ([0.0f64; 4], [0.0f64; 2]);
+        for &k in &surf {
+            let side = if gb[k].is_surf_a() { 0 } else { 1 };
+            for c in 0..3 {
+                let (x, y) = (img[k].get(c), r[k].get(c));
+                acc[side] += (x - y) * (x - y) / (y * y + 0.01);
+                acc[2 + side] += (x - y) / (y + 0.1);
+            }
+            cnt[side] += 3.0;
+        }
+        fs.relmse_a = acc[0] / cnt[0].max(1.0);
+        fs.relmse_b = acc[1] / cnt[1].max(1.0);
+        fs.bias_a = acc[2] / cnt[0].max(1.0);
+        fs.bias_b = acc[3] / cnt[1].max(1.0);
         if run_seed == 0 && SAVE_FRAMES.contains(&frame) {
-            crate::image::save(&format!("{out_dir}/f{frame:03}.png"), W, H, &img);
+            crate::image::save(&format!("{out_dir}/f{frame:03}.png"), world.w, world.h, &img);
+            // carte d'erreur relative (racine du relMSE par pixel, 1.0 = 100 %)
+            let r = &refs[&state.id()];
+            let err: Vec<V3> = (0..world.len())
+                .map(|k| {
+                    let e = (0..3).map(|c| (img[k].get(c) - r[k].get(c)).powi(2) / (r[k].get(c).powi(2) + 0.01)).sum::<f64>() / 3.0;
+                    let e = e.sqrt() * 2.0;
+                    v3(e, e * 0.35, 0.0)
+                })
+                .collect();
+            crate::image::save(&format!("{out_dir}/e{frame:03}.png"), world.w, world.h, &err);
         }
         stats.push(fs);
         prev_state = state;

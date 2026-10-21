@@ -4,13 +4,45 @@ use crate::par::par_map;
 use crate::pt::{radiance, NoRec};
 use crate::scene::Scene;
 
-pub const W: usize = 192;
-pub const H: usize = 96;
 pub const REF_SPP: usize = 4096;
-
-const EYE: V3 = v3(5.15, 1.7, 10.5);
-const LOOK: V3 = v3(5.15, 1.2, 2.0);
 const HFOV_DEG: f64 = 80.0;
+
+/// Taille de la scène (nombre de pièces) et caméra associée : 96 px de large par pièce,
+/// pour garder une densité de pixels constante quand la scène grandit.
+#[derive(Clone, Copy)]
+pub struct World {
+    pub rooms: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl World {
+    pub fn new(rooms: usize) -> World {
+        World { rooms, w: 96 * rooms, h: 96 }
+    }
+    pub fn len(&self) -> usize {
+        self.w * self.h
+    }
+    fn eye_look(&self) -> (V3, V3) {
+        let cx = 2.6 * self.rooms as f64 - 0.05;
+        (v3(cx, 1.7, 4.0 + 3.25 * self.rooms as f64), v3(cx, 1.2, 2.0))
+    }
+    /// Largeur angulaire d'un pixel (empreinte = distance × px_angle).
+    pub fn px_angle(&self) -> f64 {
+        2.0 * (HFOV_DEG.to_radians() * 0.5).tan() / self.w as f64
+    }
+    pub fn camera_ray(&self, i: usize, j: usize) -> (V3, V3) {
+        let (eye, look) = self.eye_look();
+        let f = (look - eye).norm();
+        let r = f.cross(v3(0.0, 1.0, 0.0)).norm();
+        let u = r.cross(f);
+        let th = (HFOV_DEG.to_radians() * 0.5).tan();
+        let tv = th * self.h as f64 / self.w as f64;
+        let sx = 2.0 * (i as f64 + 0.5) / self.w as f64 - 1.0;
+        let sy = 1.0 - 2.0 * (j as f64 + 0.5) / self.h as f64;
+        (eye, (f + r * (sx * th) + u * (sy * tv)).norm())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum Px {
@@ -19,20 +51,9 @@ pub enum Px {
     Surf { p: V3, n: V3, albedo: V3, dist: f64 },
 }
 
-pub fn camera_ray(i: usize, j: usize) -> (V3, V3) {
-    let f = (LOOK - EYE).norm();
-    let r = f.cross(v3(0.0, 1.0, 0.0)).norm();
-    let u = r.cross(f);
-    let th = (HFOV_DEG.to_radians() * 0.5).tan();
-    let tv = th * H as f64 / W as f64;
-    let sx = 2.0 * (i as f64 + 0.5) / W as f64 - 1.0;
-    let sy = 1.0 - 2.0 * (j as f64 + 0.5) / H as f64;
-    (EYE, (f + r * (sx * th) + u * (sy * tv)).norm())
-}
-
-pub fn gbuffer(scene: &Scene) -> Vec<Px> {
-    par_map(W * H, |k| {
-        let (o, d) = camera_ray(k % W, k / W);
+pub fn gbuffer(scene: &Scene, world: &World) -> Vec<Px> {
+    par_map(world.len(), |k| {
+        let (o, d) = world.camera_ray(k % world.w, k / world.w);
         match scene.intersect(o, d, f64::INFINITY) {
             None => Px::Miss,
             Some(h) => match h.light {
@@ -48,7 +69,7 @@ pub fn gbuffer(scene: &Scene) -> Vec<Px> {
 
 /// Image de référence : moyenne de REF_SPP chemins par pixel au point visible.
 pub fn reference(scene: &Scene, gb: &[Px]) -> Vec<V3> {
-    par_map(W * H, |k| match gb[k] {
+    par_map(gb.len(), |k| match gb[k] {
         Px::Miss => V3::default(),
         Px::Light(e) => e,
         Px::Surf { p, n, albedo, .. } => {
@@ -88,11 +109,11 @@ pub fn save_raw(path: &str, img: &[V3]) {
     std::fs::write(path, b).expect("écriture référence");
 }
 
-pub fn load_raw(path: &str) -> Option<Vec<V3>> {
+pub fn load_raw(path: &str, len: usize) -> Option<Vec<V3>> {
     let b = std::fs::read(path).ok()?;
-    if b.len() != W * H * 12 {
+    if b.len() != len * 12 {
         return None;
     }
     let f = |i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()) as f64;
-    Some((0..W * H).map(|k| v3(f(3 * k), f(3 * k + 1), f(3 * k + 2))).collect())
+    Some((0..len).map(|k| v3(f(3 * k), f(3 * k + 1), f(3 * k + 2))).collect())
 }
