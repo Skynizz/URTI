@@ -66,6 +66,9 @@ const C_SAFETY: usize = 8;
 const C_REG0: usize = 12;
 const C_VISIBLE: usize = 13;
 const C_OVERFLOW: usize = 15;
+const C_FREE: usize = 20;
+const C_TOMB: usize = 21;
+const C_EVICT: usize = 22;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -90,7 +93,7 @@ struct FrameU {
     tv: f32,
     up: [f32; 3],
     ppp: f32,
-    pad1: u32,
+    clock: u32,
     rel_cap: f32,
     eps_energy: f32,
     n_post: f32,
@@ -122,6 +125,10 @@ pub struct GpuFrame {
     pub pending: u32,
     pub max_n: f32,
     pub debt: u32,
+    /// cellules évincées dans la frame, cellules libres, pierres tombales (caméra mobile)
+    pub evicted: u32,
+    pub free: u32,
+    pub _tombs: u32,
     /// genre de chaque pixel (0 vide, 1 lampe, 2 surface), si l'image a été relue
     pub kinds: Vec<u8>,
     pub probe_rays: usize,
@@ -174,9 +181,16 @@ pub struct GpuKrc<'a> {
     /// événement de lampe : historique plafonné aussi pour les cellules sans différence mesurée
     pub zero_cap: bool,
     pending: Option<GpuEvent>,
+    _free_buf: wgpu::Buffer,
+    /// compteur de frames monotone (éviction des cellules invisibles)
+    clock: u32,
+    /// la table de hachage a trop de pierres tombales : reconstruction au début de la frame suivante
+    rebuild: bool,
 }
 
-const ENTRIES: [&str; 29] = [
+const ENTRIES: [&str; 31] = [
+    "rebuild_clear",
+    "rebuild_insert",
     "pending_mark",
     "probe_trace",
     "reference_acc",
@@ -219,8 +233,9 @@ impl<'a> GpuKrc<'a> {
     pub fn with(gpu: &'a Gpu, view: View, grid: Grid, tri: Option<&TriScene>, sharc: bool, seed: u32) -> GpuKrc<'a> {
         let dev = &gpu.device;
         let len = view.len();
-        // une cellule couvre 2 à 4 pixels de large ; avec le jitter, ≈ len/6 cellules distinctes
-        let cell_cap = (len / 2).next_power_of_two().max(1 << 14) as u32;
+        // une cellule couvre 2 à 4 pixels de large ; avec le jitter, ≈ len/6 cellules distinctes par
+        // vue, et une caméra mobile garde 60 frames de cellules invisibles avant de les évincer
+        let cell_cap = len.next_power_of_two().max(1 << 14) as u32;
         let table = (cell_cap as usize * 2).next_power_of_two();
         let task_cap = cell_cap as usize * 10 + len * 9;
         let storage = |read_only: bool| wgpu::BindingType::Buffer {
@@ -229,7 +244,7 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..22u32 {
+        for b in 0..23u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -309,6 +324,7 @@ impl<'a> GpuKrc<'a> {
         };
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let probe_buf = mk((PROBES * 32) as u64, st);
+        let free_buf = mk(cell_cap as u64 * 4, st);
         let accel = tri.map(|t| Accel::new(gpu, t));
         let n_binds = if accel.is_some() { 2 } else { 1 };
         let binds = (0..n_binds)
@@ -328,6 +344,7 @@ impl<'a> GpuKrc<'a> {
                     e.push(wgpu::BindGroupEntry { binding: 20, resource: a.mesh_table.as_entire_binding() });
                 }
                 e.push(wgpu::BindGroupEntry { binding: 21, resource: probe_buf.as_entire_binding() });
+                e.push(wgpu::BindGroupEntry { binding: 22, resource: free_buf.as_entire_binding() });
                 dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("krc"), layout: &layout, entries: &e })
             })
             .collect();
@@ -364,7 +381,16 @@ impl<'a> GpuKrc<'a> {
             s2_hist: true,
             zero_cap: true,
             pending: None,
+            clock: 0,
+            rebuild: false,
+            _free_buf: free_buf,
         }
+    }
+
+    /// Change la caméra (même résolution). Les cellules sont dans l'espace monde : elles restent.
+    pub fn set_view(&mut self, v: View) {
+        assert!(v.w == self.view.w && v.h == self.view.h);
+        self.view = v;
     }
 
     fn uniform(&self, n_boxes: usize, n_lights: usize, t: u32, flags: u32, round: u32, ev_lights: u32, pad0: u32) -> FrameU {
@@ -390,7 +416,7 @@ impl<'a> GpuKrc<'a> {
             tv: v.tv as f32,
             up: f3(v.up),
             ppp: self.ppp,
-            pad1: 0,
+            clock: self.clock,
             rel_cap: self.rel_cap,
             eps_energy: self.eps_energy,
             n_post: self.n_post,
@@ -630,6 +656,11 @@ impl<'a> GpuKrc<'a> {
 
         let mut plan: Vec<(&'static str, Dispatch)> = Vec::new();
         let px = Dispatch::Direct(len.div_ceil(64));
+        if self.rebuild {
+            plan.push(("rebuild_clear", Dispatch::Direct((self.table_mask + 1).div_ceil(256))));
+            plan.push(("rebuild_insert", Dispatch::Direct(self.cell_cap.div_ceil(64))));
+            self.rebuild = false;
+        }
         let slots = Dispatch::Direct((len * K as u32).div_ceil(256));
         let cells = Dispatch::Indirect(36);
         plan.push(("reset_ctr", Dispatch::Direct((CTR as u32).div_ceil(64))));
@@ -714,6 +745,8 @@ impl<'a> GpuKrc<'a> {
         let ms = self.period_ns as f64 * 1e-6;
         // événement de lampe dont il reste des cellules à traiter : on le garde pour la frame suivante
         self.pending = if ctr[18] > 0 { ev.cloned().or(self.pending.take()) } else { None };
+        self.rebuild = ctr[C_TOMB] as u64 * 4 > self.table_mask as u64 + 1;
+        self.clock += 1;
         GpuFrame {
             image: (0..img.len() / 4).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
             kinds: (0..img.len() / 4).map(|k| img[4 * k + 3] as u8).collect(),
@@ -732,6 +765,9 @@ impl<'a> GpuKrc<'a> {
             pending: ctr[18],
             max_n: f32::from_bits(ctr[17]),
             debt: ctr[9],
+            evicted: ctr[C_EVICT],
+            free: ctr[C_FREE],
+            _tombs: ctr[C_TOMB],
             passes: plan
                 .iter()
                 .enumerate()

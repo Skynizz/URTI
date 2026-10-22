@@ -55,6 +55,13 @@ const C_EXPLORE: u32 = 16u;
 const C_MAXN: u32 = 17u;     // max des n des cellules (bits f32 positifs : ordre préservé)
 const C_PENDING: u32 = 18u;  // cellules encore en attente de leurs chemins corrélés
 const C_DUSED: u32 = 19u;    // chemins corrélés réservés dans la frame (plafond d'amortissement)
+const C_FREE: u32 = 20u;     // cellules libres dans free_list (persistant)
+const C_TOMB: u32 = 21u;     // pierres tombales dans la table de hachage (persistant)
+const C_EVICT: u32 = 22u;    // cellules évincées dans la frame
+const TOMB: u32 = 0xffffffffu;
+// Caméra mobile : une cellule invisible depuis STALE_FRAMES frames est évincée (même règle que
+// le staleFrameNumMax de l'exemple SHaRC de NVIDIA, 60).
+const STALE_FRAMES: u32 = 60u;
 const C_HIST: u32 = 32u;     // 64 cases
 const C_SCAN: u32 = 96u;     // 3 × 32 sommes de quotas candidates (trois balayages)
 
@@ -99,7 +106,7 @@ struct Frame {
     fwd: vec3<f32>, th: f32,
     right: vec3<f32>, tv: f32,
     up: vec3<f32>, ppp: f32,  // budget : chemins par pixel de surface et par frame
-    pad1: u32,
+    clock: u32,      // compteur de frames monotone (éviction), indépendant de `frame` (graines)
     rel_cap: f32,    // variance relative d'allocation plafonnée à rel_cap × médiane (0 : aucun plafond)
     eps_energy: f32, // seuil de l'effet énergétique attendu (fraction de la luminance de la cellule)
     n_post: f32,     // poids max d'une estimation corrigée (0 : N_POST) // part du budget répartie uniformément par pixel
@@ -110,8 +117,8 @@ struct Gpx { p: vec3<f32>, kind: u32, n: vec3<f32>, dist: f32, albedo: vec3<f32>
 struct Cell {
     n: f32, lmean: f32, m2: f32, last: u32,
     mean: vec3<f32>, rn: f32,
-    rl: f32, rm2: f32, ns_prev: u32, p0: u32,
-    deps_prev: vec2<u32>, cx: f32, p1: u32,
+    rl: f32, rm2: f32, ns_prev: u32, seen: u32, // seen : dernière frame (clock) où la cellule était visible
+    deps_prev: vec2<u32>, key: u32, slot: u32,   // slot : indice dans la table + 1 (0 : cellule libre)
     freq_prev: array<u32, 18>,
 };
 
@@ -134,6 +141,7 @@ struct Cell {
 @group(0) @binding(16) var<storage, read_write> ind: array<u32>; // arguments de dispatch indirect
 // résumé compact par cellule pour l'allocation : (empreinte, n, variance relative, tirage)
 @group(0) @binding(17) var<storage, read_write> qbuf: array<vec4<f32>>;
+@group(0) @binding(22) var<storage, read_write> free_list: array<u32>;
 
 // ---------------------------------------------------------------- outils
 var<private> rng: u32;
@@ -544,7 +552,71 @@ fn cell_key(k: u32, slot: u32) -> u32 {
     key = pcg(key ^ bitcast<u32>(q.x));
     key = pcg(key ^ bitcast<u32>(q.y));
     key = pcg(key ^ bitcast<u32>(q.z));
-    return max(key, 1u);
+    return clamp(key, 1u, TOMB - 1u);
+}
+
+// cellule neuve : d'abord la liste libre (remplie par l'éviction, dans une autre passe), sinon
+// au bout du tableau
+fn alloc_cell() -> u32 {
+    var n = atomicLoad(&ctr[C_FREE]);
+    loop {
+        if (n == 0u) { break; }
+        let r = atomicCompareExchangeWeak(&ctr[C_FREE], n, n - 1u);
+        if (r.exchanged) { return free_list[n - 1u]; }
+        n = r.old_value;
+    }
+    let c = atomicAdd(&ctr[C_CELLS], 1u);
+    if (c >= fr.cell_cap) { return 0xffffffffu; }
+    return c;
+}
+
+// éviction : pierre tombale dans la table (les sondes linéaires la traversent), cellule remise à
+// zéro et rendue à la liste libre
+fn evict(c: u32) {
+    let h = cells[c].slot - 1u;
+    atomicStore(&keys[h], TOMB);
+    atomicStore(&vals[h], 0u);
+    clear_cell(c);
+    cells[c].last = 0u;
+    cells[c].seen = 0u;
+    cells[c].key = 0u;
+    cells[c].slot = 0u;
+    let b = c * ACC;
+    for (var w = 0u; w < ACC; w++) { atomicStore(&acc[b + w], 0u); }
+    let i = atomicAdd(&ctr[C_FREE], 1u);
+    free_list[i] = c;
+    atomicAdd(&ctr[C_TOMB], 1u);
+    atomicAdd(&ctr[C_EVICT], 1u);
+}
+
+// reconstruction de la table quand les pierres tombales s'accumulent : 1) vider, 2) réinsérer
+// la clé de chaque cellule vivante
+@compute @workgroup_size(256)
+fn rebuild_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = gid.x;
+    if (h == 0u) { atomicStore(&ctr[C_TOMB], 0u); }
+    if (h > fr.table_mask) { return; }
+    atomicStore(&keys[h], 0u);
+    atomicStore(&vals[h], 0u);
+}
+
+@compute @workgroup_size(64)
+fn rebuild_insert(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap) || cells[c].slot == 0u) { return; }
+    let key = cells[c].key;
+    var h = key & fr.table_mask;
+    for (var probe = 0u; probe < 1024u; probe++) {
+        let r = atomicCompareExchangeWeak(&keys[h], 0u, key);
+        if (r.exchanged) {
+            atomicStore(&vals[h], c + 1u);
+            cells[c].slot = h + 1u;
+            return;
+        }
+        if (r.old_value == 0u) { probe--; continue; }
+        h = (h + 1u) & fr.table_mask;
+    }
+    atomicAdd(&ctr[C_OVERFLOW], 1u);
 }
 
 // 1er temps : réserver les clés nouvelles (sans attente active)
@@ -558,12 +630,14 @@ fn insert(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var probe = 0u; probe < 64u; probe++) {
         let r = atomicCompareExchangeWeak(&keys[h], 0u, key);
         if (r.exchanged) {
-            let c = atomicAdd(&ctr[C_CELLS], 1u);
-            if (c >= fr.cell_cap) {
+            let c = alloc_cell();
+            if (c == 0xffffffffu) {
                 atomicAdd(&ctr[C_OVERFLOW], 1u);
                 return;
             }
-            cells[c].cx = gbuf[k].p.x;
+            cells[c].key = key;
+            cells[c].slot = h + 1u;
+            cells[c].seen = fr.clock;
             atomicStore(&vals[h], c + 1u);
             return;
         }
@@ -645,7 +719,7 @@ fn push_tasks(c: u32, m: u32, kind: u32) {
 @compute @workgroup_size(64)
 fn reset_ctr(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= 256u || i == C_CELLS || i == C_DEBT) { return; }
+    if (i >= 256u || i == C_CELLS || i == C_DEBT || i == C_FREE || i == C_TOMB) { return; }
     atomicStore(&ctr[i], 0u);
 }
 
@@ -1172,6 +1246,8 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let susp = atomicLoad(&acc[b + A_SUSP]);
     if (susp == 1u) { cell.last = fr.frame; }
+    let foot = atomicLoad(&acc[b + A_FOOT]);
+    if (foot > 0u) { cell.seen = fr.clock; }
     // vieillissement des dépendances (fenêtres alternées de DEP_WINDOW échantillons)
     let ns = atomicLoad(&acc[b + A_NS]);
     if (ns >= DEP_WINDOW) {
@@ -1194,6 +1270,7 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var w = A_FR; w <= A_FL2; w++) { atomicStore(&acc[b + w], 0u); }
     for (var w = A_PM; w < A_SUSP; w++) { atomicStore(&acc[b + w], 0u); }
     if (susp == 1u) { atomicStore(&acc[b + A_SUSP], 0u); } // 2 (en attente) persiste
+    if (cell.slot != 0u && foot == 0u && susp != 2u && fr.clock - cell.seen > STALE_FRAMES) { evict(c); }
 }
 
 @compute @workgroup_size(64)

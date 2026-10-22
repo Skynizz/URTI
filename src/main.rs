@@ -192,6 +192,20 @@ fn main() {
             }
             None => eprintln!("pas de GPU"),
         },
+        Some("cornellcam") => match gpu::Gpu::new() {
+            Some(g) => {
+                let size = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(256);
+                rt::run_tri(&g, seeds(), &rt::cornell_cam_setup(size));
+            }
+            None => eprintln!("pas de GPU"),
+        },
+        Some("sponzacam") => match gpu::Gpu::new() {
+            Some(g) => {
+                let w: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(480);
+                rt::run_tri(&g, seeds(), &rt::sponza_cam_setup(w, w * 9 / 16));
+            }
+            None => eprintln!("pas de GPU"),
+        },
         Some("cornell") => match gpu::Gpu::new() {
             Some(g) => {
                 let size = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(256);
@@ -212,6 +226,13 @@ fn main() {
                     let w: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1280);
                     rt::pareto(&g, &rt::sponza_setup(w, w * 9 / 16))
                 }
+                Some("sponzacam") => {
+                    let w: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1280);
+                    rt::pareto(&g, &rt::sponza_cam_setup(w, w * 9 / 16))
+                }
+                Some("cornellcam") => {
+                    rt::pareto(&g, &rt::cornell_cam_setup(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1024)))
+                }
                 _ => rt::pareto(&g, &rt::cornell_setup(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024))),
             },
             None => eprintln!("pas de GPU"),
@@ -226,6 +247,8 @@ fn main() {
         Some("bias") => match gpu::Gpu::new() {
             Some(g) => match args.get(1).map(String::as_str) {
                 Some("cornell") => rt::bias(&g, &rt::cornell_setup(256)),
+                Some("cornellcam") => rt::bias(&g, &rt::cornell_cam_setup(256)),
+                Some("sponzacam") => rt::bias(&g, &rt::sponza_cam_setup(480, 270)),
                 _ => rt::bias(&g, &rt::sponza_setup(480, 270)),
             },
             None => eprintln!("pas de GPU"),

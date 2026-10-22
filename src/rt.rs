@@ -412,10 +412,45 @@ pub struct TriSetup {
     pub view: crate::gpu_krc::View,
     pub at: fn(u32) -> TriScene,
     pub ref_spp: u32,
+    /// caméra mobile : (œil, point visé) à la frame t ; None = caméra fixe `view`
+    pub cam: Option<fn(u32) -> (V3, V3)>,
+}
+
+impl TriSetup {
+    /// Vue de la frame t (même résolution et même champ que `view`).
+    pub fn view_at(&self, t: u32) -> crate::gpu_krc::View {
+        let mut v = self.view;
+        if let Some(cam) = self.cam {
+            let (eye, target) = cam(t);
+            v.eye = eye;
+            v.fwd = (target - eye).norm();
+            v.right = v.fwd.cross(v3(0.0, 1.0, 0.0)).norm();
+            v.up = v.right.cross(v.fwd);
+        }
+        v
+    }
+
+    /// Nom de la référence de la frame t : l'état de la scène si la caméra est fixe, sinon la frame.
+    pub fn ref_key(&self, t: u32) -> String {
+        match self.cam {
+            Some(_) => format!("f{t:03}"),
+            None => crate::scene::state_at(t).id(),
+        }
+    }
 }
 
 pub fn cornell_setup(size: usize) -> TriSetup {
-    TriSetup { name: format!("cornell_{size}"), view: cornell_view(size), at: cornell_at, ref_spp: 4096 }
+    TriSetup { name: format!("cornell_{size}"), view: cornell_view(size), at: cornell_at, ref_spp: 4096, cam: None }
+}
+
+/// Cornell box, caméra mobile : travelling avant (z 13 → 9) avec un balancement latéral.
+pub fn cornell_cam_setup(size: usize) -> TriSetup {
+    fn cam(t: u32) -> (V3, V3) {
+        let u = t as f64 / 119.0;
+        let a = std::f64::consts::PI * t as f64 / 60.0;
+        (v3(2.75 + 1.5 * a.sin(), 2.75 + 0.4 * (2.0 * a).sin(), 13.0 - 4.0 * u), v3(2.75, 2.5, 2.0))
+    }
+    TriSetup { name: format!("cornell_cam_{size}"), cam: Some(cam), ..cornell_setup(size) }
 }
 
 /// relMSE d'une frame sur les pixels de surface : brute, et sans le 0,1 % de pixels les plus
@@ -454,7 +489,7 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
     use crate::gpu_krc::GpuKrc;
     use crate::grid::Grid;
     use crate::render::{load_raw, save_raw};
-    use crate::scene::{state_at, FRAMES};
+    use crate::scene::FRAMES;
     use std::collections::HashMap;
     let view = setup.view;
     let at = setup.at;
@@ -472,13 +507,14 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
     let mut refs: HashMap<String, Vec<V3>> = HashMap::new();
     let mut rk = GpuKrc::with(gpu, view, grid, Some(&base), false, 0);
     for f in 0..FRAMES {
-        let id = state_at(f).id();
+        let id = setup.ref_key(f);
         if refs.contains_key(&id) {
             continue;
         }
         let path = format!("{dir}/{id}.bin");
         let img = load_raw(&path, view.len()).unwrap_or_else(|| {
             let t = std::time::Instant::now();
+            rk.set_view(setup.view_at(f));
             let (img, _) = rk.reference_tri(&at(f), setup.ref_spp);
             save_raw(&path, &img);
             crate::image::save(&format!("{dir}/{id}.png"), view.w, view.h, &img);
@@ -498,14 +534,22 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
             let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 1 + seed as u32);
             let mut prev = at(0);
             let mut rows = Vec::new();
-            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio\n");
+            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio,cells_live,evicted\n");
             for t in 0..FRAMES {
                 let scene = at(t);
+                k.set_view(setup.view_at(t));
                 let f = k.frame_tri(&scene, &prev, t);
                 assert_eq!(f.overflow, 0);
-                let (rel, trim, lr) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+                let (rel, trim, lr) = frame_err(&f.image, &f.kinds, &refs[&setup.ref_key(t)]);
                 let paths = f.regular_paths + f.delta_paths + f.probe_rays as u32;
-                csv += &format!("{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e},{lr:.4}\n", f.gpu_ms(), f.suspects, f.delta_paths);
+                csv += &format!(
+                    "{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e},{lr:.4},{},{}\n",
+                    f.gpu_ms(),
+                    f.suspects,
+                    f.delta_paths,
+                    f.cells - f.free,
+                    f.evicted
+                );
                 if seed == 0 && crate::methods::SAVE_FRAMES.contains(&t) {
                     crate::image::save(&format!("{out}/f{t:03}.png"), view.w, view.h, &f.image);
                 }
@@ -553,14 +597,14 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
     use crate::gpu_krc::GpuKrc;
     use crate::grid::Grid;
     use crate::render::load_raw;
-    use crate::scene::{state_at, FRAMES};
+    use crate::scene::FRAMES;
     let view = setup.view;
     let at = setup.at;
     let base = at(0);
     let grid = Grid::fit(&base.bounds);
     let dir = format!("results/ref_{}", setup.name);
     let refs: std::collections::HashMap<String, Vec<V3>> = (0..FRAMES)
-        .map(|f| state_at(f).id())
+        .map(|f| setup.ref_key(f))
         .map(|id| {
             let img = load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes : lancer d'abord la séquence");
             (id, img)
@@ -585,10 +629,11 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
                 k.readback = pass == 0;
                 for t in 0..FRAMES {
                     let scene = at(t);
+                    k.set_view(setup.view_at(t));
                     let f = k.frame_tri(&scene, &prev, t);
                     prev = scene;
                     if pass == 0 {
-                        let (e, et, _) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+                        let (e, et, _) = frame_err(&f.image, &f.kinds, &refs[&setup.ref_key(t)]);
                         rel.push(e);
                         tr.push(et);
                         if (30..40).contains(&t) {
@@ -743,7 +788,21 @@ pub fn sponza_setup(w: usize, h: usize) -> TriSetup {
         at: sponza_at,
         // petites lampes brillantes près des murs : lucioles à 4096 spp
         ref_spp: 16384,
+        cam: None,
     }
+}
+
+/// Sponza, caméra mobile : on marche dans l'atrium (9 m en 120 frames, ~4,5 m/s à 60 Hz) en
+/// regardant à gauche et à droite (lacet ±17°) et en ondulant latéralement.
+pub fn sponza_cam_setup(w: usize, h: usize) -> TriSetup {
+    fn cam(t: u32) -> (V3, V3) {
+        let u = t as f64 / 119.0;
+        let tau = 2.0 * std::f64::consts::PI;
+        let eye = v3(-10.0 + 9.0 * u, 1.6, -0.3 + 0.8 * (tau * t as f64 / 120.0).sin());
+        let yaw = 0.3 * (tau * t as f64 / 90.0).sin();
+        (eye, eye + v3(yaw.cos(), 0.12, yaw.sin()) * 10.0)
+    }
+    TriSetup { name: format!("sponza_cam_{w}x{h}"), cam: Some(cam), ..sponza_setup(w, h) }
 }
 
 /// `krc sponzadebug` : ce que voit la caméra et où tombent les sondes de chaque lampe.
@@ -800,12 +859,12 @@ pub fn bias(gpu: &Gpu, setup: &TriSetup) {
     use crate::gpu_krc::GpuKrc;
     use crate::grid::Grid;
     use crate::render::load_raw;
-    use crate::scene::{state_at, FRAMES};
+    use crate::scene::FRAMES;
     let (view, at) = (setup.view, setup.at);
     let grid = Grid::fit(&at(0).bounds);
     let dir = format!("results/ref_{}", setup.name);
     let refs: std::collections::HashMap<String, Vec<V3>> = (0..FRAMES)
-        .map(|f| state_at(f).id())
+        .map(|f| setup.ref_key(f))
         .map(|id| (id.clone(), load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes")))
         .collect();
     let ratio = |f: &crate::gpu_krc::GpuFrame, r: &[V3]| {
@@ -830,11 +889,12 @@ pub fn bias(gpu: &Gpu, setup: &TriSetup) {
     ];
     for (name, sharc, cap, np, h, z) in variants {
         let mut k = GpuKrc::with(gpu, view, grid, Some(&last), sharc, 7);
+        k.set_view(setup.view_at(fs));
         k.rel_cap = cap;
         k.n_post = np;
         k.s2_hist = h;
         k.zero_cap = z;
-        let r = &refs[&state_at(fs).id()];
+        let r = &refs[&setup.ref_key(fs)];
         let mut line = format!("(a) {name:<13} statique, état final :");
         for t in 0..200 {
             let f = k.frame_tri(&last, &last, t);
@@ -855,12 +915,13 @@ pub fn bias(gpu: &Gpu, setup: &TriSetup) {
         let mut err = 0.0;
         for t in 0..FRAMES {
             let scene = at(t);
+            k.set_view(setup.view_at(t));
             let f = k.frame_tri(&scene, &prev, t);
             prev = scene;
-            let (_, trim, _) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+            let (_, trim, _) = frame_err(&f.image, &f.kinds, &refs[&setup.ref_key(t)]);
             err += trim / FRAMES as f64;
             if [39, 63, 79, 80, 81, 85, 99, 100, 101, 105, 119].contains(&t) {
-                line += &format!(" f{t} {:.3}", ratio(&f, &refs[&state_at(t).id()]));
+                line += &format!(" f{t} {:.3}", ratio(&f, &refs[&setup.ref_key(t)]));
             }
             if t == 80 || t == 100 {
                 line += &format!(" [susp {} zéro {}]", f.suspects, f.delta_zero);
