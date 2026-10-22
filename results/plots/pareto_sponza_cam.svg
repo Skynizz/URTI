@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="system-ui, sans-serif" font-size="12">
+<rect width="760" height="400" fill="#fcfcfb"/>
+<text x="80" y="22" font-size="15" font-weight="600" fill="#0b0b0b">Erreur contre temps GPU : Sponza, caméra mobile, 1280×720</text>
+<text x="80" y="40" fill="#52514e">RTX 4070, ray tracing matériel ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux</text>
+<line x1="80" x2="590" y1="350.0" y2="350.0" stroke="#e4e3df"/>
+<text x="72" y="354.0" text-anchor="end" fill="#52514e">1e-2</text>
+<line x1="80" x2="590" y1="58.0" y2="58.0" stroke="#e4e3df"/>
+<text x="72" y="62.0" text-anchor="end" fill="#52514e">1e-1</text>
+<line x1="80.0" x2="80.0" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="80.0" y="368" text-anchor="middle" fill="#52514e">10</text>
+<line x1="233.5" x2="233.5" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="233.5" y="368" text-anchor="middle" fill="#52514e">20</text>
+<line x1="323.3" x2="323.3" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="323.3" y="368" text-anchor="middle" fill="#52514e">30</text>
+<text x="335.0" y="392" text-anchor="middle" fill="#52514e">temps GPU moyen par frame (ms)</text>
+<text transform="translate(18 204.0) rotate(-90)" text-anchor="middle" fill="#52514e">relMSE sur la séquence</text>
+<polyline points="235.4,89.8 241.0,146.9 254.6,208.6 279.8,261.6 322.8,306.9" fill="none" stroke="#2a78d6" stroke-width="2"/>
+<circle cx="235.4" cy="89.8" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="242.4" y="83.8" fill="#52514e" font-size="10">0.25 ch/px</text>
+<circle cx="241.0" cy="146.9" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="248.0" y="140.9" fill="#52514e" font-size="10">0.5 ch/px</text>
+<circle cx="254.6" cy="208.6" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="261.6" y="202.6" fill="#52514e" font-size="10">1 ch/px</text>
+<circle cx="279.8" cy="261.6" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="286.8" y="255.6" fill="#52514e" font-size="10">2 ch/px</text>
+<circle cx="322.8" cy="306.9" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="329.8" y="300.9" fill="#52514e" font-size="10">4 ch/px</text>
+<polyline points="238.3,85.3 264.7,140.5 310.8,193.6" fill="none" stroke="#eb6834" stroke-width="2"/>
+<circle cx="238.3" cy="85.3" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="245.3" y="79.3" fill="#52514e" font-size="10">1 ch/px</text>
+<circle cx="264.7" cy="140.5" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="271.7" y="134.5" fill="#52514e" font-size="10">2 ch/px</text>
+<circle cx="310.8" cy="193.6" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="317.8" y="187.6" fill="#52514e" font-size="10">4 ch/px</text>
+<rect x="598" y="188.6" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="612" y="197.6" fill="#0b0b0b">SHaRC-like (maison)</text>
+<rect x="598" y="301.9" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="612" y="310.9" fill="#0b0b0b">KRC</text>
+</svg>

@@ -27,10 +27,15 @@ remboursés sur les frames suivantes. Reproduire : `cargo run --release -- all`,
    et ce coût ne croît plus avec la scène au-delà des pièces réellement éclairées.
 6. **Tout le pipeline tourne sur GPU** (RTX 4070), validé contre le CPU, stable sur
    12 000 frames (§7, §8).
-7. **Sur de vrais triangles avec ray tracing matériel**, à temps GPU moyen égal, KRC a
-   **2,7× (Cornell box) à 2,9× (Sponza) moins d'erreur** que le cache SHaRC-like ; à
-   erreur égale il est 1,7× (Cornell) à 3,6× (Sponza) plus rapide. Contrepartie : des
-   pics les frames d'événement (p95 9,6 à 13 ms contre un coût plat pour SHaRC) (§9, §10).
+7. **Contre le vrai SHaRC de NVIDIA** (portage WGSL validé, §12), l'avantage de KRC se
+   réduit aux **changements de lumière** : sur la séquence complète, 3 à 18× moins
+   d'erreur, presque entièrement parce que SHaRC garde une lampe éteinte des dizaines de
+   frames (7× trop clair). **En statique, caméra fixe ou mobile, SHaRC est aussi bon ou
+   meilleur pour 3 à 25× moins de temps GPU.** Les « 2,7 à 2,9× moins d'erreur à temps égal »
+   des §9 et §10 étaient mesurés contre mon cache SHaRC-like maison, beaucoup plus coûteux
+   que le vrai.
+   **Caméra mobile** : la qualité de KRC tient (Sponza 3,8e-2 contre 2,5e-2 caméra fixe),
+   mais son coût explose (12,6 ms à 0,25 chemin/px en 1280×720, 1,35 M cellules, ~460 Mo).
 8. **Sponza a révélé deux biais vers le sombre** que la relMSE récompensait (§11) :
    l'allocation de Neyman dilue les valeurs rares d'une radiance à queue lourde, et les
    cellules « sans différence mesurée » à l'allumage d'une petite lampe gardaient leur
@@ -166,7 +171,8 @@ contre 1,61e-3 à N = 8. Mémoire : 72 octets de compteurs par cellule.
 | Affirmation de départ | Verdict |
 |---|---|
 | Une scène statique converge et finit par ne plus rien coûter | ✅ ~0,01 chemin/pixel/frame (plancher d'exploration) |
-| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ✅ Cornell et Sponza : 2,7–2,9× moins d'erreur à temps moyen égal ; ⚠️ pics les frames d'événement (p95 9,6–13 ms) |
+| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ❌ contre le vrai SHaRC : perd en statique (même qualité pour 3 à 25× plus de temps) ; ✅ gagne nettement sur les changements de lumière (à confirmer contre le mode réactif de SHaRC) |
+| Tient avec une caméra mobile | ✅ qualité ; ❌ coût (12,6 ms et 1,35 M cellules à 1280×720) |
 | Le coût d'une scène dynamique suit ce qui change, pas la taille de la scène | ✅ pour les objets ; ✅ pour la lumière avec la pondération par l'énergie (le coût suit la zone réellement éclairée) |
 | Le graphe de dépendances par objets touchés suffit | ❌ faux négatifs (lampe allumée, nouvelle ombre) ; les régions traversées le battent |
 | Invalider les cellules dépendantes | ⚠️ invalider coûte cher ; **mesurer le delta par chemins corrélés et corriger** est 2 à 5× meilleur |
@@ -231,7 +237,10 @@ l'événement, puis relit l'image pour l'évaluation seulement, hors chronométr
 - **Dérive longue** (12 000 frames) : aucune dérive mesurable après deux correctifs
   (poids max d'une estimation corrigée, historique plafonné à 1 024), `results/gpu/drift.txt`.
 
-## 9. Triangles et ray tracing matériel : comparaison en ms contre SHaRC
+## 9. Triangles et ray tracing matériel : comparaison en ms contre un SHaRC-like maison
+
+> ⚠️ « SHaRC » dans les §9 et §10 désigne mon cache SHaRC-like (cellules de KRC, moyenne
+> glissante, 1 chemin par pixel), pas le SHaRC de NVIDIA. Contre le vrai, voir §12.
 
 Cornell box en triangles, ray query Vulkan sur la RTX 4070, même séquence de 120 frames.
 Chiffres après les correctifs de biais du §11. relMSE* : sans le 0,1 % de pixels les plus
@@ -259,7 +268,7 @@ fautifs ; « lum » : luminance totale image / référence (1 = pas de biais).
 - Amortir les événements de lampe sur plusieurs frames divise bien le pic par deux, mais
   l'erreur augmente de 2,5× (cellules périmées affichées) : résultat négatif.
 
-## 10. Sponza : scène réelle, comparaison en ms contre SHaRC
+## 10. Sponza : scène réelle, comparaison en ms contre le SHaRC-like maison
 
 Sponza (Crytek, 262 k triangles), 4 lampes, une boîte de 1,4 m qui se déplace, même
 séquence de 120 frames : statique, la boîte avance (frames 40–63), la petite lampe chaude de
@@ -339,3 +348,75 @@ a vu la queue lourde, pas les 8 chemins).
   corrélés.
 - Leçon de méthode : **toute évaluation doit regarder un indicateur de biais**, pas
   seulement une erreur quadratique relative ; elle peut préférer une image fausse.
+
+## 12. Caméra mobile, et comparaison contre le vrai SHaRC de NVIDIA
+
+**SHaRC officiel** : portage WGSL fonction par fonction de `HashGridCommon.h` et
+`SharcCommon.h` (RTXGI SHaRC v1.8.3, `src/sharc.wgsl`, licence dans `third_party/sharc`),
+réglages par défaut du SDK et paramètres de l'exemple Pathtracer de NVIDIA (sceneScale 50,
+accumulation 20 frames, éviction 60, 1 pixel mis à jour par bloc 5×5, 2^22 entrées). Seuls
+écarts forcés : clés 64 bits sur deux u32 avec la variante à verrous du SDK (pas
+d'atomiques 64 bits en WGSL), demi-flottants via `pack2x16float`. Même traceur que KRC
+(estimation directe, lambertien). On compare **la vue du cache au premier impact** (mode
+debug de l'exemple), comme KRC affiche ses cellules ; la passe Render de SHaRC (un chemin
+par pixel, cache aux rebonds suivants) est donnée à part, sans débruiteur.
+
+**Validation du portage** (`krc sharccheck`, scène statique, 300 frames) :
+
+| Cornell statique, relMSE* (lum) | f9 | f49 | f299 |
+|---|---|---|---|
+| SHaRC, défaut NVIDIA | 2,8e-2 (0,95) | 8,7e-3 (0,98) | 8,3e-3 (1,01) |
+| SHaRC, tous les pixels, accumulation 1024, voxels 8× plus fins | 1,7e-2 (0,95) | 3,7e-3 (0,97) | **6,8e-4** (0,99) |
+| KRC, 1 chemin/px | 4,7e-3 (1,00) | 1,1e-3 (1,00) | 4,4e-4 (1,00) |
+
+**Caméra mobile** : Cornell, travelling avant avec balancement ; Sponza, marche de 9 m
+dans l'atrium avec lacet ±17°. Même séquence d'événements. Une référence par frame.
+
+| Sponza caméra mobile, 480×270, 3 graines, relMSE* | Séquence | Statique | Lampe éteinte | GPU moyen |
+|---|---|---|---|---|
+| **KRC**, 1 chemin/px | **3,8e-2** (lum 0,96) | **3,1e-2** | **1,4e-2** (lum 0,91) | 2,1 ms |
+| SHaRC NVIDIA, défaut | 2,3e-1 (lum 1,85) | 1,2e-1 (lum 0,87) | 6,6e-1 (lum 6,9) | 0,34 ms |
+| SHaRC NVIDIA, passe Render (1 chemin/px, sans débruiteur) | 5,3e-1 | 5,1e-1 | 5,6e-1 | 0,89 ms |
+| SHaRC-like maison | 9,1e-2 | 5,2e-2 | 2,3e-1 | 1,7 ms |
+
+**Erreur contre temps**, budget variable (KRC : chemins/px ; SHaRC : 1 pixel mis à jour par
+bloc 5×5, 3×3, 2×2 ou 1×1, voxels par défaut ou 2× plus fins) :
+
+![Sponza, caméra mobile](../results/plots/pareto_sponza_cam.svg)
+
+| 1280×720, relMSE* (statique) | Sponza caméra fixe | Sponza caméra mobile | Cornell 1024² caméra mobile |
+|---|---|---|---|
+| KRC 0,25 chemin/px | — | 7,8e-2 (7,4e-2) · 20,2 ms | 1,3e-2 (5,5e-3) · 8,4 ms |
+| KRC 1 chemin/px | **2,3e-2** (1,0e-2) · 5,4 ms | **3,0e-2** (2,6e-2) · 22,0 ms | **4,8e-3** (1,5e-3) · 9,3 ms |
+| SHaRC NVIDIA, 1 px/5×5 | 9,3e-2 (1,9e-2) · 0,8 ms | 1,4e-1 (3,0e-2) · 0,9 ms | 8,8e-2 (4,8e-3) · 0,9 ms |
+| SHaRC NVIDIA, 1 px/1×1 | 7,0e-2 (**6,2e-3**) · 2,6 ms | 1,2e-1 (**9,0e-3**) · 3,3 ms | 8,9e-2 (2,0e-3) · 2,1 ms |
+| SHaRC NVIDIA, voxels /2, 1 px/3×3 | 9,4e-2 (1,9e-2) · 1,2 ms | 1,4e-1 (2,9e-2) · 1,3 ms | 8,7e-2 (**1,8e-3**) · 1,0 ms |
+
+Lecture :
+
+- **En statique, le vrai SHaRC gagne.** À caméra fixe comme mobile, il atteint la même
+  erreur que KRC, ou mieux, pour 3 à 25× moins de temps GPU. Ses chemins sont bien moins
+  chers : 4 à 100 % des pixels mis à jour, et des chemins coupés dès le 2e ou 3e sommet par
+  le rééchantillonnage du cache.
+- **Sur les changements de lumière, KRC gagne nettement.** SHaRC propage la lumière
+  d'un rebond par frame, en se relisant lui-même : après l'extinction de la grande lampe,
+  il reste 7× trop clair pendant des dizaines de frames. KRC mesure le changement par
+  chemins corrélés. Sur la séquence complète, KRC a donc 3 à 18× moins d'erreur, mais
+  pour 2 à 25× plus de temps. **À temps égal, on ne peut pas encore comparer** : le coût
+  minimal de KRC dépasse le coût total de SHaRC.
+- **Non testé, et nécessaire avant de conclure** : le mode « éclairage réactif » de SHaRC
+  (`SHARC_ENABLE_RESPONSIVE_LIGHTING`), conçu pour les lumières qui changent vite.
+- **Coût de KRC en caméra mobile** (`results/campagne_cam/passes.txt`, Sponza 1280×720,
+  0,25 chemin/px) : 12,6 ms par frame, dont 5,8 ms d'insertion dans la table de hachage
+  (3,7 M insertions par frame, sondages allongés par les pierres tombales) et 3,6 ms de
+  résolution (les 1,35 M cellules, visibles ou non, à chaque frame). Caméra fixe : 3,9 ms
+  (résolution 1,0 ms, recherche 0,5 ms). SHaRC : 0,8 ms en tout.
+- **Mémoire** : 1,35 M cellules vivantes × ~340 octets ≈ 460 Mo pour KRC, contre 176 Mo
+  fixes pour SHaRC (2^22 × 44 octets).
+
+**Ce que ça change pour l'hypothèse.** La caméra mobile n'invalide pas la qualité de KRC,
+mais la comparaison avec le vrai SHaRC invalide l'idée que KRC soit un meilleur cache
+général : l'allocation par l'incertitude coûte plus qu'elle ne rapporte face aux chemins
+courts et peu nombreux de SHaRC. Ce qui reste solide, c'est la **mise à jour différentielle
+par chemins corrélés** face aux changements d'éclairage. Hypothèse suivante : un SHaRC
+standard pour l'état stable, et les corrections corrélées de KRC seulement aux événements.

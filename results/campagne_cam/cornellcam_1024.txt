@@ -1,0 +1,9 @@
+grille : régions 0.399 m, [15, 15, 15] (3375 régions), super-régions [3, 3, 3]
+tri_krc              | tout 5.05e-3±0e0 7.37ms | statique 1.49e-3±0e0 5.32ms | boite 4.04e-3±0e0 10.35ms | apres_boite 4.20e-3±0e0 7.39ms | lampe_on 7.78e-3±0e0 6.64ms | lampe_off 4.58e-3±0e0 9.88ms
+tri_krc*             | tout 4.83e-3±0e0 lum 0.991 | statique 1.44e-3±0e0 lum 0.997 | boite 3.86e-3±0e0 lum 0.989 | apres_boite 4.05e-3±0e0 lum 0.986 | lampe_on 7.52e-3±0e0 lum 0.983 | lampe_off 4.43e-3±0e0 lum 0.995
+tri_sharc            | tout 6.30e-2±0e0 8.18ms | statique 3.80e-3±0e0 6.44ms | boite 9.74e-3±0e0 7.82ms | apres_boite 7.72e-3±0e0 11.36ms | lampe_on 2.55e-2±0e0 8.45ms | lampe_off 3.19e-1±0e0 9.69ms
+tri_sharc*           | tout 6.15e-2±0e0 lum 1.113 | statique 3.04e-3±0e0 lum 1.000 | boite 8.14e-3±0e0 lum 0.994 | apres_boite 6.61e-3±0e0 lum 0.995 | lampe_on 2.51e-2±0e0 lum 0.847 | lampe_off 3.16e-1±0e0 lum 1.841
+tri_sharc_nv         | tout 8.94e-2±0e0 1.47ms | statique 5.22e-3±0e0 1.13ms | boite 1.60e-2±0e0 1.28ms | apres_boite 7.91e-3±0e0 1.48ms | lampe_on 5.71e-2±0e0 1.75ms | lampe_off 4.38e-1±0e0 2.13ms
+tri_sharc_nv*        | tout 8.79e-2±0e0 lum 1.091 | statique 4.45e-3±0e0 lum 0.971 | boite 1.38e-2±0e0 lum 0.981 | apres_boite 6.81e-3±0e0 lum 0.989 | lampe_on 5.66e-2±0e0 lum 0.741 | lampe_off 4.36e-1±0e0 lum 1.935
+tri_sharc_nv_render  | tout 1.72e-1±0e0 5.59ms | statique 1.38e-1±0e0 4.69ms | boite 1.49e-1±0e0 4.86ms | apres_boite 1.47e-1±0e0 4.92ms | lampe_on 1.92e-1±0e0 6.35ms | lampe_off 2.74e-1±0e0 6.47ms
+tri_sharc_nv_render* | tout 1.56e-1±0e0 lum 1.041 | statique 1.25e-1±0e0 lum 0.978 | boite 1.35e-1±0e0 lum 0.988 | apres_boite 1.34e-1±0e0 lum 0.996 | lampe_on 1.81e-1±0e0 lum 0.885 | lampe_off 2.48e-1±0e0 lum 1.441

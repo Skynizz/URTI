@@ -629,16 +629,33 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
         })
         .collect();
     let mut csv = String::from("method,ppp,relmse,relmse_static,relmse_dynamic,ms_median,ms_mean,ms_p95,trim,trim_static,trim_dynamic\n");
-    let variants = [
-        ("tri_krc", false, false, vec![0.25f32, 0.5, 1.0, 2.0, 4.0]),
-        ("tri_krc_amort", false, true, vec![0.25f32, 0.5, 1.0, 2.0, 4.0]),
-        ("tri_sharc", true, false, vec![0.5f32, 1.0, 2.0, 4.0, 8.0]),
-    ];
-    for (name, sharc, amortize, ppps) in variants {
-        for ppp in ppps {
-            let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 3);
+    use crate::gpu_krc::{Method, ShParams};
+    // (méthode, budget « chemins par pixel », paramètres SHaRC). Pour le SHaRC officiel, le budget
+    // est sa densité de mise à jour : 1 pixel par bloc d×d, soit 1/d² chemin par pixel.
+    let mut variants: Vec<(String, Method, f32, ShParams)> = Vec::new();
+    let d = ShParams::default();
+    for ppp in [0.25f32, 0.5, 1.0, 2.0, 4.0] {
+        variants.push(("tri_krc".into(), Method::Krc, ppp, d));
+    }
+    for ppp in [1.0f32, 2.0, 4.0] {
+        variants.push(("tri_sharc".into(), Method::SharcLike, ppp, d));
+    }
+    for scale in [50.0f32, 100.0] {
+        for down in [5u32, 3, 2, 1] {
+            let name = format!("tri_sharc_nv_s{scale}");
+            variants.push((name, Method::Sharc, 1.0 / (down * down) as f32, ShParams { scene_scale: scale, downscale: down, ..d }));
+        }
+    }
+    let only = std::env::var("KRC_METHODS").ok();
+    for (name, method, ppp, sh) in variants {
+        if only.as_ref().is_some_and(|m| !m.split(',').any(|x| name.starts_with(x))) {
+            continue;
+        }
+        {
+            let name = name.as_str();
+            let mut k = GpuKrc::with_method(gpu, view, grid, Some(&base), method, 3);
             k.ppp = ppp;
-            k.amortize = amortize;
+            k.sh = sh;
             let mut prev = at(0);
             let (mut rel, mut rel_s, mut rel_d) = (Vec::new(), Vec::new(), Vec::new());
             let (mut tr, mut tr_s, mut tr_d) = (Vec::new(), Vec::new(), Vec::new());
@@ -698,7 +715,8 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
         }
     }
     std::fs::create_dir_all(format!("results/{}", setup.name)).unwrap();
-    std::fs::write(format!("results/{}/pareto.csv", setup.name), csv).unwrap();
+    let file = if only.is_some() { "pareto_partial.csv" } else { "pareto.csv" };
+    std::fs::write(format!("results/{}/{file}", setup.name), csv).unwrap();
 }
 
 /// `krc spikes [taille]` : composition du temps GPU des frames d'événement (KRC, 1 chemin/px).
@@ -990,4 +1008,41 @@ pub fn sharc_check(gpu: &Gpu, setup: &TriSetup) {
         }
     }
     println!("{line}");
+}
+
+/// `krc passes [sponzacam|sponza|cornellcam] [ppp]` : temps GPU moyen par passe (frames 0–119,
+/// sans relecture d'image), KRC puis SHaRC officiel, et nombre de cellules vivantes.
+pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
+    use crate::gpu_krc::{GpuKrc, Method};
+    use crate::grid::Grid;
+    use crate::scene::FRAMES;
+    let at = setup.at;
+    let grid = Grid::fit(&at(0).bounds);
+    for method in [Method::Krc, Method::Sharc] {
+        let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&at(0)), method, 3);
+        k.ppp = ppp;
+        k.readback = false;
+        let mut sum: Vec<(&'static str, f64)> = Vec::new();
+        let (mut live, mut total) = (0u32, 0.0);
+        let mut prev = at(0);
+        for t in 0..FRAMES {
+            let scene = at(t);
+            k.set_view(setup.view_at(t));
+            let f = k.frame_tri(&scene, &prev, t);
+            prev = scene;
+            total += f.gpu_ms() / FRAMES as f64;
+            live = live.max(f.cells.saturating_sub(f.free));
+            for (name, ms) in &f.passes {
+                match sum.iter_mut().find(|e| e.0 == *name) {
+                    Some(e) => e.1 += ms / FRAMES as f64,
+                    None => sum.push((name, ms / FRAMES as f64)),
+                }
+            }
+        }
+        sum.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("{method:?} : {total:.2} ms/frame en moyenne, cellules vivantes max {live}");
+        for (name, ms) in sum.iter().take(12) {
+            println!("    {name:<16} {ms:.3} ms");
+        }
+    }
 }

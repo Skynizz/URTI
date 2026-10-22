@@ -181,6 +181,7 @@ def scatter_lines(path, title, subtitle, series, xlabel, ylabel):
     """Courbes erreur/temps (log-log), un point par budget, étiqueté."""
     W, H, L, R, T, B = 760, 400, 80, 170, 58, 50
     pw, ph = W - L - R, H - T - B
+    series = list(series)
     xs = [x for _, pts in series for x, _, _ in pts]
     ys = [y for _, pts in series for _, y, _ in pts]
     xlo, xhi = 10 ** math.floor(math.log10(min(xs))), 10 ** math.ceil(math.log10(max(xs)))
@@ -195,7 +196,7 @@ def scatter_lines(path, title, subtitle, series, xlabel, ylabel):
         y = gy(10 ** e)
         o.append(f'<line x1="{L}" x2="{L + pw}" y1="{y:.1f}" y2="{y:.1f}" stroke="{GRID}"/>')
         o.append(f'<text x="{L - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{INK2}">1e{e}</text>')
-    for v in [1, 2, 3, 5, 10, 20, 30]:
+    for v in [0.2, 0.5, 1, 2, 3, 5, 10, 20, 30]:
         if xlo <= v <= xhi:
             x = gx(v)
             o.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{T}" y2="{T + ph}" stroke="{GRID}"/>')
@@ -204,6 +205,8 @@ def scatter_lines(path, title, subtitle, series, xlabel, ylabel):
     o.append(f'<text transform="translate(18 {T + ph / 2}) rotate(-90)" text-anchor="middle" fill="{INK2}">{esc(ylabel)}</text>')
     ends = []
     for i, (name, pts) in enumerate(series):
+        if not pts:
+            continue
         c = SERIES[i]
         pts = sorted(pts)
         o.append('<polyline points="' + " ".join(f"{gx(x):.1f},{gy(y):.1f}" for x, y, _ in pts) + f'" fill="none" stroke="{c}" stroke-width="2"/>')
@@ -222,28 +225,51 @@ def scatter_lines(path, title, subtitle, series, xlabel, ylabel):
         fh.write("\n".join(o))
 
 
+# ordre fixe des séries (une couleur par méthode, jamais réattribuée)
+PARETO_NAMES = [
+    ("tri_krc", "KRC"),
+    ("tri_sharc", "SHaRC-like (maison)"),
+    ("tri_sharc_nv_s50.0", "SHaRC NVIDIA (défaut)"),
+    ("tri_sharc_nv_s100.0", "SHaRC NVIDIA, voxels /2"),
+]
+
+
+def pareto_label(method, ppp):
+    if method.startswith("tri_sharc_nv"):
+        d = round(1.0 / float(ppp) ** 0.5)
+        return f"1 px/{d}×{d}"
+    return f"{ppp} ch/px"
+
+
+def pareto_rows(dirname):
+    rows = []
+    for f in ("pareto.csv", "pareto_partial.csv"):
+        p = os.path.join(ROOT, dirname, f)
+        if os.path.exists(p):
+            rows += read_csv(p)
+    return rows
+
+
 def pareto_plot(out):
-    p = os.path.join(ROOT, "cornell_1024", "pareto.csv")
-    if not os.path.exists(p):
-        return
-    rows = read_csv(p)
-    names = ["tri_sharc", "tri_krc"]
-    col = "trim" if "trim" in rows[0] else "relmse"
-    series = [(n, [(float(r["ms_mean"]), float(r[col]), r["ppp"] + " ch/px") for r in rows if r["method"] == n]) for n in names]
-    scatter_lines(os.path.join(out, "pareto_cornell.svg"), "Erreur contre temps GPU : Cornell box en triangles, 1024×1024",
-                  "ray tracing matériel (RTX 4070) ; " + ("relMSE sans le 0,1 % de pixels les plus fautifs ; " if col == "trim" else "")
-                  + "en bas à gauche = mieux",
-                  series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
-    p = os.path.join(ROOT, "sponza_1280x720", "pareto.csv")
-    if not os.path.exists(p):
-        return
-    rows = read_csv(p)
-    if "trim" not in rows[0]:
-        return
-    series = [(n, [(float(r["ms_mean"]), float(r["trim"]), r["ppp"] + " ch/px") for r in rows if r["method"] == n]) for n in names]
-    scatter_lines(os.path.join(out, "pareto_sponza.svg"), "Erreur contre temps GPU : Sponza, 1280×720",
-                  "ray tracing matériel (RTX 4070) ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux",
-                  series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
+    figs = [
+        ("cornell_1024", "pareto_cornell.svg", "Cornell box en triangles, caméra fixe, 1024×1024"),
+        ("sponza_1280x720", "pareto_sponza.svg", "Sponza, caméra fixe, 1280×720"),
+        ("cornell_cam_1024", "pareto_cornell_cam.svg", "Cornell box, caméra mobile, 1024×1024"),
+        ("sponza_cam_1280x720", "pareto_sponza_cam.svg", "Sponza, caméra mobile, 1280×720"),
+    ]
+    for dirname, svg, title in figs:
+        rows = pareto_rows(dirname)
+        if not rows or "trim" not in rows[0]:
+            continue
+        series = []
+        for key, label in PARETO_NAMES:
+            pts = [(float(r["ms_mean"]), float(r["trim"]), pareto_label(r["method"], r["ppp"])) for r in rows if r["method"] == key]
+            series.append((label, pts))
+        if not any(pts for _, pts in series):
+            continue
+        scatter_lines(os.path.join(out, svg), "Erreur contre temps GPU : " + title,
+                      "RTX 4070, ray tracing matériel ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux",
+                      series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
 
 
 if __name__ == "__main__":

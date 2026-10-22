@@ -9,3 +9,7 @@ results/gpu_dev/
 results/ref_cornell_1024/*.png
 results/ref_sponza_*/*.png
 target-sh/
+results/ref_*/*.bin
+results/*_cam_1024/*/*.png
+results/*_cam_1280x720/*/*.png
+results/ref_*/*.png

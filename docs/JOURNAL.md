@@ -209,3 +209,28 @@
   biais), Cornell +8 %, scène de boîtes +13 % (4,14e-3 → 4,67e-3).
 - **Résultat Sponza 1280×720** : à temps moyen égal, KRC a 2,7 à 2,9× moins d'erreur que
   SHaRC ; à erreur égale, il est 3,6× plus rapide. Pics : p95 9,6 ms contre 4,5 ms.
+
+## v11 — caméra mobile et vrai SHaRC : l'avantage se réduit aux changements de lumière (commits 39b9eeb → …)
+
+- **Caméra mobile** : une vue et une référence par frame ; KRC évince les cellules
+  invisibles depuis 60 frames (même règle que l'exemple SHaRC), liste libre, reconstruction
+  de la table. Il faut ~2 cellules par pixel : en marchant dans Sponza en 1280×720, KRC
+  garde jusqu'à 1,35 M cellules vivantes (~460 Mo), contre 176 Mo fixes pour SHaRC.
+- **SHaRC officiel** (NVIDIA RTXGI, v1.8.3) porté en WGSL, fonction par fonction, avec les
+  paramètres de l'exemple de NVIDIA. Validé : avec des réglages généreux, il converge vers
+  la référence (relMSE* 6,8e-4, lum 0,99, Cornell statique).
+- **Correction d'une conclusion précédente** : les « 2,7 à 2,9× moins d'erreur que SHaRC à
+  temps égal » (v9, v10) étaient mesurés contre mon cache SHaRC-like, qui traçait 1 chemin
+  par pixel avec toute la machinerie de cellules de KRC. Le vrai SHaRC met à jour 4 % des
+  pixels et coûte 0,8 à 3 ms là où KRC en coûte 4 à 22.
+- **Résultats contre le vrai SHaRC** :
+  - En statique (caméra fixe ou mobile), SHaRC est aussi bon ou meilleur que KRC pour 3 à
+    25× moins de temps GPU.
+  - Sur la séquence complète, KRC a 3 à 18× moins d'erreur, presque entièrement grâce aux
+    changements de lumière : après l'extinction de la grande lampe, SHaRC reste 7× trop
+    clair (lum 7,5) pendant des dizaines de frames, KRC est à 0,96.
+  - Le mode « éclairage réactif » de SHaRC, prévu pour ce cas, n'a pas encore été testé :
+    l'avantage de KRC sur les lampes reste à confirmer contre lui.
+- **Coût de KRC en caméra mobile** : 12,6 ms par frame à 0,25 chemin/px en 1280×720, dont
+  5,8 ms d'insertion dans la table (pierres tombales, 3,7 M insertions par frame) et 3,6 ms
+  de résolution (toutes les cellules, visibles ou non, à chaque frame). Caméra fixe : 3,9 ms.

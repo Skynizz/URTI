@@ -11,9 +11,10 @@ Résultat principal (voir [docs/RESULTATS.md](docs/RESULTATS.md)) : à budget é
 l'erreur est 3× plus faible qu'un cache avec reset et 21× plus faible que le path
 tracing accumulé sur une séquence dynamique. Une scène statique converge vers ~0,01
 chemin/pixel/frame, et le coût d'un objet qui bouge ne croît pas avec la taille de la
-scène. Sur de vrais triangles (Cornell box, Sponza) avec ray tracing matériel et tout le
-pipeline sur GPU, KRC a 2,7 à 2,9× moins d'erreur qu'un cache de type SHaRC à temps GPU
-égal, avec des pics de coût les frames d'événement.
+scène. Sur de vrais triangles (Cornell box, Sponza) avec ray tracing matériel, comparé au vrai
+SHaRC de NVIDIA (portage WGSL validé) : KRC gagne nettement sur les changements de lumière,
+mais perd en statique, où SHaRC obtient la même qualité pour 3 à 25× moins de temps GPU.
+Voir RESULTATS §12.
 
 - Hypothèse, critique de l'idée initiale et protocole : [docs/HYPOTHESE.md](docs/HYPOTHESE.md)
 - Journal de bord : [docs/JOURNAL.md](docs/JOURNAL.md)
@@ -34,6 +35,9 @@ cargo run --release -- cornell 256      # Cornell box en triangles, ray query (K
 sh tools/fetch_sponza.sh && cargo run --release -- sponza 480   # Sponza
 cargo run --release -- pareto [1024 | sponza 1280]   # erreur contre temps GPU
 cargo run --release -- bias [cornell]   # luminance image / référence (biais)
+cargo run --release -- sponzacam 480    # caméra mobile (aussi cornellcam), KRC et SHaRC officiel
+cargo run --release -- sharccheck       # validation du portage SHaRC
+cargo run --release -- passes sponzacam # temps GPU par passe
 python tools/plots.py           # graphiques SVG dans results/
 ```
 

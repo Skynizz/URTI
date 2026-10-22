@@ -1,0 +1,5 @@
+défaut NVIDIA            | f0 relMSE* 3.52e-1 lum 0.413 | f9 relMSE* 2.02e-1 lum 0.831 | f49 relMSE* 6.10e-2 lum 0.923 | f299 relMSE* 4.75e-2 lum 0.980
+tous les pixels          | f0 relMSE* 7.20e-2 lum 0.811 | f9 relMSE* 1.78e-2 lum 0.910 | f49 relMSE* 7.36e-3 lum 0.958 | f299 relMSE* 6.24e-3 lum 1.003
++ accumulation 1024      | f0 relMSE* 7.19e-2 lum 0.812 | f9 relMSE* 1.80e-2 lum 0.911 | f49 relMSE* 7.20e-3 lum 0.949 | f299 relMSE* 4.00e-3 lum 0.977
++ voxels 8× plus fins    | f0 relMSE* 4.41e-1 lum 0.833 | f9 relMSE* 6.96e-2 lum 0.866 | f49 relMSE* 3.26e-2 lum 0.757 | f299 relMSE* 2.11e-2 lum 0.769
+KRC 1 chemin/px          | f0 relMSE* 1.70e-1 lum 0.995 | f9 relMSE* 2.61e-2 lum 0.972 | f49 relMSE* 1.11e-2 lum 0.988 | f299 relMSE* 6.33e-3 lum 0.988

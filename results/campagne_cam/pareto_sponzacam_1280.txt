@@ -1,0 +1,32 @@
+tri_krc         0.25 chemin/px : relMSE 1.053e0 (statique 2.46e0, dynamique 6.17e-1) | GPU médiane 17.56 ms, moyenne 20.17 ms, p95 26.03 ms
+tri_krc*        0.25 chemin/px : relMSE sans 0,1 % 7.782e-2 (statique 7.40e-2, dynamique 6.41e-2)
+tri_krc          0.5 chemin/px : relMSE 1.016e0 (statique 2.56e-1, dynamique 1.38e0) | GPU médiane 18.12 ms, moyenne 20.69 ms, p95 27.30 ms
+tri_krc*         0.5 chemin/px : relMSE sans 0,1 % 4.962e-2 (statique 4.18e-2, dynamique 4.45e-2)
+tri_krc            1 chemin/px : relMSE 1.106e0 (statique 1.14e-1, dynamique 1.23e0) | GPU médiane 19.69 ms, moyenne 22.00 ms, p95 27.59 ms
+tri_krc*           1 chemin/px : relMSE sans 0,1 % 3.049e-2 (statique 2.59e-2, dynamique 2.78e-2)
+tri_krc            2 chemin/px : relMSE 1.337e1 (statique 6.05e-2, dynamique 1.99e1) | GPU médiane 22.68 ms, moyenne 24.65 ms, p95 30.81 ms
+tri_krc*           2 chemin/px : relMSE sans 0,1 % 2.007e-2 (statique 1.71e-2, dynamique 1.90e-2)
+tri_krc            4 chemin/px : relMSE 1.318e-1 (statique 2.88e-1, dynamique 1.01e-1) | GPU médiane 27.82 ms, moyenne 29.92 ms, p95 35.37 ms
+tri_krc*           4 chemin/px : relMSE sans 0,1 % 1.405e-2 (statique 1.14e-2, dynamique 1.39e-2)
+tri_sharc          1 chemin/px : relMSE 5.725e-1 (statique 1.18e0, dynamique 5.18e-1) | GPU médiane 18.12 ms, moyenne 20.44 ms, p95 26.66 ms
+tri_sharc*         1 chemin/px : relMSE sans 0,1 % 8.066e-2 (statique 4.73e-2, dynamique 9.38e-2)
+tri_sharc          2 chemin/px : relMSE 2.457e-1 (statique 1.76e-1, dynamique 2.56e-1) | GPU médiane 20.68 ms, moyenne 23.02 ms, p95 28.98 ms
+tri_sharc*         2 chemin/px : relMSE sans 0,1 % 5.216e-2 (statique 3.08e-2, dynamique 6.16e-2)
+tri_sharc          4 chemin/px : relMSE 2.426e-1 (statique 1.43e-1, dynamique 2.16e-1) | GPU médiane 26.06 ms, moyenne 28.35 ms, p95 34.02 ms
+tri_sharc*         4 chemin/px : relMSE sans 0,1 % 3.432e-2 (statique 2.16e-2, dynamique 4.00e-2)
+tri_sharc_nv_s50  0.04 chemin/px : relMSE 4.089e-1 (statique 3.21e-1, dynamique 2.56e-1) | GPU médiane 0.90 ms, moyenne 0.90 ms, p95 0.96 ms
+tri_sharc_nv_s50*  0.04 chemin/px : relMSE sans 0,1 % 1.351e-1 (statique 3.04e-2, dynamique 1.77e-1)
+tri_sharc_nv_s50 0.11111111 chemin/px : relMSE 1.374e-1 (statique 2.41e-2, dynamique 1.82e-1) | GPU médiane 1.06 ms, moyenne 1.06 ms, p95 1.13 ms
+tri_sharc_nv_s50* 0.11111111 chemin/px : relMSE sans 0,1 % 1.225e-1 (statique 1.61e-2, dynamique 1.71e-1)
+tri_sharc_nv_s50  0.25 chemin/px : relMSE 1.379e-1 (statique 2.30e-2, dynamique 1.79e-1) | GPU médiane 1.35 ms, moyenne 1.37 ms, p95 1.47 ms
+tri_sharc_nv_s50*  0.25 chemin/px : relMSE sans 0,1 % 1.192e-1 (statique 1.11e-2, dynamique 1.71e-1)
+tri_sharc_nv_s50     1 chemin/px : relMSE 1.195e-1 (statique 1.11e-2, dynamique 1.71e-1) | GPU médiane 3.19 ms, moyenne 3.31 ms, p95 4.29 ms
+tri_sharc_nv_s50*     1 chemin/px : relMSE sans 0,1 % 1.158e-1 (statique 8.99e-3, dynamique 1.68e-1)
+tri_sharc_nv_s100  0.04 chemin/px : relMSE 4.228e-1 (statique 3.23e-1, dynamique 3.02e-1) | GPU médiane 1.07 ms, moyenne 1.06 ms, p95 1.13 ms
+tri_sharc_nv_s100*  0.04 chemin/px : relMSE sans 0,1 % 1.744e-1 (statique 6.44e-2, dynamique 2.05e-1)
+tri_sharc_nv_s100 0.11111111 chemin/px : relMSE 1.940e-1 (statique 5.14e-2, dynamique 2.12e-1) | GPU médiane 1.28 ms, moyenne 1.29 ms, p95 1.37 ms
+tri_sharc_nv_s100* 0.11111111 chemin/px : relMSE sans 0,1 % 1.380e-1 (statique 2.88e-2, dynamique 1.80e-1)
+tri_sharc_nv_s100  0.25 chemin/px : relMSE 1.916e-1 (statique 5.40e-2, dynamique 1.97e-1) | GPU médiane 1.66 ms, moyenne 1.68 ms, p95 1.77 ms
+tri_sharc_nv_s100*  0.25 chemin/px : relMSE sans 0,1 % 1.241e-1 (statique 1.56e-2, dynamique 1.72e-1)
+tri_sharc_nv_s100     1 chemin/px : relMSE 1.248e-1 (statique 1.16e-2, dynamique 1.75e-1) | GPU médiane 3.95 ms, moyenne 4.00 ms, p95 4.49 ms
+tri_sharc_nv_s100*     1 chemin/px : relMSE sans 0,1 % 1.162e-1 (statique 8.25e-3, dynamique 1.68e-1)

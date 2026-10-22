@@ -253,6 +253,18 @@ fn main() {
             },
             None => eprintln!("pas de GPU"),
         },
+        Some("passes") => match gpu::Gpu::new() {
+            Some(g) => {
+                let ppp = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+                let setup = match args.get(1).map(String::as_str) {
+                    Some("sponza") => rt::sponza_setup(1280, 720),
+                    Some("cornellcam") => rt::cornell_cam_setup(1024),
+                    _ => rt::sponza_cam_setup(1280, 720),
+                };
+                rt::passes(&g, &setup, ppp);
+            }
+            None => eprintln!("pas de GPU"),
+        },
         Some("sharccheck") => match gpu::Gpu::new() {
             Some(g) => match args.get(1).map(String::as_str) {
                 Some("sponza") => rt::sharc_check(&g, &rt::sponza_setup(480, 270)),

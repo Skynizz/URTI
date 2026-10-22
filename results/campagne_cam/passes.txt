@@ -1,0 +1,40 @@
+== sponzacam 1280x720, 0.25 chemin/px
+Krc : 12.81 ms/frame en moyenne, cellules vivantes max 1353952
+    insert           5.852 ms
+    resolve          3.645 ms
+    trace            0.537 ms
+    lookup           0.535 ms
+    gbuffer          0.358 ms
+    delta_trace1     0.335 ms
+    alloc_hist       0.292 ms
+    display          0.247 ms
+    delta_trace2     0.246 ms
+    alloc_emit       0.244 ms
+    alloc_scan1      0.115 ms
+    alloc_scan3      0.114 ms
+Sharc : 0.84 ms/frame en moyenne, cellules vivantes max 0
+    gbuffer          0.349 ms
+    sharc_resolve    0.209 ms
+    sharc_update     0.146 ms
+    sharc_query      0.139 ms
+    reset_ctr        0.002 ms
+== sponza (caméra fixe) 1280x720, 0.25 chemin/px
+Krc : 3.89 ms/frame en moyenne, cellules vivantes max 314294
+    resolve          1.032 ms
+    trace            0.520 ms
+    lookup           0.484 ms
+    delta_trace1     0.389 ms
+    gbuffer          0.331 ms
+    insert           0.266 ms
+    display          0.223 ms
+    delta_trace2     0.171 ms
+    alloc_hist       0.132 ms
+    alloc_emit       0.116 ms
+    alloc_scan3      0.044 ms
+    alloc_scan2      0.042 ms
+Sharc : 0.79 ms/frame en moyenne, cellules vivantes max 0
+    gbuffer          0.335 ms
+    sharc_resolve    0.176 ms
+    sharc_query      0.147 ms
+    sharc_update     0.129 ms
+    reset_ctr        0.002 ms

@@ -12,9 +12,20 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Cache, allocation, événements sur GPU | ✅ pipeline entièrement GPU, stable sur 12 000 frames |
 | Rayons matériels (cœurs RT) | ✅ ray query Vulkan, BLAS/TLAS, deux TLAS (avant/après) |
 | Géométrie réelle (triangles, BVH) | ✅ Cornell box, Sponza (262 k triangles) |
-| Comparaison en ms contre un cache standard | ✅ 2,7–2,9× moins d'erreur à temps égal (Cornell, Sponza) ; pics d'événement à résoudre |
+| Comparaison en ms contre un cache standard | ⚠️ contre le vrai SHaRC (portage validé) : KRC perd en statique (3 à 25× plus cher), gagne nettement sur les changements de lumière |
 | Absence de biais sur radiance à queue lourde | ⚠️ deux biais corrigés ; ~3 % résiduel en statique, retour lent après extinction |
-| Caméra mobile, spéculaire | à faire |
+| Caméra mobile | ✅ qualité ; ❌ coût (12,6 ms, 1,35 M cellules à 1280×720) |
+| Spéculaire | à faire |
+
+## Prochaine décision (après la comparaison au vrai SHaRC)
+
+1. Tester le mode « éclairage réactif » de SHaRC : si KRC garde son avantage sur les lampes,
+   la piste continue.
+2. **Hybride** : SHaRC officiel pour l'état stable, et seulement les corrections corrélées
+   de KRC (graphe de dépendances, chemins corrélés) appliquées à ses voxels lors des
+   événements.
+3. À défaut, réduire le coût fixe de KRC : insertion fusionnée avec la recherche, résolution
+   limitée aux cellules vues ou échantillonnées, éviction sans pierres tombales.
 
 ## Étapes, dans l'ordre
 
