@@ -105,7 +105,8 @@ struct FrameU {
     sh_stale: u32,
     sh_down: u32,
     cell_px: f32,
-    pad5: [u32; 2],
+    rec_every: u32,
+    tau: f32,
 }
 
 /// Méthode du pipeline.
@@ -154,6 +155,8 @@ const F_RESAMPLE: u32 = 128;
 const F_REUSE: u32 = 256;
 const F_DEMOD: u32 = 512;
 const F_SEED: u32 = 1024;
+const F_SUPPORT: u32 = 2048;
+const F_MULTI: u32 = 4096;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -177,6 +180,9 @@ pub struct GpuFrame {
     pub evicted: u32,
     pub free: u32,
     pub _tombs: u32,
+    /// segments tracés par les chemins ordinaires, et chemins arrêtés sur le cache
+    pub segs: u32,
+    pub rs_hits: u32,
     /// genre de chaque pixel (0 vide, 1 lampe, 2 surface), si l'image a été relue
     pub kinds: Vec<u8>,
     pub probe_rays: usize,
@@ -232,12 +238,20 @@ pub struct GpuKrc<'a> {
     pub resample: bool,
     /// largeur d'une cellule, en pixels (à la distance de la surface)
     pub cell_px: f32,
+    /// un chemin ordinaire sur `rec_every` enregistre ses dépendances (1 : tous)
+    pub rec_every: u32,
+    /// qualité cible (erreur relative de la moyenne d'une cellule) ; 0 : budget fixe
+    pub tau: f32,
     /// réutilisation des sommets : le 1er rebond nourrit aussi la cellule visible qu'il touche
     pub reuse: bool,
     /// démodulation matériau (radiance / albédo dans les cellules)
     pub demod: bool,
     /// cellule neuve initialisée depuis le niveau voisin
     pub seed_levels: bool,
+    /// cellules de support hors champ pour le rééchantillonnage
+    pub support: bool,
+    /// cache à deux résolutions (cellules fines et 2× plus grandes)
+    pub multi: bool,
     pending: Option<GpuEvent>,
     _free_buf: wgpu::Buffer,
     _vis_buf: wgpu::Buffer,
@@ -253,7 +267,8 @@ pub struct GpuKrc<'a> {
     sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 36] = [
+const ENTRIES: [&str; 37] = [
+    "prep_vis2",
     "evict_sweep",
     "sharc_update",
     "sharc_resolve",
@@ -465,11 +480,17 @@ impl<'a> GpuKrc<'a> {
             n_post: 16.0,
             s2_hist: true,
             zero_cap: true,
-            resample: false,
-            cell_px: 4.0,
+            // KRC v2 (RESULTATS §13) : rééchantillonnage, a priori du niveau voisin, démodulation,
+            // cellules de 8 px, qualité cible 5 %
+            resample: true,
+            cell_px: 8.0,
+            rec_every: 1,
+            tau: 0.05,
             reuse: false,
-            demod: false,
-            seed_levels: false,
+            demod: true,
+            seed_levels: true,
+            support: false,
+            multi: false,
             pending: None,
             clock: 0,
             rebuild: false,
@@ -524,7 +545,8 @@ impl<'a> GpuKrc<'a> {
             sh_stale: self.sh.stale_frames,
             sh_down: self.sh.downscale,
             cell_px: self.cell_px,
-            pad5: [0; 2],
+            rec_every: self.rec_every,
+            tau: self.tau,
         }
     }
 
@@ -753,6 +775,12 @@ impl<'a> GpuKrc<'a> {
         if self.seed_levels {
             flags |= F_SEED;
         }
+        if self.support {
+            flags |= F_SUPPORT;
+        }
+        if self.multi {
+            flags |= F_MULTI;
+        }
         if let Some(e) = ev {
             if !self.sharc {
                 flags |= F_EVENT;
@@ -826,6 +854,7 @@ impl<'a> GpuKrc<'a> {
             }
             plan.push(("prep_reg", Dispatch::Direct(1)));
             plan.push(("trace", Dispatch::Indirect(24)));
+            plan.push(("prep_vis2", Dispatch::Direct(1)));
             plan.push(("evict_sweep", Dispatch::Direct(self.cell_cap.div_ceil(8 * 64))));
             plan.push(("resolve", vis));
             plan.push(("display", px));
@@ -895,6 +924,8 @@ impl<'a> GpuKrc<'a> {
             evicted: ctr[C_EVICT],
             free: ctr[C_FREE],
             _tombs: ctr[C_TOMB],
+            segs: ctr[25],
+            rs_hits: ctr[26],
             passes: plan
                 .iter()
                 .enumerate()

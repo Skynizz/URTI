@@ -253,73 +253,22 @@ fn main() {
             },
             None => eprintln!("pas de GPU"),
         },
-        Some("duel") => match gpu::Gpu::new() {
+        Some("duel") | Some("statique") => match gpu::Gpu::new() {
             Some(g) => {
-                use gpu_krc::{Method, ShParams};
                 let setup = match args.get(1).map(String::as_str) {
                     Some("sponza") => rt::sponza_setup(480, 270),
                     Some("cornellcam") => rt::cornell_cam_setup(256),
                     Some("cornell") => rt::cornell_setup(256),
                     _ => rt::sponza_cam_setup(480, 270),
                 };
-                let d = ShParams::default();
-                let krcs = |name, ppp, resample, cell_px, reuse, demod, seed| rt::DuelCfg {
-                    name,
-                    method: Method::Krc,
-                    ppp,
-                    resample,
-                    cell_px,
-                    reuse,
-                    demod,
-                    seed,
-                    sh: d,
-                };
-                let krcd = |name, ppp, resample, cell_px, reuse, demod| krcs(name, ppp, resample, cell_px, reuse, demod, false);
-                let krcr = |name, ppp, resample, cell_px, reuse| krcd(name, ppp, resample, cell_px, reuse, false);
-                let krcc = |name, ppp, resample, cell_px| krcr(name, ppp, resample, cell_px, false);
-                let krc = |name, ppp, resample| krcc(name, ppp, resample, 4.0);
-                let nv = |name, down| rt::DuelCfg {
-                    name,
-                    method: Method::Sharc,
-                    ppp: 1.0,
-                    resample: false,
-                    cell_px: 4.0,
-                    reuse: false,
-                    demod: false,
-                    seed: false,
-                    sh: ShParams { downscale: down, ..d },
-                };
-                let all = [
-                    krc("krc 1", 1.0, false),
-                    krc("krc 0.25", 0.25, false),
-                    krc("krc+resample 1", 1.0, true),
-                    krc("krc+resample 0.25", 0.25, true),
-                    krcc("krc+rs cell8 1", 1.0, true, 8.0),
-                    krcc("krc+rs cell8 0.25", 0.25, true, 8.0),
-                    krcc("krc+rs cell16 1", 1.0, true, 16.0),
-                    krcc("krc+rs cell16 0.25", 0.25, true, 16.0),
-                    krcr("krc+rs+ru cell8 1", 1.0, true, 8.0, true),
-                    krcr("krc+rs+ru cell8 0.25", 0.25, true, 8.0, true),
-                    krcr("krc+rs+ru cell16 0.25", 0.25, true, 16.0, true),
-                    krcd("krc+rs+dm cell8 1", 1.0, true, 8.0, false, true),
-                    krcd("krc+rs+dm cell8 0.25", 0.25, true, 8.0, false, true),
-                    krcd("krc+rs+dm cell16 1", 1.0, true, 16.0, false, true),
-                    krcd("krc+rs+dm cell16 0.25", 0.25, true, 16.0, false, true),
-                    krcs("krc+rs+sd cell8 1", 1.0, true, 8.0, false, false, true),
-                    krcs("krc+rs+sd cell8 0.25", 0.25, true, 8.0, false, false, true),
-                    krcs("krc+rs+sd cell16 0.25", 0.25, true, 16.0, false, false, true),
-                    krcs("krc+rs+sd+dm cell8 1", 1.0, true, 8.0, false, true, true),
-                    krcs("krc+rs+sd+dm cell8 0.25", 0.25, true, 8.0, false, true, true),
-                    krcs("krc+rs+sd+dm cell16 0.25", 0.25, true, 16.0, false, true, true),
-                    nv("sharc_nv 1px/5x5", 5),
-                    nv("sharc_nv 1px/1x1", 1),
-                ];
                 let only = std::env::var("KRC_DUEL").ok();
-                let cfgs: Vec<rt::DuelCfg> = all
-                    .into_iter()
-                    .filter(|c| only.as_ref().is_none_or(|o| o.split(',').any(|x| c.name.starts_with(x))))
-                    .collect();
-                rt::duel(&g, &setup, &cfgs);
+                let cfgs: Vec<rt::DuelCfg> =
+                    duel_cfgs().into_iter().filter(|c| only.as_ref().is_none_or(|o| o.split(',').any(|x| c.name.starts_with(x)))).collect();
+                if args[0] == "duel" {
+                    rt::duel(&g, &setup, &cfgs);
+                } else {
+                    rt::static_conv(&g, &setup, &cfgs);
+                }
             }
             None => eprintln!("pas de GPU"),
         },
@@ -357,4 +306,162 @@ fn main() {
         },
         _ => eprintln!("usage : krc refs | run [méthodes...] | all | scale | bench"),
     }
+}
+
+/// Configurations du duel KRC / SHaRC (filtrées par KRC_DUEL, préfixes séparés par des virgules).
+fn duel_cfgs() -> Vec<rt::DuelCfg> {
+    use gpu_krc::{Method, ShParams};
+    let d = ShParams::default();
+    let krcs = |name, ppp, resample, cell_px, reuse, demod, seed| rt::DuelCfg {
+        name,
+        method: Method::Krc,
+        ppp,
+        resample,
+        cell_px,
+        reuse,
+        demod,
+        seed,
+        support: false,
+        tau: 0.0,
+        multi: false,
+        sh: d,
+    };
+    let krcd = |name, ppp, resample, cell_px, reuse, demod| krcs(name, ppp, resample, cell_px, reuse, demod, false);
+    let krcr = |name, ppp, resample, cell_px, reuse| krcd(name, ppp, resample, cell_px, reuse, false);
+    let krcc = |name, ppp, resample, cell_px| krcr(name, ppp, resample, cell_px, false);
+    let krc = |name, ppp, resample| krcc(name, ppp, resample, 4.0);
+    let nv = |name, down| rt::DuelCfg {
+        name,
+        method: Method::Sharc,
+        ppp: 1.0,
+        resample: false,
+        cell_px: 4.0,
+        reuse: false,
+        demod: false,
+        seed: false,
+        support: false,
+        tau: 0.0,
+        multi: false,
+        sh: ShParams { downscale: down, ..d },
+    };
+    let all = [
+        krc("krc 1", 1.0, false),
+        krc("krc 0.25", 0.25, false),
+        krc("krc+resample 1", 1.0, true),
+        krc("krc+resample 0.25", 0.25, true),
+        krcc("krc+rs cell8 1", 1.0, true, 8.0),
+        krcc("krc+rs cell8 0.25", 0.25, true, 8.0),
+        krcc("krc+rs cell16 1", 1.0, true, 16.0),
+        krcc("krc+rs cell16 0.25", 0.25, true, 16.0),
+        krcr("krc+rs+ru cell8 1", 1.0, true, 8.0, true),
+        krcr("krc+rs+ru cell8 0.25", 0.25, true, 8.0, true),
+        krcr("krc+rs+ru cell16 0.25", 0.25, true, 16.0, true),
+        krcd("krc+rs+dm cell8 1", 1.0, true, 8.0, false, true),
+        krcd("krc+rs+dm cell8 0.25", 0.25, true, 8.0, false, true),
+        krcd("krc+rs+dm cell16 1", 1.0, true, 16.0, false, true),
+        krcd("krc+rs+dm cell16 0.25", 0.25, true, 16.0, false, true),
+        krcs("krc+rs+sd cell8 1", 1.0, true, 8.0, false, false, true),
+        krcs("krc+rs+sd cell8 0.25", 0.25, true, 8.0, false, false, true),
+        krcs("krc+rs+sd cell16 0.25", 0.25, true, 16.0, false, false, true),
+        krcs("krc+rs+sd+dm cell8 1", 1.0, true, 8.0, false, true, true),
+        krcs("krc+rs+sd+dm cell8 0.25", 0.25, true, 8.0, false, true, true),
+        krcs("krc+rs+sd+dm cell16 0.25", 0.25, true, 16.0, false, true, true),
+        krcs("krc+rs+sd+ru cell8 1", 1.0, true, 8.0, true, false, true),
+        krcs("krc+rs+sd+ru cell16 0.25", 0.25, true, 16.0, true, false, true),
+        krcs("krc+rs+sd+dm cell4 1", 1.0, true, 4.0, false, true, true),
+        krcs("krc+rs+sd+dm cell6 1", 1.0, true, 6.0, false, true, true),
+        krcs("krc+rs+sd+dm cell6 0.5", 0.5, true, 6.0, false, true, true),
+        nv("sharc_nv 1px/5x5", 5),
+        nv("sharc_nv 1px/1x1", 1),
+    ];
+    let mut v = all.to_vec();
+    for (name, cell, ppp) in [("v2m cell4 0.5", 4.0f32, 0.5f32), ("v2m cell4 1", 4.0, 1.0), ("v2m cell6 0.5", 6.0, 0.5), ("v2m cell6 0.25", 6.0, 0.25)] {
+        v.push(rt::DuelCfg {
+            name,
+            method: Method::Krc,
+            ppp,
+            resample: true,
+            cell_px: cell,
+            reuse: false,
+            demod: true,
+            seed: true,
+            support: false,
+            tau: 0.05,
+            multi: true,
+            sh: d,
+        });
+    }
+    for (name, cell, ppp) in [
+        ("v2 cell8 0.25", 8.0f32, 0.25f32),
+        ("v2 cell8 2", 8.0, 2.0),
+        ("v2 cell4 1", 4.0, 1.0),
+        ("v2 cell6 0.5", 6.0, 0.5),
+        ("v2 cell8 0.5", 8.0, 0.5),
+        ("v2 cell8 1", 8.0, 1.0),
+        ("v2 cell12 0.25", 12.0, 0.25),
+    ] {
+        v.push(rt::DuelCfg {
+            name,
+            method: Method::Krc,
+            ppp,
+            resample: true,
+            cell_px: cell,
+            reuse: false,
+            demod: true,
+            seed: true,
+            support: false,
+            tau: 0.05,
+            multi: false,
+            sh: d,
+        });
+    }
+    for (name, tau) in [("krc+cible 3% cell4", 0.03f32), ("krc+cible 5% cell4", 0.05), ("krc+cible 8% cell4", 0.08)] {
+        v.push(rt::DuelCfg {
+            name,
+            method: Method::Krc,
+            ppp: 1.0,
+            resample: true,
+            cell_px: 4.0,
+            reuse: false,
+            demod: true,
+            seed: true,
+            support: false,
+            tau,
+            multi: false,
+            sh: d,
+        });
+    }
+    for (name, ppp, cell) in [("krc+sup cell4 1", 1.0f32, 4.0f32), ("krc+sup cell6 0.5", 0.5, 6.0), ("krc+sup cell8 0.25", 0.25, 8.0), ("krc+sup cell6 1", 1.0, 6.0)] {
+        v.push(rt::DuelCfg {
+            name,
+            method: Method::Krc,
+            ppp,
+            resample: true,
+            cell_px: cell,
+            reuse: false,
+            demod: true,
+            seed: true,
+            support: true,
+            tau: 0.0,
+        multi: false,
+            sh: d,
+        });
+    }
+    for down in [3u32, 2] {
+        v.push(rt::DuelCfg {
+            name: if down == 3 { "sharc_nv 1px/3x3" } else { "sharc_nv 1px/2x2" },
+            method: Method::Sharc,
+            ppp: 1.0,
+            resample: false,
+            cell_px: 4.0,
+            reuse: false,
+            demod: false,
+            seed: false,
+            support: false,
+        tau: 0.0,
+        multi: false,
+            sh: ShParams { downscale: down, ..d },
+        });
+    }
+    v
 }

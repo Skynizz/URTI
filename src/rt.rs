@@ -651,13 +651,10 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
     // est sa densité de mise à jour : 1 pixel par bloc d×d, soit 1/d² chemin par pixel.
     let mut variants: Vec<(String, Method, f32, ShParams)> = Vec::new();
     let d = ShParams::default();
-    for ppp in [0.25f32, 0.5, 1.0, 2.0, 4.0] {
+    for ppp in [0.25f32, 0.5, 1.0, 2.0] {
         variants.push(("tri_krc".into(), Method::Krc, ppp, d));
     }
-    for ppp in [1.0f32, 2.0, 4.0] {
-        variants.push(("tri_sharc".into(), Method::SharcLike, ppp, d));
-    }
-    for scale in [50.0f32, 100.0] {
+    for scale in [50.0f32] {
         for down in [5u32, 3, 2, 1] {
             let name = format!("tri_sharc_nv_s{scale}");
             variants.push((
@@ -1070,8 +1067,14 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         if let Some(c) = env("KRC_CELL").and_then(|c| c.parse().ok()) {
             k.cell_px = c;
         }
+        if let Some(r) = env("KRC_REC").and_then(|c| c.parse().ok()) {
+            k.rec_every = r;
+        }
+        k.demod = env("KRC_DM").is_some();
+        k.support = env("KRC_SUP").is_some();
         let mut sum: Vec<(&'static str, f64)> = Vec::new();
         let (mut live, mut total) = (0u32, 0.0);
+        let (mut segs, mut paths, mut hits) = (0u64, 0u64, 0u64);
         let mut prev = at(0);
         for t in 0..FRAMES {
             let scene = at(t);
@@ -1080,6 +1083,9 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
             prev = scene;
             total += f.gpu_ms() / FRAMES as f64;
             live = live.max(f.cells.saturating_sub(f.free));
+            segs += f.segs as u64;
+            paths += f.regular_paths as u64;
+            hits += f.rs_hits as u64;
             for (name, ms) in &f.passes {
                 match sum.iter_mut().find(|e| e.0 == *name) {
                     Some(e) => e.1 += ms / FRAMES as f64,
@@ -1089,6 +1095,13 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         }
         sum.sort_by(|a, b| b.1.total_cmp(&a.1));
         println!("{method:?} : {total:.2} ms/frame en moyenne, cellules vivantes max {live}");
+        if method == Method::Krc {
+            println!(
+                "    {:.2} segments par chemin ordinaire, {:.0} % arrêtés sur le cache",
+                segs as f64 / paths.max(1) as f64,
+                100.0 * hits as f64 / paths.max(1) as f64
+            );
+        }
         for (name, ms) in sum.iter().take(12) {
             println!("    {name:<16} {ms:.3} ms");
         }
@@ -1106,6 +1119,9 @@ pub struct DuelCfg {
     pub reuse: bool,
     pub demod: bool,
     pub seed: bool,
+    pub support: bool,
+    pub tau: f32,
+    pub multi: bool,
     pub sh: crate::gpu_krc::ShParams,
 }
 
@@ -1134,6 +1150,9 @@ pub fn duel(gpu: &Gpu, setup: &TriSetup, cfgs: &[DuelCfg]) {
             k.reuse = c.reuse;
             k.demod = c.demod;
             k.seed_levels = c.seed;
+        k.support = c.support;
+        k.tau = c.tau;
+        k.multi = c.multi;
             k.sh = c.sh;
             for pass in 0..2 {
                 k.readback = pass == 0;
@@ -1175,6 +1194,54 @@ pub fn duel(gpu: &Gpu, setup: &TriSetup, cfgs: &[DuelCfg]) {
     }
     std::fs::create_dir_all("results/duel").unwrap();
     let path = format!("results/duel/{}.txt", setup.name);
+    let prev = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(path, prev + &out).unwrap();
+}
+
+/// `krc statique [sponza|cornell]` : convergence en scène statique, caméra fixe, 300 frames.
+/// Erreur aux frames 9, 29, 99, 299 et temps GPU moyen (sans relecture, second passage).
+pub fn static_conv(gpu: &Gpu, setup: &TriSetup, cfgs: &[DuelCfg]) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    let (view, at) = (setup.view, setup.at);
+    let scene = at(39);
+    let grid = Grid::fit(&scene.bounds);
+    let r =
+        load_raw(&format!("results/ref_{}/{}.bin", setup.name, setup.ref_key(39)), view.len()).expect("références manquantes");
+    let mut out = String::new();
+    for c in cfgs {
+        let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene), c.method, 5);
+        k.ppp = c.ppp;
+        k.resample = c.resample;
+        k.cell_px = c.cell_px;
+        k.reuse = c.reuse;
+        k.demod = c.demod;
+        k.seed_levels = c.seed;
+        k.support = c.support;
+        k.tau = c.tau;
+        k.multi = c.multi;
+        k.sh = c.sh;
+        let mut line = format!("{:<28}", c.name);
+        for t in 0..300 {
+            let f = k.frame_tri(&scene, &scene, t);
+            if [9, 29, 99, 299].contains(&t) {
+                let (_, trim, lr) = frame_err(&f.image, &f.kinds, &r);
+                line += &format!(" | f{t} {trim:.2e} (lum {lr:.2})");
+            }
+        }
+        k.readback = false;
+        let mut ms = 0.0;
+        for t in 300..360 {
+            ms += k.frame_tri(&scene, &scene, t).gpu_ms() / 60.0;
+        }
+        line += &format!(" | {ms:.2} ms");
+        println!("{line}");
+        out += &line;
+        out += "\n";
+    }
+    std::fs::create_dir_all("results/duel").unwrap();
+    let path = format!("results/duel/statique_{}.txt", setup.name);
     let prev = std::fs::read_to_string(&path).unwrap_or_default();
     std::fs::write(path, prev + &out).unwrap();
 }

@@ -59,6 +59,8 @@ const C_TOMB: u32 = 21u;     // pierres tombales dans la table de hachage (persi
 const C_EVICT: u32 = 22u;    // cellules évincées dans la frame
 const C_POP: u32 = 23u;      // cellules prises dans la liste libre pendant l'insertion
 const C_NVIS: u32 = 24u;     // cellules visibles dans la frame (vis_list)
+const C_SEGS: u32 = 25u;     // segments tracés par les chemins ordinaires
+const C_RSHIT: u32 = 26u;    // chemins ordinaires arrêtés sur le cache
 const TOMB: u32 = 0xffffffffu;
 // Caméra mobile : une cellule invisible depuis STALE_FRAMES frames est évincée (même règle que
 // le staleFrameNumMax de l'exemple SHaRC de NVIDIA, 60).
@@ -110,6 +112,20 @@ const F_DEMOD: u32 = 512u;
 // cellule neuve initialisée depuis la cellule du niveau voisin au même endroit (la caméra qui
 // avance fait changer les surfaces de niveau ; comme SHARC_BLEND_ADJACENT_LEVELS)
 const F_SEED: u32 = 1024u;
+// cellules de support hors champ (comme les voxels SHaRC aux sommets secondaires) : un chemin
+// ordinaire qui ne trouve pas de cellule mûre au sommet de rééchantillonnage en crée une (ou
+// nourrit la jeune cellule trouvée) avec la radiance de la suite de son chemin
+const F_SUPPORT: u32 = 2048u;
+// cache à deux résolutions : les K/2 premiers emplacements d'un pixel visent des cellules fines,
+// les K/2 suivants des cellules 2× plus grandes ; chaque chemin nourrit les deux niveaux ;
+// l'affichage passe du grossier au fin quand le fin a assez d'échantillons
+const F_MULTI: u32 = 4096u;
+const MULTI_N: f32 = 32.0;
+
+fn slot_dist(dist: f32, slot: u32) -> f32 {
+    if ((fr.flags & F_MULTI) != 0u && slot >= K / 2u) { return dist * 2.0; }
+    return dist;
+}
 const SEED_N: f32 = 8.0;
 
 fn demod(a: vec3<f32>) -> vec3<f32> {
@@ -133,7 +149,7 @@ struct Frame {
     // SHaRC officiel (sharc.wgsl)
     sh_cam_prev: vec3<f32>, sh_scene_scale: f32,
     sh_rscale: f32, sh_cap: u32, sh_accum: u32, sh_stale: u32,
-    sh_down: u32, cell_px: f32, pad6: u32, pad7: u32, // cell_px : largeur d'une cellule en pixels
+    sh_down: u32, cell_px: f32, rec_every: u32, tau: f32, // cell_px : largeur d'une cellule en pixels ; rec_every : 1 chemin ordinaire sur N enregistre ses dépendances
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -182,6 +198,12 @@ var<private> m_lights: u32;
 var<private> m_aff: bool;     // le chemin touche-t-il une région de l'événement ?
 var<private> resample: bool;  // chemins ordinaires seulement (jamais les chemins corrélés)
 var<private> rs_depth: u32;
+var<private> n_segs: u32;
+var<private> sp_cell: u32;
+var<private> sp_prefix: vec3<f32>;
+var<private> sp_beta: vec3<f32>;
+var<private> sp_albedo: vec3<f32>;
+var<private> rs_hit: bool;
 var<private> reuse: bool;
 var<private> ru_cell: u32;       // cellule du 1er rebond (0xffffffff : aucune)
 var<private> ru_prefix: vec3<f32>;
@@ -204,6 +226,15 @@ fn rnd() -> f32 {
 fn seed_rng(a: u32, b: u32, c: u32) {
     rng = pcg(a ^ pcg(b ^ pcg(c + fr.seed)));
 }
+
+// sommes de radiance par cellule en virgule fixe (simple atomicAdd, comme SHaRC) : les boucles
+// de CAS flottant se bousculent quand des dizaines de chemins visent la même cellule
+const FX: f32 = 16384.0;
+fn add_fx(i: u32, v: f32) {
+    let q = u32(max(v, 0.0) * FX + 0.5);
+    if (q != 0u) { atomicAdd(&acc[i], q); }
+}
+fn ld_fx(i: u32) -> f32 { return f32(atomicLoad(&acc[i])) / FX; }
 
 fn add_f32(i: u32, v: f32) {
     var old = atomicLoad(&acc[i]);
@@ -440,12 +471,14 @@ fn cache_at(p: vec3<f32>, n: vec3<f32>, dist: f32, albedo: vec3<f32>) -> CacheHi
         {
             let c = c1 + 1u;
             if (c == 0u) { return r; }
-            let cell = cells[c - 1u];
-            if (cell.n < RESAMPLE_N_MIN) { return r; }
+            // champs lus un par un : la cellule entière (144 octets) coûte cher dans la boucle de traçage
+            if (cells[c - 1u].n < RESAMPLE_N_MIN) { return r; }
             r.found = true;
-            r.mean = cell.mean * demod(albedo);
-            let b = (c - 1u) * ACC;
-            r.deps = cell.deps_prev | vec2<u32>(atomicLoad(&acc[b + A_DEPS]), atomicLoad(&acc[b + A_DEPS + 1u]));
+            r.mean = cells[c - 1u].mean * demod(albedo);
+            if (rec_on) {
+                let b = (c - 1u) * ACC;
+                r.deps = cells[c - 1u].deps_prev | vec2<u32>(atomicLoad(&acc[b + A_DEPS]), atomicLoad(&acc[b + A_DEPS + 1u]));
+            }
             return r;
         }
     }
@@ -507,6 +540,7 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
         }
         let d = cosine_dir(n);
         beta = beta * albedo;
+        n_segs++;
         let h = intersect(origin, d);
         if (!h.found) {
             mark_segment(origin, origin + d * MISS_LEN);
@@ -533,11 +567,42 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
         // rééchantillonnage : au sommet rs_depth (1 ou 2), si une cellule existe assez loin (le
         // segment dépasse la cellule, pour ne pas se relire soi-même), on prend sa moyenne ; la
         // cellule lue transmet ses dépendances (la détection d'événements reste conservatrice)
-        if (resample && depth + 1u >= rs_depth) {
+        if (resample && depth + 1u >= rs_depth && sp_cell == 0xffffffffu) {
             let dist = length(p - fr.eye);
             if (h.t > cell_size(dist) * 1.7320508) {
-                let ch = cache_at(p, n, dist, albedo);
+                let jit = vec2<f32>(rnd() - 0.5, rnd() - 0.5);
+                if ((fr.flags & F_SUPPORT) != 0u) {
+                    // cellule de support : trouvée et mûre → arrêt ; sinon créée ou nourrie
+                    let key = key_at(p, n, dist, jit);
+                    let sc = insert_key(key);
+                    if (sc != 0xffffffffu && atomicLoad(&vals[(cells[sc].slot - 1u) & fr.table_mask]) != 0u
+                        && cells[sc].n >= RESAMPLE_N_MIN) {
+                        if (depth == 0u) { ru_cell = 0xffffffffu; }
+                        rs_hit = true;
+                        res.l += beta * cells[sc].mean * demod(albedo);
+                        if (rec_on) {
+                            let b = sc * ACC;
+                            let dps = cells[sc].deps_prev | vec2<u32>(atomicLoad(&acc[b + A_DEPS]), atomicLoad(&acc[b + A_DEPS + 1u]));
+                            m_trav = m_trav | dps;
+                            m_vsup = m_vsup | dps;
+                        }
+                        break;
+                    }
+                    if (sc != 0xffffffffu) {
+                        sp_cell = sc;
+                        sp_prefix = res.l;
+                        sp_beta = beta;
+                        sp_albedo = albedo;
+                    }
+                }
+                var ch: CacheHit;
+                ch.found = false;
+                if ((fr.flags & F_SUPPORT) == 0u) { ch = cache_at(p, n, dist, albedo); }
                 if (ch.found) {
+                    // arrêt sur le cache au 1er rebond : la suite n'est pas un échantillon neuf de la
+                    // cellule touchée (SHaRC ne compte pas non plus d'échantillon dans ce cas)
+                    if (depth == 0u) { ru_cell = 0xffffffffu; }
+                    rs_hit = true;
                     res.l += beta * ch.mean;
                     if (rec_on) {
                         m_trav = m_trav | ch.deps;
@@ -632,7 +697,7 @@ fn jitter(k: u32, slot: u32) -> vec2<f32> {
 
 fn cell_key(k: u32, slot: u32) -> u32 {
     let g = gbuf[k];
-    return key_at(g.p, g.n, g.dist, jitter(k, slot));
+    return key_at(g.p, g.n, slot_dist(g.dist, slot), jitter(k, slot));
 }
 
 fn find_cell(key: u32) -> u32 {
@@ -643,6 +708,38 @@ fn find_cell(key: u32) -> u32 {
         if (kk == 0u) { break; }
         h = (h + 1u) & fr.table_mask;
     }
+    return 0xffffffffu;
+}
+
+// insère une clé (ou la retrouve) ; renvoie l'indice de la cellule, ou 0xffffffff si la table
+// ou le tableau de cellules est plein
+fn insert_key(key: u32) -> u32 {
+    var h = key & fr.table_mask;
+    for (var probe = 0u; probe < 64u; probe++) {
+        let kk = atomicLoad(&keys[h]);
+        if (kk == key) { return atomicLoad(&vals[h]) - 1u; }
+        if (kk != 0u) {
+            h = (h + 1u) & fr.table_mask;
+            continue;
+        }
+        let r = atomicCompareExchangeWeak(&keys[h], 0u, key);
+        if (r.exchanged) {
+            let c = alloc_cell();
+            if (c == 0xffffffffu) {
+                atomicAdd(&ctr[C_OVERFLOW], 1u);
+                return c;
+            }
+            cells[c].key = key;
+            cells[c].slot = h + 1u;
+            cells[c].seen = fr.clock;
+            atomicStore(&vals[h], c + 1u);
+            return c;
+        }
+        if (r.old_value == key) { return atomicLoad(&vals[h]) - 1u; }
+        if (r.old_value == 0u) { probe--; continue; }
+        h = (h + 1u) & fr.table_mask;
+    }
+    atomicAdd(&ctr[C_OVERFLOW], 1u);
     return 0xffffffffu;
 }
 
@@ -785,7 +882,7 @@ fn insert(@builtin(global_invocation_id) gid: vec3<u32>) {
             cells[c].seen = fr.clock;
             if ((fr.flags & F_SEED) != 0u) {
                 let g = gbuf[k];
-                seed_cell(c, g.p, g.n, g.dist, jitter(k, slot));
+                seed_cell(c, g.p, g.n, slot_dist(g.dist, slot), jitter(k, slot));
             }
             atomicStore(&vals[h], c + 1u);
             return;
@@ -983,10 +1080,21 @@ fn prep_cells() {
     ind[14] = 1u;
     let nf = atomicLoad(&ctr[C_FREE]);
     atomicStore(&ctr[C_FREE], nf - min(atomicLoad(&ctr[C_POP]), nf));
+    atomicStore(&ctr[C_POP], 0u);
     let n = min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap);
     ind[9] = (n + 63u) / 64u;
     ind[10] = 1u;
     ind[11] = 1u;
+}
+
+// après le traçage : la liste à résoudre a pu grandir (cellules de support), et des cellules
+// ont pu être prises dans la liste libre
+@compute @workgroup_size(1)
+fn prep_vis2() {
+    ind[12] = (atomicLoad(&ctr[C_NVIS]) + 63u) / 64u;
+    let nf = atomicLoad(&ctr[C_FREE]);
+    atomicStore(&ctr[C_FREE], nf - min(atomicLoad(&ctr[C_POP]), nf));
+    atomicStore(&ctr[C_POP], 0u);
 }
 
 @compute @workgroup_size(1)
@@ -1097,10 +1205,10 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (atomicLoad(&acc[b + A_PDIFF]) == 0u) {
         // cellule inchangée : les nouveaux échantillons sont des échantillons ordinaires
         atomicAdd(&acc[b + A_FN], u32(m));
-        add_f32(b + A_FR, xr.x * m);
-        add_f32(b + A_FR + 1u, xr.y * m);
-        add_f32(b + A_FR + 2u, xr.z * m);
-        add_f32(b + A_FL, xl * m);
+        add_fx(b + A_FR, xr.x * m);
+        add_fx(b + A_FR + 1u, xr.y * m);
+        add_fx(b + A_FR + 2u, xr.z * m);
+        add_fx(b + A_FL, xl * m);
         add_f32(b + A_FL2, ld_f32(b + A_PXL2));
         atomicAdd(&ctr[C_DZERO], 1u);
         // Aucun des m chemins n'a vu la lampe : c'est exact pour ces chemins, pas pour l'espérance
@@ -1189,6 +1297,9 @@ fn quota(c: u32, lambda: f32, prior: f32) -> u32 {
     var rel = q.z;
     if (fr.rel_cap > 0.0) { rel = min(rel, fr.rel_cap * prior); }
     let pv = post_var(n, rel, prior);
+    // qualité cible : une cellule dont l'erreur relative prédite de la moyenne est sous τ ne
+    // reçoit plus de chemins (seulement le plancher d'exploration)
+    if (fr.tau > 0.0 && n >= 1.0 && pv / n < fr.tau * fr.tau) { return 0u; }
     let t = (-1.0 + sqrt(1.0 + 4.0 * foot * pv / lambda)) * 0.5;
     // arrondi stochastique (même tirage au balayage et à l'émission) : Σ quotas suit la solution continue
     var k = max(floor(t - n + q.w), 0.0);
@@ -1329,7 +1440,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     let gx = gbuf[t.y];
     reset_rec();
     fine_dda = false;
-    rec_on = (fr.flags & F_SHARC) == 0u;
+    rec_on = (fr.flags & F_SHARC) == 0u && (pcg(t.z ^ 0x2545f491u) % max(fr.rec_every, 1u)) == 0u;
     uni = false;
     split = false;
     sel = 0u;
@@ -1338,7 +1449,27 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     rs_depth = select(1u, 2u, rnd() < 0.5);
     reuse = (fr.flags & F_REUSE) != 0u;
     ru_cell = 0xffffffffu;
+    n_segs = 0u;
+    rs_hit = false;
+    sp_cell = 0xffffffffu;
     let v_raw = radiance(gx.p, gx.n, gx.albedo).l;
+    atomicAdd(&ctr[C_SEGS], n_segs);
+    if (rs_hit) { atomicAdd(&ctr[C_RSHIT], 1u); }
+    if (sp_cell != 0xffffffffu && all(sp_beta > vec3<f32>(0.0))) {
+        // échantillon de la cellule de support : radiance sortante au sommet (suite du chemin)
+        let u = (v_raw - sp_prefix) / sp_beta / demod(sp_albedo);
+        let bs = sp_cell * ACC;
+        if (rec_on) { commit_deps(sp_cell); }
+        if (atomicAdd(&acc[bs + A_FN], 1u) == 0u && atomicLoad(&acc[bs + A_FOOT]) == 0u) {
+            vis_list[atomicAdd(&ctr[C_NVIS], 1u)] = sp_cell; // résolue avec les cellules visibles
+        }
+        add_fx(bs + A_FR, u.x);
+        add_fx(bs + A_FR + 1u, u.y);
+        add_fx(bs + A_FR + 2u, u.z);
+        let ls = lum(u);
+        add_fx(bs + A_FL, ls);
+        add_f32(bs + A_FL2, ls * ls);
+    }
     let v = v_raw / demod(gx.albedo);
     let b = c * ACC;
     if (rec_on) { commit_deps(c); }
@@ -1347,20 +1478,41 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         let u = (v_raw - ru_prefix) / ru_beta;
         let b1 = ru_cell * ACC;
         atomicAdd(&acc[b1 + A_FN], 1u);
-        add_f32(b1 + A_FR, u.x);
-        add_f32(b1 + A_FR + 1u, u.y);
-        add_f32(b1 + A_FR + 2u, u.z);
+        add_fx(b1 + A_FR, u.x);
+        add_fx(b1 + A_FR + 1u, u.y);
+        add_fx(b1 + A_FR + 2u, u.z);
         let l1 = lum(u);
-        add_f32(b1 + A_FL, l1);
+        add_fx(b1 + A_FL, l1);
         add_f32(b1 + A_FL2, l1 * l1);
     }
     atomicAdd(&acc[b + A_FN], 1u);
-    add_f32(b + A_FR, v.x);
-    add_f32(b + A_FR + 1u, v.y);
-    add_f32(b + A_FR + 2u, v.z);
+    add_fx(b + A_FR, v.x);
+    add_fx(b + A_FR + 1u, v.y);
+    add_fx(b + A_FR + 2u, v.z);
     let l = lum(v);
-    add_f32(b + A_FL, l);
+    add_fx(b + A_FL, l);
     add_f32(b + A_FL2, l * l);
+    if ((fr.flags & F_MULTI) != 0u) {
+        // même échantillon pour une cellule de l'autre niveau du pixel de départ
+        var lvl = 2u;
+        for (var s = 0u; s < K; s++) {
+            if (pix_cells[t.y * K + s] == c) { lvl = select(0u, 1u, s >= K / 2u); }
+        }
+        if (lvl < 2u) {
+            let base = select(K / 2u, 0u, lvl == 1u);
+            let pc = pix_cells[t.y * K + base + min(u32(rnd() * f32(K / 2u)), K / 2u - 1u)];
+            if (pc != 0xffffffffu) {
+                let bp = pc * ACC;
+                if (rec_on) { commit_deps(pc); }
+                atomicAdd(&acc[bp + A_FN], 1u);
+                add_fx(bp + A_FR, v.x);
+                add_fx(bp + A_FR + 1u, v.y);
+                add_fx(bp + A_FR + 2u, v.z);
+                add_fx(bp + A_FL, l);
+                add_f32(bp + A_FL2, l * l);
+            }
+        }
+    }
 }
 
 // fusion des échantillons de la frame, filet de sécurité, vieillissement, remise à zéro
@@ -1372,8 +1524,8 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     var cell = cells[c];
     let fn_ = f32(atomicLoad(&acc[b + A_FN]));
     if (fn_ > 0.0) {
-        let fm = vec3<f32>(ld_f32(b + A_FR), ld_f32(b + A_FR + 1u), ld_f32(b + A_FR + 2u)) / fn_;
-        let fl = ld_f32(b + A_FL) / fn_;
+        let fm = vec3<f32>(ld_fx(b + A_FR), ld_fx(b + A_FR + 1u), ld_fx(b + A_FR + 2u)) / fn_;
+        let fl = ld_fx(b + A_FL) / fn_;
         let fm2 = max(ld_f32(b + A_FL2) - fn_ * fl * fl, 0.0);
         if ((fr.flags & F_SHARC) != 0u) {
             let a = max(fn_ / (cell.n + fn_), 1.0 - pow(1.0 - EMA_MIN, fn_));
@@ -1422,7 +1574,7 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let susp = atomicLoad(&acc[b + A_SUSP]);
     if (susp == 1u) { cell.last = fr.frame; }
     let foot = atomicLoad(&acc[b + A_FOOT]);
-    if (foot > 0u) { cell.seen = fr.clock; }
+    if (foot > 0u || fn_ > 0.0) { cell.seen = fr.clock; }
     // vieillissement des dépendances (fenêtres alternées de DEP_WINDOW échantillons)
     let ns = atomicLoad(&acc[b + A_NS]);
     if (ns >= DEP_WINDOW) {
@@ -1469,11 +1621,43 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
         v = g.albedo;
     } else if (g.kind == 2u) {
         var w = 0.0;
-        for (var s = 0u; s < K; s++) {
-            let c = pix_cells[k * K + s];
-            if (c != 0xffffffffu && cells[c].n > 0.0) {
-                v += cells[c].mean;
-                w += 1.0;
+        if ((fr.flags & F_MULTI) != 0u) {
+            // niveaux fin et grossier : moyenne de chacun, puis passage progressif au fin
+            var vf = vec3<f32>(0.0);
+            var vc = vec3<f32>(0.0);
+            var wf = 0.0;
+            var wc = 0.0;
+            var nf = 0.0;
+            for (var s = 0u; s < K; s++) {
+                let c = pix_cells[k * K + s];
+                if (c != 0xffffffffu && cells[c].n > 0.0) {
+                    if (s < K / 2u) {
+                        vf += cells[c].mean;
+                        wf += 1.0;
+                        nf += cells[c].n;
+                    } else {
+                        vc += cells[c].mean;
+                        wc += 1.0;
+                    }
+                }
+            }
+            if (wf > 0.0 && wc > 0.0) {
+                v = mix(vc / wc, vf / wf, clamp(nf / wf / MULTI_N, 0.0, 1.0));
+                w = 1.0;
+            } else if (wf > 0.0) {
+                v = vf;
+                w = wf;
+            } else if (wc > 0.0) {
+                v = vc;
+                w = wc;
+            }
+        } else {
+            for (var s = 0u; s < K; s++) {
+                let c = pix_cells[k * K + s];
+                if (c != 0xffffffffu && cells[c].n > 0.0) {
+                    v += cells[c].mean;
+                    w += 1.0;
+                }
             }
         }
         if (w > 0.0) { v = v / w * demod(g.albedo); }
