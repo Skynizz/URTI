@@ -642,3 +642,43 @@ Lecture :
 - Non-régression (`jeu cornell`, `jeu sponza`, scènes sans spéculaire) : inchangé, KRC
   3,6e-3 contre 1,4e-2 (Cornell), 1,27e-2 contre 2,26e-2 (Sponza). La dérive sombre de
   KRC après l'extinction dans `jeu sponza` (luminance 0,63 à f110) reste à corriger.
+
+## 18. Dans un vrai jeu : Quake II RTX
+
+Quake II RTX (NVIDIA, path tracing Vulkan), démo `q2demo1` (vraie partie enregistrée), RTX 4070,
+1280×720. Les trois méthodes ne diffèrent que par l'éclairage indirect (`pt_cache`), tout le
+reste est le moteur du jeu. Outils : `python tools/q2rtx/capture.py` (images et i/s),
+`python tools/q2rtx/lag_test.py` (réaction à une coupure de lumière).
+
+![Même frame de la démo](../results/q2rtx/comparaison_f420.png)
+
+| Démo complète (timedemo) | Jeu sans cache | SHaRC NVIDIA | KRC (0,1 chemin/px) |
+|---|---|---|---|
+| Images par seconde | 255 | 228 | 226 |
+| Temps du cache (ms/frame) | — | 0,53 | 0,54 |
+| Rebonds indirects (ms/frame) | 0,69 | 0,61 | 0,63 |
+| Débruiteur (ms/frame) | 0,93 | 0,91 | 0,84 |
+
+Réaction à une coupure de courant (démo figée, toutes les lampes à 15 %, exposition figée ;
+PSNR contre la référence du jeu, accumulée en pause avec la même caméra) :
+
+| PSNR (dB) après la coupure | +1 frame | +2 | +4 | +16 | +64 |
+|---|---|---|---|---|---|
+| Jeu sans cache | 28,5 | 28,9 | 29,3 | 29,3 | 29,3 |
+| SHaRC NVIDIA | 27,6 | 28,0 | 28,2 | 28,8 | 28,8 |
+| **KRC** | **28,8** | **29,1** | 29,2 | 29,2 | 29,2 |
+
+![Réaction](../results/q2rtx/reaction/reaction.png)
+
+Lecture :
+
+- **Sur une image fixe, les trois méthodes se ressemblent** (PSNR de 37 à 48 dB entre elles,
+  invisible à l'œil) : dans Quake II RTX, l'image est dominée par l'éclairage direct, calculé
+  par pixel par le jeu, et l'indirect passe par un débruiteur puissant.
+- **Après un changement de lumière**, KRC est le plus juste dès la frame suivante ; SHaRC
+  garde l'ancienne lumière pendant plus de 64 frames (plafond trop clair). Le jeu sans cache
+  réagit vite lui aussi (un seul rebond, recalculé à chaque frame) et reste le plus proche de
+  la référence, qui est son propre moteur de rendu (deux rebonds) : les deux caches ajoutent
+  des rebonds que la référence n'a pas.
+- **Coût** : à temps égal avec SHaRC. Le débruiteur intégré enlève le retard ajouté à
+  l'indirect, mais fait gagner peu de temps ici.

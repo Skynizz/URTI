@@ -355,3 +355,27 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   sur un fond sombre de la référence (bord d'un reflet du ciel) et presque pas un reflet
   manquant : avec le ciel enfin présent dans les miroirs, il monte pour les deux méthodes
   alors que l'image s'approche de la référence.
+
+## v18 — dans un vrai jeu : Quake II RTX
+
+- Jeu : Quake II RTX (NVIDIA, open source, path tracing Vulkan), branche `krc` de
+  `F:/Q2RTX-KRC` (données du jeu : version 1.8.1, 3 niveaux shareware). La variable de console
+  `pt_cache` choisit l'éclairage indirect : 0 jeu d'origine (un rebond tracé), 1 SHaRC (SDK
+  officiel de NVIDIA v1.8.3 en GLSL, non modifié, règles de son guide d'intégration), 2 KRC.
+  Le reste (direct, reflets, débruiteur ASVGF, matériaux) est celui du jeu.
+- KRC dans le jeu : cellules en espace monde (~16 px à l'écran, par face), allocation de
+  Neyman par pixel, liste de tâches compacte, rééchantillonnage sur les cellules mûres, et
+  chemins corrélés sur les lampes animées du jeu (le moteur garde l'intensité de la frame
+  précédente de chaque lampe : chaque échantillon évalue l'avant et l'après).
+- Débruiteur intégré (idée de Skynizz) : l'indirect est reconstruit par KRC (4 cellules voisines,
+  pondérées par leur confiance), sans historique ni filtre du débruiteur du jeu, qui
+  réaccumulait l'indirect et lui rendait le retard que les chemins corrélés venaient d'enlever.
+  Gain de temps faible ici (0,06 ms : le débruiteur filtre l'indirect à 1/3 de résolution,
+  ce qui coûte, c'est le direct et les reflets à pleine résolution).
+- Coût de KRC : 1,48 → 0,54 ms par frame en 1280×720 (une insertion par pixel, marquage sans
+  atomiques contendues, réductions par sous-groupe, liste de tâches pour les chemins) ;
+  0,1 chemin/px pour le même coût que SHaRC.
+- Pièges : la pause du moteur est ignorée en timedemo (référence capturée sur l'écran de
+  fin de démo, corrigé) ; le compilateur MSVC en français casse le suivi des en-têtes par
+  Ninja (UBO incohérent entre fichiers C, image noire) ; l'exposition automatique se mêlait à
+  la mesure du retard (figée pendant le test).

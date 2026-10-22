@@ -1,0 +1,33 @@
+From b5a73bc805780d3eeb21a73f51ef77d423e2b83a Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:24:13 +0200
+Subject: [PATCH 1/5] =?UTF-8?q?Script=20de=20compilation=20(MSVC=20+=20Nin?=
+ =?UTF-8?q?ja,=20glslang=20compil=C3=A9)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ build_krc.bat | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+ create mode 100644 build_krc.bat
+
+diff --git a/build_krc.bat b/build_krc.bat
+new file mode 100644
+index 00000000..12e75839
+--- /dev/null
++++ b/build_krc.bat
+@@ -0,0 +1,10 @@
++@echo off
++rem Compilation de Quake II RTX (branche KRC) : environnement MSVC x64, CMake + Ninja de Visual Studio.
++call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
++cd /d %~dp0
++if not exist build mkdir build
++cd build
++if not exist build.ninja (
++    cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCONFIG_BUILD_GLSLANG=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. || exit /b 1
++)
++cmake --build . %* || exit /b 1
+-- 
+2.55.0.windows.3
+

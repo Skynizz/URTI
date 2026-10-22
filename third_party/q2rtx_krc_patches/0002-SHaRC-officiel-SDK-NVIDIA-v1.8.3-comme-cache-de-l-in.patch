@@ -1,0 +1,2751 @@
+From 97afd9ad6fa49adae8ae423c3d91edd7fb620107 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:35:15 +0200
+Subject: [PATCH 2/5] SHaRC officiel (SDK NVIDIA v1.8.3) comme cache de
+ l'indirect (pt_cache 1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- shader/sharc/ : en-têtes GLSL du SDK, non modifiés (licence NVIDIA jointe).
+- radiance_cache.c : buffers du cache (2^22 entrées), adresses passées au UBO,
+  vidage au changement de carte ou de méthode.
+- radiance_cache.rgen : passe Update (un pixel par bloc 5×5, chemin diffus
+  depuis la surface primaire avec l'éclairage du jeu à chaque sommet) et
+  passe Resolve, entre l'éclairage direct et les rebonds.
+- indirect_lighting.rgen : au premier rebond, arrêt sur la radiance du cache
+  si le segment dépasse le voxel (règles du guide d'intégration).
+- cvars : pt_cache (0 jeu, 1 SHaRC, 2 KRC), pt_cache_debug, pt_sharc_*,
+  pt_cache_bounces ; activation de shaderInt64 et des atomiques 64 bits.
+
+---
+ src/CMakeLists.txt                            |   2 +
+ src/refresh/vkpt/main.c                       |   6 +-
+ src/refresh/vkpt/path_tracer.c                |  57 +
+ src/refresh/vkpt/profiler.c                   |   1 +
+ src/refresh/vkpt/radiance_cache.c             | 129 +++
+ src/refresh/vkpt/shader/global_ubo.h          |  12 +
+ .../vkpt/shader/indirect_lighting.rgen        |  40 +
+ src/refresh/vkpt/shader/radiance_cache.h      |  66 ++
+ src/refresh/vkpt/shader/radiance_cache.rgen   | 273 +++++
+ src/refresh/vkpt/shader/radiance_cache_ext.h  |  15 +
+ .../vkpt/shader/sharc/HashGridCommon.h        | 404 ++++++++
+ src/refresh/vkpt/shader/sharc/HashGridTypes.h |  28 +
+ src/refresh/vkpt/shader/sharc/License.md      | 303 ++++++
+ src/refresh/vkpt/shader/sharc/SharcCommon.h   | 981 ++++++++++++++++++
+ .../vkpt/shader/sharc/SharcGlslHelpers.h      |  75 ++
+ src/refresh/vkpt/shader/sharc/SharcTypes.h    |  51 +
+ src/refresh/vkpt/vkpt.h                       |  10 +
+ 17 files changed, 2452 insertions(+), 1 deletion(-)
+ create mode 100644 src/refresh/vkpt/radiance_cache.c
+ create mode 100644 src/refresh/vkpt/shader/radiance_cache.h
+ create mode 100644 src/refresh/vkpt/shader/radiance_cache.rgen
+ create mode 100644 src/refresh/vkpt/shader/radiance_cache_ext.h
+ create mode 100644 src/refresh/vkpt/shader/sharc/HashGridCommon.h
+ create mode 100644 src/refresh/vkpt/shader/sharc/HashGridTypes.h
+ create mode 100644 src/refresh/vkpt/shader/sharc/License.md
+ create mode 100644 src/refresh/vkpt/shader/sharc/SharcCommon.h
+ create mode 100644 src/refresh/vkpt/shader/sharc/SharcGlslHelpers.h
+ create mode 100644 src/refresh/vkpt/shader/sharc/SharcTypes.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 398297bd..a85acf0d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -270,6 +270,7 @@ SET(SRC_VKPT
+ 	refresh/vkpt/mgpu.c
+ 	refresh/vkpt/models.c
+ 	refresh/vkpt/path_tracer.c
++	refresh/vkpt/radiance_cache.c
+ 	refresh/vkpt/physical_sky.c
+ 	refresh/vkpt/precomputed_sky.c
+ 	refresh/vkpt/profiler.c
+@@ -340,6 +341,7 @@ set(SRC_RT_SHADERS
+ 	refresh/vkpt/shader/primary_rays.rgen
+ 	refresh/vkpt/shader/direct_lighting.rgen
+ 	refresh/vkpt/shader/indirect_lighting.rgen
++	refresh/vkpt/shader/radiance_cache.rgen
+ 	refresh/vkpt/shader/path_tracer.rchit
+ 	refresh/vkpt/shader/path_tracer.rmiss
+ 	refresh/vkpt/shader/path_tracer_masked.rahit
+diff --git a/src/refresh/vkpt/main.c b/src/refresh/vkpt/main.c
+index 8493ca61..12cfdb46 100644
+--- a/src/refresh/vkpt/main.c
++++ b/src/refresh/vkpt/main.c
+@@ -160,6 +160,7 @@ VkptInit_t vkpt_initialization[] = {
+ 	{ "images",   vkpt_create_images,                  vkpt_destroy_images,                  VKPT_INIT_SWAPCHAIN_RECREATE, 0 },
+ 	{ "draw",     vkpt_draw_initialize,                vkpt_draw_destroy,                    VKPT_INIT_DEFAULT,            0 },
+ 	{ "pt",       vkpt_pt_init,                        vkpt_pt_destroy,                      VKPT_INIT_DEFAULT,            0 },
++	{ "rcache",   vkpt_rc_init,                        vkpt_rc_destroy,                      VKPT_INIT_DEFAULT,            0 },
+ 	{ "pt|",      vkpt_pt_create_pipelines,            vkpt_pt_destroy_pipelines,            VKPT_INIT_RELOAD_SHADER,      0 },
+ 	{ "draw|",    vkpt_draw_create_pipelines,          vkpt_draw_destroy_pipelines,          VKPT_INIT_SWAPCHAIN_RECREATE
+ 																						   | VKPT_INIT_RELOAD_SHADER,      0 },
+@@ -1353,6 +1354,7 @@ init_vulkan(void)
+ 		.samplerFilterMinmax = VK_TRUE,
+ 		.bufferDeviceAddress = VK_TRUE,
+ 		.bufferDeviceAddressMultiDevice = qvk.device_count > 1 ? VK_TRUE : VK_FALSE,
++		.shaderBufferInt64Atomics = VK_TRUE, // SHaRC : insertion des clés 64 bits
+ 	};
+ 	VkPhysicalDeviceFeatures2 device_features = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
+@@ -1398,7 +1400,7 @@ init_vulkan(void)
+ 			.shaderClipDistance = VK_FALSE,
+ 			.shaderCullDistance = VK_FALSE,
+ 			.shaderFloat64 = VK_FALSE,
+-			.shaderInt64 = VK_FALSE,
++			.shaderInt64 = VK_TRUE, // SHaRC : clés 64 bits
+ 			.shaderInt16 = qvk.supports_fp16,
+ 			.shaderResourceResidency = VK_FALSE,
+ 			.shaderResourceMinLod = VK_FALSE,
+@@ -2904,6 +2906,7 @@ prepare_ubo(refdef_t *fd, mleaf_t* viewleaf, const reference_mode_t* ref_mode, c
+ 
+ 	memcpy(ubo->cam_pos, fd->vieworg, sizeof(float) * 3);
+ 	ubo->cluster_debug_index = cluster_debug_index;
++	vkpt_rc_prepare_ubo(ubo, qvk.frame_counter);
+ 
+ 	if (!temporal_frame_valid)
+ 	{
+@@ -4300,6 +4303,7 @@ void R_AddDecal_RTX(decal_t *d)
+ void
+ R_BeginRegistration_RTX(const char *name)
+ {
++	vkpt_rc_reset();
+ 	registration_sequence++;
+ 	LOG_FUNC();
+ 	Com_Printf("loading %s\n", name);
+diff --git a/src/refresh/vkpt/path_tracer.c b/src/refresh/vkpt/path_tracer.c
+index 5b9d3332..15c63a3f 100644
+--- a/src/refresh/vkpt/path_tracer.c
++++ b/src/refresh/vkpt/path_tracer.c
+@@ -70,6 +70,8 @@ typedef enum {
+     PIPELINE_DIRECT_LIGHTING_CAUSTICS,
+     PIPELINE_INDIRECT_LIGHTING_FIRST,
+     PIPELINE_INDIRECT_LIGHTING_SECOND,
++	PIPELINE_CACHE_UPDATE,      // cache de radiance : chemins de mise à jour
++	PIPELINE_CACHE_RESOLVE,     // cache de radiance : résolution
+ 
+ 	PIPELINE_COUNT
+ } pipeline_index_t;
+@@ -1112,6 +1114,51 @@ vkpt_pt_trace_reflections(VkCommandBuffer cmd_buf, int bounce)
+ 	return VK_SUCCESS;
+ }
+ 
++extern cvar_t *cvar_pt_cache;
++extern cvar_t *cvar_pt_sharc_downscale;
++
++static void
++cache_barrier(VkCommandBuffer cmd_buf)
++{
++	VkMemoryBarrier barrier = {
++		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++		.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++	};
++	vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++		0, 1, &barrier, 0, NULL, 0, NULL);
++}
++
++// Cache de radiance (pt_cache 1 : SHaRC, 2 : KRC) : mise à jour depuis la surface primaire,
++// puis résolution, avant que les rebonds de l'indirect ne lisent le cache.
++static void
++trace_radiance_cache(VkCommandBuffer cmd_buf)
++{
++	int mode = (int)cvar_pt_cache->value;
++	if (mode <= 0)
++		return;
++
++	vkpt_rc_clear_if_needed(cmd_buf);
++
++	BEGIN_PERF_MARKER(cmd_buf, PROFILER_RADIANCE_CACHE);
++
++	pt_push_constants_t push;
++	push.gpu_index = -1;
++	push.bounce = 0;
++
++	uint32_t ds = (uint32_t)max(1, (int)cvar_pt_sharc_downscale->value);
++	uint32_t w = (qvk.extent_render.width + ds - 1) / ds;
++	uint32_t h = (qvk.extent_render.height + ds - 1) / ds;
++	dispatch_rays(cmd_buf, PIPELINE_CACHE_UPDATE, push, w, h, 1);
++	cache_barrier(cmd_buf);
++
++	uint32_t n = vkpt_rc_sharc_capacity();
++	dispatch_rays(cmd_buf, PIPELINE_CACHE_RESOLVE, push, 4096, n / 4096, 1);
++	cache_barrier(cmd_buf);
++
++	END_PERF_MARKER(cmd_buf, PROFILER_RADIANCE_CACHE);
++}
++
+ VkResult
+ vkpt_pt_trace_lighting(VkCommandBuffer cmd_buf, float num_bounce_rays)
+ {
+@@ -1147,6 +1194,8 @@ vkpt_pt_trace_lighting(VkCommandBuffer cmd_buf, float num_bounce_rays)
+ 		.size = VK_WHOLE_SIZE,
+ 	);
+ 
++	trace_radiance_cache(cmd_buf);
++
+ 	BEGIN_PERF_MARKER(cmd_buf, PROFILER_INDIRECT_LIGHTING);
+ 
+ 	assert(num_bounce_rays <= 2);
+@@ -1298,6 +1347,14 @@ vkpt_pt_create_pipelines()
+ 			shader_stages[0].module = qvk.shader_modules[QVK_MOD_INDIRECT_LIGHTING_RGEN];
+ 			shader_stages[0].pSpecializationInfo = &specInfo[1];
+ 			break;
++		case PIPELINE_CACHE_UPDATE:
++			shader_stages[0].module = qvk.shader_modules[QVK_MOD_RADIANCE_CACHE_RGEN];
++			shader_stages[0].pSpecializationInfo = &specInfo[0];
++			break;
++		case PIPELINE_CACHE_RESOLVE:
++			shader_stages[0].module = qvk.shader_modules[QVK_MOD_RADIANCE_CACHE_RGEN];
++			shader_stages[0].pSpecializationInfo = &specInfo[1];
++			break;
+ 		default:
+ 			assert(!"invalid pipeline index");
+ 			break;
+diff --git a/src/refresh/vkpt/profiler.c b/src/refresh/vkpt/profiler.c
+index ed8c39f1..141c3155 100644
+--- a/src/refresh/vkpt/profiler.c
++++ b/src/refresh/vkpt/profiler.c
+@@ -316,6 +316,7 @@ draw_profiler(int enable_asvgf)
+ 		PROFILER_DO(PROFILER_ASVGF_GRADIENT_REPROJECT, 1);
+ 	}
+ 	PROFILER_DO(PROFILER_DIRECT_LIGHTING, 1);
++	PROFILER_DO(PROFILER_RADIANCE_CACHE, 1);
+ 	PROFILER_DO(PROFILER_INDIRECT_LIGHTING, 1);
+ 	PROFILER_DO(PROFILER_INDIRECT_LIGHTING_0, 2);
+ 	PROFILER_DO(PROFILER_INDIRECT_LIGHTING_1, 2);
+diff --git a/src/refresh/vkpt/radiance_cache.c b/src/refresh/vkpt/radiance_cache.c
+new file mode 100644
+index 00000000..261ea46b
+--- /dev/null
++++ b/src/refresh/vkpt/radiance_cache.c
+@@ -0,0 +1,129 @@
++/*
++Copyright (C) 2026, Skynizz
++
++This program is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 2 of the License, or
++(at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++*/
++
++// ========================================================================== //
++// Caches de radiance pour l'éclairage indirect, à comparer dans le jeu :
++//   pt_cache 0 : jeu d'origine (rebonds tracés, sans cache) ;
++//   pt_cache 1 : SHaRC, SDK officiel de NVIDIA (v1.8.3, shader/sharc/) ;
++//   pt_cache 2 : KRC.
++// Ce fichier crée les buffers des caches et passe leurs adresses au UBO ;
++// les passes (mise à jour, résolution) sont lancées par path_tracer.c.
++// ========================================================================== //
++
++#include "vkpt.h"
++
++#define SHARC_CAPACITY (1u << 22)
++
++static BufferResource_t buf_sharc_hash;     // clés 64 bits
++static BufferResource_t buf_sharc_accum;    // accumulation de la frame, 16 octets
++static BufferResource_t buf_sharc_resolved; // données résolues, 16 octets
++static bool rc_needs_clear = true;
++static float cam_pos_prev[3];
++static int last_cache_mode = -1;
++
++extern cvar_t *cvar_pt_cache;
++
++static VkResult
++create_cache_buffer(BufferResource_t *buf, size_t size, const char *name)
++{
++	VkResult res = buffer_create(buf, size,
++		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++	if (res == VK_SUCCESS)
++		buffer_attach_name(buf, name);
++	return res;
++}
++
++VkResult
++vkpt_rc_init(void)
++{
++	_VK(create_cache_buffer(&buf_sharc_hash, (size_t)SHARC_CAPACITY * 8, "sharc hash entries"));
++	_VK(create_cache_buffer(&buf_sharc_accum, (size_t)SHARC_CAPACITY * 16, "sharc accumulation"));
++	_VK(create_cache_buffer(&buf_sharc_resolved, (size_t)SHARC_CAPACITY * 16, "sharc resolved"));
++	rc_needs_clear = true;
++	return VK_SUCCESS;
++}
++
++VkResult
++vkpt_rc_destroy(void)
++{
++	buffer_destroy(&buf_sharc_hash);
++	buffer_destroy(&buf_sharc_accum);
++	buffer_destroy(&buf_sharc_resolved);
++	return VK_SUCCESS;
++}
++
++// à appeler au changement de carte : le cache repart de zéro
++void
++vkpt_rc_reset(void)
++{
++	rc_needs_clear = true;
++}
++
++static void
++split_address(VkDeviceAddress a, uint32_t *lo, uint32_t *hi)
++{
++	*lo = (uint32_t)(a & 0xffffffffu);
++	*hi = (uint32_t)(a >> 32);
++}
++
++void
++vkpt_rc_prepare_ubo(QVKUniformBuffer_t *ubo, uint64_t frame_counter)
++{
++	split_address(buf_sharc_hash.address, &ubo->rc_addr_a[0], &ubo->rc_addr_a[1]);
++	split_address(buf_sharc_accum.address, &ubo->rc_addr_a[2], &ubo->rc_addr_a[3]);
++	split_address(buf_sharc_resolved.address, &ubo->rc_addr_b[0], &ubo->rc_addr_b[1]);
++	ubo->rc_addr_b[2] = SHARC_CAPACITY;
++	ubo->rc_addr_b[3] = (uint32_t)frame_counter;
++	ubo->rc_cam_pos_prev[0] = cam_pos_prev[0];
++	ubo->rc_cam_pos_prev[1] = cam_pos_prev[1];
++	ubo->rc_cam_pos_prev[2] = cam_pos_prev[2];
++	ubo->rc_cam_pos_prev[3] = 0;
++	memcpy(cam_pos_prev, ubo->cam_pos, sizeof(cam_pos_prev));
++
++	// changer de méthode : on repart d'un cache vide, pour une comparaison juste
++	int mode = (int)cvar_pt_cache->value;
++	if (mode != last_cache_mode)
++	{
++		rc_needs_clear = true;
++		last_cache_mode = mode;
++	}
++}
++
++// vidage des buffers (création, changement de carte ou de méthode)
++void
++vkpt_rc_clear_if_needed(VkCommandBuffer cmd_buf)
++{
++	if (!rc_needs_clear)
++		return;
++	rc_needs_clear = false;
++
++	vkCmdFillBuffer(cmd_buf, buf_sharc_hash.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_sharc_accum.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_sharc_resolved.buffer, 0, VK_WHOLE_SIZE, 0);
++
++	VkMemoryBarrier barrier = {
++		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++		.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++	};
++	vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++		0, 1, &barrier, 0, NULL, 0, NULL);
++}
++
++uint32_t
++vkpt_rc_sharc_capacity(void)
++{
++	return SHARC_CAPACITY;
++}
+diff --git a/src/refresh/vkpt/shader/global_ubo.h b/src/refresh/vkpt/shader/global_ubo.h
+index 2a3a996d..6d325b34 100644
+--- a/src/refresh/vkpt/shader/global_ubo.h
++++ b/src/refresh/vkpt/shader/global_ubo.h
+@@ -35,6 +35,14 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ // Variables that have "_lf", "_hf" or "_spec" suffix apply to the low-frequency, high-frequency or specular lighting channels, respectively.
+ 
+ #define UBO_CVAR_LIST \
++	UBO_CVAR_DO(pt_cache, 0) /* cache de radiance de l'indirect : 0 jeu d'origine, 1 SHaRC (SDK NVIDIA), 2 KRC */ \
++	UBO_CVAR_DO(pt_cache_debug, 0) /* 1 : affiche la grille du cache (SHaRC) */ \
++	UBO_CVAR_DO(pt_sharc_scene_scale, 50) /* SHaRC : voxel ≈ distance à la caméra / échelle, quelle que soit l'unité (50 : exemple du SDK) */ \
++	UBO_CVAR_DO(pt_sharc_accum_frames, 20) /* SHaRC : fenêtre d'accumulation (réglage de l'exemple NVIDIA) */ \
++	UBO_CVAR_DO(pt_sharc_stale_frames, 64) /* SHaRC : frames sans échantillon avant éviction */ \
++	UBO_CVAR_DO(pt_sharc_downscale, 5) /* SHaRC : un pixel mis à jour par bloc NxN */ \
++	UBO_CVAR_DO(pt_sharc_radiance_scale, 1000) /* SHaRC : quantification de l'accumulation */ \
++	UBO_CVAR_DO(pt_cache_bounces, 4) /* rebonds des chemins de mise à jour du cache */ \
+ 	UBO_CVAR_DO(flt_antilag_hf, 1) /* A-SVGF anti-lag filter strength, [0..inf) */ \
+ 	UBO_CVAR_DO(flt_antilag_lf, 0.2) \
+ 	UBO_CVAR_DO(flt_antilag_spec, 2) \
+@@ -221,6 +229,10 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            world_size) \
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            world_half_size_inv) \
+ 	\
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_a) /* cache de radiance : SHaRC clés (xy), accumulation (zw) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_b) /* SHaRC résolu (xy), capacité (z), frame (w) */ \
++	GLOBAL_UBO_VAR_LIST_DO(vec4,            rc_cam_pos_prev) \
++	\
+ 	GLOBAL_UBO_VAR_LIST_DO(DynLightData,    dyn_light_data[MAX_LIGHT_SOURCES]) \
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            cam_pos) \
+ 	GLOBAL_UBO_VAR_LIST_DO(mat4,            V) \
+diff --git a/src/refresh/vkpt/shader/indirect_lighting.rgen b/src/refresh/vkpt/shader/indirect_lighting.rgen
+index 917f8ca2..f5b5b857 100644
+--- a/src/refresh/vkpt/shader/indirect_lighting.rgen
++++ b/src/refresh/vkpt/shader/indirect_lighting.rgen
+@@ -27,10 +27,13 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 
+ #version 460
+ #extension GL_GOOGLE_include_directive    : enable
++#include "radiance_cache_ext.h"
+ #pragma optionNV(unroll all)
+ 
+ #include "path_tracer_rgen.h"
+ #include "path_tracer_transparency.glsl"
++#define SHARC_QUERY 1
++#include "radiance_cache.h"
+ 
+ layout(constant_id = 0) const uint spec_bounce_index = 0;
+ 
+@@ -246,6 +249,7 @@ indirect_lighting(
+ 	Triangle triangle;
+ 
+ 	bool bounce_is_sky_light = false;
++	bool cache_hit = false;
+ 
+ 	if(!found_intersection(ray_payload_geometry)) 
+ 	{
+@@ -340,6 +344,37 @@ indirect_lighting(
+ 		bounce_base_color = clamp(bounce_base_color, vec3(0), vec3(1));
+ 		uint bounce_cluster_idx    = triangle.cluster;
+ 
++		// Cache de radiance (pt_cache 1, SHaRC) : au premier rebond, si le segment dépasse le
++		// voxel (et, pour un reflet, si le cône du lobe le couvre), le chemin s'arrête sur la
++		// radiance du cache, qui remplace l'éclairage du point touché et le second rebond
++		// (règles du guide d'intégration du SDK).
++		if (cache_mode() == CACHE_SHARC && spec_bounce_index == 0)
++		{
++			SharcParameters sharc_params = sharc_parameters();
++			vec3 cache_normal = dot(bounce_direction, bounce_geo_normal) > 0 ? -bounce_geo_normal : bounce_geo_normal;
++			float voxel_size = HashGridGetVoxelSize(HashGridGetLevel(bounce_position, sharc_params.hashGridParameters), sharc_params.hashGridParameters);
++			float segment = ray_payload_geometry.hit_distance;
++			bool usable = segment > voxel_size * sqrt(3.0);
++			if (is_specular_ray)
++			{
++				float a = square(primary_roughness);
++				usable = usable && 2.0 * segment * sqrt(0.5 * a * a / max(1.0 - a * a, 1e-6)) > voxel_size;
++			}
++			SharcHitData sharc_hit;
++			sharc_hit.positionWorld = bounce_position;
++			sharc_hit.normalWorld = cache_normal;
++			sharc_hit.materialDemodulation = rc_demodulation(bounce_base_color);
++			vec3 cached_radiance;
++			if (usable && SharcGetCachedRadiance(sharc_params, sharc_hit, cached_radiance, false))
++			{
++				bounce_contrib += bounce_throughput * cached_radiance * indirect_specular_weight;
++				cache_hit = true;
++				if(spec_bounce_index < global_ubo.pt_num_bounce_rays - 1)
++					imageStore(IMG_PT_SHADING_POSITION, ipos, vec4(0));
++			}
++		}
++
++		if (!cache_hit) {
+ 
+ 		vec3 emissive = sample_emissive_texture(triangle.material_id, bounce_minfo, tex_coord, vec2(0), vec2(0), is_specular_ray ? 2 : 3);
+ 		emissive *= triangle.emissive_factor;
+@@ -446,11 +481,16 @@ indirect_lighting(
+ 			imageStore(IMG_PT_VIEW_DIRECTION2, ipos, vec4(bounce_direction, 0));
+ 			imageStore(IMG_PT_BOUNCE_THROUGHPUT, ipos, vec4(bounce_throughput, is_specular_ray ? 1 : 0));
+ 		}
++		} // !cache_hit
+ 	}
+ 
+ 	if (is_specular_ray)
+ 		bounce_contrib = demodulate_specular(primary_base_reflectivity, bounce_contrib);
+ 
++	// pt_cache_debug 1 : vert là où le premier rebond a lu le cache, rouge sinon
++	if (global_ubo.pt_cache_debug == 1 && spec_bounce_index == 0 && !is_specular_ray)
++		bounce_contrib = cache_hit ? vec3(0, 2, 0) : vec3(2, 0, 0);
++
+ 	if(spec_bounce_index > 0 && first_bounce_is_specular)
+ 		is_specular_ray = true;
+ 
+diff --git a/src/refresh/vkpt/shader/radiance_cache.h b/src/refresh/vkpt/shader/radiance_cache.h
+new file mode 100644
+index 00000000..8fb70219
+--- /dev/null
++++ b/src/refresh/vkpt/shader/radiance_cache.h
+@@ -0,0 +1,66 @@
++/*
++Copyright (C) 2026, Skynizz
++Licence GPL v2 ou ultérieure (voir license.txt).
++*/
++
++// ========================================================================== //
++// Caches de radiance de l'indirect (pt_cache) : partie commune aux passes
++// du cache (radiance_cache.rgen) et à leur lecture (indirect_lighting.rgen).
++//   pt_cache 1 : SHaRC, SDK officiel de NVIDIA v1.8.3 (sharc/), réglages de
++//                l'exemple du SDK ; rien n'est modifié dans le SDK.
++// À inclure après path_tracer_rgen.h (les macros du SDK, lerp, saturate…,
++// ne doivent pas toucher le code du jeu inclus avant).
++// ========================================================================== //
++
++#ifndef RADIANCE_CACHE_H_
++#define RADIANCE_CACHE_H_
++
++#define SHARC_ENABLE_GLSL 1
++#define SHARC_MATERIAL_DEMODULATION 1   // comme l'exemple Pathtracer du SDK
++#ifndef SHARC_UPDATE
++#define SHARC_UPDATE 0
++#endif
++#ifndef SHARC_QUERY
++#define SHARC_QUERY 0
++#endif
++
++#include "sharc/SharcGlslHelpers.h"
++#include "sharc/SharcCommon.h"
++
++#define CACHE_NONE  0
++#define CACHE_SHARC 1
++#define CACHE_KRC   2
++
++int cache_mode()
++{
++	return int(global_ubo.pt_cache);
++}
++
++uint64_t rc_address(uvec2 a)
++{
++	return packUint2x32(a);
++}
++
++SharcParameters sharc_parameters()
++{
++	SharcParameters p;
++	p.hashGridParameters.cameraPosition = global_ubo.cam_pos.xyz;
++	p.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
++	p.hashGridParameters.sceneScale = global_ubo.pt_sharc_scene_scale;
++	p.hashGridParameters.levelBias = SHARC_GRID_LEVEL_BIAS;
++	p.hashGridData.capacity = global_ubo.rc_addr_b.z;
++	p.hashGridData.hashEntriesBuffer = RWStructuredBuffer_uint64_t(rc_address(global_ubo.rc_addr_a.xy));
++	p.radianceScale = global_ubo.pt_sharc_radiance_scale;
++	p.accumulationBuffer = RWStructuredBuffer_SharcAccumulationData(rc_address(global_ubo.rc_addr_a.zw));
++	p.resolvedBuffer = RWStructuredBuffer_SharcPackedData(rc_address(global_ubo.rc_addr_b.xy));
++	return p;
++}
++
++// démodulation par l'albédo diffus (le cache stocke la lumière ÷ albédo ; la texture est
++// remise à la lecture)
++vec3 rc_demodulation(vec3 albedo)
++{
++	return max(albedo, vec3(0.05));
++}
++
++#endif // RADIANCE_CACHE_H_
+diff --git a/src/refresh/vkpt/shader/radiance_cache.rgen b/src/refresh/vkpt/shader/radiance_cache.rgen
+new file mode 100644
+index 00000000..f7339164
+--- /dev/null
++++ b/src/refresh/vkpt/shader/radiance_cache.rgen
+@@ -0,0 +1,273 @@
++/*
++Copyright (C) 2026, Skynizz
++
++This program is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 2 of the License, or
++(at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++*/
++
++// ========================================================================== //
++// Passes des caches de radiance (pt_cache), entre l'éclairage direct et les
++// rebonds de l'indirect :
++//   spec_pass 0 : mise à jour. SHaRC : un pixel tiré au hasard par bloc NxN
++//                 (pt_sharc_downscale) trace un chemin diffus depuis sa surface
++//                 primaire et nourrit le cache à chaque sommet (SharcUpdateHit) ;
++//   spec_pass 1 : résolution (SharcResolveEntry) sur toutes les entrées.
++// L'éclairage de chaque sommet est celui du jeu (get_direct_illumination,
++// get_sunlight, émission), en diffus comme les rebonds du jeu.
++// ========================================================================== //
++
++#version 460
++#extension GL_GOOGLE_include_directive    : enable
++#include "radiance_cache_ext.h"
++#pragma optionNV(unroll all)
++
++#define SHARC_UPDATE 1
++#include "path_tracer_rgen.h"
++#include "radiance_cache.h"
++
++layout(constant_id = 0) const uint spec_pass = 0;
++
++// ---------------------------------------------------------------- aléa
++uint rc_state;
++
++uint rc_hash(uint x)
++{
++	x ^= x >> 16; x *= 0x7feb352du;
++	x ^= x >> 15; x *= 0x846ca68bu;
++	x ^= x >> 16;
++	return x;
++}
++
++float rc_rand()
++{
++	rc_state = rc_state * 747796405u + 2891336453u;
++	uint w = ((rc_state >> ((rc_state >> 28u) + 4u)) ^ rc_state) * 277803737u;
++	return float((w >> 22u) ^ w) * (1.0 / 4294967296.0);
++}
++
++// ---------------------------------------------------------------- surfaces
++struct RcSurface
++{
++	vec3 position;
++	vec3 normal;       // normale géométrique, tournée vers le rayon arrivant
++	vec3 albedo;
++	vec3 emissive;
++	uint material_id;
++	uint cluster;
++	bool analytic_light; // lampe échantillonnée par l'éclairage direct : pas d'émission au rebond
++};
++
++int rc_shadow_mask()
++{
++	int mask = SHADOW_RAY_CULL_MASK;
++	if (global_ubo.first_person_model != 0)
++		mask |= AS_FLAG_VIEWER_MODELS;
++	else
++		mask |= AS_FLAG_VIEWER_WEAPON;
++	return mask;
++}
++
++int rc_bounce_mask()
++{
++	int mask = BOUNCE_RAY_CULL_MASK;
++	if (global_ubo.first_person_model != 0)
++		mask |= AS_FLAG_VIEWER_MODELS;
++	else
++		mask |= AS_FLAG_VIEWER_WEAPON;
++	return mask;
++}
++
++// lumière diffuse sortante d'un sommet : (direct + soleil) × albédo, plus son émission
++// (sauf lampe analytique, déjà comptée par l'éclairage direct du sommet précédent)
++vec3 rc_vertex_lighting(RcSurface s, vec3 view_dir, int bounce)
++{
++	rng_seed = rc_hash(rc_state ^ 0x9e3779b9u);
++	rc_rand();
++
++	vec3 diffuse, specular;
++	get_direct_illumination(
++		s.position, s.normal, s.normal, s.cluster, s.material_id, rc_shadow_mask(), view_dir,
++		s.albedo, vec3(0), 0.0, 1.0, MEDIUM_NONE, false, 0.0,
++		bounce == 0 ? global_ubo.pt_direct_polygon_lights > 0 : global_ubo.pt_indirect_polygon_lights > 0,
++		bounce == 0 ? global_ubo.pt_direct_dyn_lights > 0 : global_ubo.pt_indirect_dyn_lights > 0,
++		false, min(bounce, 1), diffuse, specular);
++
++	vec3 sun_diffuse, sun_specular;
++	get_sunlight(
++		s.cluster, s.material_id, s.position, s.normal, s.normal, view_dir,
++		vec3(0), 0.0, 1.0, MEDIUM_NONE, false, sun_diffuse, sun_specular, rc_shadow_mask());
++	float sun_scale = (bounce == 0) ? (global_ubo.pt_direct_sun_light != 0 ? 1.0 : 0.0) : global_ubo.sun_bounce_scale;
++
++	vec3 emissive = s.analytic_light ? vec3(0) : s.emissive;
++	return clamp_output(s.albedo * (diffuse + sun_diffuse * sun_scale) + emissive);
++}
++
++// surface touchée par le dernier rayon géométrique (même lecture que indirect_lighting.rgen) ;
++// renvoie false si c'est le ciel, avec sa radiance
++bool rc_hit_surface(vec3 dir, bool from_primary, out RcSurface s, out vec3 sky_radiance)
++{
++	sky_radiance = vec3(0);
++	Triangle triangle = get_hit_triangle(ray_payload_geometry);
++	bool polygonal = from_primary ? global_ubo.pt_direct_polygon_lights >= 0 : global_ubo.pt_indirect_polygon_lights >= 0;
++	bool analytic = (triangle.material_id & MATERIAL_FLAG_LIGHT) != 0 && polygonal;
++
++	if (is_sky(triangle.material_id))
++	{
++		if (!analytic)
++			sky_radiance = env_map(dir, true) * global_ubo.pt_env_scale;
++		return false;
++	}
++
++	vec3 bary = get_hit_barycentric(ray_payload_geometry);
++	vec2 tex_coord = triangle.tex_coords * bary;
++	if ((triangle.material_id & MATERIAL_FLAG_WARP) != 0)
++		tex_coord = lava_uv_warp(tex_coord, global_ubo.time);
++
++	MaterialInfo minfo = get_material_info(triangle.material_id);
++
++	s.position = triangle.positions * bary;
++	s.normal = normalize(triangle.normals * bary);
++	vec3 flat_normal = normalize(cross(
++		triangle.positions[1] - triangle.positions[0],
++		triangle.positions[2] - triangle.positions[1]));
++	if (dot(flat_normal, dir) > 0)
++		s.normal = -s.normal;
++	if (dot(dir, s.normal) > 0)
++		s.normal = -s.normal;
++
++	vec3 base_color = vec3(minfo.base_factor);
++	if (minfo.base_texture != 0)
++		base_color *= global_textureLod(minfo.base_texture, tex_coord, 2).rgb;
++	s.albedo = clamp(base_color, vec3(0), vec3(1));
++
++	vec3 emissive = sample_emissive_texture(triangle.material_id, minfo, tex_coord, vec2(0), vec2(0), 3);
++	emissive *= triangle.emissive_factor;
++	emissive += get_emissive_shell(triangle.material_id, triangle.shell) * s.albedo;
++	emissive *= sqrt(max(0, -dot(dir, s.normal))); // même profil que l'échantillonnage des lampes
++	s.emissive = emissive;
++
++	s.material_id = triangle.material_id;
++	s.cluster = triangle.cluster;
++	s.analytic_light = analytic;
++	return true;
++}
++
++// surface primaire du pixel (G-buffer) ; false si pas de surface éclairable
++bool rc_primary_surface(ivec2 ipos, out RcSurface s, out vec3 view_dir)
++{
++	vec4 position_material = texelFetch(TEX_PT_SHADING_POSITION, ipos, 0);
++	s.material_id = floatBitsToUint(position_material.w);
++	view_dir = texelFetch(TEX_PT_VIEW_DIRECTION, ipos, 0).xyz;
++	if (s.material_id == 0 || is_lava(s.material_id) || is_sky(s.material_id))
++		return false;
++
++	s.position = position_material.xyz;
++	s.normal = decode_normal(texelFetch(TEX_PT_GEO_NORMAL_A, ipos, 0).x);
++	if (dot(s.normal, view_dir) > 0)
++		s.normal = -s.normal;
++	vec4 base_color = texelFetch(TEX_PT_BASE_COLOR_A, ipos, 0);
++	float metallic = texelFetch(TEX_PT_METALLIC_A, ipos, 0).x;
++	vec3 base_reflectivity;
++	get_reflectivity(base_color.rgb, metallic, s.albedo, base_reflectivity);
++	s.cluster = texelFetch(TEX_PT_CLUSTER_A, ipos, 0).x;
++	if (s.cluster == 0xffff) s.cluster = ~0u; // l'image est en uint16
++	s.emissive = vec3(0); // l'émission vue par la caméra est déjà dans l'image
++	s.analytic_light = true;
++	return true;
++}
++
++// rebond diffus depuis s : direction tirée selon le cosinus, rayon géométrique
++bool rc_bounce(RcSurface s, vec3 view_dir, out vec3 dir)
++{
++	vec2 u = vec2(rc_rand(), rc_rand());
++	dir = normalize(construct_ONB_frisvad(s.normal) * sample_cos_hemisphere(u));
++
++	Ray ray;
++	ray.origin = s.position - view_dir * 0.01;
++	ray.direction = dir;
++	ray.t_min = 0;
++	ray.t_max = 10000;
++	trace_geometry_ray(ray, true, rc_bounce_mask());
++	return found_intersection(ray_payload_geometry);
++}
++
++// ---------------------------------------------------------------- SHaRC
++void sharc_update(uvec2 block)
++{
++	uint ds = uint(max(1.0, global_ubo.pt_sharc_downscale));
++	rc_state = rc_hash(block.x * 9781u + block.y * 6271u + rc_hash(global_ubo.rc_addr_b.w));
++	ivec2 ipos = ivec2(block * ds) + ivec2(min(uvec2(rc_rand() * ds, rc_rand() * ds), uvec2(ds - 1)));
++	if (ipos.x >= global_ubo.width || ipos.y >= global_ubo.height)
++		return;
++
++	RcSurface s;
++	vec3 view_dir;
++	if (!rc_primary_surface(ipos, s, view_dir))
++		return;
++
++	SharcParameters params = sharc_parameters();
++	SharcState state;
++	SharcInit(state);
++
++	int bounces = int(global_ubo.pt_cache_bounces);
++	for (int b = 0; ; b++)
++	{
++		SharcHitData hit;
++		hit.positionWorld = s.position;
++		hit.normalWorld = s.normal;
++		hit.materialDemodulation = rc_demodulation(s.albedo);
++		vec3 lighting = rc_vertex_lighting(s, view_dir, b);
++		if (!SharcUpdateHit(params, state, hit, lighting, rc_rand()))
++			break;
++		if (b >= bounces)
++			break;
++
++		vec3 dir;
++		bool found = rc_bounce(s, view_dir, dir);
++		// rebond lambertien tiré selon le cosinus : poids = albédo
++		SharcSetThroughput(state, s.albedo);
++		if (!found)
++		{
++			SharcUpdateMiss(params, state, vec3(0));
++			break;
++		}
++		vec3 sky;
++		bool from_primary = (b == 0);
++		if (!rc_hit_surface(dir, from_primary, s, sky))
++		{
++			SharcUpdateMiss(params, state, sky);
++			break;
++		}
++		view_dir = dir;
++	}
++}
++
++void sharc_resolve(uint index)
++{
++	SharcResolveParameters rp;
++	rp.cameraPositionPrev = global_ubo.rc_cam_pos_prev.xyz;
++	rp.accumulationFrameNum = uint(global_ubo.pt_sharc_accum_frames);
++	rp.responsiveFrameNum = 1;
++	rp.staleFrameNumMax = uint(global_ubo.pt_sharc_stale_frames);
++	rp.frameIndex = global_ubo.rc_addr_b.w;
++	SharcResolveEntry(index, sharc_parameters(), rp);
++}
++
++void main()
++{
++	uvec2 id = uvec2(rt_LaunchID.xy);
++	if (cache_mode() == CACHE_SHARC)
++	{
++		if (spec_pass == 0)
++			sharc_update(id);
++		else
++			sharc_resolve(id.y * 4096u + id.x);
++	}
++}
+diff --git a/src/refresh/vkpt/shader/radiance_cache_ext.h b/src/refresh/vkpt/shader/radiance_cache_ext.h
+new file mode 100644
+index 00000000..cfbddf0b
+--- /dev/null
++++ b/src/refresh/vkpt/shader/radiance_cache_ext.h
+@@ -0,0 +1,15 @@
++/*
++Copyright (C) 2026, Skynizz
++Licence GPL v2 ou ultérieure (voir license.txt).
++*/
++
++// Extensions requises par le SDK SHaRC (sharc/SharcGlslHelpers.h). À inclure juste après
++// #version, avant tout code.
++
++#extension GL_EXT_buffer_reference : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#extension GL_EXT_shader_atomic_int64 : require
++#extension GL_KHR_shader_subgroup_ballot : require
++#extension GL_EXT_shader_16bit_storage : enable
++#extension GL_EXT_control_flow_attributes : require
+diff --git a/src/refresh/vkpt/shader/sharc/HashGridCommon.h b/src/refresh/vkpt/shader/sharc/HashGridCommon.h
+new file mode 100644
+index 00000000..2caf2d59
+--- /dev/null
++++ b/src/refresh/vkpt/shader/sharc/HashGridCommon.h
+@@ -0,0 +1,404 @@
++/*
++ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
++ *
++ * NVIDIA CORPORATION and its licensors retain all intellectual property
++ * and proprietary rights in and to this software, related documentation
++ * and any modifications thereto.  Any use, reproduction, disclosure or
++ * distribution of this software and related documentation without an express
++ * license agreement from NVIDIA CORPORATION is strictly prohibited.
++ */
++
++// Hash grid overview
++//
++// HashGridCommon.h implements a reusable logarithmic world-space hash grid.
++// SHaRC uses it to map hit positions, and optionally coarse normal direction,
++// to stable cache entries, but the hash grid itself is independent of SHaRC and
++// can be used as a general sparse spatial lookup structure.
++//
++// The grid chooses a voxel level from distance to the camera, then quantizes the
++// world-space position at that level. The final key packs quantized XYZ,
++// logarithmic level, and optional normal bits. The key is hashed to a base slot
++// and resolved through a fixed-size linear probe bucket.
++//
++// Main operations:
++// - HashGridInsertEntry(): compute key and atomically insert/find a slot.
++// - HashGridFindEntry(): compute key and search for an existing slot.
++// - HashGridGetLevel() / HashGridGetVoxelSize(): query the logarithmic LOD.
++// - HashGridDebugColoredHash(), HashGridDebugOccupancy(), and
++//   HashGridDebugHashCollisions(): visualize grid layout, occupancy, and
++//   collision behavior.
++//
++// HASH_GRID_COMPACT selects 32-bit keys; otherwise 64-bit keys are used.
++// If 64-bit atomics are unavailable, the grid can use a lock buffer for
++// compare-exchange during insertion.
++
++#ifndef HASH_GRID_PREFIX
++#error HASH_GRID_PREFIX must be defined before including HashGridCommon.h
++#endif
++
++#ifndef HASH_GRID_CONST_PREFIX
++#error HASH_GRID_CONST_PREFIX must be defined before including HashGridCommon.h
++#endif
++
++#ifndef HASH_GRID_KEY_TYPE
++#error HASH_GRID_KEY_TYPE must be defined before including HashGridCommon.h
++#endif
++
++#define HASH_GRID_CONCAT(a, b) a##b
++#define HASH_GRID_CONCAT2(a, b) HASH_GRID_CONCAT(a, b)
++#define HashGrid_(name) HASH_GRID_CONCAT2(HASH_GRID_PREFIX, name)
++#define HASH_GRID_(name) HASH_GRID_CONCAT2(HASH_GRID_CONST_PREFIX, _##name)
++
++#ifndef HASH_GRID_CONST
++#define HASH_GRID_CONST static const
++#endif
++
++// Constant parameters
++#if HASH_GRID_COMPACT
++HASH_GRID_CONST uint HASH_GRID_(KEY_BIT_NUM)           = 32; // 32-bit hash grid keys
++HASH_GRID_CONST uint HASH_GRID_(POSITION_BIT_NUM)      = 8;
++HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_NUM)         = 5;
++HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_NUM)        = 3;
++#else // !HASH_GRID_COMPACT
++HASH_GRID_CONST uint HASH_GRID_(KEY_BIT_NUM)           = 64; // 64-bit hash grid keys. Reserve 1 bit for user data (e.g. responsive lighting signal in SHARC)
++HASH_GRID_CONST uint HASH_GRID_(POSITION_BIT_NUM)      = 17;
++HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_NUM)         = 9;
++HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_NUM)        = 3;
++#endif // HASH_GRID_COMPACT
++
++HASH_GRID_CONST uint HASH_GRID_(POSITION_BIT_MASK)     = (1u << HASH_GRID_(POSITION_BIT_NUM)) - 1;
++HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_MASK)        = (1u << HASH_GRID_(LEVEL_BIT_NUM)) - 1;
++HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_MASK)       = (1u << HASH_GRID_(NORMAL_BIT_NUM)) - 1;
++
++HASH_GRID_CONST uint HASH_GRID_(LEVEL_BIT_OFFSET)      = HASH_GRID_(POSITION_BIT_NUM) * 3;
++HASH_GRID_CONST uint HASH_GRID_(NORMAL_BIT_OFFSET)     = HASH_GRID_(LEVEL_BIT_OFFSET) + HASH_GRID_(LEVEL_BIT_NUM);
++
++// Tweakable parameters
++#ifndef HASH_GRID_ENABLE_64_BIT_ATOMICS
++#define HASH_GRID_ENABLE_64_BIT_ATOMICS     1       // use 64-bit atomics for hash key insertion; if not available, a lock buffer will be used for synchronization
++#endif
++
++#ifndef HASH_GRID_USE_NORMALS
++#define HASH_GRID_USE_NORMALS               1       // account for the normal data in the hash key
++#endif
++
++#ifndef HASH_GRID_POSITION_BIAS
++#define HASH_GRID_POSITION_BIAS             1e-4f   // may require adjustment for extreme scene scales
++#endif
++
++#ifndef HASH_GRID_NORMAL_BIAS
++#define HASH_GRID_NORMAL_BIAS               1e-3f   // bias for normal to stabilize hashing on surfaces nearly parallel to coordinate planes
++#endif
++
++#ifndef HASH_GRID_LOOP_ATTR
++#define HASH_GRID_LOOP_ATTR                 [loop]  // loop attribute used to control shader compiler unrolling behavior
++#endif
++
++#ifndef HASH_GRID_LIMIT_EMPTY_SLOTS
++#define HASH_GRID_LIMIT_EMPTY_SLOTS         0       // stop searching after N empty slots; 0 means never stop early (no-op); we typically avoid unrolling for these loops
++#endif
++
++// Computes logarithm with an arbitrary base.
++// The base controls how frequently the hash grid level changes with distance
++// (i.e., the rate at which voxel size increases across levels).
++// SHaRC typically uses base 2.0 as a good default
++float HashGrid_(LogBase)(float x, float base)
++{
++    return log2(x) * rcp(log2(base));
++}
++
++// http://burtleburtle.net/bob/hash/integer.html
++uint HashGrid_(HashJenkins32)(uint a)
++{
++    a = (a + 0x7ed55d16) + (a << 12);
++    a = (a ^ 0xc761c23c) ^ (a >> 19);
++    a = (a + 0x165667b1) + (a << 5);
++    a = (a + 0xd3a2646c) ^ (a << 9);
++    a = (a + 0xfd7046c5) + (a << 3);
++    a = (a ^ 0xb55a4f09) ^ (a >> 16);
++
++    return a;
++}
++
++uint HashGrid_(Hash32)(HASH_GRID_KEY_TYPE hashKey)
++{
++#if HASH_GRID_COMPACT
++    return HashGrid_(HashJenkins32)(hashKey);
++#else // !HASH_GRID_COMPACT
++    return HashGrid_(HashJenkins32)(uint(hashKey)) ^ HashGrid_(HashJenkins32)(uint(hashKey >> 32));
++#endif // HASH_GRID_COMPACT
++}
++
++// Computes the first slot for the probe bucket.
++// The bucket is kept contiguous and does not wrap around the end of the table,
++// which simplifies lookup / insertion logic. Applications may allocate
++// HASH_GRID_HASH_MAP_BUCKET_SIZE - 1 extra slots beyond capacity to avoid
++// clamping the base slot near the end
++uint HashGrid_(GetBaseSlot)(const HASH_GRID_KEY_TYPE hashKey, uint capacity)
++{
++    const uint baseSlotCount = capacity - HASH_GRID_HASH_MAP_BUCKET_SIZE + 1;
++
++    return HashGrid_(Hash32)(hashKey) % baseSlotCount;
++}
++
++uint HashGrid_(GetLevel)(float3 samplePosition, HashGridParameters gridParameters)
++{
++    float3 cameraOffset = gridParameters.cameraPosition - samplePosition;
++    float distance2 = dot(cameraOffset, cameraOffset);
++    distance2 = max(distance2, 1e-10f);
++    float gridLevel = 0.5f * HashGrid_(LogBase)(distance2, gridParameters.logarithmBase) + gridParameters.levelBias;
++
++    return uint(clamp(gridLevel, 1.0f, float(HASH_GRID_(LEVEL_BIT_MASK))));
++}
++
++float HashGrid_(GetVoxelSize)(uint gridLevel, HashGridParameters gridParameters)
++{
++    float exponent = log2(gridParameters.logarithmBase) * (float(gridLevel) - gridParameters.levelBias);
++
++    return exp2(exponent) * rcp(gridParameters.sceneScale);
++}
++
++// Based on logarithmic caching by Johannes Jendersie
++int4 HashGrid_(CalculatePositionLogWithVoxelSize)(float3 samplePosition, HashGridParameters gridParameters, out float voxelSize)
++{
++    samplePosition += float3(HASH_GRID_POSITION_BIAS, HASH_GRID_POSITION_BIAS, HASH_GRID_POSITION_BIAS);
++
++    uint gridLevel      = HashGrid_(GetLevel)(samplePosition, gridParameters);
++    voxelSize           = HashGrid_(GetVoxelSize)(gridLevel, gridParameters);
++    int3 gridPosition   = int3(floor(samplePosition * rcp(voxelSize)));
++
++    return int4(gridPosition.xyz, gridLevel);
++}
++
++int4 HashGrid_(CalculatePositionLog)(float3 samplePosition, HashGridParameters gridParameters)
++{
++    float voxelSize;
++    return HashGrid_(CalculatePositionLogWithVoxelSize)(samplePosition, gridParameters, voxelSize);
++}
++
++HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHashFromGridPosition)(uint4 gridPosition, float3 sampleNormal)
++{
++    HASH_GRID_KEY_TYPE hashKey =
++        ((HASH_GRID_KEY_TYPE(gridPosition.x) & HASH_GRID_(POSITION_BIT_MASK)) << (HASH_GRID_(POSITION_BIT_NUM) * 0)) |
++        ((HASH_GRID_KEY_TYPE(gridPosition.y) & HASH_GRID_(POSITION_BIT_MASK)) << (HASH_GRID_(POSITION_BIT_NUM) * 1)) |
++        ((HASH_GRID_KEY_TYPE(gridPosition.z) & HASH_GRID_(POSITION_BIT_MASK)) << (HASH_GRID_(POSITION_BIT_NUM) * 2)) |
++        ((HASH_GRID_KEY_TYPE(gridPosition.w) & HASH_GRID_(LEVEL_BIT_MASK)) << HASH_GRID_(LEVEL_BIT_OFFSET));
++
++#if HASH_GRID_USE_NORMALS
++    uint normalBits =
++        (sampleNormal.x + HASH_GRID_NORMAL_BIAS >= 0 ? 0 : 1) +
++        (sampleNormal.y + HASH_GRID_NORMAL_BIAS >= 0 ? 0 : 2) +
++        (sampleNormal.z + HASH_GRID_NORMAL_BIAS >= 0 ? 0 : 4);
++
++    hashKey |= (HASH_GRID_KEY_TYPE(normalBits) << HASH_GRID_(NORMAL_BIT_OFFSET));
++#endif // HASH_GRID_USE_NORMALS
++
++    return hashKey;
++}
++
++HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHashWithVoxelSize)(float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters, out float voxelSize)
++{
++    uint4 gridPosition = uint4(HashGrid_(CalculatePositionLogWithVoxelSize)(samplePosition, gridParameters, voxelSize));
++    return HashGrid_(ComputeSpatialHashFromGridPosition)(gridPosition, sampleNormal);
++}
++
++HASH_GRID_KEY_TYPE HashGrid_(ComputeSpatialHash)(float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters)
++{
++    float voxelSize;
++    return HashGrid_(ComputeSpatialHashWithVoxelSize)(samplePosition, sampleNormal, gridParameters, voxelSize);
++}
++
++float3 HashGrid_(GetPositionFromKey)(const HASH_GRID_KEY_TYPE hashKey, HashGridParameters gridParameters)
++{
++    int3 gridPosition;
++    gridPosition.x = int((hashKey >> (HASH_GRID_(POSITION_BIT_NUM) * 0)) & HASH_GRID_(POSITION_BIT_MASK));
++    gridPosition.y = int((hashKey >> (HASH_GRID_(POSITION_BIT_NUM) * 1)) & HASH_GRID_(POSITION_BIT_MASK));
++    gridPosition.z = int((hashKey >> (HASH_GRID_(POSITION_BIT_NUM) * 2)) & HASH_GRID_(POSITION_BIT_MASK));
++
++    // Sign-extend packed coordinates without divergent branches.
++    gridPosition = (gridPosition << (32 - HASH_GRID_(POSITION_BIT_NUM))) >> (32 - HASH_GRID_(POSITION_BIT_NUM));
++
++    uint   gridLevel        = uint((hashKey >> HASH_GRID_(LEVEL_BIT_OFFSET)) & HASH_GRID_(LEVEL_BIT_MASK));
++    float  voxelSize        = HashGrid_(GetVoxelSize)(gridLevel, gridParameters);
++    float3 samplePosition   = (gridPosition + 0.5f) * voxelSize;
++
++    return samplePosition;
++}
++
++struct HashGrid_(Data)
++{
++    uint capacity;
++
++    RW_STRUCTURED_BUFFER(hashEntriesBuffer, HASH_GRID_KEY_TYPE);
++
++#if !HASH_GRID_ENABLE_64_BIT_ATOMICS && !HASH_GRID_COMPACT
++    RW_STRUCTURED_BUFFER(lockBuffer, uint);
++#endif // !HASH_GRID_ENABLE_64_BIT_ATOMICS && !HASH_GRID_COMPACT
++};
++
++void HashGrid_(AtomicCompareExchange)(in HashGrid_(Data) hashData, in uint dstOffset, in HASH_GRID_KEY_TYPE compareValue, in HASH_GRID_KEY_TYPE value, out HASH_GRID_KEY_TYPE originalValue)
++{
++#if HASH_GRID_ENABLE_64_BIT_ATOMICS || HASH_GRID_COMPACT
++    InterlockedCompareExchange(BUFFER_AT_OFFSET(hashData.hashEntriesBuffer, dstOffset), compareValue, value, originalValue);
++#else // !HASH_GRID_ENABLE_64_BIT_ATOMICS
++    // ANY rearangments to the code below lead to device hang if fuse is unlimited
++    const uint cLock = 0xAAAAAAAA;
++    uint fuse = 0;
++    const uint fuseLength = 8;
++    bool busy = true;
++    while (busy && fuse < fuseLength)
++    {
++        uint state;
++        InterlockedExchange(BUFFER_AT_OFFSET(hashData.lockBuffer, dstOffset), cLock, state);
++        busy = state != 0;
++
++        if (state != cLock)
++        {
++            originalValue = BUFFER_AT_OFFSET(hashData.hashEntriesBuffer, dstOffset);
++            if (originalValue == compareValue)
++                BUFFER_AT_OFFSET(hashData.hashEntriesBuffer, dstOffset) = value;
++            InterlockedExchange(BUFFER_AT_OFFSET(hashData.lockBuffer, dstOffset), state, fuse);
++            fuse = fuseLength;
++        }
++        ++fuse;
++    }
++#endif // HASH_GRID_ENABLE_64_BIT_ATOMICS
++}
++
++bool HashGrid_(Insert)(in HashGrid_(Data) hashData, const HASH_GRID_KEY_TYPE hashKey, uint baseSlot, uint probeRange, out HashGridIndex cacheIndex, out uint bucketOffset)
++{
++    cacheIndex = HASH_GRID_INVALID_CACHE_INDEX;
++    probeRange = min(probeRange, HASH_GRID_HASH_MAP_BUCKET_SIZE);
++
++    HASH_GRID_LOOP_ATTR
++    for (bucketOffset = 0; bucketOffset < probeRange; ++bucketOffset)
++    {
++        HASH_GRID_KEY_TYPE prevHashKey;
++        HashGrid_(AtomicCompareExchange)(hashData, baseSlot + bucketOffset, HASH_GRID_INVALID_HASH_KEY, hashKey, prevHashKey);
++
++        if (prevHashKey == HASH_GRID_INVALID_HASH_KEY || prevHashKey == hashKey)
++        {
++            cacheIndex = baseSlot + bucketOffset;
++            return true;
++        }
++    }
++
++    return false;
++}
++
++bool HashGrid_(Find)(in HashGrid_(Data) hashData, const HASH_GRID_KEY_TYPE hashKey, uint baseSlot, uint probeRange, out HashGridIndex cacheIndex, out uint bucketOffset)
++{
++    cacheIndex = HASH_GRID_INVALID_CACHE_INDEX;
++    probeRange = min(probeRange, HASH_GRID_HASH_MAP_BUCKET_SIZE);
++    uint emptyEntires = 0;
++
++    HASH_GRID_LOOP_ATTR
++    for (bucketOffset = 0; bucketOffset < probeRange; ++bucketOffset)
++    {
++        HASH_GRID_KEY_TYPE storedHashKey = BUFFER_AT_OFFSET(hashData.hashEntriesBuffer, baseSlot + bucketOffset);
++#if HASH_GRID_LIMIT_EMPTY_SLOTS
++        if (storedHashKey == HASH_GRID_INVALID_HASH_KEY)
++        {
++            if (emptyEntires > HASH_GRID_LIMIT_EMPTY_SLOTS)
++                break;
++
++            ++emptyEntires;
++        }
++#endif // HASH_GRID_LIMIT_EMPTY_SLOTS
++
++        if (storedHashKey == hashKey)
++        {
++            cacheIndex = baseSlot + bucketOffset;
++            return true;
++        }
++    }
++
++    return false;
++}
++
++bool HashGrid_(InsertEntry)(in HashGrid_(Data) hashData, float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters, out HASH_GRID_KEY_TYPE hashKey, out HashGridIndex cacheIndex)
++{
++    hashKey                     = HashGrid_(ComputeSpatialHash)(samplePosition, sampleNormal, gridParameters);
++    uint baseSlot               = HashGrid_(GetBaseSlot)(hashKey, hashData.capacity);
++    uint bucketOffset;
++
++    return HashGrid_(Insert)(hashData, hashKey, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, cacheIndex, bucketOffset);
++}
++
++HashGridIndex HashGrid_(FindEntry)(in HashGrid_(Data) hashData, float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters, out HASH_GRID_KEY_TYPE hashKey)
++{
++    HashGridIndex cacheIndex    = HASH_GRID_INVALID_CACHE_INDEX;
++    hashKey                     = HashGrid_(ComputeSpatialHash)(samplePosition, sampleNormal, gridParameters);
++    uint baseSlot               = HashGrid_(GetBaseSlot)(hashKey, hashData.capacity);
++    uint bucketOffset;
++    HashGrid_(Find)(hashData, hashKey, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, cacheIndex, bucketOffset);
++
++    return cacheIndex;
++}
++
++// Debug functions
++float3 HashGrid_(GetColorFromHash32)(uint hash)
++{
++    float3 color;
++    color.x = ((hash >>  0) & 0x3ff) / 1023.0f;
++    color.y = ((hash >> 11) & 0x7ff) / 2047.0f;
++    color.z = ((hash >> 22) & 0x7ff) / 2047.0f;
++
++    return color;
++}
++
++// Debug visualization
++float3 HashGrid_(DebugColoredHash)(float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters)
++{
++    HASH_GRID_KEY_TYPE hashKey  = HashGrid_(ComputeSpatialHash)(samplePosition, sampleNormal, gridParameters);
++    uint gridLevel              = HashGrid_(GetLevel)(samplePosition, gridParameters);
++    float3 color                = HashGrid_(GetColorFromHash32)(HashGrid_(Hash32)(hashKey)) * HashGrid_(GetColorFromHash32)(HashGrid_(HashJenkins32)(gridLevel)).xyz;
++
++    return color;
++}
++
++float3 HashGrid_(DebugOccupancy)(uint2 pixelPosition, uint2 screenSize, HashGrid_(Data) hashData)
++{
++    const uint elementSize = 7;
++    const uint borderSize = 1;
++    const uint blockSize = elementSize + borderSize;
++
++    uint rowNum = screenSize.y / blockSize;
++    uint rowIndex = pixelPosition.y / blockSize;
++    uint columnIndex = pixelPosition.x / blockSize;
++    uint elementIndex = (columnIndex / HASH_GRID_HASH_MAP_BUCKET_SIZE) * (rowNum * HASH_GRID_HASH_MAP_BUCKET_SIZE) + rowIndex * HASH_GRID_HASH_MAP_BUCKET_SIZE + (columnIndex % HASH_GRID_HASH_MAP_BUCKET_SIZE);
++
++    if (elementIndex < hashData.capacity && ((pixelPosition.x % blockSize) < elementSize && (pixelPosition.y % blockSize) < elementSize))
++    {
++        HASH_GRID_KEY_TYPE hashGridKey = BUFFER_AT_OFFSET(hashData.hashEntriesBuffer, elementIndex);
++        if (hashGridKey != HASH_GRID_INVALID_HASH_KEY)
++            return (hashGridKey >> (HASH_GRID_(KEY_BIT_NUM) - 1)) != 0 ? float3(1.0f, 0.75f, 0.0f) : float3(0.0f, 1.0f, 0.0f);
++    }
++
++    return float3(0.0f, 0.0f, 0.0f);
++}
++
++float3 HashGrid_(DebugHashCollisions)(float3 samplePosition, float3 sampleNormal, HashGridParameters gridParameters, HashGrid_(Data) hashData)
++{
++    HASH_GRID_KEY_TYPE hashKey  = HashGrid_(ComputeSpatialHash)(samplePosition, sampleNormal, gridParameters);
++    HashGridIndex cacheIndex    = HASH_GRID_INVALID_CACHE_INDEX;
++    uint baseSlot               = HashGrid_(GetBaseSlot)(hashKey, hashData.capacity);
++    uint bucketOffset;
++    HashGrid_(Find)(hashData, hashKey, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, cacheIndex, bucketOffset);
++
++    float3 debugColor;
++    if (bucketOffset == 0)
++        debugColor = float3(0.0f, 0.0f, 1.0f);
++    else if (bucketOffset == 1)
++        debugColor = float3(0.0f, 0.5f, 0.5f);
++    else if (bucketOffset == 2)
++        debugColor = float3(0.0f, 1.0f, 0.0f);
++    else if (bucketOffset == 3)
++        debugColor = float3(1.0f, 1.0f, 0.0f);
++    else if (bucketOffset == 4)
++        debugColor = float3(0.75f, 0.25f, 0.0f);
++    else
++        debugColor = float3(1.0f, 0.0f, 0.0f);
++
++    return debugColor;
++}
+diff --git a/src/refresh/vkpt/shader/sharc/HashGridTypes.h b/src/refresh/vkpt/shader/sharc/HashGridTypes.h
+new file mode 100644
+index 00000000..f70c1249
+--- /dev/null
++++ b/src/refresh/vkpt/shader/sharc/HashGridTypes.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
++ *
++ * NVIDIA CORPORATION and its licensors retain all intellectual property
++ * and proprietary rights in and to this software, related documentation
++ * and any modifications thereto.  Any use, reproduction, disclosure or
++ * distribution of this software and related documentation without an express
++ * license agreement from NVIDIA CORPORATION is strictly prohibited.
++ */
++
++#ifndef HASH_GRID_TYPES_H
++#define HASH_GRID_TYPES_H
++
++#define HASH_GRID_HASH_MAP_BUCKET_SIZE  16
++#define HASH_GRID_INVALID_HASH_KEY      0
++#define HASH_GRID_INVALID_CACHE_INDEX   0xFFFFFFFF
++
++#define HashGridIndex uint
++
++struct HashGridParameters
++{
++    float3 cameraPosition;      // world-space camera position; distance to camera defines voxel level/size
++    float logarithmBase;        // controls how quickly grid levels change with distance (SHaRC typically uses 2.0f)
++    float sceneScale;           // world-space scale factor controlling voxel size
++    float levelBias;            // biases level selection: can add more near-camera levels or clamp minimum voxel size (start with 0)
++};
++
++#endif // HASH_GRID_TYPES_H
+diff --git a/src/refresh/vkpt/shader/sharc/License.md b/src/refresh/vkpt/shader/sharc/License.md
+new file mode 100644
+index 00000000..8f401315
+--- /dev/null
++++ b/src/refresh/vkpt/shader/sharc/License.md
+@@ -0,0 +1,303 @@
++NVIDIA RTX SDKs LICENSE
++
++This license is a legal agreement between you and NVIDIA Corporation ("NVIDIA") and governs the use of the NVIDIA RTX 
++software development kits, including the DLSS SDK, NGX SDK, RTXGI SDK, RTXDI SDK, RTX Video SDK and/or NRD SDK, if and 
++when made available to you under this license (in each case, the “SDK”).
++This license can be accepted only by an adult of legal age of majority in the country in which the SDK is used. If you are 
++under the legal age of majority, you must ask your parent or legal guardian to consent to this license. If you are entering this 
++license on behalf of a company or other legal entity, you represent that you have legal authority and “you” will mean the 
++entity you represent. 
++By using the SDK, you affirm that you have reached the legal age of majority, you accept the terms of this license, and you 
++take legal and financial responsibility for the actions of your permitted users. 
++
++You agree to use the SDK only for purposes that are permitted by (a) this license, and (b) any applicable law, regulation or 
++generally accepted practices or guidelines in the relevant jurisdictions.
++1. LICENSE. Subject to the terms of this license and the terms in the supplement attached, NVIDIA hereby grants you a non-
++exclusive, non-transferable license, without the right to sublicense (except as expressly provided in this license) to: 
++a. Install and use the SDK,
++b. Modify and create derivative works of sample source code delivered in the SDK, and
++c. Distribute any software and materials within the SDK, other than developer tools provided for your internal use, as 
++incorporated in object code format into a software application subject to the distribution requirements indicated in this 
++license.
++
++2. DISTRIBUTION REQUIREMENTS. These are the distribution requirements for you to exercise the grants above:
++a.	An application must have material additional functionality, beyond the included portions of the SDK. 
++b.	The following notice shall be included in modifications and derivative works of source code distributed: “This software 
++contains source code provided by NVIDIA Corporation.” 
++c.	You agree to distribute the SDK subject to the terms at least as protective as the terms of this license, including (without 
++limitation) terms relating to the license grant, license restrictions and protection of NVIDIA’s intellectual property rights. 
++Additionally, you agree that you will protect the privacy, security and legal rights of your application users. 
++d.	You agree to notify NVIDIA in writing of any known or suspected distribution or use of the SDK not in compliance with 
++the requirements of this license, and to enforce the terms of your agreements with respect to the distributed portions of 
++the SDK. 
++3. AUTHORIZED USERS. You may allow employees and contractors of your entity or of your subsidiary(ies) to access and use 
++the SDK from your secure network to perform work on your behalf. If you are an academic institution you may allow users 
++enrolled or employed by the academic institution to access and use the SDK from your secure network. You are responsible 
++for the compliance with the terms of this license by your authorized users. 
++
++4. LIMITATIONS. Your license to use the SDK is restricted as follows:
++a.	You may not reverse engineer, decompile or disassemble, or remove copyright or other proprietary notices from any 
++portion of the SDK or copies of the SDK. 
++b.	Except as expressly provided in this license, you may not copy, sell, rent, sublicense, transfer, distribute, modify, or 
++create derivative works of any portion of the SDK. For clarity, you may not distribute or sublicense the SDK as a stand-alone 
++product.
++c.	 Unless you have an agreement with NVIDIA for this purpose, you may not indicate that an application created with the 
++SDK is sponsored or endorsed by NVIDIA.
++d.	 You may not bypass, disable, or circumvent any technical limitation, encryption, security, digital rights management or 
++authentication mechanism in the SDK.  
++e.	You may not use the SDK in any manner that would cause it to become subject to an open source software license. As 
++examples, licenses that require as a condition of use, modification, and/or distribution that the SDK be: (i) disclosed or 
++distributed in source code form; (ii) licensed for the purpose of making derivative works; or (iii) redistributable at no charge.
++f.	 Unless you have an agreement with NVIDIA for this purpose, you may not use the SDK with any system or application 
++where the use or failure of the system or application can reasonably be expected to threaten or result in personal injury, 
++death, or catastrophic loss. Examples include use in avionics, navigation, military, medical, life support or other life critical 
++applications. NVIDIA does not design, test or manufacture the SDK for these critical uses and NVIDIA shall not be liable to 
++you or any third party, in whole or in part, for any claims or damages arising from such uses. 
++g.	You agree to defend, indemnify and hold harmless NVIDIA and its affiliates, and their respective employees, contractors, 
++agents, officers and directors, from and against any and all claims, damages, obligations, losses, liabilities, costs or debt, 
++fines, restitutions and expenses (including but not limited to attorney’s fees and costs incident to establishing the right of 
++indemnification) arising out of or related to your use of the SDK outside of the scope of this license, or not in compliance 
++with its terms. 
++
++5. UPDATES. NVIDIA may, at its option, make available patches, workarounds or other updates to this SDK. Unless the 
++updates are provided with their separate governing terms, they are deemed part of the SDK licensed to you as provided in 
++this license. Further, NVIDIA may, at its option, automatically update the SDK or other software in the system, except for 
++those updates that you may opt-out via the SDK API. You agree that the form and content of the SDK that NVIDIA provides 
++may change without prior notice to you. While NVIDIA generally maintains compatibility between versions, NVIDIA may in 
++some cases make changes that introduce incompatibilities in future versions of the SDK.
++
++6. PRE-RELEASE VERSIONS. SDK versions identified as alpha, beta, preview, early access or otherwise as pre-release may not 
++be fully functional, may contain errors or design flaws, and may have reduced or different security, privacy, availability, and 
++reliability standards relative to commercial versions of NVIDIA software and materials. You may use a pre-release SDK 
++version at your own risk, understanding that these versions are not intended for use in production or business-critical 
++systems. NVIDIA may choose not to make available a commercial version of any pre-release SDK. NVIDIA may also choose to 
++abandon development and terminate the availability of a pre-release SDK at any time without liability.
++
++7. THIRD-PARTY COMPONENTS. The SDK may include third-party components with separate legal notices or terms as may 
++be described in proprietary notices accompanying the SDK. If and to the extent there is a conflict between the terms in this 
++license and the third-party license terms, the third-party terms control only to the extent necessary to resolve the conflict. 
++
++8. OWNERSHIP. 
++
++8.1 NVIDIA reserves all rights, title and interest in and to the SDK not expressly granted to you under this license. NVIDIA 
++and its suppliers hold all rights, title and interest in and to the SDK, including their respective intellectual property rights. 
++The SDK is copyrighted and protected by the laws of the United States and other countries, and international treaty 
++provisions.
++
++8.2 Subject to the rights of NVIDIA and its suppliers in the SDK, you hold all rights, title and interest in and to your 
++applications and your derivative works of the sample source code delivered in the SDK including their respective intellectual 
++property rights. 
++ 
++9. FEEDBACK. You may, but are not obligated to, provide Feedback to NVIDIA. “Feedback” means all suggestions, fixes, 
++modifications, feature requests or other feedback regarding the SDK. Feedback, even if designated as confidential by you, 
++shall not create any confidentiality obligation for NVIDIA. If you provide Feedback, you hereby grant NVIDIA, its affiliates 
++and its designees a non-exclusive, perpetual, irrevocable, sublicensable, worldwide, royalty-free, fully paid-up and 
++transferable license, under your intellectual property rights, to publicly perform, publicly display, reproduce, use, make, 
++have made, sell, offer for sale, distribute (through multiple tiers of distribution), import, create derivative works of and 
++otherwise commercialize and exploit the Feedback at NVIDIA’s discretion. You will not give Feedback (i) that you have 
++reason to believe is subject to any restriction that impairs the exercise of the grant stated in this section, such as third-party 
++intellectual property rights or (ii) subject to license terms which seek to require any product incorporating or developed 
++using such Feedback, or other intellectual property of NVIDIA or its affiliates, to be licensed to or otherwise shared with any 
++third party. 
++
++10. NO WARRANTIES. THE SDK IS PROVIDED AS-IS. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW NVIDIA AND 
++ITS AFFILIATES EXPRESSLY DISCLAIM ALL WARRANTIES OF ANY KIND OR NATURE, WHETHER EXPRESS, IMPLIED OR 
++STATUTORY, INCLUDING, BUT NOT LIMITED TO, WARRANTIES OF MERCHANTABILITY, NON-INFRINGEMENT, FITNESS FOR A 
++PARTICULAR PURPOSE, USAGE OF TRADE AND COURSE OF DEALING. NVIDIA DOES NOT WARRANT THAT THE SDK WILL 
++MEET YOUR REQUIREMENTS OR THAT THE OPERATION THEREOF WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ALL 
++ERRORS WILL BE CORRECTED. 
++
++11. LIMITATIONS OF LIABILITY. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW NVIDIA AND ITS AFFILIATES SHALL 
++NOT BE LIABLE FOR ANY (I) SPECIAL, INCIDENTAL, PUNITIVE OR CONSEQUENTIAL DAMAGES, OR FOR DAMAGES FOR  (A) 
++ANY LOST PROFITS, PROJECT DELAYS, LOSS OF USE, LOSS OF DATA OR LOSS OF GOODWILL, OR (B) THE COSTS OF 
++PROCURING SUBSTITUTE PRODUCTS, ARISING OUT OF OR IN CONNECTION WITH THIS LICENSE OR THE USE OR 
++PERFORMANCE OF THE SDK, WHETHER SUCH LIABILITY ARISES FROM ANY CLAIM BASED UPON BREACH OF CONTRACT, 
++BREACH OF WARRANTY, TORT (INCLUDING NEGLIGENCE), PRODUCT LIABILITY OR ANY OTHER CAUSE OF ACTION OR 
++THEORY OF LIABILITY, EVEN IF NVIDIA HAS PREVIOUSLY BEEN ADVISED OF, OR COULD REASONABLY HAVE FORESEEN, THE 
++POSSIBILITY OF SUCH DAMAGES. IN NO EVENT WILL NVIDIA’S AND ITS AFFILIATES TOTAL CUMULATIVE LIABILITY UNDER OR 
++ARISING OUT OF THIS LICENSE EXCEED US$10.00. THE NATURE OF THE LIABILITY OR THE NUMBER OF CLAIMS OR SUITS 
++SHALL NOT ENLARGE OR EXTEND THIS LIMIT. 
++
++12. TERMINATION. Your rights under this license will terminate automatically without notice from NVIDIA if you fail to 
++comply with any term and condition of this license or if you commence or participate in any legal proceeding against 
++NVIDIA with respect to the SDK. NVIDIA may terminate this license with advance written notice to you, if NVIDIA decides to 
++no longer provide the SDK in a country or, in NVIDIA’s sole discretion, the continued use of it is no longer commercially 
++viable. Upon any termination of this license, you agree to promptly discontinue use of the SDK and destroy all copies in your 
++possession or control. Your prior distributions in accordance with this license are not affected by the termination of this 
++license. All provisions of this license will survive termination, except for the license granted to you. 
++
++13. APPLICABLE LAW. This license will be governed in all respects by the laws of the United States and of the State of 
++Delaware, without regard to the conflicts of laws principles. The United Nations Convention on Contracts for the 
++International Sale of Goods is specifically disclaimed. You agree to all terms of this license in the English language. The state 
++or federal courts residing in Santa Clara County, California shall have exclusive jurisdiction over any dispute or claim arising 
++out of this license. Notwithstanding this, you agree that NVIDIA shall still be allowed to apply for injunctive remedies or 
++urgent legal relief in any jurisdiction. 
++
++14. NO ASSIGNMENT. This license and your rights and obligations thereunder may not be assigned by you by any means or 
++operation of law without NVIDIA’s permission. Any attempted assignment not approved by NVIDIA in writing shall be void 
++and of no effect. NVIDIA may assign, delegate or transfer this license and its rights and obligations, and if to a non-affiliate 
++you will be notified.
++ 
++15. EXPORT. The SDK is subject to United States export laws and regulations. You agree to comply with all applicable U.S. 
++and international export laws, including the Export Administration Regulations (EAR) administered by the U.S. Department 
++of Commerce and economic sanctions administered by the U.S. Department of Treasury’s Office of Foreign Assets Control 
++(OFAC). These laws include restrictions on destinations, end-users and end-use. By accepting this license, you confirm that 
++you are not currently residing in a country or region currently embargoed by the U.S. and that you are not otherwise 
++prohibited from receiving the SDK.
++
++16. GOVERNMENT USE. The SDK, documentation and technology (“Protected Items”) are “Commercial products” as this 
++term is defined at 48 C.F.R. 2.101, consisting of “commercial computer software” and “commercial computer software 
++documentation” as such terms are used in, respectively, 48 C.F.R. 12.212 and 48 C.F.R. 227.7202 & 252.227-7014(a)(1). 
++Before any Protected Items are supplied to the U.S. Government, you will (i) inform the U.S. Government in writing that the 
++Protected Items are and must be treated as commercial computer software and commercial computer software 
++documentation developed at private expense; (ii) inform the U.S. Government that the Protected Items are provided 
++subject to the terms of the Agreement; and (iii) mark the Protected Items as commercial computer software and 
++commercial computer software documentation developed at private expense. In no event will you permit the U.S. 
++Government to acquire rights in Protected Items beyond those specified in 48 C.F.R. 52.227-19(b)(1)-(2) or 252.227-7013(c) 
++except as expressly approved by NVIDIA in writing.
++
++17. NOTICES. You agree that any notices that NVIDIA sends you electronically, such as via email, will satisfy any legal 
++communication requirements. Please direct your legal notices or other correspondence to NVIDIA Corporation, 2788 San 
++Tomas Expressway, Santa Clara, California 95051, United States of America, Attention: Legal Department.
++
++18. ENTIRE AGREEMENT. This license is the final, complete and exclusive agreement between the parties relating to the 
++subject matter of this license and supersedes all prior or contemporaneous understandings and agreements relating to this 
++subject matter, whether oral or written. If any court of competent jurisdiction determines that any provision of this license 
++is illegal, invalid or unenforceable, the remaining provisions will remain in full force and effect. Any amendment or waiver 
++under this license shall be in writing and signed by representatives of both parties.
++
++19. LICENSING. If the distribution terms in this license are not suitable for your organization, or for any questions regarding 
++this license, please contact NVIDIA at nvidia-rtx-license-questions@nvidia.com.
++(v. February 23, 2024)
++
++                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++ 
++
++
++NVIDIA RTX SUPPLEMENT TO SOFTWARE LICENSE AGREEMENT FOR NVIDIA SOFTWARE DEVELOPMENT KITS
++The terms in this supplement govern your use of the NVIDIA RTX SDKs, including the DLSS SDK, NGX SDK, RTXGI SDK, RTXDI 
++SDK, Video SDK and/or NRD SDK, if and when made available to you (in each case, the “SDK”) under the terms of your 
++license agreement (“Agreement”) as modified by this supplement. Capitalized terms used but not defined below have the 
++meaning assigned to them in the Agreement.
++This supplement is an exhibit to the Agreement and is incorporated as an integral part of the Agreement. In the event of 
++conflict between the terms in this supplement and the terms in the Agreement, the terms in this supplement govern.  
++
++1. Interoperability. Your applications that incorporate, or are based on, the SDK must be fully interoperable with 
++compatible GPU hardware products designed by NVIDIA or its affiliates. Further, the DLSS SDK and NGX SDK are licensed for 
++you to develop applications only for their use in systems with NVIDIA GPUs.
++
++2. Game License. You may, but are not obligated to, provide your game or related content (“Game Content”) to NVIDIA. If 
++you provide Game Content, you hereby grant NVIDIA, its affiliates and its designees a non-exclusive, perpetual, irrevocable, 
++worldwide, royalty-free, fully paid-up license, to use the Game Content to improve NVIDIA DLSS SDK and DLSS Model 
++Training. The terms in this section do not apply to the Video SDK.
++
++3. Limitations for the DLSS SDK and NGX SDK. Your applications that incorporate, or are based on, the DLSS SDK or NGX SDK 
++may be deployed in a cloud service that runs on systems that consume NVIDIA vGPU software, and any other cloud service 
++use of such SDKs or their functionality is outside of the scope of the Agreement. For the purpose of this section, cloud 
++services include application service providers or service bureaus, operators of hosted/virtual system environments, or 
++hosting, time sharing or providing any other type of service to others. 
++4. Notification for the DLSS SDK and NGX SDK. You are required to notify NVIDIA prior to commercial release of an 
++application (including a plug-in to a commercial application) that incorporates, or is based on, the DLSS SDK or NGX SDK. 
++Please send notifications to: https://developer.nvidia.com/sw-notification and provide the following information in the 
++email: company name, publisher and developer name, NVIDIA SDK used, application name, platform (i.e. PC, Linux), 
++scheduled ship date, and weblink to product/video. 
++
++5. Audio and Video Encoders and Decoders. You acknowledge and agree that it is your sole responsibility to obtain any 
++additional third-party licenses required to make, have made, use, have used, sell, import, and offer for sale your products or 
++services that include or incorporate any third-party software and content relating to audio and/or video encoders and 
++decoders from, including but not limited to, Microsoft, Thomson, Fraunhofer IIS, Sisvel S.p.A., MPEG-LA, and Coding 
++Technologies. NVIDIA does not grant to you under this Agreement any necessary patent or other rights with respect to any 
++audio and/or video encoders and decoders. The terms in this section do not apply to the Video SDK.
++
++6. DLSS SDK Terms. By installing or using the DLSS SDK you agree that NVIDIA can make over-the-air updates of DLSS in 
++systems that have DLSS installed, including (without limitation) for quality, stability or performance improvements or to 
++support new hardware. If you publicly release a DLSS integration in an end user game or application that presents material 
++stability, performance, image quality, or other technical issues impacting the user experience, you will work to quickly 
++address the integration issues. In the case issues are not addressed, NVIDIA reserves the right, as a last resort, to 
++temporarily disable the DLSS integration until the issues can be fixed.
++7. Marketing.
++7.1 Marketing Activities. Your license to the SDK(s) under the Agreement is subject to your compliance with the following 
++marketing terms:
++(a)  Identification by You in the DLSS SDK, Video SDK or NGX SDK.  During the term of the Agreement, NVIDIA agrees that 
++you may identify NVIDIA on your websites, printed collateral, trade-show displays and other retail packaging materials, as 
++the supplier of the DLSS SDK, Video SDK or NGX SDK for the applications that were developed with use of such SDKs, 
++provided that all such references to NVIDIA will be subject to NVIDIA's prior review and written approval, which will not be 
++unreasonably withheld or delayed. 
++(b)  NVIDIA Trademark Placement in Applications with the DLSS SDK or NGX SDK.  For applications that incorporate the DLSS 
++SDK or NGX SDK or portions thereof, you must attribute the use of the applicable SDK and include the NVIDIA Marks on 
++splash screens, in the about box of the application (if present), and in credits for game applications.
++(c) NVIDIA Trademark Placement in Applications with a licensed SDK, other than the DLSS SDK, Video SDK or NGX SDK. For 
++applications that incorporates and/or makes use of a licensed SDK, other than the DLSS SDK, Video SDK or NGX SDK, you 
++must attribute the use of the applicable SDK and include the NVIDIA Marks on the credit screen for applications that have 
++such credit screen, or where a credit screen is not present prominently in end user documentation for the application. 
++(d) Identification by NVIDIA in the DLSS SDK, Video SDK or NGX SDK.  You agree that NVIDIA may identify you on NVIDIA's 
++websites, printed collateral, trade-show displays, and other retail packaging materials as an individual or entity that 
++produces products and services which incorporate  the DLSS SDK, Video SDK or NGX SDK as applicable. To the extent that 
++you provide NVIDIA with input or usage requests with regard to the use of your logo or materials, NVIDIA will use 
++commercially reasonable efforts to comply with such requests.  For the avoidance of doubt, NVIDIA’s rights pursuant to this 
++section shall survive any expiration or termination of the Agreement with respect to existing applications which incorporate 
++the DLSS SDK, Video SDK or NGX SDK.
++(e) Applications Marketing Material in the DLSS SDK Video SDK or NGX SDK. You may provide NVIDIA with screenshots, 
++imagery, and video footage of applications representative of your use of the NVIDIA DLSS SDK or NGX SDKs in your 
++application (collectively, “Assets”). You hereby grant to NVIDIA the right to create and display self-promotional demo 
++materials using the Assets, and after release of the application to the public to distribute, sub-license, and use the Assets to 
++promote and market the NVIDIA RTX SDKs.  To the extent you provide NVIDIA with input or usage requests with regard to 
++the use of your logo or materials, NVIDIA will use commercially reasonable efforts to comply with such requests.  For the 
++avoidance of doubt, NVIDIA’s rights pursuant to this section shall survive any termination of the Agreement with respect to 
++applications which incorporate the NVIDIA RTX SDK.
++7.2 Trademark Ownership and Licenses. Trademarks are owned and licenses as follows:
++(a)	Ownership of Trademarks.  Each party owns the trademarks, logos, and trade names (collectively "Marks") for their 
++respective products or services, including without limitation in applications, and the NVIDIA RTX SDKs. Each party agrees to 
++use the Marks of the other only as permitted in this exhibit.
++
++(b)	Trademark License to NVIDIA.  You grant to NVIDIA a non-exclusive, non-sub licensable, non-transferable (except as set 
++forth in the assignment provision of the Agreement), worldwide license to refer to you and your applications, and to use 
++your Marks on NVIDIA's marketing materials and on NVIDIA's website (subject to any reasonable conditions of you) solely 
++for NVIDIA’s marketing activities set forth in this exhibit Sections (d)-(e) above.  NVIDIA will follow your specifications for 
++your Marks as to style, color, and typeface as reasonably provided to NVIDIA.
++
++(c)	Trademark License to You.  NVIDIA grants to you a non-exclusive, non-sub licensable, non-transferable (except as set 
++forth in the assignment provision of the Agreement), worldwide license, subject to the terms of this exhibit and the 
++Agreement, to use NVIDIA RTX™, NVIDIA GeForce RTX™ in combination with GeForce products, and/or NVIDIA Quadro 
++RTX™  in combination with Quadro products (collectively, the “NVIDIA Marks”) on your marketing materials and on your 
++website (subject to any reasonable conditions of NVIDIA) solely for your marketing activities set forth in this exhibit Sections 
++6.1 (a)-(c) above.  For the avoidance of doubt, you will not and will not permit others to use any NVIDIA Mark for any other 
++goods or services, or in a way that tarnishes, degrades, disparages or reflects adversely any of the NVIDIA Marks or NVIDIA’s 
++business or reputation, or that dilutes or otherwise harms the value, reputation or distinctiveness of or NVIDIA’s goodwill in 
++any NVIDIA Mark. In addition to the termination rights set forth in the Agreement, NVIDIA may terminate this trademark 
++license at any time upon written notice to you. You will follow NVIDIA's use guidelines and specifications for NVIDIA's Marks 
++as to style, color and typeface as provided in NVIDIA Marks and submit a sample of each proposed use of NVIDIA's Marks at 
++least two (2) weeks prior to the desired implementation of such use to obtain NVIDIA's prior written approval (which 
++approval will not be unreasonably withheld or delayed).  If NVIDIA does not respond within ten (10) business days of your 
++submission of such sample, the sample will be deemed unapproved. All goodwill associated with use of NVIDIA Marks will 
++inure to the sole benefit of NVIDIA. For the video SDK, contact NVIDIA at nvidia-rtx-video-sdk-license-
++questions@nvidia.com.
++
++7.3 Use Guidelines. Use of the NVIDIA Marks is subject to the following guidelines:
++(a)	Business Practices.  You covenant that you will: (a)  conduct business with respect to NVIDIA’s products in a manner that 
++reflects favorably at all times on the good name, goodwill and reputation of such products; (b) avoid deceptive, misleading 
++or unethical practices that are detrimental to NVIDIA, its customers, or end users; (c) make no false or misleading 
++representations with regard to NVIDIA or its products; and (d) not publish or employ or cooperate in the publication or 
++employment of any misleading or deceptive advertising or promotional materials.
++
++(b)	No Combination Marks or Similar Marks.  You agree not to (a) combine NVIDIA Marks with any other content without 
++NVIDIA’s prior written approval, or (b) use any other trademark, trade name, or other designation of source which creates a 
++likelihood of confusion with NVIDIA Marks.
++
++(v. February 23, 2024)
+\ No newline at end of file
+diff --git a/src/refresh/vkpt/shader/sharc/SharcCommon.h b/src/refresh/vkpt/shader/sharc/SharcCommon.h
+new file mode 100644
+index 00000000..55668138
+--- /dev/null
++++ b/src/refresh/vkpt/shader/sharc/SharcCommon.h
+@@ -0,0 +1,981 @@
++/*
++ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
++ *
++ * NVIDIA CORPORATION and its licensors retain all intellectual property
++ * and proprietary rights in and to this software, related documentation
++ * and any modifications thereto.  Any use, reproduction, disclosure or
++ * distribution of this software and related documentation without an express
++ * license agreement from NVIDIA CORPORATION is strictly prohibited.
++ */
++
++// Version
++#define SHARC_VERSION_MAJOR                     1
++#define SHARC_VERSION_MINOR                     8
++#define SHARC_VERSION_BUILD                     3
++#define SHARC_VERSION_REVISION                  0
++
++// SHaRC usage overview
++//
++// SHaRC uses a world-space radiance cache to reduce path tracing cost. The
++// integration typically consists of three render-time passes:
++//
++// 1. SHaRC Update
++//    Sparse RT pass, compiled with SHARC_UPDATE=1, that traces a subset of
++//    paths and writes newly observed radiance into the accumulation cache.
++//    Call SharcInit() for each sampled path, SharcUpdateHit() on hits, and
++//    SharcUpdateMiss() on misses. If SharcUpdateHit() returns false, the path
++//    must be terminated early. Each path segment is treated independently:
++//    after selecting the next ray, call SharcSetThroughput() with the segment
++//    throughput, then reset path throughput to 1.0 for the next segment.
++//
++// 2. SHaRC Resolve
++//    Compute pass that calls SharcResolveEntry() for each cache entry. This
++//    combines per-frame accumulation data with previously resolved data,
++//    updates temporal accumulation, handles stale entry eviction, and clears
++//    accumulation data for the next frame.
++//
++// 3. SHaRC Render / Query
++//    Main render RT pass, compiled with SHARC_QUERY=1, that traces normally but
++//    queries the resolved cache on eligible non-primary hits using
++//    SharcGetCachedRadiance(). On a successful query, cached radiance is used
++//    and the path can terminate early.
++//
++// Required resources are hash entries, accumulation, and resolved buffers.
++// All buffers must have the same number of entries and be zero-initialized.
++// Proper UAV barriers are required between passes to guarantee correctness.
++//
++// HLSL shaders that include SHARC headers must be compiled with DXC
++// -enable-16bit-types and, for DXIL, Shader Model 6.2 or newer.
++
++// Constants
++#define SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET  0
++#define SHARC_ACCUMULATED_FRAME_NUM_BIT_NUM     16
++#define SHARC_ACCUMULATED_FRAME_NUM_BIT_MASK    ((1 << SHARC_ACCUMULATED_FRAME_NUM_BIT_NUM) - 1)
++#define SHARC_STALE_FRAME_NUM_BIT_OFFSET        16
++#define SHARC_STALE_FRAME_NUM_BIT_NUM           16
++#define SHARC_STALE_FRAME_NUM_BIT_MASK          ((1 << SHARC_STALE_FRAME_NUM_BIT_NUM) - 1)
++#define SHARC_GRID_LOGARITHM_BASE               2.0f
++#define SHARC_ACCUMULATED_FRAME_NUM_MIN         1       // minimum number of frames to use for data accumulation
++#define SHARC_ACCUMULATED_FRAME_NUM_MAX         1024    // maximum number of frames to use for data accumulation
++#define SHARC_STALE_FRAME_NUM_MAX               1024    // maximum number of frames without new samples before the cache entry is evicted
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++#define SHARC_CACHE_INDEX_BIT_NUM               26
++#define SHARC_CACHE_INDEX_BIT_MASK              ((1 << SHARC_CACHE_INDEX_BIT_NUM) - 1)
++#define SHARC_RESPONSIVE_INDEX_OFFSET_BIT_NUM   6
++#define SHARC_RESPONSIVE_INDEX_OFFSET_BIT_MASK  ((1 << SHARC_RESPONSIVE_INDEX_OFFSET_BIT_NUM) - 1)
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++// Tweakable parameters
++#ifndef SHARC_SAMPLE_NUM_THRESHOLD
++#define SHARC_SAMPLE_NUM_THRESHOLD              0       // elements with sample count above this threshold will be used for early-out/resampling
++#endif
++
++#ifndef SHARC_SEPARATE_EMISSIVE
++#define SHARC_SEPARATE_EMISSIVE                 0       // if enabled, emissive values must be provided separately during updates. For cache queries, you can either supply them directly or include them in the query result
++#endif
++
++#ifndef SHARC_MATERIAL_DEMODULATION
++#define SHARC_MATERIAL_DEMODULATION             0       // enable material demodulation to preserve material details; requires sampling material data to reconstruct shading from cached values
++#endif
++
++#ifndef SHARC_ENABLE_SH_ENCODING
++#define SHARC_ENABLE_SH_ENCODING                0       // store resolved radiance as mixed YCoCg SH2 data: Y L0/L1 plus Co/Cg L0
++#endif
++
++#ifndef SHARC_LINEAR_PROBE_WINDOW_SIZE
++#define SHARC_LINEAR_PROBE_WINDOW_SIZE          8       // size of the linear search window for probe lookups
++#endif
++
++#ifndef SHARC_ENABLE_CACHE_RESAMPLING
++#define SHARC_ENABLE_CACHE_RESAMPLING           SHARC_UPDATE // resamples the cache during update step
++#endif
++
++#ifndef SHARC_PROPAGATION_DEPTH
++#if SHARC_ENABLE_CACHE_RESAMPLING
++#define SHARC_PROPAGATION_DEPTH                 2       // controls the amount of vertices stored in memory for signal backpropagation with cache resampling
++#else // !SHARC_ENABLE_CACHE_RESAMPLING
++#define SHARC_PROPAGATION_DEPTH                 4       // controls the amount of vertices stored in memory for signal backpropagation
++#endif // SHARC_ENABLE_CACHE_RESAMPLING
++#endif
++
++#ifndef SHARC_BLEND_ADJACENT_LEVELS
++#define SHARC_BLEND_ADJACENT_LEVELS             1       // combine the data from adjacent levels on camera movement
++#endif
++
++#ifndef SHARC_ENABLE_FADE_ACCELERATION
++#define SHARC_ENABLE_FADE_ACCELERATION          0       // boost accumulator convergence when signal amplitude is fading
++#endif
++
++#ifndef SHARC_RESAMPLING_DEPTH_MIN
++#define SHARC_RESAMPLING_DEPTH_MIN              1       // controls minimum path depth which can be used with cache resampling
++#endif
++
++#ifndef SHARC_STALE_FRAME_NUM_MIN
++#define SHARC_STALE_FRAME_NUM_MIN               8       // minimum number of frames to keep the element in the cache
++#endif
++
++#ifndef SHARC_GRID_LEVEL_BIAS
++#define SHARC_GRID_LEVEL_BIAS                   0       // LOD bias - positive adds extra magnified levels, negative reduces levels
++#endif
++
++#ifndef SHARC_USE_FP16
++#define SHARC_USE_FP16                          0       // use native fp16 for sample weights storage; HLSL requires DXC -enable-16bit-types
++#endif
++
++#ifndef SHARC_RESPONSIVE_ENTRY_PROBE_RANGE
++#define SHARC_RESPONSIVE_ENTRY_PROBE_RANGE      16      // maximum depth for responsive entry search, deeper search is not justified
++#endif
++
++#ifndef HASH_GRID_COMPACT
++#define HASH_GRID_COMPACT                       0
++#endif
++
++#ifndef HASH_GRID_LIMIT_EMPTY_SLOTS
++#define HASH_GRID_LIMIT_EMPTY_SLOTS             2
++#endif
++
++#ifndef RW_STRUCTURED_BUFFER
++#define RW_STRUCTURED_BUFFER(name, type)        RWStructuredBuffer<type> name
++#endif
++
++#ifndef BUFFER_AT_OFFSET
++#define BUFFER_AT_OFFSET(name, offset)          name[offset]
++#endif
++
++#if SHARC_USE_FP16
++#define SharcSampleWeight float16_t3
++#else // !SHARC_USE_FP16
++#define SharcSampleWeight float3
++#endif // SHARC_USE_FP16
++
++#if HASH_GRID_COMPACT
++#define HashGridKey uint
++#else // !HASH_GRID_COMPACT
++#define HashGridKey uint64_t
++#endif // !HASH_GRID_COMPACT
++#define HASH_GRID_KEY_TYPE HashGridKey
++#define HASH_GRID_PREFIX HashGrid
++#define HASH_GRID_CONST_PREFIX HASH_GRID
++#include "HashGridTypes.h"
++#include "HashGridCommon.h"
++#undef HASH_GRID_KEY_TYPE
++#undef HASH_GRID_PREFIX
++#undef HASH_GRID_CONST_PREFIX
++
++// Error checks
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++#if SHARC_RESPONSIVE_ENTRY_PROBE_RANGE < 1
++#error SHARC_RESPONSIVE_ENTRY_PROBE_RANGE must be at least 1
++#endif
++
++#if SHARC_RESPONSIVE_ENTRY_PROBE_RANGE > HASH_GRID_HASH_MAP_BUCKET_SIZE
++#error SHARC_RESPONSIVE_ENTRY_PROBE_RANGE must not exceed HASH_GRID_HASH_MAP_BUCKET_SIZE
++#endif
++
++#if HASH_GRID_COMPACT
++#error compact hash grid currently doesn't work with responsive lighting
++#endif
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++#include "SharcTypes.h"
++
++struct SharcParameters
++{
++    HashGridParameters hashGridParameters;
++    HashGridData hashGridData;
++    float radianceScale;            // quantization factor for atomic radiance accumulation (u32 per channel during SHARC_UPDATE). Start with 1e3f; reduce for large radiance values to prevent overflow
++
++    RW_STRUCTURED_BUFFER(accumulationBuffer, SharcAccumulationData);
++    RW_STRUCTURED_BUFFER(resolvedBuffer, SharcPackedData);
++};
++
++struct SharcState
++{
++#if SHARC_UPDATE
++    HashGridIndex cacheIndices[SHARC_PROPAGATION_DEPTH];
++    SharcSampleWeight sampleWeights[SHARC_PROPAGATION_DEPTH];
++#if SHARC_ENABLE_SH_ENCODING
++    float3 radianceDirections[SHARC_PROPAGATION_DEPTH];
++    float radianceDirectionWeights[SHARC_PROPAGATION_DEPTH];
++#endif // SHARC_ENABLE_SH_ENCODING
++    uint pathLength;
++ #else // !SHARC_UPDATE
++    uint placeholder;               // prevents empty-struct compilation issues with GLSL
++#endif // SHARC_UPDATE
++};
++
++struct SharcHitData
++{
++    float3 positionWorld;
++    float3 normalWorld;             // geometry normal in world space. Shading or object-space normals should work, but are not generally recommended
++#if SHARC_ENABLE_SH_ENCODING
++    float3 radianceDirectionWorld;  // normalized outgoing direction for cached radiance, pointing from the hit toward the previous path vertex
++    float radianceDirectionWeight;  // 0 for diffuse radiance, 1 for strongly directional glossy/specular radiance
++#endif // SHARC_ENABLE_SH_ENCODING
++#if SHARC_MATERIAL_DEMODULATION
++    float3 materialDemodulation;    // demodulation factor used to preserve material details. Use > 0 when active; set to float3(1.0f, 1.0f, 1.0f) when unused
++#endif // SHARC_MATERIAL_DEMODULATION
++#if SHARC_SEPARATE_EMISSIVE
++    float3 emissive;                // separate emissive improves behavior with dynamic lighting. Requires computing material emissive on each(even cached) hit
++#endif // SHARC_SEPARATE_EMISSIVE
++};
++
++struct SharcRadianceData
++{
++#if SHARC_ENABLE_SH_ENCODING
++    float4 luminanceSH;             // xyz - L1, w - L0
++    float2 chromaL0;                // Co/Cg L0 in YCoCg color space
++#else // !SHARC_ENABLE_SH_ENCODING
++    float3 radiance;
++#endif // SHARC_ENABLE_SH_ENCODING
++};
++
++float3 SharcGetRadianceDirection(SharcHitData sharcHitData)
++{
++#if SHARC_ENABLE_SH_ENCODING
++    return sharcHitData.radianceDirectionWorld;
++#else // !SHARC_ENABLE_SH_ENCODING
++    return float3(0.0f, 0.0f, 1.0f);
++#endif // SHARC_ENABLE_SH_ENCODING
++}
++
++float SharcGetRadianceDirectionWeight(SharcHitData sharcHitData)
++{
++#if SHARC_ENABLE_SH_ENCODING
++    return saturate(sharcHitData.radianceDirectionWeight);
++#else // !SHARC_ENABLE_SH_ENCODING
++    return 0.0f;
++#endif // SHARC_ENABLE_SH_ENCODING
++}
++
++struct SharcVoxelData
++{
++    SharcRadianceData accumulatedRadiance;
++    float accumulatedSampleNum;
++    uint accumulatedFrameNum;
++    uint staleFrameNum;
++    uint sampleDataExt;
++};
++
++struct SharcResolveParameters
++{
++    float3 cameraPositionPrev;      // previous camera position
++    uint accumulationFrameNum;      // maximum number of frames for the temporal accumulation window
++    uint responsiveFrameNum;        // maximum number of frames for the temporal accumulation window used with responsive signal
++    uint staleFrameNumMax;          // maximum number of frames without new samples before the cache entry is evicted
++    uint frameIndex;
++};
++
++SharcRadianceData SharcZeroRadianceData()
++{
++    SharcRadianceData radianceData;
++#if SHARC_ENABLE_SH_ENCODING
++    radianceData.luminanceSH = float4(0, 0, 0, 0);
++    radianceData.chromaL0 = float2(0, 0);
++#else // !SHARC_ENABLE_SH_ENCODING
++    radianceData.radiance = float3(0, 0, 0);
++#endif // SHARC_ENABLE_SH_ENCODING
++
++    return radianceData;
++}
++
++SharcRadianceData SharcAddRadianceData(SharcRadianceData a, SharcRadianceData b)
++{
++    SharcRadianceData result;
++#if SHARC_ENABLE_SH_ENCODING
++    result.luminanceSH = a.luminanceSH + b.luminanceSH;
++    result.chromaL0 = a.chromaL0 + b.chromaL0;
++#else // !SHARC_ENABLE_SH_ENCODING
++    result.radiance = a.radiance + b.radiance;
++#endif // SHARC_ENABLE_SH_ENCODING
++
++    return result;
++}
++
++SharcRadianceData SharcScaleRadianceData(SharcRadianceData radianceData, float scale)
++{
++    SharcRadianceData result;
++#if SHARC_ENABLE_SH_ENCODING
++    result.luminanceSH = radianceData.luminanceSH * scale;
++    result.chromaL0 = radianceData.chromaL0 * scale;
++#else // !SHARC_ENABLE_SH_ENCODING
++    result.radiance = radianceData.radiance * scale;
++#endif // SHARC_ENABLE_SH_ENCODING
++
++    return result;
++}
++
++float3 SharcRGBToYCoCg(float3 color)
++{
++    return float3(0.25f * (color.x + 2.0f * color.y + color.z), color.x - color.z, color.y - 0.5f * (color.x + color.z));
++}
++
++float3 SharcYCoCgToRGB(float3 color)
++{
++    return float3(color.x + 0.5f * (color.y - color.z), color.x + 0.5f * color.z, color.x - 0.5f * (color.y + color.z));
++}
++
++SharcRadianceData SharcEncodeRadiance(float3 radiance, float3 radianceDirection, float radianceDirectionWeight)
++{
++    SharcRadianceData radianceData;
++#if SHARC_ENABLE_SH_ENCODING
++    float3 direction = normalize(radianceDirection);
++    float3 ycocg = SharcRGBToYCoCg(radiance);
++    radianceData.luminanceSH = float4(ycocg.x * direction * saturate(radianceDirectionWeight), ycocg.x);
++    radianceData.chromaL0 = ycocg.yz;
++#else // !SHARC_ENABLE_SH_ENCODING
++    radianceData.radiance = radiance;
++#endif // SHARC_ENABLE_SH_ENCODING
++
++    return radianceData;
++}
++
++float3 SharcDecodeRadiance(SharcRadianceData radianceData, float3 radianceDirection)
++{
++#if SHARC_ENABLE_SH_ENCODING
++    float3 direction = normalize(radianceDirection);
++    float directionalLuminance = min(length(radianceData.luminanceSH.xyz), max(radianceData.luminanceSH.w, 0.0f));
++    float diffuseLuminance = max(radianceData.luminanceSH.w - directionalLuminance, 0.0f);
++    float luminance = diffuseLuminance + max(dot(radianceData.luminanceSH.xyz, direction), 0.0f);
++    float chromaScale = (radianceData.luminanceSH.w > 1e-6f) ? (luminance / radianceData.luminanceSH.w) : 0.0f;
++    float2 chromaL0 = radianceData.chromaL0 * chromaScale;
++    return max(SharcYCoCgToRGB(float3(luminance, chromaL0.x, chromaL0.y)), float3(0.0f, 0.0f, 0.0f));
++#else // !SHARC_ENABLE_SH_ENCODING
++    return radianceData.radiance;
++#endif // SHARC_ENABLE_SH_ENCODING
++}
++
++uint SharcPackFloat16(float value)
++{
++    return f32tof16(value) & 0xFFFFu;
++}
++
++float SharcUnpackFloat16(uint value)
++{
++    return f16tof32(value & 0xFFFFu);
++}
++
++uint SharcPackFloat16Pair(float2 value)
++{
++    return SharcPackFloat16(value.x) | (SharcPackFloat16(value.y) << 16);
++}
++
++float2 SharcUnpackFloat16Pair(uint value)
++{
++    return float2(SharcUnpackFloat16(value), SharcUnpackFloat16(value >> 16));
++}
++
++SharcPackedData SharcZeroPackedData()
++{
++    SharcPackedData packedData;
++    packedData.radianceData = float16_t4(0, 0, 0, 0);
++#if SHARC_ENABLE_SH_ENCODING
++    packedData.radianceDataExt = 0;
++    packedData.sampleNumData = 0;
++#endif // SHARC_ENABLE_SH_ENCODING
++    packedData.sampleData = 0;
++    packedData.sampleDataExt = 0;
++
++    return packedData;
++}
++
++SharcAccumulationData SharcZeroAccumulationData()
++{
++    SharcAccumulationData accumulatedData;
++#if SHARC_ENABLE_SH_ENCODING
++    accumulatedData.data = int4(0, 0, 0, 0);
++    accumulatedData.dataExt = int4(0, 0, 0, 0);
++#else // !SHARC_ENABLE_SH_ENCODING
++    accumulatedData.data = uint4(0, 0, 0, 0);
++#endif // SHARC_ENABLE_SH_ENCODING
++
++    return accumulatedData;
++}
++
++float SharcGetAccumulatedSampleNum(SharcAccumulationData accumulatedData)
++{
++#if SHARC_ENABLE_SH_ENCODING
++    return float(accumulatedData.dataExt.z);
++#else // !SHARC_ENABLE_SH_ENCODING
++    return float(accumulatedData.data.w);
++#endif // SHARC_ENABLE_SH_ENCODING
++}
++
++SharcRadianceData SharcGetAccumulatedRadianceData(SharcAccumulationData accumulatedData, float radianceScale, float sampleNum)
++{
++    SharcRadianceData radianceData;
++    float scale = rcp(radianceScale * max(sampleNum, 1e-6f));
++#if SHARC_ENABLE_SH_ENCODING
++    radianceData.luminanceSH = float4(accumulatedData.data) * scale;
++    radianceData.chromaL0 = float2(accumulatedData.dataExt.xy) * scale;
++#else // !SHARC_ENABLE_SH_ENCODING
++    radianceData.radiance = float3(accumulatedData.data.xyz) * scale;
++#endif // SHARC_ENABLE_SH_ENCODING
++
++    return radianceData;
++}
++
++SharcPackedData SharcPackVoxelData(SharcRadianceData radianceData, float sampleNum, uint accumulatedFrameNum, uint staleFrameNum, uint sampleDataExt)
++{
++    const float float16Max = 65504.0f;
++
++    SharcPackedData packedData;
++#if SHARC_ENABLE_SH_ENCODING
++    packedData.radianceData = float16_t4(clamp(radianceData.luminanceSH, float4(-float16Max, -float16Max, -float16Max, -float16Max), float4(float16Max, float16Max, float16Max, float16Max)));
++    packedData.radianceDataExt = SharcPackFloat16Pair(clamp(radianceData.chromaL0, float2(-float16Max, -float16Max), float2(float16Max, float16Max)));
++    packedData.sampleNumData = SharcPackFloat16(min(sampleNum, float16Max));
++#else // !SHARC_ENABLE_SH_ENCODING
++    packedData.radianceData = float16_t4(min(float4(radianceData.radiance, sampleNum), float4(float16Max, float16Max, float16Max, float16Max)));
++#endif // SHARC_ENABLE_SH_ENCODING
++    packedData.sampleData = accumulatedFrameNum | (staleFrameNum << SHARC_STALE_FRAME_NUM_BIT_OFFSET);
++    packedData.sampleDataExt = sampleDataExt;
++
++    return packedData;
++}
++
++SharcVoxelData SharcUnpackVoxelData(SharcPackedData packedData)
++{
++    SharcVoxelData voxelData;
++#if SHARC_ENABLE_SH_ENCODING
++    voxelData.accumulatedRadiance.luminanceSH = float4(packedData.radianceData);
++    voxelData.accumulatedRadiance.chromaL0 = SharcUnpackFloat16Pair(packedData.radianceDataExt);
++    voxelData.accumulatedSampleNum = SharcUnpackFloat16(packedData.sampleNumData);
++#else // !SHARC_ENABLE_SH_ENCODING
++    float4 radianceAndSampleNum = float4(packedData.radianceData);
++    voxelData.accumulatedRadiance.radiance = radianceAndSampleNum.xyz;
++    voxelData.accumulatedSampleNum = radianceAndSampleNum.w;
++#endif // SHARC_ENABLE_SH_ENCODING
++    voxelData.accumulatedFrameNum = (packedData.sampleData >> SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET) & SHARC_ACCUMULATED_FRAME_NUM_BIT_MASK;
++    voxelData.staleFrameNum = (packedData.sampleData >> SHARC_STALE_FRAME_NUM_BIT_OFFSET) & SHARC_STALE_FRAME_NUM_BIT_MASK;
++    voxelData.sampleDataExt = packedData.sampleDataExt;
++
++    return voxelData;
++}
++
++SharcVoxelData SharcGetVoxelData(RW_STRUCTURED_BUFFER(voxelDataBuffer, SharcPackedData), HashGridIndex hashGridIndex)
++{
++    SharcPackedData packedData = BUFFER_AT_OFFSET(voxelDataBuffer, hashGridIndex);
++
++    return SharcUnpackVoxelData(packedData);
++}
++
++float SharcLuma(float3 color)
++{
++    const float3 luma = float3(0.213f, 0.715f, 0.072f);
++
++    return dot(color, luma);
++}
++
++float SharcRadianceLuma(SharcRadianceData radianceData)
++{
++#if SHARC_ENABLE_SH_ENCODING
++    return max(radianceData.luminanceSH.w, 0.0f);
++#else // !SHARC_ENABLE_SH_ENCODING
++    return SharcLuma(radianceData.radiance);
++#endif // SHARC_ENABLE_SH_ENCODING
++}
++
++void SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex hashGridIndex, float3 sampleValue, float3 sampleWeight, float3 sampleDirection, float sampleDirectionWeight, uint sampleData)
++{
++#if SHARC_ENABLE_SH_ENCODING
++    SharcRadianceData scaledSample = SharcEncodeRadiance(sampleValue * sampleWeight, sampleDirection, sampleDirectionWeight);
++    int4 scaledLuminanceSH = int4(scaledSample.luminanceSH * sharcParameters.radianceScale);
++    int2 scaledChromaL0 = int2(scaledSample.chromaL0 * sharcParameters.radianceScale);
++
++    if (scaledLuminanceSH.x != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.x, scaledLuminanceSH.x);
++    if (scaledLuminanceSH.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.y, scaledLuminanceSH.y);
++    if (scaledLuminanceSH.z != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.z, scaledLuminanceSH.z);
++    if (scaledLuminanceSH.w != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.w, scaledLuminanceSH.w);
++    if (scaledChromaL0.x != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).dataExt.x, scaledChromaL0.x);
++    if (scaledChromaL0.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).dataExt.y, scaledChromaL0.y);
++    if (sampleData != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).dataExt.z, int(sampleData));
++#else // !SHARC_ENABLE_SH_ENCODING
++    uint3 scaledRadiance = uint3(sampleValue * sampleWeight * sharcParameters.radianceScale);
++
++    if (scaledRadiance.x != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.x, scaledRadiance.x);
++    if (scaledRadiance.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.y, scaledRadiance.y);
++    if (scaledRadiance.z != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.z, scaledRadiance.z);
++    if (sampleData != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, hashGridIndex).data.w, sampleData);
++#endif // SHARC_ENABLE_SH_ENCODING
++}
++
++void SharcInit(inout SharcState sharcState)
++{
++#if SHARC_UPDATE
++    sharcState.pathLength = 0;
++#endif // SHARC_UPDATE
++}
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++uint SharcPackCacheIndexWithOffset(uint baseIndex, int offset)
++{
++    uint offsetBits = (uint(offset)) & SHARC_RESPONSIVE_INDEX_OFFSET_BIT_MASK;
++
++    return (baseIndex & SHARC_CACHE_INDEX_BIT_MASK) | (offsetBits << SHARC_CACHE_INDEX_BIT_NUM);
++}
++
++int SharcUnpackOffset(uint packedIndex)
++{
++    return (int(packedIndex)) >> SHARC_CACHE_INDEX_BIT_NUM;
++}
++
++bool SharcGetResponsiveIndexOffset(in SharcParameters sharcParameters, HashGridIndex hashGridIndex, out int responsiveIndexOffset, out bool isNewSample)
++{
++    responsiveIndexOffset = SharcUnpackOffset(hashGridIndex);
++    isNewSample = false;
++    if (responsiveIndexOffset == 0)
++    {
++        HashGridKey hashGridKey = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, hashGridIndex);
++        uint baseSlot = HashGridGetBaseSlot(hashGridKey, sharcParameters.hashGridData.capacity);
++        hashGridKey |= HashGridKey(1) << (HASH_GRID_KEY_BIT_NUM - 1);
++        HashGridIndex responsiveIndex;
++        uint bucketOffset;
++        if (!HashGridInsert(sharcParameters.hashGridData, hashGridKey, baseSlot, SHARC_RESPONSIVE_ENTRY_PROBE_RANGE, responsiveIndex, bucketOffset))
++            return false;
++
++        responsiveIndexOffset = int(responsiveIndex) - int(hashGridIndex);
++        isNewSample = true;
++    }
++
++    return true;
++}
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++void SharcUpdateMiss(in SharcParameters sharcParameters, in SharcState sharcState, float3 radiance
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++    , bool isResponsiveLighting
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++    )
++{
++#if SHARC_UPDATE
++    for (int i = 0; i < sharcState.pathLength; ++i)
++    {
++        HashGridIndex hashGridIndex = sharcState.cacheIndices[i];
++        bool isNewSample = false;
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++        if (isResponsiveLighting)
++        {
++            int responsiveIndexOffset;
++            if (!SharcGetResponsiveIndexOffset(sharcParameters, sharcState.cacheIndices[i], responsiveIndexOffset, isNewSample))
++                return;
++
++            hashGridIndex += responsiveIndexOffset;
++        }
++
++        hashGridIndex &= SHARC_CACHE_INDEX_BIT_MASK;
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++#if SHARC_ENABLE_SH_ENCODING
++        float3 radianceDirection = sharcState.radianceDirections[i];
++        float radianceDirectionWeight = sharcState.radianceDirectionWeights[i];
++#else // !SHARC_ENABLE_SH_ENCODING
++        float3 radianceDirection = float3(0.0f, 0.0f, 1.0f);
++        float radianceDirectionWeight = 0.0f;
++#endif // SHARC_ENABLE_SH_ENCODING
++        SharcAddVoxelData(sharcParameters, hashGridIndex, radiance, sharcState.sampleWeights[i], radianceDirection, radianceDirectionWeight, isNewSample ? 1 : 0);
++    }
++#endif // SHARC_UPDATE
++}
++
++bool SharcUpdateHit(in SharcParameters sharcParameters, inout SharcState sharcState, SharcHitData sharcHitData, float3 directLighting, float random
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++    , bool isResponsiveLighting
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++    )
++{
++    bool continueTracing = true;
++#if SHARC_UPDATE
++    HashGridKey hashGridKey;
++    HashGridIndex hashGridIndex;
++    if (!HashGridInsertEntry(sharcParameters.hashGridData, sharcHitData.positionWorld, sharcHitData.normalWorld, sharcParameters.hashGridParameters, hashGridKey, hashGridIndex))
++        return false;
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++    HashGridIndex responsiveCacheIndex = HASH_GRID_INVALID_CACHE_INDEX;
++    if (isResponsiveLighting)
++    {
++        uint baseSlot = HashGridGetBaseSlot(hashGridKey, sharcParameters.hashGridData.capacity);
++        hashGridKey |= HashGridKey(1) << (HASH_GRID_KEY_BIT_NUM - 1);
++        uint bucketOffset;
++        if (!HashGridInsert(sharcParameters.hashGridData, hashGridKey, baseSlot, SHARC_RESPONSIVE_ENTRY_PROBE_RANGE, responsiveCacheIndex, bucketOffset))
++            return false;
++    }
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++    float3 sharcRadiance = directLighting;
++    float3 materialDemodulation = float3(1.0f, 1.0f, 1.0f);
++    float3 sharcRadianceDirection = SharcGetRadianceDirection(sharcHitData);
++    float sharcRadianceDirectionWeight = SharcGetRadianceDirectionWeight(sharcHitData);
++#if SHARC_MATERIAL_DEMODULATION
++    materialDemodulation = sharcHitData.materialDemodulation;
++#endif // SHARC_MATERIAL_DEMODULATION
++    float3 inverseMaterialDemodulation = rcp(materialDemodulation);
++
++#if SHARC_ENABLE_CACHE_RESAMPLING
++    uint resamplingDepth = uint(round(lerp(SHARC_RESAMPLING_DEPTH_MIN, SHARC_PROPAGATION_DEPTH, random)));
++    if (resamplingDepth <= sharcState.pathLength)
++    {
++        SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, hashGridIndex);
++        if (voxelData.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
++        {
++            sharcRadiance = SharcDecodeRadiance(voxelData.accumulatedRadiance, sharcRadianceDirection);
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++            if (responsiveCacheIndex != HASH_GRID_INVALID_CACHE_INDEX)
++            {
++                SharcVoxelData responsiveVoxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, responsiveCacheIndex);
++                if (responsiveVoxelData.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
++                    sharcRadiance += SharcDecodeRadiance(responsiveVoxelData.accumulatedRadiance, sharcRadianceDirection);
++            }
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++            sharcRadiance *= materialDemodulation;
++            continueTracing = false;
++        }
++    }
++#endif // SHARC_ENABLE_CACHE_RESAMPLING
++
++    if (continueTracing)
++    {
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++        if (responsiveCacheIndex != HASH_GRID_INVALID_CACHE_INDEX)
++        {
++            SharcAddVoxelData(sharcParameters, responsiveCacheIndex, directLighting * inverseMaterialDemodulation, float3(1.0f, 1.0f, 1.0f), sharcRadianceDirection, sharcRadianceDirectionWeight, 1);
++            directLighting = float3(0.0f, 0.0f, 0.0f); // avoid adding the direct lighting contribution twice
++        }
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++        SharcAddVoxelData(sharcParameters, hashGridIndex, directLighting * inverseMaterialDemodulation, float3(1.0f, 1.0f, 1.0f), sharcRadianceDirection, sharcRadianceDirectionWeight, 1);
++    }
++
++#if SHARC_SEPARATE_EMISSIVE
++    sharcRadiance += sharcHitData.emissive;
++#endif // SHARC_SEPARATE_EMISSIVE
++
++    uint i;
++    for (i = 0; i < sharcState.pathLength; ++i)
++    {
++        HashGridIndex tempHashGridIndex = sharcState.cacheIndices[i];
++        if (tempHashGridIndex == HASH_GRID_INVALID_CACHE_INDEX)
++            continue;
++
++        bool isNewSample = false;
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++        if (responsiveCacheIndex != HASH_GRID_INVALID_CACHE_INDEX)
++        {
++            int responsiveIndexOffset;
++            if (!SharcGetResponsiveIndexOffset(sharcParameters, sharcState.cacheIndices[i], responsiveIndexOffset, isNewSample))
++                return false;
++
++            tempHashGridIndex += responsiveIndexOffset;
++
++            if (isNewSample)
++                sharcState.cacheIndices[i] = SharcPackCacheIndexWithOffset(sharcState.cacheIndices[i], responsiveIndexOffset);
++        }
++
++        tempHashGridIndex &= SHARC_CACHE_INDEX_BIT_MASK;
++        isNewSample = isNewSample && isResponsiveLighting;
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++#if SHARC_ENABLE_SH_ENCODING
++        float3 radianceDirection = sharcState.radianceDirections[i];
++        float radianceDirectionWeight = sharcState.radianceDirectionWeights[i];
++#else // !SHARC_ENABLE_SH_ENCODING
++        float3 radianceDirection = float3(0.0f, 0.0f, 1.0f);
++        float radianceDirectionWeight = 0.0f;
++#endif // SHARC_ENABLE_SH_ENCODING
++        SharcAddVoxelData(sharcParameters, tempHashGridIndex, sharcRadiance, sharcState.sampleWeights[i], radianceDirection, radianceDirectionWeight, isNewSample ? 1 : 0);
++    }
++
++    for (i = min(sharcState.pathLength, SHARC_PROPAGATION_DEPTH - 1); i > 0; --i)
++    {
++        sharcState.cacheIndices[i] = sharcState.cacheIndices[i - 1];
++        sharcState.sampleWeights[i] = sharcState.sampleWeights[i - 1];
++#if SHARC_ENABLE_SH_ENCODING
++        sharcState.radianceDirections[i] = sharcState.radianceDirections[i - 1];
++        sharcState.radianceDirectionWeights[i] = sharcState.radianceDirectionWeights[i - 1];
++#endif // SHARC_ENABLE_SH_ENCODING
++    }
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++    if (responsiveCacheIndex != HASH_GRID_INVALID_CACHE_INDEX)
++    {
++        int responsiveIndexOffset = int(responsiveCacheIndex) - int(hashGridIndex);
++        hashGridIndex = SharcPackCacheIndexWithOffset(hashGridIndex, responsiveIndexOffset);
++    }
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++    sharcState.cacheIndices[0] = hashGridIndex;
++    sharcState.sampleWeights[0] = SharcSampleWeight(inverseMaterialDemodulation);
++#if SHARC_ENABLE_SH_ENCODING
++    sharcState.radianceDirections[0] = sharcRadianceDirection;
++    sharcState.radianceDirectionWeights[0] = sharcRadianceDirectionWeight;
++#endif // SHARC_ENABLE_SH_ENCODING
++    sharcState.pathLength = min(++sharcState.pathLength, SHARC_PROPAGATION_DEPTH);
++#endif // SHARC_UPDATE
++    return continueTracing;
++}
++
++void SharcSetThroughput(inout SharcState sharcState, float3 throughput)
++{
++#if SHARC_UPDATE
++    for (uint i = 0; i < sharcState.pathLength; ++i)
++        sharcState.sampleWeights[i] *= SharcSampleWeight(throughput);
++#endif // SHARC_UPDATE
++}
++
++void SharcSetRadianceDirectionWeight(inout SharcState sharcState, float radianceDirectionWeight)
++{
++#if SHARC_UPDATE && SHARC_ENABLE_SH_ENCODING
++    if (sharcState.pathLength > 0)
++        sharcState.radianceDirectionWeights[0] = saturate(radianceDirectionWeight);
++#endif // SHARC_UPDATE && SHARC_ENABLE_SH_ENCODING
++}
++
++bool SharcGetCachedRadianceFromHash(in SharcParameters sharcParameters, in SharcHitData sharcHitData, HashGridKey hashGridKey, out float3 radiance, bool skipResponsiveLighting)
++{
++    HashGridIndex hashGridIndex;
++    uint baseSlot = HashGridGetBaseSlot(hashGridKey, sharcParameters.hashGridData.capacity);
++    uint bucketOffset;
++    if (!HashGridFind(sharcParameters.hashGridData, hashGridKey, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, hashGridIndex, bucketOffset))
++        return false;
++
++    SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, hashGridIndex);
++    if (voxelData.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
++    {
++        float3 sharcRadianceDirection = SharcGetRadianceDirection(sharcHitData);
++        radiance = SharcDecodeRadiance(voxelData.accumulatedRadiance, sharcRadianceDirection);
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++        uint temp;
++        hashGridKey |= HashGridKey(1) << (HASH_GRID_KEY_BIT_NUM - 1);
++        if (!skipResponsiveLighting && HashGridFind(sharcParameters.hashGridData, hashGridKey, baseSlot, SHARC_RESPONSIVE_ENTRY_PROBE_RANGE, hashGridIndex, temp))
++        {
++            SharcVoxelData responsiveVoxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, hashGridIndex);
++            if (responsiveVoxelData.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
++                radiance += SharcDecodeRadiance(responsiveVoxelData.accumulatedRadiance, sharcRadianceDirection);
++        }
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++#if SHARC_MATERIAL_DEMODULATION
++        radiance *= sharcHitData.materialDemodulation;
++#endif // SHARC_MATERIAL_DEMODULATION
++#if SHARC_SEPARATE_EMISSIVE
++        radiance += sharcHitData.emissive;
++#endif // SHARC_SEPARATE_EMISSIVE
++
++        return true;
++    }
++
++    return false;
++}
++
++bool SharcGetCachedRadiance(in SharcParameters sharcParameters, in SharcHitData sharcHitData, out float3 radiance, bool skipResponsiveLighting)
++{
++    HashGridKey hashGridKey = HashGridComputeSpatialHash(sharcHitData.positionWorld, sharcHitData.normalWorld, sharcParameters.hashGridParameters);
++    return SharcGetCachedRadianceFromHash(sharcParameters, sharcHitData, hashGridKey, radiance, skipResponsiveLighting);
++}
++
++int SharcGetGridDistance2(int3 position)
++{
++    return position.x * position.x + position.y * position.y + position.z * position.z;
++}
++
++HashGridKey SharcGetAdjacentLevelHashKey(HashGridKey hashGridKey, HashGridParameters gridParameters, float3 cameraPositionPrev)
++{
++    int3 gridPosition;
++    gridPosition.x = int((hashGridKey >> HASH_GRID_POSITION_BIT_NUM * 0) & HASH_GRID_POSITION_BIT_MASK);
++    gridPosition.y = int((hashGridKey >> HASH_GRID_POSITION_BIT_NUM * 1) & HASH_GRID_POSITION_BIT_MASK);
++    gridPosition.z = int((hashGridKey >> HASH_GRID_POSITION_BIT_NUM * 2) & HASH_GRID_POSITION_BIT_MASK);
++
++    // Sign-extend packed coordinates without divergent branches.
++    gridPosition = (gridPosition << (32 - HASH_GRID_POSITION_BIT_NUM)) >> (32 - HASH_GRID_POSITION_BIT_NUM);
++
++    int level = int((hashGridKey >> HASH_GRID_LEVEL_BIT_OFFSET) & HASH_GRID_LEVEL_BIT_MASK);
++
++    float voxelSize = HashGridGetVoxelSize(uint(level), gridParameters);
++    float inverseVoxelSize = rcp(voxelSize);
++    int3 cameraGridPosition = int3(floor(gridParameters.cameraPosition * inverseVoxelSize));
++    int3 cameraVector = cameraGridPosition - gridPosition;
++    int cameraDistance = SharcGetGridDistance2(cameraVector);
++
++    int3 cameraGridPositionPrev = int3(floor(cameraPositionPrev * inverseVoxelSize));
++    int3 cameraVectorPrev = cameraGridPositionPrev - gridPosition;
++    int cameraDistancePrev = SharcGetGridDistance2(cameraVectorPrev);
++
++    if (cameraDistance < cameraDistancePrev)
++    {
++        gridPosition = int3(floor(gridPosition / gridParameters.logarithmBase));
++        level = min(level + 1, int(HASH_GRID_LEVEL_BIT_MASK));
++    }
++    else // this may be inaccurate
++    {
++        gridPosition = int3(floor(gridPosition * gridParameters.logarithmBase));
++        level = max(level - 1, 1);
++    }
++
++    HashGridKey modifiedHashGridKey = ((HashGridKey(gridPosition.x) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 0))
++        | ((HashGridKey(gridPosition.y) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 1))
++        | ((HashGridKey(gridPosition.z) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 2))
++        | ((HashGridKey(level) & HASH_GRID_LEVEL_BIT_MASK) << HASH_GRID_LEVEL_BIT_OFFSET);
++
++#if HASH_GRID_USE_NORMALS
++    modifiedHashGridKey |= hashGridKey & (HashGridKey(HASH_GRID_NORMAL_BIT_MASK) << HASH_GRID_NORMAL_BIT_OFFSET);
++#endif // HASH_GRID_USE_NORMALS
++
++    return modifiedHashGridKey;
++}
++
++void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcResolveParameters resolveParameters)
++{
++    if (entryIndex >= sharcParameters.hashGridData.capacity)
++        return;
++
++    HashGridKey hashGridKey = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex);
++    if (hashGridKey == HASH_GRID_INVALID_HASH_KEY)
++        return;
++
++    bool isResponsiveSignal = false;
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++    isResponsiveSignal = (hashGridKey >> (HASH_GRID_KEY_BIT_NUM - 1)) != 0;
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++    SharcAccumulationData accumulatedData = BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex);
++    SharcPackedData resolvedData = BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex);
++    SharcVoxelData sharcVoxelData = SharcUnpackVoxelData(resolvedData);
++
++    float sampleNum = SharcGetAccumulatedSampleNum(accumulatedData);
++    float sampleNumPrev = sharcVoxelData.accumulatedSampleNum;
++    uint accumulatedFrameNum = sharcVoxelData.accumulatedFrameNum + 1;
++    uint staleFrameNum = sharcVoxelData.staleFrameNum;
++
++    staleFrameNum = (sampleNum != 0) ? 0 : staleFrameNum + 1;
++    uint staleFrameNumMax = clamp(resolveParameters.staleFrameNumMax, SHARC_STALE_FRAME_NUM_MIN, SHARC_STALE_FRAME_NUM_MAX);
++
++    if (isResponsiveSignal)
++        staleFrameNumMax = resolveParameters.responsiveFrameNum;
++
++    bool isValidElement = (staleFrameNum < staleFrameNumMax) ? true : false;
++    if (!isValidElement)
++    {
++        SharcAccumulationData zeroAccumulationData = SharcZeroAccumulationData();
++        SharcPackedData zeroPackedData = SharcZeroPackedData();
++
++        BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex) = HASH_GRID_INVALID_HASH_KEY;
++        BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex) = zeroAccumulationData;
++        BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = zeroPackedData;
++        return;
++    }
++    else if (sampleNum == 0 && !isResponsiveSignal)
++    {
++        // Resolve dispatches exactly one thread per entry, so no atomic is needed.
++        BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex).sampleData = resolvedData.sampleData + ((1 << SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET) | (1 << SHARC_STALE_FRAME_NUM_BIT_OFFSET));
++#if SHARC_ENABLE_FADE_ACCELERATION
++        uint bitOffset = resolveParameters.frameIndex % 32u;
++        uint bit = 1u << bitOffset;
++        BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex).sampleDataExt = resolvedData.sampleDataExt | bit;
++#endif // SHARC_ENABLE_FADE_ACCELERATION
++        return;
++    }
++
++#if SHARC_ENABLE_RESPONSIVE_LIGHTING
++    if (isResponsiveSignal)
++    {
++        HashGridKey targetHashGridKey = hashGridKey & ~(HashGridKey(1) << (HASH_GRID_KEY_BIT_NUM - 1)); // clear responsive bit to find the main entry
++        uint baseSlot = HashGridGetBaseSlot(targetHashGridKey, sharcParameters.hashGridData.capacity);
++        for (uint i = 0; i < SHARC_RESPONSIVE_ENTRY_PROBE_RANGE; ++i)
++        {
++            uint searchIndex = baseSlot + i;
++            HashGridKey searchHashGridKey = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, searchIndex);
++            if (searchHashGridKey == targetHashGridKey)
++            {
++                SharcAccumulationData targetAccumulatedData = BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, searchIndex);
++                sampleNum = SharcGetAccumulatedSampleNum(targetAccumulatedData);
++                break;
++            }
++        }
++    }
++#endif // SHARC_ENABLE_RESPONSIVE_LIGHTING
++
++    // Performs hash map lookup to find existing entries in case previous insertions
++    // encountered collisions and a different slot was assigned.
++    // Uses a fixed-size linear probe window
++    if (sampleNumPrev == 0)
++    {
++        uint searchEnd = min(entryIndex + 1 + SHARC_LINEAR_PROBE_WINDOW_SIZE, sharcParameters.hashGridData.capacity);
++        for (uint i = entryIndex + 1; i < searchEnd; ++i)
++        {
++            HashGridKey hashKeyOld = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, i);
++            if (hashKeyOld == hashGridKey)
++            {
++                resolvedData = BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, i);
++                sharcVoxelData = SharcUnpackVoxelData(resolvedData);
++                sampleNumPrev = sharcVoxelData.accumulatedSampleNum;
++                accumulatedFrameNum = sharcVoxelData.accumulatedFrameNum + 1;
++                staleFrameNum = 0;
++                break;
++            }
++        }
++    }
++
++    SharcRadianceData accumulatedRadiance = SharcGetAccumulatedRadianceData(accumulatedData, sharcParameters.radianceScale, sampleNum);
++    SharcRadianceData accumulatedRadiancePrev = sharcVoxelData.accumulatedRadiance;
++    uint accumulationFrameNum = clamp(isResponsiveSignal ? resolveParameters.responsiveFrameNum : resolveParameters.accumulationFrameNum, SHARC_ACCUMULATED_FRAME_NUM_MIN, SHARC_ACCUMULATED_FRAME_NUM_MAX);
++    if (accumulatedFrameNum > accumulationFrameNum)
++    {
++        float normalizationScale = float(accumulationFrameNum) / float(accumulatedFrameNum);
++        accumulatedFrameNum = accumulationFrameNum;
++        sampleNumPrev *= normalizationScale;
++    }
++
++#if SHARC_ENABLE_FADE_ACCELERATION
++    {
++        uint bitOffset = resolveParameters.frameIndex % 32u;
++        uint bit = 1u << bitOffset;
++
++        float lumaCur = SharcRadianceLuma(accumulatedRadiance);
++        float lumaPrev = SharcRadianceLuma(accumulatedRadiancePrev);
++        bool fading = lumaCur < lumaPrev;
++
++        sharcVoxelData.sampleDataExt = (sharcVoxelData.sampleDataExt & ~bit) | (fading ? bit : 0u);
++        uint fadingFrameNum = countbits(sharcVoxelData.sampleDataExt);
++        if (fadingFrameNum == 32)
++            sampleNumPrev = sampleNum;
++    }
++#endif // SHARC_ENABLE_FADE_ACCELERATION
++    float sampleTotalInv = rcp(sampleNumPrev + sampleNum);
++    accumulatedRadiance = SharcAddRadianceData(SharcScaleRadianceData(accumulatedRadiancePrev, sampleNumPrev * sampleTotalInv), SharcScaleRadianceData(accumulatedRadiance, sampleNum * sampleTotalInv));
++    float accumulatedSampleNum = sampleNumPrev + sampleNum;
++
++#if SHARC_BLEND_ADJACENT_LEVELS
++    // Reproject sample from adjacent level
++    float3 cameraOffset = sharcParameters.hashGridParameters.cameraPosition.xyz - resolveParameters.cameraPositionPrev.xyz;
++    if (!isResponsiveSignal && (dot(cameraOffset, cameraOffset) > 1e-6f) && (accumulatedFrameNum <= 2))
++    {
++        HashGridKey adjacentLevelHashKey = SharcGetAdjacentLevelHashKey(hashGridKey, sharcParameters.hashGridParameters, resolveParameters.cameraPositionPrev);
++
++        HashGridIndex hashGridIndex;
++        uint baseSlot = HashGridGetBaseSlot(adjacentLevelHashKey, sharcParameters.hashGridData.capacity);
++        uint hashCollisionsNum;
++        if (HashGridFind(sharcParameters.hashGridData, adjacentLevelHashKey, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, hashGridIndex, hashCollisionsNum))
++        {
++            SharcPackedData adjacentPackedDataPrev = BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, hashGridIndex);
++            SharcVoxelData adjacentVoxelDataPrev = SharcUnpackVoxelData(adjacentPackedDataPrev);
++            float adjacentSampleNum = adjacentVoxelDataPrev.accumulatedSampleNum;
++            if (adjacentSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
++            {
++                float blendWeight = rcp(adjacentSampleNum + accumulatedSampleNum);
++                accumulatedRadiance = SharcAddRadianceData(
++                    SharcScaleRadianceData(adjacentVoxelDataPrev.accumulatedRadiance, adjacentSampleNum * blendWeight),
++                    SharcScaleRadianceData(accumulatedRadiance, accumulatedSampleNum * blendWeight));
++                accumulatedSampleNum += adjacentSampleNum;
++            }
++        }
++    }
++#endif // SHARC_BLEND_ADJACENT_LEVELS
++
++    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum, sharcVoxelData.sampleDataExt);
++
++#if !SHARC_ENABLE_RESPONSIVE_LIGHTING
++    // Clear buffer entry for the next frame
++    SharcAccumulationData zeroAccumulationData = SharcZeroAccumulationData();
++    BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex) = zeroAccumulationData;
++#endif // !SHARC_ENABLE_RESPONSIVE_LIGHTING
++}
+diff --git a/src/refresh/vkpt/shader/sharc/SharcGlslHelpers.h b/src/refresh/vkpt/shader/sharc/SharcGlslHelpers.h
+new file mode 100644
+index 00000000..3024fe48
+--- /dev/null
++++ b/src/refresh/vkpt/shader/sharc/SharcGlslHelpers.h
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
++ *
++ * NVIDIA CORPORATION and its licensors retain all intellectual property
++ * and proprietary rights in and to this software, related documentation
++ * and any modifications thereto.  Any use, reproduction, disclosure or
++ * distribution of this software and related documentation without an express
++ * license agreement from NVIDIA CORPORATION is strictly prohibited.
++ */
++
++#if SHARC_ENABLE_GLSL
++
++// Required extensions
++// #extension GL_EXT_buffer_reference : require
++// #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
++// #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++// #extension GL_EXT_shader_atomic_int64 : require
++// #extension GL_KHR_shader_subgroup_ballot : require
++// #extension GL_EXT_shader_16bit_storage : enable
++// #extension GL_EXT_control_flow_attributes : require
++
++// Buffer reference types can be constructed from a 'uint64_t' or a 'uvec2' value.
++// The low - order 32 bits of the reference map to and from the 'x' component
++// of the 'uvec2'.
++
++#define float2 vec2
++#define float3 vec3
++#define float4 vec4
++
++#define uint2 uvec2
++#define uint3 uvec3
++#define uint4 uvec4
++
++#define int2 ivec2
++#define int3 ivec3
++#define int4 ivec4
++
++#define float16_t2 f16vec2
++#define float16_t3 f16vec3
++#define float16_t4 f16vec4
++
++#define lerp mix
++#define rcp(x) (1.0/(x))
++#define saturate(x) clamp(x,0,1)
++#define countbits bitCount
++#define asfloat uintBitsToFloat
++#define asuint floatBitsToUint
++#define f32tof16(f) packHalf2x16(vec2(f, 0))
++#define f16tof32(u) unpackHalf2x16(u).x
++#define InterlockedAdd atomicAdd
++#define InterlockedOr atomicOr
++#define InterlockedExchange(destination, value, original) original = atomicExchange(destination, value)
++#define InterlockedCompareExchange(destination, compare, value, original) original = atomicCompSwap(destination, compare, value)
++
++#define HASH_GRID_CONST const
++#define HASH_GRID_LOOP_ATTR [[dont_unroll]]
++
++#define RW_STRUCTURED_BUFFER_I(name, type) RWStructuredBuffer_##type name
++#define RW_STRUCTURED_BUFFER(name, type) RW_STRUCTURED_BUFFER_I(name, type)
++
++#define BUFFER_AT_OFFSET(name, offset) name.data[offset]
++
++layout(buffer_reference, std430, buffer_reference_align = 8) buffer RWStructuredBuffer_uint64_t {
++    uint64_t data[];
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) buffer RWStructuredBuffer_uint {
++    uint data[];
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 16) buffer RWStructuredBuffer_uint4 {
++    uvec4 data[];
++};
++
++#endif // SHARC_ENABLE_GLSL
+diff --git a/src/refresh/vkpt/shader/sharc/SharcTypes.h b/src/refresh/vkpt/shader/sharc/SharcTypes.h
+new file mode 100644
+index 00000000..ba659a44
+--- /dev/null
++++ b/src/refresh/vkpt/shader/sharc/SharcTypes.h
+@@ -0,0 +1,51 @@
++/*
++ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
++ *
++ * NVIDIA CORPORATION and its licensors retain all intellectual property
++ * and proprietary rights in and to this software, related documentation
++ * and any modifications thereto.  Any use, reproduction, disclosure or
++ * distribution of this software and related documentation without an express
++ * license agreement from NVIDIA CORPORATION is strictly prohibited.
++ */
++
++#ifndef SHARC_TYPES_H
++#define SHARC_TYPES_H
++
++// SharcPackedData uses native float16_t storage. HLSL shaders that include this
++// header must be compiled with DXC -enable-16bit-types and, for DXIL, Shader
++// Model 6.2 or newer. The runtime device must support native 16-bit types.
++
++struct SharcAccumulationData
++{
++#if SHARC_ENABLE_SH_ENCODING
++    int4 data;
++    int4 dataExt;
++#else // !SHARC_ENABLE_SH_ENCODING
++    uint4 data;
++#endif // SHARC_ENABLE_SH_ENCODING
++};
++
++struct SharcPackedData
++{
++    float16_t4 radianceData;
++#if SHARC_ENABLE_SH_ENCODING
++    uint radianceDataExt;
++    uint sampleNumData;
++#endif // SHARC_ENABLE_SH_ENCODING
++    uint sampleData;
++    uint sampleDataExt;
++};
++
++#if SHARC_ENABLE_GLSL
++layout(buffer_reference, std430, buffer_reference_align = 16) buffer RWStructuredBuffer_SharcAccumulationData
++{
++    SharcAccumulationData data[];
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 16) buffer RWStructuredBuffer_SharcPackedData
++{
++    SharcPackedData data[];
++};
++#endif // SHARC_ENABLE_GLSL
++
++#endif // SHARC_TYPES_H
+diff --git a/src/refresh/vkpt/vkpt.h b/src/refresh/vkpt/vkpt.h
+index f43508c8..8f0886a3 100644
+--- a/src/refresh/vkpt/vkpt.h
++++ b/src/refresh/vkpt/vkpt.h
+@@ -109,6 +109,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 	SHADER_MODULE_DO(QVK_MOD_REFLECT_REFRACT_RGEN)                   \
+ 	SHADER_MODULE_DO(QVK_MOD_DIRECT_LIGHTING_RGEN)                   \
+ 	SHADER_MODULE_DO(QVK_MOD_INDIRECT_LIGHTING_RGEN)                 \
++	SHADER_MODULE_DO(QVK_MOD_RADIANCE_CACHE_RGEN)                    \
+ 
+ #define LIST_RT_PIPELINE_SHADER_MODULES \
+ 	SHADER_MODULE_DO(QVK_MOD_PATH_TRACER_RCHIT)                      \
+@@ -479,6 +480,7 @@ void create_orthographic_matrix(mat4_t matrix, float xmin, float xmax,
+ 	PROFILER_DO(REFLECT_REFRACT_2,          1) \
+ 	PROFILER_DO(ASVGF_GRADIENT_REPROJECT,   1) \
+ 	PROFILER_DO(DIRECT_LIGHTING,            1) \
++	PROFILER_DO(RADIANCE_CACHE,             1) \
+ 	PROFILER_DO(INDIRECT_LIGHTING,          1) \
+ 	PROFILER_DO(INDIRECT_LIGHTING_0,        2) \
+ 	PROFILER_DO(INDIRECT_LIGHTING_1,        2) \
+@@ -665,6 +667,14 @@ VkResult vkpt_destroy_images(void);
+ VkResult vkpt_destroy_lazy_image(vkpt_lazy_image_t *lazy_image);
+ 
+ VkResult vkpt_pt_init(void);
++
++// caches de radiance (radiance_cache.c)
++VkResult vkpt_rc_init(void);
++VkResult vkpt_rc_destroy(void);
++void vkpt_rc_reset(void);
++void vkpt_rc_prepare_ubo(QVKUniformBuffer_t *ubo, uint64_t frame_counter);
++void vkpt_rc_clear_if_needed(VkCommandBuffer cmd_buf);
++uint32_t vkpt_rc_sharc_capacity(void);
+ VkResult vkpt_pt_destroy(void);
+ VkResult vkpt_pt_create_pipelines(void);
+ VkResult vkpt_pt_destroy_pipelines(void);
+-- 
+2.55.0.windows.3
+

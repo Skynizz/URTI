@@ -1,0 +1,1056 @@
+From 61bee8c9ad00e1fa546350ddb872662e13776599 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:48:21 +0200
+Subject: [PATCH 3/5] =?UTF-8?q?KRC=20comme=20cache=20de=20l'indirect=20(pt?=
+ =?UTF-8?q?=5Fcache=202),=20premi=C3=A8re=20version=20dans=20le=20jeu?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Cellules en espace monde (≈ pt_krc_cell_px pixels, niveaux en puissances
+  de 2, par face), K = 4 cellules décalées par pixel, moyenne tronquée.
+- Allocation de Neyman par pixel (pt_krc_ppp × sigma / sigma moyen), sans
+  liste de tâches ; chemins depuis la surface primaire avec l'éclairage du
+  jeu, rééchantillonnage sur les cellules mûres.
+- Chemins corrélés : chaque échantillon évalue la lumière directe avec
+  l'intensité des lampes animées de la frame et de la précédente
+  (prev_style_scale du jeu), la différence corrige l'historique.
+- Détection des changements non expliqués (portes, objets).
+- Lecture : l'indirect diffus du pixel vient des cellules, sans rayon ;
+  le reflet spéculaire reste celui du jeu.
+- Compilateur en anglais (VSLANG) : Ninja suit enfin les en-têtes.
+
+---
+ build_krc.bat                                 |   4 +-
+ src/refresh/vkpt/path_tracer.c                |  65 ++-
+ src/refresh/vkpt/radiance_cache.c             |  50 ++
+ src/refresh/vkpt/shader/global_ubo.h          |  11 +
+ .../vkpt/shader/indirect_lighting.rgen        |  49 ++
+ src/refresh/vkpt/shader/radiance_cache.h      | 158 ++++++
+ src/refresh/vkpt/shader/radiance_cache.rgen   | 506 +++++++++++++++++-
+ src/refresh/vkpt/vkpt.h                       |   1 +
+ 8 files changed, 823 insertions(+), 21 deletions(-)
+
+diff --git a/build_krc.bat b/build_krc.bat
+index 12e75839..bba2d390 100644
+--- a/build_krc.bat
++++ b/build_krc.bat
+@@ -1,5 +1,7 @@
+ @echo off
+-rem Compilation de Quake II RTX (branche KRC) : environnement MSVC x64, CMake + Ninja de Visual Studio.
++rem Compilation de Quake II RTX (branche krc) : MSVC x64, CMake + Ninja de Visual Studio.
++rem Compilateur en anglais : Ninja ne lit les dependances aux en-tetes que dans ce format.
++set VSLANG=1033
+ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+ cd /d %~dp0
+ if not exist build mkdir build
+diff --git a/src/refresh/vkpt/path_tracer.c b/src/refresh/vkpt/path_tracer.c
+index 15c63a3f..f710f0e5 100644
+--- a/src/refresh/vkpt/path_tracer.c
++++ b/src/refresh/vkpt/path_tracer.c
+@@ -70,8 +70,8 @@ typedef enum {
+     PIPELINE_DIRECT_LIGHTING_CAUSTICS,
+     PIPELINE_INDIRECT_LIGHTING_FIRST,
+     PIPELINE_INDIRECT_LIGHTING_SECOND,
+-	PIPELINE_CACHE_UPDATE,      // cache de radiance : chemins de mise à jour
+-	PIPELINE_CACHE_RESOLVE,     // cache de radiance : résolution
++	PIPELINE_CACHE_FIRST,       // caches de radiance : une passe par valeur de spec_pass
++	PIPELINE_CACHE_LAST = PIPELINE_CACHE_FIRST + 6,
+ 
+ 	PIPELINE_COUNT
+ } pipeline_index_t;
+@@ -1116,6 +1116,7 @@ vkpt_pt_trace_reflections(VkCommandBuffer cmd_buf, int bounce)
+ 
+ extern cvar_t *cvar_pt_cache;
+ extern cvar_t *cvar_pt_sharc_downscale;
++extern cvar_t *cvar_pt_krc_passes;
+ 
+ static void
+ cache_barrier(VkCommandBuffer cmd_buf)
+@@ -1146,15 +1147,30 @@ trace_radiance_cache(VkCommandBuffer cmd_buf)
+ 	push.gpu_index = -1;
+ 	push.bounce = 0;
+ 
+-	uint32_t ds = (uint32_t)max(1, (int)cvar_pt_sharc_downscale->value);
+-	uint32_t w = (qvk.extent_render.width + ds - 1) / ds;
+-	uint32_t h = (qvk.extent_render.height + ds - 1) / ds;
+-	dispatch_rays(cmd_buf, PIPELINE_CACHE_UPDATE, push, w, h, 1);
+-	cache_barrier(cmd_buf);
+-
+-	uint32_t n = vkpt_rc_sharc_capacity();
+-	dispatch_rays(cmd_buf, PIPELINE_CACHE_RESOLVE, push, 4096, n / 4096, 1);
+-	cache_barrier(cmd_buf);
++	if (mode == 1)
++	{
++		// SHaRC : Update (un pixel par bloc NxN), Resolve (toutes les entrées)
++		uint32_t ds = (uint32_t)max(1, (int)cvar_pt_sharc_downscale->value);
++		uint32_t w = (qvk.extent_render.width + ds - 1) / ds;
++		uint32_t h = (qvk.extent_render.height + ds - 1) / ds;
++		dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 0, push, w, h, 1);
++		cache_barrier(cmd_buf);
++
++		uint32_t n = vkpt_rc_sharc_capacity();
++		dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 1, push, 4096, n / 4096, 1);
++		cache_barrier(cmd_buf);
++	}
++	else if (mode == 2)
++	{
++		// KRC : compteurs, cellules des pixels et chemins (Neyman), liste libre, éviction, résolution
++		uint32_t n = vkpt_rc_krc_cells();
++		int passes = (int)cvar_pt_krc_passes->value; // débogage : passes actives (bits)
++		if (passes & 1) { dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 2, push, 1, 1, 1); cache_barrier(cmd_buf); }
++		if (passes & 2) { dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 3, push, qvk.extent_render.width, qvk.extent_render.height, 1); cache_barrier(cmd_buf); }
++		if (passes & 4) { dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 4, push, 1, 1, 1); cache_barrier(cmd_buf); }
++		if (passes & 8) { dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 5, push, 4096, n / 8 / 4096, 1); cache_barrier(cmd_buf); }
++		if (passes & 16) { dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 6, push, 4096, n / 4096, 1); cache_barrier(cmd_buf); }
++	}
+ 
+ 	END_PERF_MARKER(cmd_buf, PROFILER_RADIANCE_CACHE);
+ }
+@@ -1285,6 +1301,19 @@ vkpt_pt_create_pipelines()
+ 		}
+ 	};
+ 
++	// passes des caches de radiance : spec_pass = 0..6
++	uint32_t cache_numbers[7] = { 0, 1, 2, 3, 4, 5, 6 };
++	VkSpecializationInfo cache_spec_info[7];
++	for (int i = 0; i < 7; i++)
++	{
++		cache_spec_info[i] = (VkSpecializationInfo) {
++			.mapEntryCount = 1,
++			.pMapEntries = &specEntry,
++			.dataSize = sizeof(uint32_t),
++			.pData = &cache_numbers[i],
++		};
++	}
++
+ 	uint32_t num_shader_groups = SBT_ENTRIES_PER_PIPELINE * PIPELINE_COUNT;
+ 	char* shader_handles = alloca(num_shader_groups * shaderGroupHandleSize);
+ 	memset(shader_handles, 0, num_shader_groups * shaderGroupHandleSize);
+@@ -1347,15 +1376,13 @@ vkpt_pt_create_pipelines()
+ 			shader_stages[0].module = qvk.shader_modules[QVK_MOD_INDIRECT_LIGHTING_RGEN];
+ 			shader_stages[0].pSpecializationInfo = &specInfo[1];
+ 			break;
+-		case PIPELINE_CACHE_UPDATE:
+-			shader_stages[0].module = qvk.shader_modules[QVK_MOD_RADIANCE_CACHE_RGEN];
+-			shader_stages[0].pSpecializationInfo = &specInfo[0];
+-			break;
+-		case PIPELINE_CACHE_RESOLVE:
+-			shader_stages[0].module = qvk.shader_modules[QVK_MOD_RADIANCE_CACHE_RGEN];
+-			shader_stages[0].pSpecializationInfo = &specInfo[1];
+-			break;
+ 		default:
++			if (index >= PIPELINE_CACHE_FIRST && index <= PIPELINE_CACHE_LAST)
++			{
++				shader_stages[0].module = qvk.shader_modules[QVK_MOD_RADIANCE_CACHE_RGEN];
++				shader_stages[0].pSpecializationInfo = &cache_spec_info[index - PIPELINE_CACHE_FIRST];
++				break;
++			}
+ 			assert(!"invalid pipeline index");
+ 			break;
+ 		}
+diff --git a/src/refresh/vkpt/radiance_cache.c b/src/refresh/vkpt/radiance_cache.c
+index 261ea46b..85c9dedf 100644
+--- a/src/refresh/vkpt/radiance_cache.c
++++ b/src/refresh/vkpt/radiance_cache.c
+@@ -25,9 +25,20 @@ GNU General Public License for more details.
+ 
+ #define SHARC_CAPACITY (1u << 22)
+ 
++#define KRC_TABLE      (1u << 22)   // cases de la table de hachage
++#define KRC_CELLS      (1u << 20)   // cellules
++#define KRC_CELL_SIZE  48           // octets, struct KrcCell
++#define KRC_ACC        10           // accumulateurs 64 bits par cellule
++#define KRC_CTR        64           // compteurs 64 bits
++#define KRC_K          4            // cellules par pixel
++#define KRC_MAX_PIXELS (2560u * 1600u)
++
+ static BufferResource_t buf_sharc_hash;     // clés 64 bits
+ static BufferResource_t buf_sharc_accum;    // accumulation de la frame, 16 octets
+ static BufferResource_t buf_sharc_resolved; // données résolues, 16 octets
++
++static BufferResource_t buf_krc_keys, buf_krc_vals, buf_krc_cells, buf_krc_acc, buf_krc_ctr,
++	buf_krc_vis, buf_krc_free, buf_krc_pix;
+ static bool rc_needs_clear = true;
+ static float cam_pos_prev[3];
+ static int last_cache_mode = -1;
+@@ -51,6 +62,14 @@ vkpt_rc_init(void)
+ 	_VK(create_cache_buffer(&buf_sharc_hash, (size_t)SHARC_CAPACITY * 8, "sharc hash entries"));
+ 	_VK(create_cache_buffer(&buf_sharc_accum, (size_t)SHARC_CAPACITY * 16, "sharc accumulation"));
+ 	_VK(create_cache_buffer(&buf_sharc_resolved, (size_t)SHARC_CAPACITY * 16, "sharc resolved"));
++	_VK(create_cache_buffer(&buf_krc_keys, (size_t)KRC_TABLE * 4, "krc keys"));
++	_VK(create_cache_buffer(&buf_krc_vals, (size_t)KRC_TABLE * 4, "krc vals"));
++	_VK(create_cache_buffer(&buf_krc_cells, (size_t)KRC_CELLS * KRC_CELL_SIZE, "krc cells"));
++	_VK(create_cache_buffer(&buf_krc_acc, (size_t)KRC_CELLS * KRC_ACC * 8, "krc accumulators"));
++	_VK(create_cache_buffer(&buf_krc_ctr, (size_t)KRC_CTR * 8, "krc counters"));
++	_VK(create_cache_buffer(&buf_krc_vis, (size_t)KRC_CELLS * 4, "krc visible cells"));
++	_VK(create_cache_buffer(&buf_krc_free, (size_t)KRC_CELLS * 4, "krc free list"));
++	_VK(create_cache_buffer(&buf_krc_pix, (size_t)KRC_MAX_PIXELS * KRC_K * 4, "krc pixel cells"));
+ 	rc_needs_clear = true;
+ 	return VK_SUCCESS;
+ }
+@@ -61,6 +80,14 @@ vkpt_rc_destroy(void)
+ 	buffer_destroy(&buf_sharc_hash);
+ 	buffer_destroy(&buf_sharc_accum);
+ 	buffer_destroy(&buf_sharc_resolved);
++	buffer_destroy(&buf_krc_keys);
++	buffer_destroy(&buf_krc_vals);
++	buffer_destroy(&buf_krc_cells);
++	buffer_destroy(&buf_krc_acc);
++	buffer_destroy(&buf_krc_ctr);
++	buffer_destroy(&buf_krc_vis);
++	buffer_destroy(&buf_krc_free);
++	buffer_destroy(&buf_krc_pix);
+ 	return VK_SUCCESS;
+ }
+ 
+@@ -90,6 +117,18 @@ vkpt_rc_prepare_ubo(QVKUniformBuffer_t *ubo, uint64_t frame_counter)
+ 	ubo->rc_cam_pos_prev[1] = cam_pos_prev[1];
+ 	ubo->rc_cam_pos_prev[2] = cam_pos_prev[2];
+ 	ubo->rc_cam_pos_prev[3] = 0;
++	split_address(buf_krc_keys.address, &ubo->rc_addr_c[0], &ubo->rc_addr_c[1]);
++	split_address(buf_krc_vals.address, &ubo->rc_addr_c[2], &ubo->rc_addr_c[3]);
++	split_address(buf_krc_cells.address, &ubo->rc_addr_d[0], &ubo->rc_addr_d[1]);
++	split_address(buf_krc_acc.address, &ubo->rc_addr_d[2], &ubo->rc_addr_d[3]);
++	split_address(buf_krc_ctr.address, &ubo->rc_addr_e[0], &ubo->rc_addr_e[1]);
++	split_address(buf_krc_vis.address, &ubo->rc_addr_e[2], &ubo->rc_addr_e[3]);
++	split_address(buf_krc_free.address, &ubo->rc_addr_f[0], &ubo->rc_addr_f[1]);
++	split_address(buf_krc_pix.address, &ubo->rc_addr_f[2], &ubo->rc_addr_f[3]);
++	ubo->rc_krc[0] = KRC_TABLE - 1;
++	ubo->rc_krc[1] = KRC_CELLS;
++	ubo->rc_krc[2] = KRC_MAX_PIXELS;
++	ubo->rc_krc[3] = 0;
+ 	memcpy(cam_pos_prev, ubo->cam_pos, sizeof(cam_pos_prev));
+ 
+ 	// changer de méthode : on repart d'un cache vide, pour une comparaison juste
+@@ -112,6 +151,11 @@ vkpt_rc_clear_if_needed(VkCommandBuffer cmd_buf)
+ 	vkCmdFillBuffer(cmd_buf, buf_sharc_hash.buffer, 0, VK_WHOLE_SIZE, 0);
+ 	vkCmdFillBuffer(cmd_buf, buf_sharc_accum.buffer, 0, VK_WHOLE_SIZE, 0);
+ 	vkCmdFillBuffer(cmd_buf, buf_sharc_resolved.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_krc_keys.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_krc_vals.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_krc_cells.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_krc_acc.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_krc_ctr.buffer, 0, VK_WHOLE_SIZE, 0);
+ 
+ 	VkMemoryBarrier barrier = {
+ 		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+@@ -127,3 +171,9 @@ vkpt_rc_sharc_capacity(void)
+ {
+ 	return SHARC_CAPACITY;
+ }
++
++uint32_t
++vkpt_rc_krc_cells(void)
++{
++	return KRC_CELLS;
++}
+diff --git a/src/refresh/vkpt/shader/global_ubo.h b/src/refresh/vkpt/shader/global_ubo.h
+index 6d325b34..974df814 100644
+--- a/src/refresh/vkpt/shader/global_ubo.h
++++ b/src/refresh/vkpt/shader/global_ubo.h
+@@ -43,6 +43,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 	UBO_CVAR_DO(pt_sharc_downscale, 5) /* SHaRC : un pixel mis à jour par bloc NxN */ \
+ 	UBO_CVAR_DO(pt_sharc_radiance_scale, 1000) /* SHaRC : quantification de l'accumulation */ \
+ 	UBO_CVAR_DO(pt_cache_bounces, 4) /* rebonds des chemins de mise à jour du cache */ \
++	UBO_CVAR_DO(pt_krc_ppp, 0.25) /* KRC : chemins par pixel et par frame (moyenne, allocation de Neyman) */ \
++	UBO_CVAR_DO(pt_krc_cell_px, 16) /* KRC : taille d'une cellule à l'écran, en pixels */ \
++	UBO_CVAR_DO(pt_krc_hist, 256) /* KRC : historique maximal d'une cellule (échantillons) */ \
++	UBO_CVAR_DO(pt_krc_delta, 1) /* KRC : chemins corrélés (lumière d'avant / d'après des lampes animées) */ \
++	UBO_CVAR_DO(pt_krc_detect, 1) /* KRC : détection de changement non expliqué (porte, objet) */ \
++	UBO_CVAR_DO(pt_krc_passes, 31) /* KRC, débogage : passes actives (bits : compteurs, pixels, liste libre, éviction, résolution) */ \
+ 	UBO_CVAR_DO(flt_antilag_hf, 1) /* A-SVGF anti-lag filter strength, [0..inf) */ \
+ 	UBO_CVAR_DO(flt_antilag_lf, 0.2) \
+ 	UBO_CVAR_DO(flt_antilag_spec, 2) \
+@@ -232,6 +238,11 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_a) /* cache de radiance : SHaRC clés (xy), accumulation (zw) */ \
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_b) /* SHaRC résolu (xy), capacité (z), frame (w) */ \
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            rc_cam_pos_prev) \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_c) /* KRC : clés (xy), valeurs (zw) de la table */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_d) /* KRC : cellules (xy), accumulateurs (zw) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_e) /* KRC : compteurs (xy), cellules visibles (zw) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_f) /* KRC : liste libre (xy), cellules des pixels (zw) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_krc) /* KRC : masque de la table, capacité, pixels max, - */ \
+ 	\
+ 	GLOBAL_UBO_VAR_LIST_DO(DynLightData,    dyn_light_data[MAX_LIGHT_SOURCES]) \
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            cam_pos) \
+diff --git a/src/refresh/vkpt/shader/indirect_lighting.rgen b/src/refresh/vkpt/shader/indirect_lighting.rgen
+index f5b5b857..043124bb 100644
+--- a/src/refresh/vkpt/shader/indirect_lighting.rgen
++++ b/src/refresh/vkpt/shader/indirect_lighting.rgen
+@@ -37,6 +37,11 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 
+ layout(constant_id = 0) const uint spec_bounce_index = 0;
+ 
++// KRC (pt_cache 2) : indirect diffus du pixel lu dans ses cellules, ajouté au canal LF
++vec3 krc_lf = vec3(0);
++vec3 krc_lf_direction = vec3(0, 0, 1);
++bool krc_used = false;
++
+ void
+ indirect_lighting(
+ 	ivec2 ipos, 
+@@ -211,6 +216,29 @@ indirect_lighting(
+ 		}
+ 	}
+ 
++	// KRC : l'indirect diffus vient des cellules du pixel (même grandeur que le rebond diffus
++	// du jeu, 1 - F compris, avec tous les rebonds) ; le rayon diffus n'est plus tracé, ni le
++	// second rebond qui le suivrait. Le reflet spéculaire reste celui du jeu. Tant que les
++	// cellules du pixel n'ont pas d'échantillon, le jeu trace son rayon diffus comme avant.
++	if (spec_bounce_index == 0 && cache_mode() == CACHE_KRC)
++	{
++		vec3 cell_value;
++		if (krc_pixel_indirect(ipos, cell_value))
++		{
++			krc_lf = throughput.rgb * cell_value;
++			krc_lf_direction = normal;
++			krc_used = true;
++			if (!is_specular_ray)
++			{
++				bounce_direction = normal;
++				bounce_contrib = vec3(0);
++				if(spec_bounce_index < global_ubo.pt_num_bounce_rays - 1)
++					imageStore(IMG_PT_SHADING_POSITION, ipos, vec4(0));
++				return;
++			}
++		}
++	}
++
+ 	Ray bounce_ray;
+ 	bounce_ray.origin = position;
+ 	bounce_ray.direction = bounce_direction;
+@@ -523,6 +551,27 @@ main()
+ 
+ 	indirect_lighting(ipos, half_res, bounce_direction, bounce_contrib, is_specular_ray);
+ 
++	if (global_ubo.pt_cache_debug == 1 && spec_bounce_index == 0 && cache_mode() == CACHE_KRC)
++	{
++		krc_lf = krc_used ? vec3(0, 2, 0) : vec3(2, 0, 0);
++		krc_used = true;
++	}
++
++	if (krc_used && !any(isnan(krc_lf)) && !any(isinf(krc_lf)))
++	{
++		vec3 lf = clamp_output(krc_lf) * STORAGE_SCALE_LF;
++		SH low_freq = load_SH(TEX_PT_COLOR_LF_SH, TEX_PT_COLOR_LF_COCG, ipos);
++	#if ENABLE_SH
++		if(global_ubo.flt_enable == 0)
++			low_freq.shY.xyz += lf;
++		else
++			accumulate_SH(low_freq, irradiance_to_SH(lf, krc_lf_direction), 1.0);
++	#else
++		low_freq.shY.xyz += lf;
++	#endif
++		STORE_SH(IMG_PT_COLOR_LF_SH, IMG_PT_COLOR_LF_COCG, ipos, low_freq);
++	}
++
+ 	if(any(isinf(bounce_contrib)) || any(isnan(bounce_contrib)) || any(isinf(bounce_direction)) || any(isnan(bounce_direction)) )
+ 		return;
+ 
+diff --git a/src/refresh/vkpt/shader/radiance_cache.h b/src/refresh/vkpt/shader/radiance_cache.h
+index 8fb70219..551b3808 100644
+--- a/src/refresh/vkpt/shader/radiance_cache.h
++++ b/src/refresh/vkpt/shader/radiance_cache.h
+@@ -63,4 +63,162 @@ vec3 rc_demodulation(vec3 albedo)
+ 	return max(albedo, vec3(0.05));
+ }
+ 
++// ========================================================================== //
++// KRC (pt_cache 2). Cellules en espace monde, de taille ≈ pt_krc_cell_px pixels
++// à l'écran (niveaux en puissances de 2 selon la distance) et par face (axe
++// dominant de la normale). Chaque pixel lit K = 4 cellules, décalées au hasard
++// d'au plus une demi-cellule : l'indirect diffus du pixel est leur moyenne
++// tronquée. Une cellule stocke la même grandeur que le canal LF du jeu
++// (indirect diffus démodulé, avec le facteur 1 - F du jeu).
++// ========================================================================== //
++
++layout(buffer_reference, std430, buffer_reference_align = 4) buffer KrcU32 { uint v[]; };
++layout(buffer_reference, std430, buffer_reference_align = 8) buffer KrcU64 { uint64_t v[]; };
++
++struct KrcCell
++{
++	vec3 mean;      // indirect moyen (démodulé)
++	float n;        // échantillons dans l'historique (plafonné à pt_krc_hist)
++	float lmean;    // luminance moyenne
++	float var;      // variance par échantillon de la luminance (moyenne glissante)
++	uint seen;      // dernière frame (horloge KRC) où la cellule a servi
++	uint key;
++	uint slot;      // case de la table + 1 (0 : libre)
++	float sigma;    // écart-type par échantillon (allocation de Neyman)
++	uint born;
++	uint pad;
++};
++layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells { KrcCell c[]; };
++
++#define KRC_K        4
++#define KRC_NONE     0xffffffffu
++#define KRC_TOMB     0xffffffffu
++#define KRC_FX       65536.0
++// accumulateurs par cellule (64 bits, virgule fixe KRC_FX)
++#define KRC_ACC      10
++#define KRC_A_FOOT   0   // pixels qui lisent la cellule dans la frame
++#define KRC_A_FN     1   // échantillons de la frame
++#define KRC_A_SUM    2   // 2..4 : somme rgb
++#define KRC_A_LUM    5
++#define KRC_A_LUM2   6
++#define KRC_A_DELTA  7   // 7..9 : somme rgb des différences « après - avant » (signée)
++// compteurs (64 bits)
++#define KRC_C_CELLS     0
++#define KRC_C_NVIS      1
++#define KRC_C_FREE      2
++#define KRC_C_POP       3
++#define KRC_C_SIG       4   // Σ sigma des pixels qui échantillonnent (virgule fixe)
++#define KRC_C_PIX       5
++#define KRC_C_SIG_PREV  6
++#define KRC_C_PIX_PREV  7
++#define KRC_C_CLOCK     8
++#define KRC_C_OVERFLOW  9
++
++KrcU32 krc_keys()  { return KrcU32(rc_address(global_ubo.rc_addr_c.xy)); }
++KrcU32 krc_vals()  { return KrcU32(rc_address(global_ubo.rc_addr_c.zw)); }
++KrcCells krc_cells() { return KrcCells(rc_address(global_ubo.rc_addr_d.xy)); }
++KrcU64 krc_acc()   { return KrcU64(rc_address(global_ubo.rc_addr_d.zw)); }
++KrcU64 krc_ctr()   { return KrcU64(rc_address(global_ubo.rc_addr_e.xy)); }
++KrcU32 krc_vis()   { return KrcU32(rc_address(global_ubo.rc_addr_e.zw)); }
++KrcU32 krc_free()  { return KrcU32(rc_address(global_ubo.rc_addr_f.xy)); }
++KrcU32 krc_pix()   { return KrcU32(rc_address(global_ubo.rc_addr_f.zw)); }
++
++uint krc_mix(uint h, uint v)
++{
++	h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2);
++	h ^= h >> 16; h *= 0x7feb352du;
++	h ^= h >> 15; h *= 0x846ca68bu;
++	h ^= h >> 16;
++	return h;
++}
++
++// angle (en radians) couvert par un pixel
++float krc_pixel_angle()
++{
++	return 2.0 / (abs(global_ubo.P[1][1]) * float(global_ubo.height));
++}
++
++// clé de la cellule du point p (normale n, à la distance dist de la caméra), décalée de
++// jitter (en fractions de cellule)
++uint krc_key(vec3 p, vec3 n, float dist, vec3 jitter, out float size)
++{
++	float target = global_ubo.pt_krc_cell_px * max(dist, 1.0) * krc_pixel_angle();
++	int level = int(floor(log2(max(target, 1e-3)) + 0.5));
++	size = exp2(float(level));
++	ivec3 q = ivec3(floor(p / size + jitter));
++	vec3 an = abs(n);
++	uint axis = (an.x >= an.y && an.x >= an.z) ? 0u : ((an.y >= an.z) ? 1u : 2u);
++	float sgn = (axis == 0u) ? n.x : ((axis == 1u) ? n.y : n.z);
++	uint face = axis * 2u + (sgn < 0.0 ? 1u : 0u);
++	uint h = krc_mix(0x12345u, uint(q.x));
++	h = krc_mix(h, uint(q.y));
++	h = krc_mix(h, uint(q.z));
++	h = krc_mix(h, uint(level + 128) * 8u + face);
++	if (h == 0u || h == KRC_TOMB)
++		h = 1u;
++	return h;
++}
++
++// cellule existante pour la clé, ou KRC_NONE
++uint krc_find(uint key)
++{
++	uint mask = global_ubo.rc_krc.x;
++	uint h = key & mask;
++	KrcU32 keys = krc_keys();
++	for (uint probe = 0u; probe < 64u; probe++)
++	{
++		uint k = keys.v[h];
++		if (k == key)
++		{
++			uint v = krc_vals().v[h];
++			return v == 0u ? KRC_NONE : v - 1u;
++		}
++		if (k == 0u)
++			return KRC_NONE;
++		h = (h + 1u) & mask;
++	}
++	return KRC_NONE;
++}
++
++// indirect diffus d'un pixel (canal LF) : moyenne tronquée de ses K cellules (sans la plus
++// claire ni la plus sombre quand il y en a 4) ; false si aucune cellule n'a d'échantillon
++bool krc_pixel_indirect(ivec2 ipos, out vec3 value)
++{
++	value = vec3(0);
++	uint idx = uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x);
++	if (uint(global_ubo.width) * uint(global_ubo.height) > global_ubo.rc_krc.z)
++		return false;
++	KrcU32 pix = krc_pix();
++	KrcCells cells = krc_cells();
++	vec3 vals[KRC_K];
++	uint nv = 0u;
++	for (uint s = 0u; s < KRC_K; s++)
++	{
++		uint c = pix.v[idx * KRC_K + s];
++		if (c != KRC_NONE && cells.c[c].n > 0.0)
++			vals[nv++] = cells.c[c].mean;
++	}
++	if (nv == 0u)
++		return false;
++	if (nv == KRC_K)
++	{
++		uint imin = 0u, imax = 0u;
++		for (uint s = 1u; s < KRC_K; s++)
++		{
++			if (luminance(vals[s]) < luminance(vals[imin])) imin = s;
++			if (luminance(vals[s]) >= luminance(vals[imax])) imax = s;
++		}
++		if (imin == imax) imax = (imin + 1u) % KRC_K;
++		for (uint s = 0u; s < KRC_K; s++)
++			if (s != imin && s != imax) value += vals[s];
++		value *= 0.5;
++	}
++	else
++	{
++		for (uint s = 0u; s < nv; s++) value += vals[s];
++		value /= float(nv);
++	}
++	return true;
++}
++
+ #endif // RADIANCE_CACHE_H_
+diff --git a/src/refresh/vkpt/shader/radiance_cache.rgen b/src/refresh/vkpt/shader/radiance_cache.rgen
+index f7339164..d320ae20 100644
+--- a/src/refresh/vkpt/shader/radiance_cache.rgen
++++ b/src/refresh/vkpt/shader/radiance_cache.rgen
+@@ -260,6 +260,491 @@ void sharc_resolve(uint index)
+ 	SharcResolveEntry(index, sharc_parameters(), rp);
+ }
+ 
++// ---------------------------------------------------------------- KRC
++// Éclairage direct diffus d'un sommet avec la lumière de la frame (d_new) et celle de la
++// frame précédente (d_old), pour le même tirage : même lampe, même point, même rayon d'ombre.
++// Copie de get_direct_illumination / sample_polygonal_lights du jeu, en diffus, avec une
++// différence : la lampe est tirée selon max(intensité, intensité précédente), pour qu'une
++// lampe qui s'éteint soit encore tirée et que sa disparition soit mesurée.
++// Les lampes dynamiques et le ciel sont pris identiques avant et après.
++void krc_direct(RcSurface s, vec3 view_dir, int bounce, out vec3 d_new, out vec3 d_old)
++{
++	d_new = vec3(0);
++	d_old = vec3(0);
++	vec3 p = s.position;
++	vec3 n = s.normal;
++	bool polygonal = bounce == 0 ? global_ubo.pt_direct_polygon_lights > 0 : global_ubo.pt_indirect_polygon_lights > 0;
++	bool dynamic = bounce == 0 ? global_ubo.pt_direct_dyn_lights > 0 : global_ubo.pt_indirect_dyn_lights > 0;
++
++	vec3 pl_pos = p, pl_new = vec3(0), pl_old = vec3(0);
++	if (polygonal && s.cluster != ~0u)
++	{
++		uint list_start = light_buffer.light_list_offsets[s.cluster];
++		uint list_end = light_buffer.light_list_offsets[s.cluster + 1];
++		uint light_count = list_end - list_start;
++		float partitions = ceil(float(light_count) / float(MAX_BRUTEFORCE_SAMPLING));
++		float u = rc_rand() * max(partitions, 1.0);
++		float fpart = min(floor(u), max(partitions - 1.0, 0.0));
++		u -= fpart;
++		uint first = list_start + uint(fpart);
++		uint stride = uint(max(partitions, 1.0));
++
++		float masses[MAX_BRUTEFORCE_SAMPLING];
++		float mass = 0.0;
++		for (uint i = 0u, li = first; i < MAX_BRUTEFORCE_SAMPLING; i++, li += stride)
++		{
++			masses[i] = 0.0;
++			if (li >= list_end)
++				continue;
++			uint idx = light_buffer.light_list_lights[li];
++			if (idx >= MAX_LIGHT_POLYS)
++				continue;
++			LightPolygon light = get_light_polygon(idx);
++			float m = spherical_tri_area(light.positions, p, n, view_dir, 1.0, 1.0, 0.0);
++			float style = max(light.light_style_scale, light.prev_style_scale);
++			m *= abs(luminance(light.color)) * (light.color.r >= 0 ? style : 1.0);
++			masses[i] = m;
++			mass += m;
++		}
++		if (mass > 0.0)
++		{
++			float r = u * mass;
++			uint pick = 0u;
++			float pdf = 0.0;
++			uint li = first;
++			for (uint i = 0u; i < MAX_BRUTEFORCE_SAMPLING; i++, li += stride)
++			{
++				if (li >= list_end)
++					break;
++				pick = li;
++				pdf = masses[i];
++				r -= masses[i];
++				if (r <= 0.0)
++					break;
++			}
++			pdf /= mass * max(partitions, 1.0);
++			uint idx = light_buffer.light_list_lights[pick];
++			if (pdf > 0.0 && idx < MAX_LIGHT_POLYS)
++			{
++				LightPolygon light = get_light_polygon(idx);
++				vec3 light_normal;
++				float pdfw;
++				pl_pos = sample_projected_triangle(p, light.positions, vec2(rc_rand(), rc_rand()), light_normal, pdfw);
++				vec3 L = normalize(pl_pos - p);
++				if (dot(L, n) > 0.0 && pdfw > 0.0)
++				{
++					float spotlight = sqrt(max(0.0, -dot(light_normal, L)));
++					if (light.color.r >= 0)
++					{
++						pl_new = light.color * (spotlight * light.light_style_scale / pdfw / pdf);
++						pl_old = light.color * (spotlight * light.prev_style_scale / pdfw / pdf);
++					}
++					else
++					{
++						pl_new = env_map(L, true) * (global_ubo.pt_env_scale / pdfw / pdf);
++						pl_old = pl_new;
++					}
++				}
++			}
++		}
++	}
++
++	vec3 dl_pos = p, dl = vec3(0);
++	if (dynamic)
++	{
++		vec3 rng3 = vec3(rc_rand(), rc_rand(), rc_rand());
++		sample_dynamic_lights(p, n, n, bounce == 0 ? 2.0 * M_PI : 0.02, dl_pos, dl, rng3);
++	}
++
++	float lp = luminance(max(abs(pl_new), abs(pl_old)));
++	float ld = luminance(abs(dl));
++	if (lp + ld <= 0.0)
++		return;
++	float w = lp / (lp + ld);
++	bool use_polygonal = rc_rand() < w;
++	vec3 pos = use_polygonal ? pl_pos : dl_pos;
++	vec3 c_new = use_polygonal ? pl_new / w : dl / (1.0 - w);
++	vec3 c_old = use_polygonal ? pl_old / w : dl / (1.0 - w);
++
++	float vis = trace_shadow_ray(get_shadow_ray(p - view_dir * 0.01, pos, 0), rc_shadow_mask());
++	float NdotL = max(0.0, dot(n, normalize(pos - p)));
++	d_new = c_new * (vis * NdotL / M_PI);
++	d_old = c_old * (vis * NdotL / M_PI);
++}
++
++// soleil diffus d'un sommet de rebond (identique avant et après)
++vec3 krc_sun(RcSurface s, vec3 view_dir)
++{
++	rng_seed = rc_hash(rc_state ^ 0x51ed270bu);
++	rc_rand();
++	vec3 sun_diffuse, sun_specular;
++	get_sunlight(s.cluster, s.material_id, s.position, s.normal, s.normal, view_dir,
++		vec3(0), 0.0, 1.0, MEDIUM_NONE, false, sun_diffuse, sun_specular, rc_shadow_mask());
++	return sun_diffuse * global_ubo.sun_bounce_scale;
++}
++
++uint krc_alloc()
++{
++	KrcU64 ctr = krc_ctr();
++	uint n = uint(ctr.v[KRC_C_FREE]);
++	uint i = uint(atomicAdd(ctr.v[KRC_C_POP], uint64_t(1)));
++	if (i < n)
++		return krc_free().v[n - 1u - i];
++	uint c = uint(atomicAdd(ctr.v[KRC_C_CELLS], uint64_t(1)));
++	if (c >= global_ubo.rc_krc.y)
++	{
++		atomicAdd(ctr.v[KRC_C_OVERFLOW], uint64_t(1));
++		return KRC_NONE;
++	}
++	return c;
++}
++
++// cellule de la clé, créée si besoin ; KRC_NONE si la table ou les cellules sont pleines
++uint krc_insert(uint key)
++{
++	uint mask = global_ubo.rc_krc.x;
++	uint h = key & mask;
++	KrcU32 keys = krc_keys();
++	KrcU32 vals = krc_vals();
++	for (uint probe = 0u; probe < 64u; probe++)
++	{
++		uint k = keys.v[h];
++		if (k == key)
++		{
++			uint v = vals.v[h];
++			return v == 0u ? KRC_NONE : v - 1u;
++		}
++		if (k != 0u)
++		{
++			h = (h + 1u) & mask;
++			continue;
++		}
++		uint old = atomicCompSwap(keys.v[h], 0u, key);
++		if (old == 0u)
++		{
++			uint c = krc_alloc();
++			if (c == KRC_NONE)
++			{
++				keys.v[h] = KRC_TOMB;
++				return KRC_NONE;
++			}
++			KrcCell cell;
++			cell.mean = vec3(0);
++			cell.n = 0.0;
++			cell.lmean = 0.0;
++			cell.var = 0.0;
++			cell.seen = uint(krc_ctr().v[KRC_C_CLOCK]);
++			cell.key = key;
++			cell.slot = h + 1u;
++			cell.sigma = 0.0;
++			cell.born = cell.seen;
++			cell.pad = 0u;
++			krc_cells().c[c] = cell;
++			atomicExchange(vals.v[h], c + 1u);
++			return c;
++		}
++		if (old == key)
++		{
++			uint v = vals.v[h];
++			return v == 0u ? KRC_NONE : v - 1u;
++		}
++		h = (h + 1u) & mask;
++	}
++	return KRC_NONE;
++}
++
++// écart-type par échantillon d'une cellule pour l'allocation ; une cellule jeune reçoit un a
++// priori large (exploration)
++float krc_sigma(uint c, float sigma_mean)
++{
++	KrcCell cell = krc_cells().c[c];
++	if (cell.n < 8.0)
++		return max(sigma_mean, 1e-3) * 4.0;
++	return max(cell.sigma, 1e-4);
++}
++
++// Un chemin d'indirect depuis la surface primaire du pixel : même premier rebond que le jeu
++// (cosinus autour de la normale d'ombrage, poids 1 - F), puis jusqu'à pt_cache_bounces rebonds
++// diffus, avec arrêt sur une cellule mûre au 1er ou 2e sommet (rééchantillonnage du cache).
++// value : estimation avec la lumière de la frame ; old : la même avec celle d'avant.
++void krc_path(ivec2 ipos, RcSurface s, vec3 view_dir, out vec3 value, out vec3 old)
++{
++	value = vec3(0);
++	old = vec3(0);
++
++	vec3 normal = decode_normal(texelFetch(TEX_PT_NORMAL_A, ipos, 0).x);
++	if (dot(normal, view_dir) > 0)
++		normal = -normal;
++	vec4 base_color = texelFetch(TEX_PT_BASE_COLOR_A, ipos, 0);
++	float metallic = texelFetch(TEX_PT_METALLIC_A, ipos, 0).x;
++	vec3 albedo, base_reflectivity;
++	get_reflectivity(base_color.rgb, metallic, albedo, base_reflectivity);
++
++	vec2 u = vec2(rc_rand(), rc_rand());
++	vec3 dir = normalize(construct_ONB_frisvad(normal) * sample_cos_hemisphere(u));
++	vec3 H = normalize(dir - view_dir);
++	vec3 F = schlick_fresnel(base_reflectivity, max(0.0, dot(-view_dir, H)), base_color.a);
++	vec3 beta = vec3(1.0) - F;
++
++	Ray ray;
++	ray.origin = s.position - view_dir * 0.01;
++	ray.direction = dir;
++	ray.t_min = 0;
++	ray.t_max = 10000;
++	trace_geometry_ray(ray, true, rc_bounce_mask());
++	if (!found_intersection(ray_payload_geometry))
++		return;
++
++	int bounces = max(int(global_ubo.pt_cache_bounces), 1);
++	uint rs_depth = rc_rand() < 0.5 ? 1u : 2u;
++	bool from_primary = true;
++	for (int b = 1; ; b++)
++	{
++		float segment = ray_payload_geometry.hit_distance;
++		vec3 sky;
++		RcSurface h;
++		if (!rc_hit_surface(dir, from_primary, h, sky))
++		{
++			value += beta * sky;
++			old += beta * sky;
++			return;
++		}
++		from_primary = false;
++		vec3 emissive = h.analytic_light ? vec3(0) : h.emissive;
++
++		vec3 d_new, d_old;
++		rng_seed = rc_hash(rc_state ^ 0x2545f491u);
++		krc_direct(h, dir, 1, d_new, d_old);
++		vec3 sun = krc_sun(h, dir);
++		if (b == 1)
++		{
++			// atténuation du soleil au premier rebond, comme le jeu
++			float sun_attenuation = square(clamp(1.0 - square(square(segment / global_ubo.pt_sun_bounce_range)), 0, 1));
++			sun *= sun_attenuation;
++		}
++
++		// rééchantillonnage : le reste du chemin est lu dans une cellule mûre assez éloignée
++		if (uint(b) == rs_depth)
++		{
++			float size;
++			float dist = length(h.position - global_ubo.cam_pos.xyz);
++			uint key = krc_key(h.position, h.normal, dist, vec3(rc_rand(), rc_rand(), rc_rand()) - 0.5, size);
++			if (segment > size * 1.7320508)
++			{
++				uint c = krc_find(key);
++				if (c != KRC_NONE && krc_cells().c[c].n >= 8.0)
++				{
++					vec3 cached = krc_cells().c[c].mean;
++					value += beta * (h.albedo * (d_new + sun + cached) + emissive);
++					old += beta * (h.albedo * (d_old + sun + cached) + emissive);
++					return;
++				}
++			}
++		}
++
++		value += beta * (h.albedo * (d_new + sun) + emissive);
++		old += beta * (h.albedo * (d_old + sun) + emissive);
++		if (b >= bounces)
++			return;
++
++		beta *= h.albedo;
++		if (b >= 2)
++		{
++			float q = clamp(max(beta.x, max(beta.y, beta.z)), 0.05, 0.95);
++			if (rc_rand() > q)
++				return;
++			beta /= q;
++		}
++
++		vec3 nd;
++		bool found = rc_bounce(h, dir, nd);
++		dir = nd;
++		if (!found)
++			return;
++	}
++}
++
++void krc_add(uint i, float v)
++{
++	atomicAdd(krc_acc().v[i], uint64_t(int64_t(v * KRC_FX)));
++}
++
++// passe 2 : compteurs de la frame
++void krc_prep()
++{
++	KrcU64 ctr = krc_ctr();
++	ctr.v[KRC_C_SIG_PREV] = ctr.v[KRC_C_SIG];
++	ctr.v[KRC_C_PIX_PREV] = ctr.v[KRC_C_PIX];
++	ctr.v[KRC_C_SIG] = 0;
++	ctr.v[KRC_C_PIX] = 0;
++	ctr.v[KRC_C_NVIS] = 0;
++	ctr.v[KRC_C_CLOCK] += 1;
++}
++
++// passe 3 : les K cellules du pixel (créées si besoin), puis ses chemins : le pixel tire une
++// de ses cellules et y envoie en moyenne pt_krc_ppp × sigma / sigma moyen chemins (allocation
++// de Neyman : plus de chemins là où la lumière varie)
++void krc_pixel(ivec2 ipos)
++{
++	if (ipos.x >= global_ubo.width || ipos.y >= global_ubo.height)
++		return;
++	if (uint(global_ubo.width) * uint(global_ubo.height) > global_ubo.rc_krc.z)
++		return;
++	uint idx = uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x);
++	KrcU32 pix = krc_pix();
++
++	RcSurface s;
++	vec3 view_dir;
++	if (!rc_primary_surface(ipos, s, view_dir))
++	{
++		for (uint k = 0u; k < KRC_K; k++)
++			pix.v[idx * KRC_K + k] = KRC_NONE;
++		return;
++	}
++
++	rc_state = rc_hash(idx * 0x9e3779b9u + rc_hash(global_ubo.rc_addr_b.w));
++	float dist = length(s.position - global_ubo.cam_pos.xyz);
++	KrcU64 acc = krc_acc();
++	KrcU64 ctr = krc_ctr();
++	uint my_cells[KRC_K];
++	for (uint k = 0u; k < KRC_K; k++)
++	{
++		float size;
++		uint key = krc_key(s.position, s.normal, dist, vec3(rc_rand(), rc_rand(), rc_rand()) - 0.5, size);
++		uint c = krc_insert(key);
++		my_cells[k] = c;
++		pix.v[idx * KRC_K + k] = c;
++		if (c != KRC_NONE && atomicAdd(acc.v[c * KRC_ACC + KRC_A_FOOT], uint64_t(1)) == 0)
++			krc_vis().v[uint(atomicAdd(ctr.v[KRC_C_NVIS], uint64_t(1)))] = c;
++	}
++
++	uint c = my_cells[min(uint(rc_rand() * KRC_K), KRC_K - 1u)];
++	if (c == KRC_NONE)
++		return;
++	float pix_prev = float(ctr.v[KRC_C_PIX_PREV]);
++	float sigma_mean = pix_prev > 0 ? float(ctr.v[KRC_C_SIG_PREV]) / KRC_FX / pix_prev : 0.0;
++	float sigma = krc_sigma(c, sigma_mean);
++	atomicAdd(ctr.v[KRC_C_SIG], uint64_t(sigma * KRC_FX));
++	atomicAdd(ctr.v[KRC_C_PIX], uint64_t(1));
++	float p = global_ubo.pt_krc_ppp * (sigma_mean > 0 ? sigma / sigma_mean : 1.0);
++	int paths = int(floor(min(p, 4.0) + rc_rand()));
++
++	KrcCell cell = krc_cells().c[c];
++	for (int j = 0; j < paths; j++)
++	{
++		vec3 v, o;
++		krc_path(ipos, s, view_dir, v, o);
++		v = clamp_output(v);
++		o = clamp_output(o);
++		// écrêtage des lucioles : un échantillon plus de 50× la moyenne d'une cellule mûre
++		float l = luminance(v);
++		if (cell.n >= 8.0 && l > 50.0 * max(cell.lmean, 1e-3))
++		{
++			float k = 50.0 * max(cell.lmean, 1e-3) / l;
++			v *= k;
++			o *= k;
++			l *= k;
++		}
++		uint b = c * KRC_ACC;
++		atomicAdd(acc.v[b + KRC_A_FN], uint64_t(1));
++		krc_add(b + KRC_A_SUM + 0u, v.x);
++		krc_add(b + KRC_A_SUM + 1u, v.y);
++		krc_add(b + KRC_A_SUM + 2u, v.z);
++		krc_add(b + KRC_A_LUM, l);
++		krc_add(b + KRC_A_LUM2, l * l);
++		vec3 d = v - o;
++		krc_add(b + KRC_A_DELTA + 0u, d.x);
++		krc_add(b + KRC_A_DELTA + 1u, d.y);
++		krc_add(b + KRC_A_DELTA + 2u, d.z);
++	}
++}
++
++// passe 4 : la liste libre après les insertions
++void krc_mid()
++{
++	KrcU64 ctr = krc_ctr();
++	uint64_t nf = ctr.v[KRC_C_FREE];
++	ctr.v[KRC_C_FREE] = nf - min(ctr.v[KRC_C_POP], nf);
++	ctr.v[KRC_C_POP] = 0;
++}
++
++// passe 5 : éviction des cellules inutilisées depuis 120 frames (1/8 des cellules par frame)
++void krc_evict(uint id)
++{
++	KrcU64 ctr = krc_ctr();
++	uint clock = uint(ctr.v[KRC_C_CLOCK]);
++	uint c = id * 8u + (clock & 7u);
++	if (c >= min(uint(ctr.v[KRC_C_CELLS]), global_ubo.rc_krc.y))
++		return;
++	KrcCells cells = krc_cells();
++	KrcCell cell = cells.c[c];
++	KrcU64 acc = krc_acc();
++	if (cell.slot == 0u || acc.v[c * KRC_ACC + KRC_A_FOOT] != 0 || clock - cell.seen <= 120u)
++		return;
++	uint h = cell.slot - 1u;
++	krc_keys().v[h] = KRC_TOMB;
++	krc_vals().v[h] = 0u;
++	cells.c[c].slot = 0u;
++	cells.c[c].n = 0.0;
++	for (uint i = 0u; i < KRC_ACC; i++)
++		acc.v[c * KRC_ACC + i] = 0;
++	krc_free().v[uint(atomicAdd(ctr.v[KRC_C_FREE], uint64_t(1)))] = c;
++}
++
++float krc_load(uint i)
++{
++	return float(int64_t(krc_acc().v[i])) / KRC_FX;
++}
++
++// passe 6 : résolution des cellules utilisées dans la frame. D'abord la correction corrélée :
++// l'historique reçoit la différence « après - avant » mesurée par les chemins de la frame
++// (lampes animées), sans rien oublier ; puis la moyenne glissante avec les nouveaux
++// échantillons ; un changement que les différences n'expliquent pas (porte, objet) raccourcit
++// l'historique.
++void krc_resolve(uint id)
++{
++	KrcU64 ctr = krc_ctr();
++	if (id >= uint(ctr.v[KRC_C_NVIS]))
++		return;
++	uint c = krc_vis().v[id];
++	KrcCells cells = krc_cells();
++	KrcCell cell = cells.c[c];
++	KrcU64 acc = krc_acc();
++	uint b = c * KRC_ACC;
++	float fn = float(acc.v[b + KRC_A_FN]);
++	if (fn > 0.0)
++	{
++		vec3 fm = vec3(krc_load(b + KRC_A_SUM), krc_load(b + KRC_A_SUM + 1u), krc_load(b + KRC_A_SUM + 2u)) / fn;
++		float fl = krc_load(b + KRC_A_LUM) / fn;
++		float fl2 = krc_load(b + KRC_A_LUM2) / fn;
++		vec3 fd = vec3(krc_load(b + KRC_A_DELTA), krc_load(b + KRC_A_DELTA + 1u), krc_load(b + KRC_A_DELTA + 2u)) / fn;
++		float var_s = max(fl2 - fl * fl, 0.0);
++
++		if (cell.n > 0.0 && global_ubo.pt_krc_delta != 0)
++		{
++			cell.mean = max(cell.mean + fd, vec3(0));
++			cell.lmean = max(cell.lmean + luminance(fd), 0.0);
++		}
++		if (global_ubo.pt_krc_detect != 0 && cell.n >= 8.0 && fn >= 4.0)
++		{
++			float se = sqrt((var_s + cell.var) / fn);
++			if (abs(fl - cell.lmean) > 4.0 * se + 0.05 * cell.lmean)
++				cell.n = min(cell.n, 4.0);
++		}
++		float a = max(fn / (cell.n + fn), fn / max(global_ubo.pt_krc_hist, 1.0));
++		a = min(a, 1.0);
++		cell.mean = mix(cell.mean, fm, a);
++		cell.lmean = mix(cell.lmean, fl, a);
++		cell.var = (cell.n > 0.0) ? mix(cell.var, var_s + square(fl - cell.lmean), a) : var_s;
++		cell.n = min(cell.n + fn, global_ubo.pt_krc_hist);
++		cell.sigma = sqrt(cell.var);
++	}
++	cell.seen = uint(ctr.v[KRC_C_CLOCK]);
++	cells.c[c] = cell;
++	for (uint i = 0u; i < KRC_ACC; i++)
++		acc.v[b + i] = 0;
++}
++
+ void main()
+ {
+ 	uvec2 id = uvec2(rt_LaunchID.xy);
+@@ -267,7 +752,26 @@ void main()
+ 	{
+ 		if (spec_pass == 0)
+ 			sharc_update(id);
+-		else
++		else if (spec_pass == 1)
+ 			sharc_resolve(id.y * 4096u + id.x);
+ 	}
++	else if (cache_mode() == CACHE_KRC)
++	{
++		if (spec_pass == 2)
++		{
++			if (id.x == 0 && id.y == 0)
++				krc_prep();
++		}
++		else if (spec_pass == 3)
++			krc_pixel(ivec2(id));
++		else if (spec_pass == 4)
++		{
++			if (id.x == 0 && id.y == 0)
++				krc_mid();
++		}
++		else if (spec_pass == 5)
++			krc_evict(id.y * 4096u + id.x);
++		else if (spec_pass == 6)
++			krc_resolve(id.y * 4096u + id.x);
++	}
+ }
+diff --git a/src/refresh/vkpt/vkpt.h b/src/refresh/vkpt/vkpt.h
+index 8f0886a3..e15ee9c4 100644
+--- a/src/refresh/vkpt/vkpt.h
++++ b/src/refresh/vkpt/vkpt.h
+@@ -675,6 +675,7 @@ void vkpt_rc_reset(void);
+ void vkpt_rc_prepare_ubo(QVKUniformBuffer_t *ubo, uint64_t frame_counter);
+ void vkpt_rc_clear_if_needed(VkCommandBuffer cmd_buf);
+ uint32_t vkpt_rc_sharc_capacity(void);
++uint32_t vkpt_rc_krc_cells(void);
+ VkResult vkpt_pt_destroy(void);
+ VkResult vkpt_pt_create_pipelines(void);
+ VkResult vkpt_pt_destroy_pipelines(void);
+-- 
+2.55.0.windows.3
+
