@@ -308,6 +308,14 @@ fn main() {
             Some(g) => rt::vitrine_video(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(960)),
             None => eprintln!("pas de GPU"),
         },
+        Some("vitrineref") => match gpu::Gpu::new() {
+            Some(g) => rt::vitrine_ref(
+                &g,
+                args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60),
+                args.get(2).and_then(|s| s.parse().ok()).unwrap_or(64),
+            ),
+            None => eprintln!("pas de GPU"),
+        },
         Some("vitrinems") => match gpu::Gpu::new() {
             Some(g) => rt::vitrine_ms(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(960)),
             None => eprintln!("pas de GPU"),
@@ -360,6 +368,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
         debt_rate: -1.0,
         reset_ratio: 0.0,
         dn_gamma: 0.0,
+        drs: false,
     };
     let krcd = |name, ppp, resample, cell_px, reuse, demod| krcs(name, ppp, resample, cell_px, reuse, demod, false);
     let krcr = |name, ppp, resample, cell_px, reuse| krcd(name, ppp, resample, cell_px, reuse, false);
@@ -430,6 +439,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             debt_rate: -1.0,
             reset_ratio: 0.0,
             dn_gamma: 0.0,
+            drs: false,
         });
     }
     for (name, cell, ppp) in [("v2m cell4 0.5", 4.0f32, 0.5f32), ("v2m cell4 1", 4.0, 1.0), ("v2m cell6 0.5", 6.0, 0.5), ("v2m cell6 0.25", 6.0, 0.25)] {
@@ -450,6 +460,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             debt_rate: -1.0,
             reset_ratio: 0.0,
             dn_gamma: 0.0,
+            drs: false,
         });
     }
     for (name, cell, ppp) in [
@@ -478,6 +489,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             debt_rate: -1.0,
             reset_ratio: 0.0,
             dn_gamma: 0.0,
+            drs: false,
         });
     }
     for (name, tau) in [("krc+cible 3% cell4", 0.03f32), ("krc+cible 5% cell4", 0.05), ("krc+cible 8% cell4", 0.08)] {
@@ -498,6 +510,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             debt_rate: -1.0,
             reset_ratio: 0.0,
             dn_gamma: 0.0,
+            drs: false,
         });
     }
     for (name, ppp, cell) in [("krc+sup cell4 1", 1.0f32, 4.0f32), ("krc+sup cell6 0.5", 0.5, 6.0), ("krc+sup cell8 0.25", 0.25, 8.0), ("krc+sup cell6 1", 1.0, 6.0)] {
@@ -559,6 +572,7 @@ fn game_cfgs() -> Vec<(rt::DuelCfg, bool)> {
         debt_rate: -1.0,
         reset_ratio: 0.0,
         dn_gamma: 0.0,
+        drs: false,
     };
     let krc = |name, ppp| rt::DuelCfg { name, ppp, ..base };
     let sh = |name, down, acc| rt::DuelCfg { name, method: Method::Sharc, sh: ShParams { downscale: down, accum_frames: acc, ..d }, ..base };
@@ -576,6 +590,8 @@ fn game_cfgs() -> Vec<(rt::DuelCfg, bool)> {
     vec![
         // correctifs (KRC 0,5 chemin/px), un à la fois puis ensemble
         // campagne finale : KRC jeu (32 chemins corrélés de lampe), SHaRC, bornage 1,5 et 3
+        (rt::DuelCfg { drs: true, ..fix("drs krc 0.5 m32", 8.0, 32, -1.0, 0.0, 0.0) }, true),
+        (rt::DuelCfg { drs: true, ..fix("drs krc 0.5 m8", 8.0, 0, -1.0, 0.0, 0.0) }, true),
         (fix("final krc 0.5 g3", 8.0, 32, -1.0, 0.0, 3.0), true),
         (rt::DuelCfg { ppp: 0.25, ..fix("final krc 0.25 g3", 8.0, 32, -1.0, 0.0, 3.0) }, true),
         (fix("final krc 0.5 g1.5", 8.0, 32, -1.0, 0.0, 0.0), true),

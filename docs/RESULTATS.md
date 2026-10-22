@@ -561,3 +561,38 @@ Lecture :
   pendant des dizaines de frames. Les taches de KRC ont nettement diminué mais restent
   visibles à f119.
 - **Pics** : p95 de KRC 1,3 à 1,9 ms contre 0,9 ms pour SHaRC à 480×270.
+
+## 16. Vitrine : la différence à l'œil
+
+`cargo run --release -- vitrine 960` (après `sh tools/fetch_sponza.sh`) : Sponza texturée et
+brillante (sol poli presque miroir, pierre satinée, métal, sphère chromée qui roule, sphère
+dorée), ciel au-dessus du toit qui se couche à la frame 100, lampe de galerie qui s'allume à
+la frame 80, caméra qui marche. Même pipeline de jeu pour les deux méthodes, à temps GPU égal
+(~5,5 ms en 960×540 sans relecture). Vidéos : `results/vitrine/comparaison.mp4` (24 i/s) et
+`comparaison_lente.mp4` (12 i/s) ; images fixes `comparaison_f039/060/090/110.png`.
+
+![Après le coucher du ciel](../results/vitrine/comparaison_f110.png)
+
+| relMSE* contre la référence (2 048 chemins/px) | KRC | SHaRC NVIDIA |
+|---|---|---|
+| Statique, ciel (f39) | 9,0e-3 | **6,5e-3** |
+| La sphère roule (f60) | 1,8e-2 | **1,3e-2** |
+| Juste après le coucher du ciel (f101) | **2,5e-3** | 5,0e-3 |
+| 10 et 19 frames après (f110, f119) | **6,4e-4**, **4,0e-4** | 1,5e-3, 9,1e-4 |
+| Séquence | 1,04e-2 | **7,96e-3** |
+
+Lecture :
+
+- **Quand la lumière change, la différence se voit tout de suite** : après le coucher du
+  ciel, KRC est sombre et chaud comme la référence ; SHaRC montre encore le jour pendant des
+  dizaines de frames (luminance 1,5 à 2,1× trop forte).
+- **Scène claire et immobile, ou sphère qui roule** : SHaRC est un peu meilleur (1,4×).
+  À l'œil, les deux sont proches ; SHaRC est un peu plus propre, KRC garde quelques taches
+  sombres. Sur la séquence entière, SHaRC a donc la plus petite erreur moyenne.
+- **Reflets** : la sphère miroir reste bruitée chez les deux (un rayon de reflet par
+  pixel) ; KRC la rend un peu moins bruitée grâce à ses cellules relues au point reflété.
+- **Pics** : l'allumage d'une lampe coûte 12,6 ms à KRC (16 chemins corrélés par cellule) ;
+  SHaRC a un coût plat.
+- Les rapports de luminance de la phase claire (0,3 à 0,7 pour les deux) viennent surtout
+  des lucioles de la référence (2 048 chemins/px, petites lampes et sol brillant), pas des
+  méthodes.

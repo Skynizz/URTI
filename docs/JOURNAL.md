@@ -291,3 +291,21 @@ Tests courts (`krc duel`, `krc statique` : 480×270 ou 256², 3 graines) pour d�
   méthodes.
 - Résultat : taches nettement réduites mais pas disparues ; dérive sombre après l'extinction
   0,74–0,81 (réglage du débruiteur) ; statique Sponza toujours légèrement en faveur de SHaRC.
+
+## v15 — vitrine : Sponza texturée et brillante, vidéo comparative
+
+- Matériaux PBR : vraies textures de Sponza (69, 512² avec mipmaps), BRDF lambertien + GGX,
+  sol de pierre polie presque miroir, pierre satinée, métal, feuillages en masque alpha
+  (texels transparents traversés), sphère chromée qui roule, sphère dorée, ciel au-dessus
+  du toit qui « se couche », tone mapping ACES.
+- Les deux méthodes dans le même pipeline de jeu : reflet par pixel (KRC relit ses cellules
+  au point reflété, démodulées puis remultipliées par l'albédo exact : texture nette, lumière
+  sans bruit ; SHaRC suit sa règle officielle d'empreinte du lobe), débruiteur commun avec
+  canal spéculaire séparé et filtre anti-lucioles.
+- Réglages à temps égal (~5,5 ms en 960×540) : KRC 0,25 chemin/px dans les cellules + 2
+  estimations directes par pixel ; SHaRC 1 pixel mis à jour par bloc 2×2, 3 chemins/px.
+- Corrections trouvées en regardant les images : écrêtage des lucioles dans les cellules à
+  100× la moyenne (20× assombrissait), 16 chemins corrélés par cellule pour une lampe
+  (pic de 19,7 → 12,6 ms à l'allumage).
+- Faux problème écarté : la sphère miroir « mal placée » dans la référence (sa moitié basse
+  reflète le sol et s'y fond).

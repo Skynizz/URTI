@@ -44,15 +44,34 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rough = g_rough(g);
         let metal = g_metal(g);
         let wo = normalize(fr.eye - g.p);
+        // krc_spp estimations par pixel de l'éclairage direct et du reflet (le cache donne l'indirect
+        // diffus, déjà lisse ; le bruit de l'image finale vient du direct par pixel)
+        let nspp = max(fr.krc_spp, 1u);
+        var sp = vec3<f32>(0.0);
+        for (var si = 0u; si < nspp; si++) {
         let ns = nee_split(g.p, g.n, wo, g.albedo, rough, metal);
-        v = ns.d;
-        var sp = ns.s;
+        v += ns.d;
+        sp += ns.s;
         if (!is_diffuse(rough, metal)) {
             // reflet : un rayon du lobe spéculaire ; au point touché, radiance avec lecture du cache
             let bs = spec_sample(g.n, wo, g.albedo, rough, metal);
             if (bs.ok) {
                 let h = intersect(g.p + g.n * OFFSET, bs.wi);
+                // point reflété couvert par une cellule mûre : sa lumière diffuse (démodulée) ×
+                // l'albédo exact du point touché (texture nette) + le spéculaire direct du point
+                var cached = false;
                 if (h.found && h.light < 0) {
+                    let c1 = cell_at(h.p, h.n, length(h.p - fr.eye));
+                    if (c1 != 0xffffffffu && cells[c1].n >= 4.0) {
+                        let nh = nee_split(h.p, h.n, -bs.wi, h.albedo, h.rough, h.metal);
+                        let ld = select(cells[c1].mean - cells[c1].dmean, cells[c1].mean, (fr.flags & F_DSPLIT) == 0u);
+                        // diffus : direct calculé ici (net), indirect de la cellule
+                        let lind = max(ld, vec3<f32>(0.0)) * demod(diff_albedo(h.albedo, h.metal));
+                        sp += bs.w * (nh.d + nh.s + lind);
+                        cached = true;
+                    }
+                }
+                if (!cached && h.found && h.light < 0) {
                     pm_wo = -bs.wi;
                     pm_rough = h.rough;
                     pm_metal = h.metal;
@@ -63,6 +82,9 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+        }
+        v /= f32(nspp);
+        sp /= f32(nspp);
         spec_img[k] = vec4<f32>(sp, 0.0);
         var ind = vec3<f32>(0.0);
         var w = 0.0;
@@ -82,6 +104,48 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         spec_img[k] = vec4<f32>(0.0);
     }
     image[k] = vec4<f32>(v, f32(g.kind));
+}
+
+// anti-lucioles (identique pour les deux méthodes, comme dans les débruiteurs de jeu) : un pixel
+// plus de 2× plus lumineux que le plus lumineux de ses 8 voisins est ramené à ce voisin
+fn ff_diffuse(k: u32) -> vec3<f32> {
+    let c = image[k].rgb / dn_dalb(gbuf[k]);
+    let x = i32(k % fr.w);
+    let y = i32(k / fr.w);
+    var mx = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            let qx = x + dx;
+            let qy = y + dy;
+            if (qx < 0 || qy < 0 || qx >= i32(fr.w) || qy >= i32(fr.h)) { continue; }
+            let qi = u32(qy) * fr.w + u32(qx);
+            if (gbuf[qi].kind != 2u) { continue; }
+            mx = max(mx, lum(image[qi].rgb / dn_dalb(gbuf[qi])));
+        }
+    }
+    let l = lum(c);
+    if (l > 2.0 * mx && l > 0.0) { return c * (mx / l); }
+    return c;
+}
+
+fn ff_spec(k: u32) -> vec3<f32> {
+    let c = spec_img[k].rgb;
+    let x = i32(k % fr.w);
+    let y = i32(k / fr.w);
+    var mx = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            let qx = x + dx;
+            let qy = y + dy;
+            if (qx < 0 || qy < 0 || qx >= i32(fr.w) || qy >= i32(fr.h)) { continue; }
+            mx = max(mx, lum(spec_img[u32(qy) * fr.w + u32(qx)].rgb));
+        }
+    }
+    let l = lum(c);
+    if (l > 2.0 * mx && l > 0.0) { return c * (mx / l); }
+    return c;
 }
 
 // pixel (continu) d'un point monde dans la caméra précédente ; x < 0 si hors champ
@@ -133,7 +197,7 @@ fn dn_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
         dn_t1[k] = vec4<f32>(image[k].rgb, 0.0);
         return;
     }
-    let cur = image[k].rgb / dn_dalb(g);
+    let cur = ff_diffuse(k);
     var out = vec4<f32>(cur, 1.0);
     let q = dn_prev_px(g.p);
     if (q.x >= 0.0) {
@@ -166,7 +230,7 @@ fn dn_spec(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x;
     if (k >= fr.w * fr.h) { return; }
     let g = gbuf[k];
-    let cur = spec_img[k].rgb;
+    let cur = ff_spec(k);
     var out = vec4<f32>(cur, 1.0);
     if (g.kind == 2u && !is_diffuse(g_rough(g), g_metal(g))) {
         let q = dn_prev_px(g.p);
@@ -220,7 +284,7 @@ fn dn_spec_out(k: u32) -> vec3<f32> {
     let g = gbuf[k];
     let rough = g_rough(g);
     if (is_diffuse(rough, g_metal(g))) { return vec3<f32>(0.0); }
-    if (rough < 0.2) { return spec_t[k].rgb; }
+    if (rough < 0.1) { return spec_t[k].rgb; }
     let x = i32(k % fr.w);
     let y = i32(k / fr.w);
     var acc = vec3<f32>(0.0);

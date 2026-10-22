@@ -1222,15 +1222,24 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         k.demod = env("KRC_DM").is_some();
         k.support = env("KRC_SUP").is_some();
         k.game = env("KRC_GAME").is_some();
+        k.delta_resample = env("KRC_DRS").is_some();
+        if let Some(r) = env("KRC_SPP").and_then(|c| c.parse().ok()) {
+            k.krc_spp = r;
+        }
+        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
         let mut sum: Vec<(&'static str, f64)> = Vec::new();
         let (mut live, mut total) = (0u32, 0.0);
         let (mut segs, mut paths, mut hits) = (0u64, 0u64, 0u64);
         let mut prev = at(0);
+        let mut worst: (f64, u32, Vec<(&'static str, f64)>) = (0.0, 0, Vec::new());
         for t in 0..FRAMES {
             let scene = at(t);
             k.set_view(setup.view_at(t));
             let f = k.frame_tri(&scene, &prev, t);
             prev = scene;
+            if f.gpu_ms() > worst.0 {
+                worst = (f.gpu_ms(), t, f.passes.clone());
+            }
             total += f.gpu_ms() / FRAMES as f64;
             live = live.max(f.cells.saturating_sub(f.free));
             segs += f.segs as u64;
@@ -1255,6 +1264,10 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         for (name, ms) in sum.iter().take(12) {
             println!("    {name:<16} {ms:.3} ms");
         }
+        let mut wp = worst.2.clone();
+        wp.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("    frame la plus lente : f{} {:.2} ms — {}", worst.1, worst.0,
+            wp.iter().take(5).map(|(n, m)| format!("{n} {m:.2}")).collect::<Vec<_>>().join(", "));
     }
 }
 
@@ -1279,6 +1292,8 @@ pub struct DuelCfg {
     pub debt_rate: f32,
     pub reset_ratio: f32,
     pub dn_gamma: f32,
+    /// chemins corrélés arrêtés sur le cache
+    pub drs: bool,
 }
 
 impl Default for DuelCfg {
@@ -1300,6 +1315,7 @@ impl Default for DuelCfg {
             debt_rate: -1.0,
             reset_ratio: 0.0,
             dn_gamma: 0.0,
+            drs: false,
         }
     }
 }
@@ -1461,6 +1477,7 @@ pub fn game_eval(gpu: &Gpu, setup: &TriSetup, cfgs: &[(DuelCfg, bool)]) {
             k.debt_rate = c.debt_rate;
             k.reset_ratio = c.reset_ratio;
             k.dn_gamma = c.dn_gamma;
+            k.delta_resample = c.drs;
             k.dn_wide = std::env::var("KRC_DN5").is_ok();
             for pass in 0..2 {
                 k.readback = pass == 0;
@@ -1726,6 +1743,10 @@ pub fn vitrine_ms(gpu: &Gpu, w: usize) {
         ("krc 0.25", Method::Krc, 0.25, d),
         ("krc 0.5", Method::Krc, 0.5, d),
         ("krc 1", Method::Krc, 1.0, d),
+        ("krc 0.25 spp2", Method::Krc, 0.25, ShParams { render_spp: 2, ..d }),
+        ("krc 0.25 spp3", Method::Krc, 0.25, ShParams { render_spp: 3, ..d }),
+        ("krc 0.5 spp2", Method::Krc, 0.5, ShParams { render_spp: 2, ..d }),
+        ("krc 0.5 spp3", Method::Krc, 0.5, ShParams { render_spp: 3, ..d }),
         ("sharc 5x5 spp1", Method::Sharc, 1.0, d),
         ("sharc 5x5 spp2", Method::Sharc, 1.0, ShParams { render_spp: 2, ..d }),
         ("sharc 2x2 spp2", Method::Sharc, 1.0, ShParams { render_spp: 2, downscale: 2, ..d }),
@@ -1737,6 +1758,7 @@ pub fn vitrine_ms(gpu: &Gpu, w: usize) {
         k.game = true;
         k.ppp = ppp;
         k.sh = sh;
+        k.krc_spp = sh.render_spp; // pour KRC, render_spp sert de nombre d'estimations par pixel
         k.readback = false;
         let mut prev = at(0);
         let mut ms = 0.0;
@@ -1802,25 +1824,46 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
     }
     let d = ShParams::default();
     let methods = [
-        ("krc", "KRC", Method::Krc, 0.5f32, d),
+        ("krc", "KRC", Method::Krc, 0.25f32, ShParams { render_spp: 2, ..d }),
         ("sharc", "SHaRC NVIDIA", Method::Sharc, 1.0, ShParams { downscale: 2, render_spp: 3, ..d }),
     ];
     let mut report = String::new();
     let mut labels = Vec::new();
     for (dir, label, method, ppp, sh) in methods {
+        // temps GPU : passage séparé, sans relecture ni écriture d'images (sinon le GPU attend le
+        // CPU et ralentit)
         let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene0), method, 1);
         k.game = true;
         k.ppp = ppp;
         k.sh = sh;
-        k.m_light = 32;
+        k.krc_spp = sh.render_spp;
+        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        k.readback = false;
         let mut prev = at(0);
-        let (mut ms, mut err) = (Vec::new(), 0.0);
+        let mut ms = Vec::new();
+        for f in 0..FRAMES {
+            let scene = at(f);
+            k.set_view(setup.view_at(f));
+            ms.push(k.frame_tri(&scene, &prev, f).gpu_ms());
+            prev = scene;
+        }
+        drop(k);
+        ms.sort_by(|a, b| a.total_cmp(b));
+        let mean_ms = ms.iter().sum::<f64>() / ms.len() as f64;
+        let p95 = ms[ms.len() * 95 / 100];
+        let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene0), method, 1);
+        k.game = true;
+        k.ppp = ppp;
+        k.sh = sh;
+        k.krc_spp = sh.render_spp;
+        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        let mut prev = at(0);
+        let mut err = 0.0;
         for f in 0..FRAMES {
             let scene = at(f);
             k.set_view(setup.view_at(f));
             let fr = k.frame_tri(&scene, &prev, f);
             prev = scene;
-            ms.push(fr.gpu_ms());
             let (_, e, lr) = frame_err(&fr.image, &fr.kinds, &refs[f as usize]);
             err += e / FRAMES as f64;
             if [39u32, 60, 81, 101, 110, 119].contains(&f) {
@@ -1828,8 +1871,7 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
             }
             crate::image::write_png(&format!("{out}/{dir}/f{f:03}.png"), w, h, &tonemap(&fr.image, exposure)).unwrap();
         }
-        let mean_ms = ms.iter().sum::<f64>() / ms.len() as f64;
-        report += &format!("{label} : relMSE* moyenne {err:.3e}, GPU moyen {mean_ms:.2} ms\n");
+        report += &format!("{label} : relMSE* moyenne {err:.3e}, GPU moyen {mean_ms:.2} ms, p95 {p95:.2} ms\n");
         labels.push(format!("{label} - {mean_ms:.1} ms par frame"));
         eprintln!("{label} : relMSE* {err:.3e}, {mean_ms:.2} ms");
     }
@@ -1868,4 +1910,31 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
         cmd.arg(format!("{out}/comparaison_f{f:03}.png"));
         cmd.status().expect("ffmpeg");
     }
+}
+
+/// `krc vitrineref f [spp]` : référence d'une frame de la vitrine (contrôle).
+pub fn vitrine_ref(gpu: &Gpu, f: u32, spp: u32) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    let setup = vitrine_setup(960, 540);
+    let scene0 = (setup.at)(0);
+    let mut rk = GpuKrc::with(gpu, setup.view, Grid::fit(&scene0.bounds), Some(&scene0), false, 0);
+    rk.set_view(setup.view_at(f));
+    let (img, _) = rk.reference_tri(&(setup.at)(f), spp);
+    crate::image::write_png(&format!("results/vitrine/test_ref_f{f:03}.png"), 960, 540, &tonemap(&img, 9.3)).unwrap();
+    // référence construite directement avec la scène de la frame f
+    let scf = (setup.at)(f);
+    let mut rk2 = GpuKrc::with(gpu, setup.view, Grid::fit(&scene0.bounds), Some(&scf), false, 0);
+    rk2.set_view(setup.view_at(f));
+    let (img3, _) = rk2.reference_tri(&scf, spp);
+    crate::image::write_png(&format!("results/vitrine/test_ref_direct_f{f:03}.png"), 960, 540, &tonemap(&img3, 9.3)).unwrap();
+    // même frame, KRC à froid (une seule frame, sans séquence)
+    let mut k = GpuKrc::with(gpu, setup.view, Grid::fit(&scene0.bounds), Some(&scene0), false, 1);
+    k.set_view(setup.view_at(f));
+    let sc = (setup.at)(f);
+    let mut img2 = Vec::new();
+    for _ in 0..8 {
+        img2 = k.frame_tri(&sc, &sc, f).image;
+    }
+    crate::image::write_png(&format!("results/vitrine/test_krc_cold_f{f:03}.png"), 960, 540, &tonemap(&img2, 9.3)).unwrap();
 }

@@ -129,6 +129,11 @@ const F_INDIRECT: u32 = 8192u;
 // = total − direct moyen, et le direct par pixel
 const F_DSPLIT: u32 = 16384u;
 const F_GAME: u32 = 32768u;   // pipeline de jeu (parties diffuse / spéculaire séparées, game.wgsl)
+// chemins corrélés arrêtés eux aussi sur le cache au 1er ou 2e rebond : les deux chemins de la
+// paire lisent la même valeur, qui s'annule dans la différence ; il manque seulement l'effet de
+// l'événement au-delà du point d'arrêt (second ordre, corrigé aux frames suivantes)
+const F_DRS: u32 = 65536u;
+const FIREFLY_K: f32 = 1.0e9;
 const MULTI_N: f32 = 32.0;
 
 fn slot_dist(dist: f32, slot: u32) -> f32 {
@@ -164,7 +169,7 @@ struct Frame {
     prev_fwd: vec3<f32>, debt_rate: f32,   // part du budget qui rembourse les chemins d'événement (< 0 : DEBT_RATE)
     prev_right: vec3<f32>, reset_ratio: f32, // changement relatif au-delà duquel on repart de zéro (0 : jamais)
     prev_up: vec3<f32>, dn_gamma: f32,     // bornage de l'historique du débruiteur (0 : DN_GAMMA)
-    sh_spp: u32, pad12: u32, pad13: u32, pad14: u32, // SHaRC : chemins par pixel de la passe Render
+    sh_spp: u32, krc_spp: u32, pad13: u32, pad14: u32, // SHaRC : chemins par pixel de la passe Render ; KRC : estimations du direct par pixel (mode jeu)
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -1365,6 +1370,8 @@ fn delta_trace(g: u32, round: u32) {
     split = !geometry;
     sel = 0u;
     seed_rng(t.z, i, fr.frame);
+    resample = (fr.flags & F_DRS) != 0u;
+    rs_depth = select(1u, 2u, (pcg(t.z ^ 0x68e31da4u) & 1u) == 0u);
     let s0 = rng;
     set_primary(gx, true);
     let r = radiance(gx.p, gx.n, gx.albedo);
@@ -1733,9 +1740,19 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         add_f32(bs + A_FL2, ls * ls);
     }
     let gda = diff_albedo(gx.albedo, g_metal(gx));
-    let v = (v_raw - select(vec3<f32>(0.0), d0_l, (fr.flags & F_INDIRECT) != 0u)) / demod(gda);
+    var v = (v_raw - select(vec3<f32>(0.0), d0_l, (fr.flags & F_INDIRECT) != 0u)) / demod(gda);
+    // mode jeu : écrêtage des lucioles (comme les caches des jeux) — un échantillon plus de
+    // FIREFLY_K fois plus lumineux que la moyenne de sa cellule est ramené à cette borne ; sinon
+    // il fait une tache de la taille de la cellule, que le débruiteur étale
+    var vscale = 1.0;
+    if ((fr.flags & F_GAME) != 0u && cells[c].n >= 8.0) {
+        let cap = FIREFLY_K * max(cells[c].lmean, 1e-4);
+        let lv = lum(v);
+        if (lv > cap) { vscale = cap / lv; }
+    }
+    v = v * vscale;
     if ((fr.flags & F_DSPLIT) != 0u) {
-        let dd = d0_l / demod(gda);
+        let dd = d0_l * vscale / demod(gda);
         add_fx(c * ACC + A_FD, dd.x);
         add_fx(c * ACC + A_FD + 1u, dd.y);
         add_fx(c * ACC + A_FD + 2u, dd.z);

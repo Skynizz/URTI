@@ -116,7 +116,8 @@ struct FrameU {
     prev_up: [f32; 3],
     dn_gamma: f32,
     sh_spp: u32,
-    pad12: [u32; 3],
+    krc_spp: u32,
+    pad12: [u32; 2],
 }
 
 /// Méthode du pipeline.
@@ -172,6 +173,7 @@ const F_MULTI: u32 = 4096;
 const F_INDIRECT: u32 = 8192;
 const F_DSPLIT: u32 = 16384;
 const F_GAME: u32 = 32768;
+const F_DRS: u32 = 65536;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -276,6 +278,10 @@ pub struct GpuKrc<'a> {
     pub indirect_only: bool,
     /// débruiteur à 5 passages à-trous (pas 1 à 16) au lieu de 3
     pub dn_wide: bool,
+    /// mode jeu : estimations par pixel de l'éclairage direct et du reflet (KRC)
+    pub krc_spp: u32,
+    /// chemins corrélés arrêtés sur le cache (événements moins chers)
+    pub delta_resample: bool,
     /// chemins corrélés par cellule pour un événement de lampe (0 : 8)
     pub m_light: u32,
     /// part du budget qui rembourse les chemins d'événement (< 0 : 0,5)
@@ -571,6 +577,8 @@ impl<'a> GpuKrc<'a> {
             denoise: true,
             indirect_only: false,
             dn_wide: false,
+            krc_spp: 1,
+            delta_resample: false,
             m_light: 0,
             debt_rate: -1.0,
             reset_ratio: 0.0,
@@ -644,7 +652,8 @@ impl<'a> GpuKrc<'a> {
             prev_up: f3(self.prev_view.up),
             dn_gamma: self.dn_gamma,
             sh_spp: self.sh.render_spp,
-            pad12: [0; 3],
+            krc_spp: self.krc_spp,
+            pad12: [0; 2],
         }
     }
 
@@ -863,6 +872,9 @@ impl<'a> GpuKrc<'a> {
         }
         if self.resample {
             flags |= F_RESAMPLE;
+        }
+        if self.delta_resample {
+            flags |= F_DRS;
         }
         if self.reuse {
             flags |= F_REUSE;
