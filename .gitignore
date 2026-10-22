@@ -3,3 +3,6 @@ results/ref/*.bin
 target-dev/
 assets/
 results/ref_*/*.bin
+results/cornell_1024/*/*.png
+results/sponza_1280x720/*/*.png
+results/gpu_dev/
