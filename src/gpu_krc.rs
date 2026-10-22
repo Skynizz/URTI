@@ -97,7 +97,50 @@ struct FrameU {
     rel_cap: f32,
     eps_energy: f32,
     n_post: f32,
+    sh_cam_prev: [f32; 3],
+    sh_scene_scale: f32,
+    sh_rscale: f32,
+    sh_cap: u32,
+    sh_accum: u32,
+    sh_stale: u32,
+    sh_down: u32,
+    pad5: [u32; 3],
 }
+
+/// Méthode du pipeline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Method {
+    Krc,
+    /// cache SHaRC-like maison (cellules KRC, moyenne glissante, 1 chemin par pixel)
+    SharcLike,
+    /// portage WGSL du SHaRC officiel de NVIDIA (sharc.wgsl)
+    Sharc,
+}
+
+/// Paramètres du SHaRC officiel : valeurs par défaut de l'exemple Pathtracer de NVIDIA RTXGI
+/// (UI.h : sceneScale 50, accumulation 20 frames, éviction après 60, 1 pixel par bloc 5×5 ;
+/// Pathtracer.cpp : 4 M entrées).
+#[derive(Clone, Copy, Debug)]
+pub struct ShParams {
+    pub scene_scale: f32,
+    pub accum_frames: u32,
+    pub stale_frames: u32,
+    /// quantification des radiances (u32) : l'exemple prend 1e3 pour des radiances ~1 ; nos
+    /// scènes sont ~30× plus sombres (Sponza), d'où 1e4 pour que la troncature reste < 0,2 %
+    pub radiance_scale: f32,
+    pub downscale: u32,
+    /// image finale : passe Render (chemin par pixel, cache aux impacts secondaires) au lieu de
+    /// la vue du cache au premier impact
+    pub render: bool,
+}
+
+impl Default for ShParams {
+    fn default() -> Self {
+        ShParams { scene_scale: 50.0, accum_frames: 20, stale_frames: 60, radiance_scale: 1e4, downscale: 5, render: false }
+    }
+}
+
+const SH_CAPACITY: usize = 1 << 22;
 
 const F_EVENT: u32 = 1;
 const F_GEOMETRY: u32 = 2;
@@ -182,13 +225,23 @@ pub struct GpuKrc<'a> {
     pub zero_cap: bool,
     pending: Option<GpuEvent>,
     _free_buf: wgpu::Buffer,
+    _sh_bufs: [wgpu::Buffer; 4],
     /// compteur de frames monotone (éviction des cellules invisibles)
     clock: u32,
     /// la table de hachage a trop de pierres tombales : reconstruction au début de la frame suivante
     rebuild: bool,
+    method: Method,
+    /// paramètres du SHaRC officiel (méthode Sharc)
+    pub sh: ShParams,
+    sh_cap: u32,
+    sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 31] = [
+const ENTRIES: [&str; 35] = [
+    "sharc_update",
+    "sharc_resolve",
+    "sharc_query",
+    "sharc_render",
     "rebuild_clear",
     "rebuild_insert",
     "pending_mark",
@@ -231,11 +284,18 @@ impl<'a> GpuKrc<'a> {
 
     /// Cas général : `tri` = scène en triangles (ray query matériel) ou None pour les boîtes.
     pub fn with(gpu: &'a Gpu, view: View, grid: Grid, tri: Option<&TriScene>, sharc: bool, seed: u32) -> GpuKrc<'a> {
+        GpuKrc::with_method(gpu, view, grid, tri, if sharc { Method::SharcLike } else { Method::Krc }, seed)
+    }
+
+    pub fn with_method(gpu: &'a Gpu, view: View, grid: Grid, tri: Option<&TriScene>, method: Method, seed: u32) -> GpuKrc<'a> {
+        let sharc = method != Method::Krc;
+        let sh_cap = if method == Method::Sharc { SH_CAPACITY } else { 16 };
         let dev = &gpu.device;
         let len = view.len();
         // une cellule couvre 2 à 4 pixels de large ; avec le jitter, ≈ len/6 cellules distinctes par
-        // vue, et une caméra mobile garde 60 frames de cellules invisibles avant de les évincer
-        let cell_cap = len.next_power_of_two().max(1 << 14) as u32;
+        // vue ; une caméra mobile en crée ~3 000 par frame à 480×270 et les garde 60 frames avant
+        // de les évincer (~250 000 cellules vivantes mesurées dans Sponza), d'où 2 par pixel
+        let cell_cap = (2 * len).next_power_of_two().max(1 << 14) as u32;
         let table = (cell_cap as usize * 2).next_power_of_two();
         let task_cap = cell_cap as usize * 10 + len * 9;
         let storage = |read_only: bool| wgpu::BindingType::Buffer {
@@ -244,7 +304,7 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..23u32 {
+        for b in 0..27u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -264,7 +324,7 @@ impl<'a> GpuKrc<'a> {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let mut src = grid.template(include_str!("krc_gpu.wgsl"));
+        let mut src = grid.template(include_str!("krc_gpu.wgsl")) + include_str!("sharc.wgsl");
         if tri.is_some() {
             let (a, b) = (src.find("// <geometrie>").unwrap(), src.find("// </geometrie>").unwrap());
             src = format!("{}{}{}", &src[..a], crate::rt::TRI_GEOMETRY, &src[b..]);
@@ -325,6 +385,8 @@ impl<'a> GpuKrc<'a> {
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let probe_buf = mk((PROBES * 32) as u64, st);
         let free_buf = mk(cell_cap as u64 * 4, st);
+        // SHaRC : clés 64 bits, verrous, accumulation (uint4), résolu (half4 + 2 u32)
+        let sh_bufs = [8u64, 4, 16, 16].map(|b| mk(sh_cap as u64 * b, st));
         let accel = tri.map(|t| Accel::new(gpu, t));
         let n_binds = if accel.is_some() { 2 } else { 1 };
         let binds = (0..n_binds)
@@ -345,6 +407,9 @@ impl<'a> GpuKrc<'a> {
                 }
                 e.push(wgpu::BindGroupEntry { binding: 21, resource: probe_buf.as_entire_binding() });
                 e.push(wgpu::BindGroupEntry { binding: 22, resource: free_buf.as_entire_binding() });
+                for (i, b) in sh_bufs.iter().enumerate() {
+                    e.push(wgpu::BindGroupEntry { binding: 23 + i as u32, resource: b.as_entire_binding() });
+                }
                 dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("krc"), layout: &layout, entries: &e })
             })
             .collect();
@@ -384,6 +449,11 @@ impl<'a> GpuKrc<'a> {
             clock: 0,
             rebuild: false,
             _free_buf: free_buf,
+            _sh_bufs: sh_bufs,
+            method,
+            sh: ShParams::default(),
+            sh_cap: sh_cap as u32,
+            sh_cam_prev: view.eye,
         }
     }
 
@@ -420,6 +490,14 @@ impl<'a> GpuKrc<'a> {
             rel_cap: self.rel_cap,
             eps_energy: self.eps_energy,
             n_post: self.n_post,
+            sh_cam_prev: f3(self.sh_cam_prev),
+            sh_scene_scale: self.sh.scene_scale,
+            sh_rscale: self.sh.radiance_scale,
+            sh_cap: self.sh_cap,
+            sh_accum: self.sh.accum_frames,
+            sh_stale: self.sh.stale_frames,
+            sh_down: self.sh.downscale,
+            pad5: [0; 3],
         }
     }
 
@@ -665,6 +743,14 @@ impl<'a> GpuKrc<'a> {
         let cells = Dispatch::Indirect(36);
         plan.push(("reset_ctr", Dispatch::Direct((CTR as u32).div_ceil(64))));
         plan.push(("gbuffer", px));
+        if self.method == Method::Sharc {
+            // Update (pixels clairsemés) → Resolve (toutes les entrées) → vue du cache ou Render
+            let d = self.sh.downscale;
+            let blocks = self.view.w.div_ceil(d as usize) as u32 * self.view.h.div_ceil(d as usize) as u32;
+            plan.push(("sharc_update", Dispatch::Direct(blocks.div_ceil(64))));
+            plan.push(("sharc_resolve", Dispatch::Direct(self.sh_cap.div_ceil(256))));
+            plan.push((if self.sh.render { "sharc_render" } else { "sharc_query" }, px));
+        } else {
         plan.push(("insert", slots));
         plan.push(("lookup", slots));
         plan.push(("prep_cells", Dispatch::Direct(1)));
@@ -701,6 +787,7 @@ impl<'a> GpuKrc<'a> {
         plan.push(("trace", Dispatch::Indirect(24)));
         plan.push(("resolve", cells));
         plan.push(("display", px));
+        }
 
         let dev = &self.gpu.device;
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("krc frame") });
@@ -747,6 +834,7 @@ impl<'a> GpuKrc<'a> {
         self.pending = if ctr[18] > 0 { ev.cloned().or(self.pending.take()) } else { None };
         self.rebuild = ctr[C_TOMB] as u64 * 4 > self.table_mask as u64 + 1;
         self.clock += 1;
+        self.sh_cam_prev = self.view.eye;
         GpuFrame {
             image: (0..img.len() / 4).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
             kinds: (0..img.len() / 4).map(|k| img[4 * k + 3] as u8).collect(),

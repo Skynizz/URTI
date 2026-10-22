@@ -526,29 +526,46 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
     let phases: [(&str, u32, u32); 6] =
         [("tout", 0, 120), ("statique", 30, 40), ("boite", 40, 64), ("apres_boite", 64, 80), ("lampe_on", 80, 100), ("lampe_off", 100, 120)];
     let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame,trim_mean,trim_std,lum_ratio\n");
-    for (name, sharc) in [("tri_krc", false), ("tri_sharc", true)] {
+    use crate::gpu_krc::Method;
+    // tri_sharc : cache SHaRC-like maison ; tri_sharc_nv : portage du SHaRC officiel de NVIDIA,
+    // vue du cache au premier impact ; tri_sharc_nv_render : sa passe Render (1 chemin/px)
+    let all = [
+        ("tri_krc", Method::Krc, false),
+        ("tri_sharc", Method::SharcLike, false),
+        ("tri_sharc_nv", Method::Sharc, false),
+        ("tri_sharc_nv_render", Method::Sharc, true),
+    ];
+    let only = std::env::var("KRC_METHODS").ok();
+    for (name, method, render) in all {
+        if only.as_ref().is_some_and(|m| !m.split(',').any(|x| x == name)) {
+            continue;
+        }
         let out = format!("results/{}/{name}", setup.name);
         std::fs::create_dir_all(&out).unwrap();
         let mut runs: Vec<Vec<(f64, f64, u32, f64, f64)>> = Vec::new();
         for seed in 0..seeds {
-            let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 1 + seed as u32);
+            let mut k = GpuKrc::with_method(gpu, view, grid, Some(&base), method, 1 + seed as u32);
+            k.sh.render = render;
             let mut prev = at(0);
             let mut rows = Vec::new();
-            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio,cells_live,evicted\n");
+            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio,cells_live,evicted,overflow\n");
             for t in 0..FRAMES {
                 let scene = at(t);
                 k.set_view(setup.view_at(t));
                 let f = k.frame_tri(&scene, &prev, t);
-                assert_eq!(f.overflow, 0);
+                if f.overflow > 0 {
+                    eprintln!("{name} graine {seed} frame {t} : {} insertions perdues (table pleine)", f.overflow);
+                }
                 let (rel, trim, lr) = frame_err(&f.image, &f.kinds, &refs[&setup.ref_key(t)]);
                 let paths = f.regular_paths + f.delta_paths + f.probe_rays as u32;
                 csv += &format!(
-                    "{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e},{lr:.4},{},{}\n",
+                    "{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e},{lr:.4},{},{},{}\n",
                     f.gpu_ms(),
                     f.suspects,
                     f.delta_paths,
                     f.cells - f.free,
-                    f.evicted
+                    f.evicted,
+                    f.overflow
                 );
                 if seed == 0 && crate::methods::SAVE_FRAMES.contains(&t) {
                     crate::image::save(&format!("{out}/f{t:03}.png"), view.w, view.h, &f.image);
@@ -560,8 +577,8 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
             std::fs::write(format!("{out}/{file}"), csv).unwrap();
             runs.push(rows);
         }
-        let mut line = format!("{name:<10}");
-        let mut line_t = format!("{:<10}", format!("{name}*"));
+        let mut line = format!("{name:<20}");
+        let mut line_t = format!("{:<20}", format!("{name}*"));
         let stat = |v: Vec<f64>| {
             let m = v.iter().sum::<f64>() / v.len() as f64;
             (m, (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (v.len().max(2) - 1) as f64).sqrt())
@@ -587,7 +604,8 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
         println!("{line}");
         println!("{line_t}");
     }
-    std::fs::write(format!("results/{}/summary.csv", setup.name), summary).unwrap();
+    let file = if only.is_some() { "summary_partial.csv" } else { "summary.csv" };
+    std::fs::write(format!("results/{}/{file}", setup.name), summary).unwrap();
 }
 
 /// `krc pareto [taille]` : erreur contre temps GPU, KRC et SHaRC, pour plusieurs budgets
@@ -929,4 +947,47 @@ pub fn bias(gpu: &Gpu, setup: &TriSetup) {
         }
         println!("{line} | relMSE* {err:.3e}");
     }
+}
+
+/// `krc sharccheck [cornell|sponza]` : validation du portage SHaRC. Scène statique (frame 39),
+/// caméra fixe, 300 frames ; avec des réglages généreux (tous les pixels mis à jour, longue
+/// accumulation, voxels fins), le cache doit converger vers la référence.
+pub fn sharc_check(gpu: &Gpu, setup: &TriSetup) {
+    use crate::gpu_krc::{GpuKrc, Method, ShParams};
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    let (view, at) = (setup.view, setup.at);
+    let scene = at(39);
+    let grid = Grid::fit(&scene.bounds);
+    let r = load_raw(&format!("results/ref_{}/{}.bin", setup.name, setup.ref_key(39)), view.len()).expect("références manquantes");
+    let d = ShParams::default();
+    let variants = [
+        ("défaut NVIDIA", d),
+        ("tous les pixels", ShParams { downscale: 1, ..d }),
+        ("+ accumulation 1024", ShParams { downscale: 1, accum_frames: 1024, ..d }),
+        ("+ voxels 8× plus fins", ShParams { downscale: 1, accum_frames: 1024, scene_scale: 400.0, ..d }),
+    ];
+    for (name, sh) in variants {
+        let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene), Method::Sharc, 5);
+        k.sh = sh;
+        let mut line = format!("{name:<24}");
+        for t in 0..300 {
+            let f = k.frame_tri(&scene, &scene, t);
+            if [0, 9, 49, 299].contains(&t) {
+                let (_, trim, lr) = frame_err(&f.image, &f.kinds, &r);
+                line += &format!(" | f{t} relMSE* {trim:.2e} lum {lr:.3}");
+            }
+        }
+        println!("{line}");
+    }
+    let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene), Method::Krc, 5);
+    let mut line = format!("{:<24}", "KRC 1 chemin/px");
+    for t in 0..300 {
+        let f = k.frame_tri(&scene, &scene, t);
+        if [0, 9, 49, 299].contains(&t) {
+            let (_, trim, lr) = frame_err(&f.image, &f.kinds, &r);
+            line += &format!(" | f{t} relMSE* {trim:.2e} lum {lr:.3}");
+        }
+    }
+    println!("{line}");
 }

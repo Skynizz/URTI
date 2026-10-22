@@ -253,6 +253,13 @@ fn main() {
             },
             None => eprintln!("pas de GPU"),
         },
+        Some("sharccheck") => match gpu::Gpu::new() {
+            Some(g) => match args.get(1).map(String::as_str) {
+                Some("sponza") => rt::sharc_check(&g, &rt::sponza_setup(480, 270)),
+                _ => rt::sharc_check(&g, &rt::cornell_setup(256)),
+            },
+            None => eprintln!("pas de GPU"),
+        },
         Some("sponzadebug") => match gpu::Gpu::new() {
             Some(g) => rt::sponza_debug(&g),
             None => eprintln!("pas de GPU"),

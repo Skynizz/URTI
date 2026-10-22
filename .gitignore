@@ -8,3 +8,4 @@ results/sponza_1280x720/*/*.png
 results/gpu_dev/
 results/ref_cornell_1024/*.png
 results/ref_sponza_*/*.png
+target-sh/

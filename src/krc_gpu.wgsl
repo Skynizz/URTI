@@ -109,7 +109,11 @@ struct Frame {
     clock: u32,      // compteur de frames monotone (éviction), indépendant de `frame` (graines)
     rel_cap: f32,    // variance relative d'allocation plafonnée à rel_cap × médiane (0 : aucun plafond)
     eps_energy: f32, // seuil de l'effet énergétique attendu (fraction de la luminance de la cellule)
-    n_post: f32,     // poids max d'une estimation corrigée (0 : N_POST) // part du budget répartie uniformément par pixel
+    n_post: f32,     // poids max d'une estimation corrigée (0 : N_POST)
+    // SHaRC officiel (sharc.wgsl)
+    sh_cam_prev: vec3<f32>, sh_scene_scale: f32,
+    sh_rscale: f32, sh_cap: u32, sh_accum: u32, sh_stale: u32,
+    sh_down: u32, pad5: u32, pad6: u32, pad7: u32,
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
