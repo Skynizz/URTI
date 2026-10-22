@@ -118,7 +118,7 @@ struct FrameU {
     sh_spp: u32,
     krc_spp: u32,
     dbg: u32,
-    pad12: u32,
+    off: u32,
 }
 
 /// Méthode du pipeline.
@@ -152,7 +152,15 @@ pub struct ShParams {
 
 impl Default for ShParams {
     fn default() -> Self {
-        ShParams { scene_scale: 50.0, accum_frames: 20, stale_frames: 60, radiance_scale: 1e4, downscale: 5, render_spp: 1, render: false }
+        ShParams {
+            scene_scale: 50.0,
+            accum_frames: 20,
+            stale_frames: 60,
+            radiance_scale: 1e4,
+            downscale: 5,
+            render_spp: 1,
+            render: false,
+        }
     }
 }
 
@@ -283,6 +291,11 @@ pub struct GpuKrc<'a> {
     pub krc_spp: u32,
     /// diagnostic de l'image finale KRC : 1 indirect des cellules seul, 2 direct + reflet seuls
     pub dbg: u32,
+    /// protections désactivées (diagnostic) : 1 anti-lucioles, 2 moyenne tronquée, 4 écrêtage
+    /// des cellules, 8 régularisation des chemins
+    pub off: u32,
+    /// référence régularisée (mêmes chemins que le mode jeu au-delà du premier sommet)
+    pub ref_reg: bool,
     /// chemins corrélés arrêtés sur le cache (événements moins chers)
     pub delta_resample: bool,
     /// chemins corrélés par cellule pour un événement de lampe (0 : 8)
@@ -312,7 +325,9 @@ pub struct GpuKrc<'a> {
     sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 48] = [
+const ENTRIES: [&str; 50] = [
+    "krc_refl",
+    "game_combine",
     "dn_spec",
     "dn_spec_store",
     "dn_atrous3b",
@@ -582,6 +597,8 @@ impl<'a> GpuKrc<'a> {
             dn_wide: false,
             krc_spp: 1,
             dbg: 0,
+            off: 0,
+            ref_reg: false,
             delta_resample: false,
             m_light: 0,
             debt_rate: -1.0,
@@ -658,7 +675,7 @@ impl<'a> GpuKrc<'a> {
             sh_spp: self.sh.render_spp,
             krc_spp: self.krc_spp,
             dbg: self.dbg,
-            pad12: 0,
+            off: self.off,
         }
     }
 
@@ -807,7 +824,8 @@ impl<'a> GpuKrc<'a> {
         let len = self.view.len() as u32;
         let chunk = 64u32;
         for pass in 0..spp.div_ceil(chunk) {
-            let fu = self.uniform(0, l.len(), pass, 0, 0, 0, chunk.min(spp - pass * chunk));
+            // ref_reg : référence avec la régularisation des chemins du mode jeu
+            let fu = self.uniform(0, l.len(), pass, if self.ref_reg { F_GAME } else { 0 }, 0, 0, chunk.min(spp - pass * chunk));
             q.write_buffer(&self.bufs[0], 0, bytemuck::bytes_of(&fu));
             let mut enc = dev.create_command_encoder(&Default::default());
             if pass == 0 {
@@ -977,13 +995,31 @@ impl<'a> GpuKrc<'a> {
             plan.push(("trace", Dispatch::Indirect(24)));
             plan.push(("prep_vis2", Dispatch::Direct(1)));
             plan.push(("evict_sweep", Dispatch::Direct(self.cell_cap.div_ceil(8 * 64))));
+            if self.game {
+                // reflets : nourrissent les cellules hors champ, résolues dans la même frame
+                plan.push(("krc_refl", px));
+                plan.push(("prep_vis2", Dispatch::Direct(1)));
+            }
             plan.push(("resolve", vis));
             plan.push((if self.game { "krc_final" } else { "display" }, px));
         }
 
+        if self.game && !self.denoise {
+            plan.push(("game_combine", px));
+        }
         if self.game && self.denoise {
             let passes: &[&'static str] = if self.dn_wide {
-                &["dn_temporal", "dn_spec", "dn_store", "dn_spec_store", "dn_atrous1", "dn_atrous2", "dn_atrous3b", "dn_atrous4", "dn_atrous5"]
+                &[
+                    "dn_temporal",
+                    "dn_spec",
+                    "dn_store",
+                    "dn_spec_store",
+                    "dn_atrous1",
+                    "dn_atrous2",
+                    "dn_atrous3b",
+                    "dn_atrous4",
+                    "dn_atrous5",
+                ]
             } else {
                 &["dn_temporal", "dn_spec", "dn_store", "dn_spec_store", "dn_atrous1", "dn_atrous2", "dn_atrous3"]
             };

@@ -600,3 +600,45 @@ Lecture :
 - Les rapports de luminance de la phase claire (0,3 à 0,7 pour les deux) viennent surtout
   des lucioles de la référence (2 048 chemins/px, petites lampes et sol brillant), pas des
   méthodes.
+
+## 17. Vitrine après correctifs : bannières, luminosité, miroirs
+
+Mêmes conditions que §16 (`cargo run --release -- vitrine 960`), après les correctifs du
+JOURNAL v17. KRC : cellules de 16 px, 0,4 chemin/px, 2 estimations directes par pixel ;
+SHaRC : réglages de §16. Le débruiteur, le MIS et le bornage spéculaire sont communs.
+
+![La sphère qui roule](../results/vitrine/comparaison_f060.png)
+
+| Contre la référence (2 048 chemins/px) | KRC | SHaRC NVIDIA |
+|---|---|---|
+| PSNR affiché, statique (f39) | 22,6 dB | **24,2 dB** |
+| PSNR affiché, la sphère roule (f60) | **21,4 dB** | 20,1 dB |
+| PSNR affiché, juste après le coucher du ciel (f101) | **22,3 dB** | 14,4 dB |
+| PSNR affiché, 10 et 19 frames après (f110, f119) | **26,1**, **27,0 dB** | 18,5, 19,9 dB |
+| Luminance (f39 / f60 / f110) | 0,91 / 0,97 / 0,98 | 0,91 / 0,95 / 1,51 |
+| PSNR affiché moyen sur la séquence | **23,1 dB** | 22,5 dB |
+| Temps GPU moyen, p95 | **6,3 ms**, **6,7 ms** | 7,4 ms, 20 ms |
+
+Balayage de la taille des cellules (KRC, même séquence) : 6 px 21,2 dB (8,2 ms) ; 8 px
+22,4 dB (7,2 ms) ; 12 px 22,7 dB (6,6 ms) ; 16 px 23,0 dB (6,5 ms) ; 16 px à 0,4 chemin/px
+23,1 dB (6,3 ms).
+
+Lecture :
+
+- **Luminosité** : les deux méthodes sont maintenant au niveau de la référence (0,91 à
+  1,05) ; l'assombrissement venait du débruiteur et du ciel absent des reflets, pas des
+  caches.
+- **Bannières** : bordures dorées nettes chez les deux.
+- **Miroirs** : la sphère chromée de KRC est nettement plus propre que celle de SHaRC (le
+  reflet est lu dans les cellules, y compris hors champ) ; il reste du flou quand la sphère
+  remplit l'écran (f81 : relMSE* 0,28 contre 0,25), l'historique spéculaire suivant la
+  surface et non le reflet.
+- **Statique** : SHaRC reste meilleur (1,6 dB à f39) ; KRC garde des taches de la taille
+  d'une cellule.
+- **Événements** : 8 dB d'avance à KRC après le coucher du ciel ; SHaRC garde le jour
+  (luminance 1,5).
+- Le relMSE* moyen (KRC 7,4e-2, SHaRC 7,2e-2) est dominé par les bords des reflets du ciel
+  dans la sphère (f60 à f90) ; voir JOURNAL v17.
+- Non-régression (`jeu cornell`, `jeu sponza`, scènes sans spéculaire) : inchangé, KRC
+  3,6e-3 contre 1,4e-2 (Cornell), 1,27e-2 contre 2,26e-2 (Sponza). La dérive sombre de
+  KRC après l'extinction dans `jeu sponza` (luminance 0,63 à f110) reste à corriger.

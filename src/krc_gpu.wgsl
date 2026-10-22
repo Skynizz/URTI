@@ -170,7 +170,7 @@ struct Frame {
     prev_fwd: vec3<f32>, debt_rate: f32,   // part du budget qui rembourse les chemins d'événement (< 0 : DEBT_RATE)
     prev_right: vec3<f32>, reset_ratio: f32, // changement relatif au-delà duquel on repart de zéro (0 : jamais)
     prev_up: vec3<f32>, dn_gamma: f32,     // bornage de l'historique du débruiteur (0 : DN_GAMMA)
-    sh_spp: u32, krc_spp: u32, dbg: u32, pad14: u32, // SHaRC : chemins par pixel de la passe Render ; KRC : estimations du direct par pixel (mode jeu)
+    sh_spp: u32, krc_spp: u32, dbg: u32, off: u32, // off : protections désactivées (1 anti-lucioles, 2 moyenne tronquée, 4 écrêtage des cellules, 8 régularisation) // SHaRC : chemins par pixel de la passe Render ; KRC : estimations du direct par pixel (mode jeu)
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -471,7 +471,7 @@ fn is_diffuse(rough: f32, metal: f32) -> bool { return rough >= 0.999 && metal <
 // caustiques (diffus → miroir → petite lampe), quasi impossibles à échantillonner, disparaissent
 const PATH_REG: f32 = 0.3;
 fn reg_rough(r: f32) -> f32 {
-    if ((fr.flags & F_GAME) == 0u) { return r; }
+    if ((fr.flags & F_GAME) == 0u || (fr.off & 8u) != 0u) { return r; }
     return max(r, PATH_REG);
 }
 fn diff_albedo(base: vec3<f32>, metal: f32) -> vec3<f32> { return base * (1.0 - metal); }
@@ -578,6 +578,39 @@ fn spec_sample(n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: f32, metal: 
     return b;
 }
 
+// MIS (heuristique d'équilibre) au premier sommet du mode jeu, entre le tirage d'une lampe et le
+// tirage du BSDF : un miroir qui voit une lampe étendue (le ciel) ne l'atteint presque jamais par
+// le tirage de lampe (lobe minuscule), d'où des points blancs ; le rayon de reflet qui touche la
+// lampe porte alors l'essentiel. mis_mode 0 : pas de MIS ; 1 : lobe spéculaire seul (reflets par
+// pixel de KRC, seule la partie spéculaire est pondérée) ; 2 : BSDF complet (SHaRC Render).
+var<private> mis_mode: u32;
+
+fn mis_bsdf_pdf(n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> f32 {
+    let nl = max(dot(n, wi), 0.0);
+    if (mis_mode == 1u) { return pdf_spec(n, wo, wi, rough); }
+    if (is_diffuse(rough, metal)) { return nl / PI; }
+    let ps = spec_prob(n, wo, base, rough, metal);
+    return (1.0 - ps) * nl / PI + ps * pdf_spec(n, wo, wi, rough);
+}
+
+// densité (angle solide) du tirage de lampe pour un rayon qui touche la lampe j à la distance t
+fn light_hit_pdf(j: u32, t: f32, wi: vec3<f32>) -> f32 {
+    var total = 0.0;
+    for (var i = 0u; i < n_lights(); i++) { total += light_power(i); }
+    let li = light_at(j);
+    if (total <= 0.0 || wi.y <= 0.0) { return 0.0; }
+    return light_power(j) / total * t * t / (wi.y * 4.0 * li.hx * li.hz);
+}
+
+// lumière d'une lampe touchée par le rayon du BSDF au premier sommet, pondérée par le MIS
+fn mis_light_hit(j: u32, t: f32, n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> vec3<f32> {
+    let li = light_at(j);
+    if (li.on < 0.5 || wi.y <= 0.0) { return vec3<f32>(0.0); }
+    let pb = mis_bsdf_pdf(n, wo, wi, base, rough, metal);
+    let pl = light_hit_pdf(j, t, wi);
+    return li.emission * (pb / max(pb + pl, 1e-12));
+}
+
 // éclairage direct d'un sommet (une lampe tirée selon sa puissance), parties diffuse et spéculaire
 fn nee_split(p: vec3<f32>, n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> Brdf2 {
     var r: Brdf2;
@@ -613,6 +646,12 @@ fn nee_split(p: vec3<f32>, n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: 
     let k = li.emission * (cos_l / dist2 * (4.0 * li.hx * li.hz) / pmf);
     r.d = f.d * k;
     r.s = f.s * k;
+    if (mis_mode != 0u) {
+        let pl = pmf * dist2 / (cos_l * 4.0 * li.hx * li.hz);
+        let wl = pl / max(pl + mis_bsdf_pdf(n, wo, wd, base, rough, metal), 1e-12);
+        r.s *= wl;
+        if (mis_mode == 2u) { r.d *= wl; }
+    }
     return r;
 }
 
@@ -1754,7 +1793,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     // FIREFLY_K fois plus lumineux que la moyenne de sa cellule est ramené à cette borne ; sinon
     // il fait une tache de la taille de la cellule, que le débruiteur étale
     var vscale = 1.0;
-    if ((fr.flags & F_GAME) != 0u && cells[c].n >= 8.0) {
+    if ((fr.flags & F_GAME) != 0u && (fr.off & 4u) == 0u && cells[c].n >= 8.0) {
         // jeune cellule (après un événement, une valeur rare pèse lourd) : borne plus stricte
         let kf = select(FIREFLY_K, FIREFLY_K_YOUNG, cells[c].n < 64.0);
         let cap = kf * max(cells[c].lmean, 1e-4);

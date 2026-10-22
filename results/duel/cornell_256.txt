@@ -7,3 +7,7 @@ v2 cell8 0.5                 relMSE* 3.514e-3 (statique 2.12e-3, dynamique 3.57e
 v2 cell8 1                   relMSE* 2.564e-3 (statique 2.05e-3, dynamique 2.56e-3) lum min 0.97 | GPU moy 0.32 ms, p95 0.89 ms
 sharc_nv 1px/3x3             relMSE* 7.061e-2 (statique 5.52e-3, dynamique 1.00e-1) lum min 0.63 | GPU moy 0.10 ms, p95 0.10 ms
 sharc_nv 1px/2x2             relMSE* 6.799e-2 (statique 4.19e-3, dynamique 9.83e-2) lum min 0.63 | GPU moy 0.11 ms, p95 0.11 ms
+v2 cell8 1                   relMSE* 2.575e-3 (statique 2.00e-3, dynamique 2.61e-3) lum min 0.97 | GPU moy 0.26 ms, p95 0.63 ms
+v2 cell8 1                   relMSE* 2.567e-3 (statique 2.05e-3, dynamique 2.56e-3) lum min 0.98 | GPU moy 0.83 ms, p95 2.28 ms
+v2 cell8 1                   relMSE* 2.569e-3 (statique 1.99e-3, dynamique 2.60e-3) lum min 0.98 | GPU moy 0.26 ms, p95 0.66 ms
+v2 cell8 1                   relMSE* 2.602e-3 (statique 2.05e-3, dynamique 2.61e-3) lum min 0.98 | GPU moy 0.26 ms, p95 0.66 ms

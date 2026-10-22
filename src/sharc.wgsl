@@ -454,6 +454,7 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         split = false;
         sel = 0u;
         seed_rng(k, 0x7e4du, fr.frame);
+        mis_mode = 0u;
         let spp = max(fr.sh_spp, 1u);
         for (var si = 0u; si < spp; si++) {
         var p = g.p;
@@ -479,7 +480,10 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
                     break;
                 }
             }
+            let mis = depth == 0u && (fr.flags & F_GAME) != 0u && (fr.off & 32768u) == 0u;
+            mis_mode = select(0u, 2u, mis);
             let ns = nee_split(p, n, wo, albedo, rough, metal);
+            mis_mode = 0u;
             if (depth == 0u) {
                 v += ns.d;
                 vs_spec += ns.s;
@@ -502,6 +506,13 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
                 beta = beta * bs.w;
             }
             let h = intersect(p + n * OFFSET, d);
+            if (mis && h.found && h.light >= 0) {
+                // lampe touchée par le rayon du BSDF au premier sommet : part BSDF du MIS
+                mis_mode = 2u;
+                let e = beta * mis_light_hit(u32(h.light), h.t, n, wo, d, albedo, rough, metal);
+                mis_mode = 0u;
+                if (to_spec) { vs_spec += e; } else { v += e; }
+            }
             if (!h.found || h.light >= 0) { break; }
             seg = h.t;
             p = h.p;

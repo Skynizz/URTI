@@ -325,3 +325,33 @@ Tests courts (`krc duel`, `krc statique` : 480×270 ou 256², 3 graines) pour d�
   rugosité ≥ 0,3 : les caustiques diffus → miroir → petite lampe, à l'origine des taches
   cyan sur le rideau bleu, disparaissent ; la référence reste exacte).
 - Cellules de 12 ou 16 px : pas mieux.
+
+## v17 — vitrine : bannières, luminosité et miroirs
+
+Retours à l'œil : « le drapeau n'est pas pareil », « c'est plus sombre ». Quatre causes, toutes
+dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux méthodes :
+
+- **Bannières floues et ternes** (les deux) : le débruiteur divise la lumière par l'albédo
+  avant de filtrer, avec un plancher à 0,05. Sur un rouge saturé (vert et bleu ≈ 0,02), le
+  plancher laissait la texture dans la lumière filtrée : bordures dorées étalées, orangées.
+  Plancher à 0,002 : bordures nettes, comme la référence.
+- **Image trop sombre** (les deux) : le ciel vu dans les surfaces brillantes n'arrivait que
+  par le tirage de lampe, presque impossible pour un lobe étroit (sol poli, sphère miroir).
+  MIS (heuristique d'équilibre) au premier sommet entre tirage de lampe et rayon de reflet :
+  luminance de 0,79 → 0,91 à f39, 0,98 à 1,05 ensuite (référence = 1).
+- **Grande tache blanche sur la sphère qui roule** (les deux, révélée par le MIS) :
+  l'historique spéculaire sans bornage traînait le reflet du ciel. Bornage 3×3 (γ = 2)
+  rétabli ; il n'assombrit plus, car avec le MIS les lampes reflétées ne sont plus des
+  valeurs rares.
+- **Points blancs dans la sphère miroir** (KRC) : les reflets hors champ (décor derrière la
+  caméra, sol caché par la sphère) étaient des chemins isolés, et le direct au point reflété
+  un seul rayon d'ombre. Nouvelle passe `krc_refl`, avant le resolve : le rayon de reflet crée
+  la cellule au point touché et la nourrit (puis 1 rayon sur 4 une fois mûre, pour suivre la
+  lumière) ; un point non métallique est lu entièrement dans sa cellule (direct compris).
+  La sphère de KRC devient nettement plus propre que celle de SHaRC.
+- Taille des cellules : 16 px au lieu de 8 dans la vitrine (moins de taches basse
+  fréquence, et moins cher) ; le temps gagné passe à 0,4 chemin/px.
+- Mesure ajoutée : PSNR des images affichées. Le relMSE* pénalise énormément un pixel clair
+  sur un fond sombre de la référence (bord d'un reflet du ciel) et presque pas un reflet
+  manquant : avec le ciel enfin présent dans les miroirs, il monte pour les deux méthodes
+  alors que l'image s'approche de la référence.

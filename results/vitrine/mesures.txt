@@ -1,14 +1,14 @@
-KRC f039 : relMSE* 8.809e-3, lum 0.63
-KRC f060 : relMSE* 1.766e-2, lum 0.60
-KRC f081 : relMSE* 2.105e-2, lum 0.31
-KRC f101 : relMSE* 2.328e-3, lum 1.31
-KRC f110 : relMSE* 6.594e-4, lum 0.98
-KRC f119 : relMSE* 3.819e-4, lum 0.89
-KRC : relMSE* moyenne 9.888e-3, GPU moyen 7.33 ms, p95 11.89 ms
-SHaRC NVIDIA f039 : relMSE* 6.444e-3, lum 0.70
-SHaRC NVIDIA f060 : relMSE* 1.347e-2, lum 0.55
-SHaRC NVIDIA f081 : relMSE* 1.813e-2, lum 0.28
-SHaRC NVIDIA f101 : relMSE* 5.160e-3, lum 2.15
-SHaRC NVIDIA f110 : relMSE* 1.537e-3, lum 1.56
-SHaRC NVIDIA f119 : relMSE* 9.510e-4, lum 1.51
-SHaRC NVIDIA : relMSE* moyenne 7.975e-3, GPU moyen 6.94 ms, p95 23.47 ms
+KRC f039 : relMSE* 4.837e-3, lum 0.91, PSNR affiché 22.59 dB
+KRC f060 : relMSE* 2.756e-2, lum 0.97, PSNR affiché 21.37 dB
+KRC f081 : relMSE* 2.769e-1, lum 0.97, PSNR affiché 21.50 dB
+KRC f101 : relMSE* 1.007e-3, lum 1.13, PSNR affiché 22.25 dB
+KRC f110 : relMSE* 3.694e-4, lum 0.98, PSNR affiché 26.07 dB
+KRC f119 : relMSE* 2.739e-4, lum 0.98, PSNR affiché 27.02 dB
+KRC : relMSE* moyenne 7.425e-2, PSNR affiché moyen 23.10 dB, GPU moyen 6.26 ms, p95 6.68 ms
+SHaRC NVIDIA f039 : relMSE* 4.137e-3, lum 0.91, PSNR affiché 24.17 dB
+SHaRC NVIDIA f060 : relMSE* 3.400e-2, lum 0.95, PSNR affiché 20.12 dB
+SHaRC NVIDIA f081 : relMSE* 2.498e-1, lum 0.91, PSNR affiché 21.69 dB
+SHaRC NVIDIA f101 : relMSE* 3.665e-3, lum 2.13, PSNR affiché 14.41 dB
+SHaRC NVIDIA f110 : relMSE* 9.721e-4, lum 1.51, PSNR affiché 18.54 dB
+SHaRC NVIDIA f119 : relMSE* 6.808e-4, lum 1.49, PSNR affiché 19.91 dB
+SHaRC NVIDIA : relMSE* moyenne 7.208e-2, PSNR affiché moyen 22.54 dB, GPU moyen 7.41 ms, p95 20.01 ms

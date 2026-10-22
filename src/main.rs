@@ -320,6 +320,14 @@ fn main() {
             Some(g) => rt::vitrine_dbg(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(39)),
             None => eprintln!("pas de GPU"),
         },
+        Some("vitrinelum") => match gpu::Gpu::new() {
+            Some(g) => rt::vitrine_lum(&g),
+            None => eprintln!("pas de GPU"),
+        },
+        Some("vitrineregref") => match gpu::Gpu::new() {
+            Some(g) => rt::vitrine_regref(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(39)),
+            None => eprintln!("pas de GPU"),
+        },
         Some("vitrinems") => match gpu::Gpu::new() {
             Some(g) => rt::vitrine_ms(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(960)),
             None => eprintln!("pas de GPU"),

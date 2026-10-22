@@ -198,13 +198,19 @@ pub fn tex_view(gpu: &Gpu, tex: Option<&TexArray>) -> wgpu::TextureView {
     for (l, data) in t.mips.iter().enumerate() {
         let s = (t.size >> l).max(1);
         gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: l as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: l as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             data,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * s), rows_per_image: Some(s) },
             wgpu::Extent3d { width: s, height: s, depth_or_array_layers: t.layers },
         );
     }
-    texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
+    texture
+        .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 fn transform(o: V3) -> [f32; 12] {
@@ -1266,8 +1272,12 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         }
         let mut wp = worst.2.clone();
         wp.sort_by(|a, b| b.1.total_cmp(&a.1));
-        println!("    frame la plus lente : f{} {:.2} ms — {}", worst.1, worst.0,
-            wp.iter().take(5).map(|(n, m)| format!("{n} {m:.2}")).collect::<Vec<_>>().join(", "));
+        println!(
+            "    frame la plus lente : f{} {:.2} ms — {}",
+            worst.1,
+            worst.0,
+            wp.iter().take(5).map(|(n, m)| format!("{n} {m:.2}")).collect::<Vec<_>>().join(", ")
+        );
     }
 }
 
@@ -1345,9 +1355,9 @@ pub fn duel(gpu: &Gpu, setup: &TriSetup, cfgs: &[DuelCfg]) {
             k.reuse = c.reuse;
             k.demod = c.demod;
             k.seed_levels = c.seed;
-        k.support = c.support;
-        k.tau = c.tau;
-        k.multi = c.multi;
+            k.support = c.support;
+            k.tau = c.tau;
+            k.multi = c.multi;
             k.sh = c.sh;
             for pass in 0..2 {
                 k.readback = pass == 0;
@@ -1675,6 +1685,12 @@ pub fn vitrine_setup(w: usize, h: usize) -> TriSetup {
     TriSetup { name: format!("vitrine_{w}x{h}"), view, at: vitrine_at, ref_spp: 8192, cam: Some(cam) }
 }
 
+/// PSNR (dB) entre deux images 8 bits.
+pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    let mse = a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+    10.0 * (255.0 * 255.0 / mse.max(1e-12)).log10()
+}
+
 /// Tone mapping filmique (ACES, approximation de Narkowicz) puis sRGB 8 bits.
 pub fn tonemap(img: &[V3], exposure: f64) -> Vec<u8> {
     let aces = |x: f64| {
@@ -1758,7 +1774,8 @@ pub fn vitrine_ms(gpu: &Gpu, w: usize) {
         k.game = true;
         k.ppp = ppp;
         k.sh = sh;
-        k.krc_spp = sh.render_spp; // pour KRC, render_spp sert de nombre d'estimations par pixel
+        k.krc_spp = sh.render_spp;
+        k.off = std::env::var("KRC_OFF").ok().and_then(|c| c.parse().ok()).unwrap_or(0); // pour KRC, render_spp sert de nombre d'estimations par pixel
         k.readback = false;
         let mut prev = at(0);
         let mut ms = 0.0;
@@ -1819,12 +1836,19 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
     let mean = refs[0].iter().zip(&kinds0).filter(|(_, k)| **k == 2).map(|(v, _)| v.lum()).sum::<f64>()
         / kinds0.iter().filter(|k| **k == 2).count().max(1) as f64;
     let exposure = 0.25 / mean.max(1e-6);
-    for (f, r) in refs.iter().enumerate() {
-        crate::image::write_png(&format!("{out}/reference/f{f:03}.png"), w, h, &tonemap(r, exposure)).unwrap();
+    let ref_png: Vec<Vec<u8>> = refs.iter().map(|r| tonemap(r, exposure)).collect();
+    for (f, r) in ref_png.iter().enumerate() {
+        crate::image::write_png(&format!("{out}/reference/f{f:03}.png"), w, h, r).unwrap();
     }
     let d = ShParams::default();
     let methods = [
-        ("krc", "KRC", Method::Krc, 0.25f32, ShParams { render_spp: 2, ..d }),
+        (
+            "krc",
+            "KRC",
+            Method::Krc,
+            std::env::var("KRC_PPP").ok().and_then(|c| c.parse().ok()).unwrap_or(0.4f32),
+            ShParams { render_spp: 2, ..d },
+        ),
         ("sharc", "SHaRC NVIDIA", Method::Sharc, 1.0, ShParams { downscale: 2, render_spp: 3, ..d }),
     ];
     let mut report = String::new();
@@ -1837,12 +1861,13 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
         k.ppp = ppp;
         k.sh = sh;
         k.krc_spp = sh.render_spp;
+        k.off = std::env::var("KRC_OFF").ok().and_then(|c| c.parse().ok()).unwrap_or(0);
         if method == Method::Krc {
-            if let Some(c) = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()) {
-                k.cell_px = c;
-            }
+            // cellules de 16 px : moins de taches basse fréquence (bruit propre à chaque cellule) que
+            // 8 px dans cette scène texturée, et moins chères ; balayage 6/8/12/16 px dans RESULTATS §17
+            k.cell_px = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()).unwrap_or(16.0);
         }
-        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         k.readback = false;
         let mut prev = at(0);
         let mut ms = Vec::new();
@@ -1861,14 +1886,15 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
         k.ppp = ppp;
         k.sh = sh;
         k.krc_spp = sh.render_spp;
+        k.off = std::env::var("KRC_OFF").ok().and_then(|c| c.parse().ok()).unwrap_or(0);
         if method == Method::Krc {
-            if let Some(c) = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()) {
-                k.cell_px = c;
-            }
+            // cellules de 16 px : moins de taches basse fréquence (bruit propre à chaque cellule) que
+            // 8 px dans cette scène texturée, et moins chères ; balayage 6/8/12/16 px dans RESULTATS §17
+            k.cell_px = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()).unwrap_or(16.0);
         }
-        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         let mut prev = at(0);
-        let mut err = 0.0;
+        let (mut err, mut psnr_m) = (0.0, 0.0);
         for f in 0..FRAMES {
             let scene = at(f);
             k.set_view(setup.view_at(f));
@@ -1876,12 +1902,20 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
             prev = scene;
             let (_, e, lr) = frame_err(&fr.image, &fr.kinds, &refs[f as usize]);
             err += e / FRAMES as f64;
+            // erreur « à l'œil » : PSNR des images affichées (après tone mapping, 8 bits) ; le relMSE*
+            // pénalise très fort un pixel clair sur un fond sombre de la référence (bord d'un reflet
+            // du ciel), beaucoup moins un reflet manquant
+            let img = tonemap(&fr.image, exposure);
+            let p = psnr(&img, &ref_png[f as usize]);
+            psnr_m += p / FRAMES as f64;
             if [39u32, 60, 81, 101, 110, 119].contains(&f) {
-                report += &format!("{label} f{f:03} : relMSE* {e:.3e}, lum {lr:.2}\n");
+                report += &format!("{label} f{f:03} : relMSE* {e:.3e}, lum {lr:.2}, PSNR affiché {p:.2} dB\n");
             }
-            crate::image::write_png(&format!("{out}/{dir}/f{f:03}.png"), w, h, &tonemap(&fr.image, exposure)).unwrap();
+            crate::image::write_png(&format!("{out}/{dir}/f{f:03}.png"), w, h, &img).unwrap();
         }
-        report += &format!("{label} : relMSE* moyenne {err:.3e}, GPU moyen {mean_ms:.2} ms, p95 {p95:.2} ms\n");
+        report += &format!(
+            "{label} : relMSE* moyenne {err:.3e}, PSNR affiché moyen {psnr_m:.2} dB, GPU moyen {mean_ms:.2} ms, p95 {p95:.2} ms\n"
+        );
         labels.push(format!("{label} - {mean_ms:.1} ms par frame"));
         eprintln!("{label} : relMSE* {err:.3e}, {mean_ms:.2} ms");
     }
@@ -1971,6 +2005,7 @@ pub fn vitrine_dbg(gpu: &Gpu, f: u32) {
                 k.cell_px = c;
             }
             k.denoise = denoise;
+            k.off = std::env::var("KRC_OFF").ok().and_then(|c| c.parse().ok()).unwrap_or(0);
             let mut prev = at(0);
             let mut img = Vec::new();
             for t in 0..=f {
@@ -1984,7 +2019,89 @@ pub fn vitrine_dbg(gpu: &Gpu, f: u32) {
                 }
             }
             let tag = if denoise { "debruite" } else { "brut" };
-            crate::image::write_png(&format!("results/vitrine/dbg_f{f:03}_{name}_{tag}.png"), 960, 540, &tonemap(&img, 9.3)).unwrap();
+            crate::image::write_png(&format!("results/vitrine/dbg_f{f:03}_{name}_{tag}.png"), 960, 540, &tonemap(&img, 9.3))
+                .unwrap();
         }
     }
+}
+
+/// `krc vitrinelum` : part de chaque protection dans l'assombrissement (KRC et SHaRC, mode jeu,
+/// frames 0–45, relMSE* et luminance contre la référence aux frames 30–45).
+pub fn vitrine_lum(gpu: &Gpu) {
+    use crate::gpu_krc::{GpuKrc, Method, ShParams};
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    let setup = vitrine_setup(960, 540);
+    let at = setup.at;
+    let scene0 = at(0);
+    let grid = Grid::fit(&scene0.bounds);
+    let refdir = format!("results/ref_{}_2048", setup.name);
+    let d = ShParams::default();
+    let cases: Vec<(&str, Method, u32, bool, f32)> = vec![
+        ("krc", Method::Krc, 0, true, 0.0),
+        ("krc sans anti-lucioles", Method::Krc, 1, true, 0.0),
+        ("krc sans moyenne tronquée", Method::Krc, 2, true, 0.0),
+        ("krc sans écrêtage cellules", Method::Krc, 4, true, 0.0),
+        ("krc sans régularisation", Method::Krc, 8, true, 0.0),
+        ("krc sans rien", Method::Krc, 15, true, 0.0),
+        ("krc sans rien, bornage 4", Method::Krc, 15, true, 4.0),
+        ("krc brut (sans débruiteur)", Method::Krc, 15, false, 0.0),
+        ("krc sans temporel", Method::Krc, 15 | 16, true, 0.0),
+        ("krc sans à-trous", Method::Krc, 15 | 32, true, 0.0),
+        ("krc spéculaire brut", Method::Krc, 15 | 64, true, 0.0),
+        ("sharc sans temporel", Method::Sharc, 15 | 16, true, 0.0),
+        ("sharc sans à-trous", Method::Sharc, 15 | 32, true, 0.0),
+        ("sharc spéculaire brut", Method::Sharc, 15 | 64, true, 0.0),
+        ("sharc", Method::Sharc, 0, true, 0.0),
+        ("sharc sans rien", Method::Sharc, 15, true, 0.0),
+        ("sharc brut", Method::Sharc, 15, false, 0.0),
+    ];
+    for (name, method, off, denoise, gamma) in cases {
+        let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&scene0), method, 1);
+        k.game = true;
+        k.off = off;
+        k.denoise = denoise;
+        k.dn_gamma = gamma;
+        k.m_light = 16;
+        if method == Method::Krc {
+            k.ppp = 0.25;
+            k.krc_spp = 2;
+        } else {
+            k.sh = ShParams { downscale: 2, render_spp: 3, ..d };
+        }
+        let mut prev = at(0);
+        let (mut e, mut lr, mut n) = (0.0, 0.0, 0.0);
+        for t in 0..=45u32 {
+            let scene = at(t);
+            k.set_view(setup.view_at(t));
+            k.readback = t >= 30;
+            let f = k.frame_tri(&scene, &prev, t);
+            prev = scene;
+            if t >= 30 {
+                let r = load_raw(&format!("{refdir}/f{t:03}.bin"), setup.view.len()).expect("référence");
+                let (_, et, l) = frame_err(&f.image, &f.kinds, &r);
+                e += et;
+                lr += l;
+                n += 1.0;
+            }
+        }
+        println!("{name:<30} relMSE* {:.3e}  lum {:.3}", e / n, lr / n);
+    }
+}
+
+/// `krc vitrineregref f` : luminance d'une référence régularisée contre la référence exacte.
+pub fn vitrine_regref(gpu: &Gpu, f: u32) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    let setup = vitrine_setup(960, 540);
+    let scene0 = (setup.at)(0);
+    let mut rk = GpuKrc::with(gpu, setup.view, Grid::fit(&scene0.bounds), Some(&scene0), false, 0);
+    rk.set_view(setup.view_at(f));
+    rk.ref_reg = true;
+    let (img, kinds) = rk.reference_tri(&(setup.at)(f), 2048);
+    let r = load_raw(&format!("results/ref_{}_2048/f{f:03}.bin", setup.name), setup.view.len()).expect("référence");
+    let (_, e, lr) = frame_err(&img, &kinds, &r);
+    println!("référence régularisée / exacte, f{f} : lum {lr:.3}, relMSE* {e:.3e}");
+    crate::image::write_png(&format!("results/vitrine/ref_reg_f{f:03}.png"), 960, 540, &tonemap(&img, 9.3)).unwrap();
 }

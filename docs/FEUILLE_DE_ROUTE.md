@@ -15,7 +15,24 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Comparaison en ms contre un cache standard | ✅ KRC v2 contre le vrai SHaRC : 2 à 4× moins d'erreur à temps égal (Sponza), 20× (Cornell) ; ⚠️ statique en caméra mobile et coût minimal en faveur de SHaRC |
 | Absence de biais sur radiance à queue lourde | ⚠️ deux biais corrigés ; ~3 % résiduel en statique, retour lent après extinction |
 | Caméra mobile | ✅ qualité ; ⚠️ coût minimal 3 ms à 1280×720 (KRC v2) |
-| Spéculaire | à faire |
+| Spéculaire | ✅ matériaux PBR (GGX), reflets par pixel lus dans le cache, MIS (RESULTATS §16–17) |
+
+## Vers de vrais jeux (après la vitrine, RESULTATS §17)
+
+KRC ne peut pas être « injecté » dans un jeu fermé comme Cyberpunk 2077 : son moteur
+(REDengine, DX12) calcule lui-même son éclairage et n'offre aucun point d'entrée pour le
+remplacer (le path tracing de Cyberpunk est le code de NVIDIA, intégré par CD Projekt). Les
+voies réalistes, dans l'ordre :
+1. **Plugin Bevy** (Rust + wgpu, la même pile que ce prototype) : KRC comme passe d'éclairage
+   global d'un moteur de jeu ouvert, avec ses G-buffers, ses lumières et sa caméra. C'est la
+   démo jouable.
+2. **RTX Remix** (runtime `dxvk-remix`, open source) : il remplace le rendu de vieux jeux
+   DirectX 8/9 (Portal, Half-Life 2, Morrowind…) par un path tracer, et son cache de
+   radiance est justement SHaRC/NRC. Y brancher KRC à la place permettrait de comparer
+   les deux dans de vrais jeux.
+3. **Unreal Engine 5** (sources accessibles) : en plugin de rendu, à côté de Lumen.
+Prérequis communs : HLSL/DX12 ou Vulkan natif (portage du WGSL), budget 2 à 4 ms en 1440p,
+lumières nombreuses (ReSTIR pour le direct), objets animés (BLAS mises à jour).
 
 ## Après le test « comme en jeu » (RESULTATS §14)
 

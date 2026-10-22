@@ -21,10 +21,129 @@
 
 const DN_HIST_MAX: f32 = 32.0;
 const DN_SPEC_HIST_MAX: f32 = 4.0;
+const DN_SPEC_GAMMA: f32 = 2.0;
 
-fn dn_demod(a: vec3<f32>) -> vec3<f32> { return max(a, vec3<f32>(0.05)); }
+// plancher bas : à 0,05, les canaux sombres d'une texture saturée (rouge : vert et bleu ≈ 0,02)
+// gardaient la texture dans l'illumination, que le filtre spatial étalait (bordures dorées des
+// bannières floues et ternes)
+fn dn_demod(a: vec3<f32>) -> vec3<f32> { return max(a, vec3<f32>(0.002)); }
 // albédo diffus du pixel (démodulation de la partie diffuse)
 fn dn_dalb(g: Gpx) -> vec3<f32> { return dn_demod(diff_albedo(g.albedo, g_metal(g))); }
+
+// Reflets KRC (passe avant le resolve). Un rayon du lobe spéculaire par estimation ; au point
+// touché, si une cellule mûre le couvre : sa lumière indirecte (démodulée) × l'albédo exact du
+// point (texture nette) + le direct calculé ici. Sinon (point hors champ : décor derrière la
+// caméra, sol caché par la sphère), la cellule y est créée et le chemin tracé la nourrit : dès
+// les frames suivantes, le reflet est lu dans le cache au lieu d'être un chemin isolé (points
+// blancs). Une cellule hors champ mûre reste nourrie par une fraction REFL_FEED des rayons
+// (moyenne glissante du resolve), pour suivre les changements de lumière.
+const REFL_FEED: f32 = 0.25;
+const REFL_N_MIN: f32 = 4.0;
+
+fn refl_deposit(c: u32, l: vec3<f32>, dl: vec3<f32>, gda: vec3<f32>) {
+    var u = l / demod(gda);
+    var dd = dl / demod(gda);
+    // même écrêtage des lucioles que les échantillons ordinaires
+    if ((fr.off & 4u) == 0u && cells[c].n >= 8.0) {
+        let kf = select(FIREFLY_K, FIREFLY_K_YOUNG, cells[c].n < 64.0);
+        let cap = kf * max(cells[c].lmean, 1e-4);
+        let lu = lum(u);
+        if (lu > cap) {
+            u *= cap / lu;
+            dd *= cap / lu;
+        }
+    }
+    let b = c * ACC;
+    if (atomicAdd(&acc[b + A_FN], 1u) == 0u && atomicLoad(&acc[b + A_FOOT]) == 0u) {
+        vis_list[atomicAdd(&ctr[C_NVIS], 1u)] = c; // résolue avec les cellules visibles
+    }
+    add_fx(b + A_FR, u.x);
+    add_fx(b + A_FR + 1u, u.y);
+    add_fx(b + A_FR + 2u, u.z);
+    let lu = lum(u);
+    add_fx(b + A_FL, lu);
+    add_f32(b + A_FL2, lu * lu);
+    if ((fr.flags & F_DSPLIT) != 0u) {
+        add_fx(b + A_FD, dd.x);
+        add_fx(b + A_FD + 1u, dd.y);
+        add_fx(b + A_FD + 2u, dd.z);
+    }
+}
+
+fn refl_sample(g: Gpx, wo: vec3<f32>, rough: f32, metal: f32) -> vec3<f32> {
+    let bs = spec_sample(g.n, wo, g.albedo, rough, metal);
+    if (!bs.ok) { return vec3<f32>(0.0); }
+    let h = intersect(g.p + g.n * OFFSET, bs.wi);
+    if (h.found && h.light >= 0 && (fr.off & 32768u) == 0u) {
+        // lampe vue dans le reflet (le ciel dans la sphère) : part BSDF du MIS
+        mis_mode = 1u;
+        let e = mis_light_hit(u32(h.light), h.t, g.n, wo, bs.wi, g.albedo, rough, metal);
+        mis_mode = 0u;
+        return bs.w * e;
+    }
+    if (!h.found || h.light >= 0) { return vec3<f32>(0.0); }
+    let hd = length(h.p - fr.eye);
+    let gda = diff_albedo(h.albedo, h.metal);
+    let key = key_at(h.p, h.n, hd, vec2<f32>(rnd() - 0.5, rnd() - 0.5));
+    var c = find_cell(key);
+    let mature = c != 0xffffffffu && cells[c].n >= REFL_N_MIN;
+    var feed = 0xffffffffu;
+    if ((fr.off & 4096u) == 0u) {
+        if (!mature) {
+            feed = insert_key(key);
+        } else if (atomicLoad(&acc[c * ACC + A_FOOT]) == 0u && rnd() < REFL_FEED) {
+            feed = c;
+        }
+    }
+    var out = vec3<f32>(0.0);
+    if (mature) {
+        if (h.metal < 0.5 && (fr.off & 8192u) == 0u) {
+            // surface non métallique : toute sa lumière (direct compris) lue dans la cellule ; un seul
+            // rayon d'ombre par pixel au point reflété faisait des points blancs dans les miroirs
+            out = cells[c].mean * demod(gda);
+        } else {
+            // métal : le spéculaire dépend de la direction, calculé ici ; indirect de la cellule
+            let nh = nee_split(h.p, h.n, -bs.wi, h.albedo, reg_rough(h.rough), h.metal);
+            let ld = select(cells[c].mean - cells[c].dmean, cells[c].mean, (fr.flags & F_DSPLIT) == 0u);
+            out = nh.d + nh.s + max(ld, vec3<f32>(0.0)) * demod(gda);
+        }
+    }
+    if (!mature || feed != 0xffffffffu) {
+        pm_wo = -bs.wi;
+        pm_rough = reg_rough(h.rough);
+        pm_metal = h.metal;
+        pm_diffuse_only = false;
+        resample = (fr.flags & F_RESAMPLE) != 0u;
+        rs_depth = 1u;
+        let l = radiance(h.p, h.n, h.albedo).l;
+        if (!mature) { out = l; }
+        if (feed != 0xffffffffu) { refl_deposit(feed, l, d0_l, gda); }
+    }
+    return bs.w * out;
+}
+
+@compute @workgroup_size(64)
+fn krc_refl(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    let g = gbuf[k];
+    var sp = vec3<f32>(0.0);
+    if (g.kind == 2u && !is_diffuse(g_rough(g), g_metal(g))) {
+        rec_on = false;
+        uni = false;
+        split = false;
+        sel = 0u;
+        seed_rng(k, 0x5bd1u, fr.frame);
+        mis_mode = 0u;
+        let wo = normalize(fr.eye - g.p);
+        let nspp = max(fr.krc_spp, 1u);
+        for (var si = 0u; si < nspp; si++) {
+            sp += refl_sample(g, wo, g_rough(g), g_metal(g));
+        }
+        sp /= f32(nspp);
+    }
+    spec_img[k] = vec4<f32>(sp, 0.0);
+}
 
 // image finale KRC : direct par pixel + indirect des cellules
 @compute @workgroup_size(64)
@@ -44,48 +163,20 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rough = g_rough(g);
         let metal = g_metal(g);
         let wo = normalize(fr.eye - g.p);
-        // krc_spp estimations par pixel de l'éclairage direct et du reflet (le cache donne l'indirect
-        // diffus, déjà lisse ; le bruit de l'image finale vient du direct par pixel)
+        // krc_spp estimations par pixel de l'éclairage direct (le cache donne l'indirect diffus, déjà
+        // lisse ; le bruit de l'image finale vient du direct par pixel) ; le reflet vient de krc_refl
         let nspp = max(fr.krc_spp, 1u);
         var sp = vec3<f32>(0.0);
         for (var si = 0u; si < nspp; si++) {
-        let ns = nee_split(g.p, g.n, wo, g.albedo, rough, metal);
-        v += ns.d;
-        sp += ns.s;
-        if (!is_diffuse(rough, metal)) {
-            // reflet : un rayon du lobe spéculaire ; au point touché, radiance avec lecture du cache
-            let bs = spec_sample(g.n, wo, g.albedo, rough, metal);
-            if (bs.ok) {
-                let h = intersect(g.p + g.n * OFFSET, bs.wi);
-                // point reflété couvert par une cellule mûre : sa lumière diffuse (démodulée) ×
-                // l'albédo exact du point touché (texture nette) + le spéculaire direct du point
-                var cached = false;
-                if (h.found && h.light < 0) {
-                    let c1 = cell_at(h.p, h.n, length(h.p - fr.eye));
-                    if (c1 != 0xffffffffu && cells[c1].n >= 4.0) {
-                        let nh = nee_split(h.p, h.n, -bs.wi, h.albedo, reg_rough(h.rough), h.metal);
-                        let ld = select(cells[c1].mean - cells[c1].dmean, cells[c1].mean, (fr.flags & F_DSPLIT) == 0u);
-                        // diffus : direct calculé ici (net), indirect de la cellule
-                        let lind = max(ld, vec3<f32>(0.0)) * demod(diff_albedo(h.albedo, h.metal));
-                        sp += bs.w * (nh.d + nh.s + lind);
-                        cached = true;
-                    }
-                }
-                if (!cached && h.found && h.light < 0) {
-                    pm_wo = -bs.wi;
-                    pm_rough = reg_rough(h.rough);
-                    pm_metal = h.metal;
-                    pm_diffuse_only = false;
-                    resample = (fr.flags & F_RESAMPLE) != 0u;
-                    rs_depth = 1u;
-                    sp += bs.w * radiance(h.p, h.n, h.albedo).l;
-                }
-            }
-        }
+            mis_mode = select(1u, 0u, (fr.off & 32768u) != 0u || is_diffuse(rough, metal));
+            let ns = nee_split(g.p, g.n, wo, g.albedo, rough, metal);
+            mis_mode = 0u;
+            v += ns.d;
+            sp += ns.s;
         }
         v /= f32(nspp);
         sp /= f32(nspp);
-        spec_img[k] = vec4<f32>(sp, 0.0);
+        spec_img[k] = vec4<f32>(spec_img[k].rgb + sp, 0.0);
         // indirect des K cellules du pixel : moyenne tronquée (sans la plus claire ni la plus
         // sombre) dès qu'il y en a 4 ; une cellule aberrante isolée (luciole capturée) n'est
         // alors jamais affichée, une vraie variation partagée par les voisines passe
@@ -104,7 +195,7 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         var ind = vec3<f32>(0.0);
         var w = 0.0;
-        if (nv == 4u) {
+        if (nv == 4u && (fr.off & 2u) == 0u) {
             var imin = 0u;
             var imax = 0u;
             for (var s = 1u; s < 4u; s++) {
@@ -136,7 +227,9 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // anti-lucioles (identique pour les deux méthodes, comme dans les débruiteurs de jeu) : un pixel
-// plus de 2× plus lumineux que le plus lumineux de ses 8 voisins est ramené à ce voisin
+// plus de FF_K fois plus lumineux que le plus lumineux de ses 8 voisins est ramené à cette borne
+// (à 2×, il retirait 20 à 30 % de la lumière d'une scène éclairée par des valeurs rares)
+const FF_K: f32 = 8.0;
 fn ff_diffuse(k: u32) -> vec3<f32> {
     let c = image[k].rgb / dn_dalb(gbuf[k]);
     let x = i32(k % fr.w);
@@ -154,7 +247,7 @@ fn ff_diffuse(k: u32) -> vec3<f32> {
         }
     }
     let l = lum(c);
-    if (l > 2.0 * mx && l > 0.0) { return c * (mx / l); }
+    if ((fr.off & 1u) == 0u && l > FF_K * mx && l > 0.0) { return c * (FF_K * mx / l); }
     return c;
 }
 
@@ -173,7 +266,7 @@ fn ff_spec(k: u32) -> vec3<f32> {
         }
     }
     let l = lum(c);
-    if (l > 2.0 * mx && l > 0.0) { return c * (mx / l); }
+    if ((fr.off & 1u) == 0u && l > FF_K * mx && l > 0.0) { return c * (FF_K * mx / l); }
     return c;
 }
 
@@ -187,7 +280,9 @@ fn dn_prev_px(p: vec3<f32>) -> vec2<f32> {
     return vec2<f32>((sx + 1.0) * 0.5 * f32(fr.w) - 0.5, (1.0 - sy) * 0.5 * f32(fr.h) - 0.5);
 }
 
-const DN_GAMMA: f32 = 1.5;
+// bornage de l'historique du diffus, en écarts-types du voisinage 5×5 (plus large et plus robuste
+// qu'un 3×3 : sur une entrée à queue lourde, un bornage serré assombrit)
+const DN_GAMMA: f32 = 2.0;
 struct Moments { m1: vec3<f32>, m2: vec3<f32> };
 
 // moments de l'illumination courante (démodulée) sur le voisinage 3×3 de surface
@@ -198,8 +293,8 @@ fn dn_moments(k: u32) -> Moments {
     var n = 0.0;
     let x = i32(k % fr.w);
     let y = i32(k / fr.w);
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
+    for (var dy = -2; dy <= 2; dy++) {
+        for (var dx = -2; dx <= 2; dx++) {
             let qx = x + dx;
             let qy = y + dy;
             if (qx < 0 || qy < 0 || qx >= i32(fr.w) || qy >= i32(fr.h)) { continue; }
@@ -228,6 +323,10 @@ fn dn_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let cur = ff_diffuse(k);
     var out = vec4<f32>(cur, 1.0);
+    if ((fr.off & 16u) != 0u) {
+        dn_t1[k] = out;
+        return;
+    }
     let q = dn_prev_px(g.p);
     if (q.x >= 0.0) {
         let i = i32(round(q.x));
@@ -246,7 +345,13 @@ fn dn_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let sd = sqrt(max(mo.m2 - mo.m1 * mo.m1, vec3<f32>(0.0)));
                 let gam = select(DN_GAMMA, fr.dn_gamma, fr.dn_gamma > 0.0);
                 let hc = clamp(h.rgb, mo.m1 - gam * sd, mo.m1 + gam * sd);
-                out = vec4<f32>(mix(hc, cur, 1.0 / len), len);
+                // détection de changement (comme A-SVGF) : si la moyenne locale actuelle (25 pixels)
+                // s'écarte de l'historique bien au-delà de son incertitude (σ/5), l'éclairage a
+                // vraiment changé : historique ramené à 2 frames, l'image suit tout de suite
+                var l2 = len;
+                let dl = abs(lum(h.rgb) - lum(mo.m1));
+                if (dl > 3.0 * lum(sd) / 5.0 + 0.05 * lum(mo.m1)) { l2 = min(len, 2.0); }
+                out = vec4<f32>(mix(hc, cur, 1.0 / l2), l2);
             }
         }
     }
@@ -292,8 +397,12 @@ fn dn_spec(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let sd = sqrt(max(m2 - m1 * m1, vec3<f32>(0.0)));
                     let h = spec_hist[idx];
                     let len = min(h.w + 1.0, DN_SPEC_HIST_MAX);
-                    let hc = clamp(h.rgb, m1 - DN_GAMMA * sd, m1 + DN_GAMMA * sd);
-                    out = vec4<f32>(mix(hc, cur, 1.0 / len), len);
+                    // bornage par le voisinage 3×3 (γ = DN_SPEC_GAMMA) : avec le MIS, les lampes vues en
+                    // reflet ne sont plus des valeurs rares, et sans bornage un reflet très lumineux
+                    // (le ciel dans la sphère qui roule) traînait en une grande tache blanche
+                    var hs = h.rgb;
+                    if ((fr.off & 65536u) == 0u) { hs = clamp(hs, m1 - DN_SPEC_GAMMA * sd, m1 + DN_SPEC_GAMMA * sd); }
+                    out = vec4<f32>(mix(hs, cur, 1.0 / len), len);
                 }
             }
         }
@@ -312,6 +421,7 @@ fn dn_spec_store(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn dn_spec_out(k: u32) -> vec3<f32> {
     let g = gbuf[k];
     let rough = g_rough(g);
+    if ((fr.off & 64u) != 0u) { return spec_img[k].rgb; }
     if (is_diffuse(rough, g_metal(g))) { return vec3<f32>(0.0); }
     if (rough < 0.1) { return spec_t[k].rgb; }
     let x = i32(k % fr.w);
@@ -353,7 +463,7 @@ fn dn_load(src: u32, i: u32) -> vec3<f32> {
 // filtre à-trous 5×5 (noyau B3), arrêts sur la normale et la position
 fn dn_atrous(k: u32, step: i32, src: u32) -> vec3<f32> {
     let g = gbuf[k];
-    if (g.kind != 2u) { return dn_load(src, k); }
+    if (g.kind != 2u || (fr.off & 32u) != 0u) { return dn_load(src, k); }
     var h = array<f32, 5>(1.0 / 16.0, 0.25, 0.375, 0.25, 1.0 / 16.0);
     let x = i32(k % fr.w);
     let y = i32(k / fr.w);
@@ -426,4 +536,12 @@ fn dn_atrous3(@builtin(global_invocation_id) gid: vec3<u32>) {
     var v = dn_atrous(k, 4, 1u);
     if (g.kind == 2u) { v = v * dn_dalb(g) + dn_spec_out(k); }
     image[k] = vec4<f32>(v, f32(g.kind));
+}
+
+// sans débruiteur : image finale = partie diffuse + partie spéculaire
+@compute @workgroup_size(64)
+fn game_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    if (gbuf[k].kind == 2u) { image[k] = vec4<f32>(image[k].rgb + spec_img[k].rgb, image[k].w); }
 }
