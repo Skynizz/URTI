@@ -27,7 +27,6 @@ const KAPPA: f32 = 4.0;
 const PRIOR_FLOOR: f32 = 0.1;
 const REL_EPS: f32 = 0.01;
 const DEP_WINDOW: u32 = 64u;
-const EPS_ENERGY: f32 = 0.01;
 const DEBT_RATE: f32 = 0.5;
 const CELL_PX: f32 = 4.0;
 const EMA_MIN: f32 = 0.015625;
@@ -87,7 +86,9 @@ const F_EVENT: u32 = 1u;
 const F_GEOMETRY: u32 = 2u;
 const F_SHARC: u32 = 4u;
 const F_PENDING: u32 = 8u;   // frame sans nouvel événement, mais avec des cellules en attente
-const F_AMORTIZE: u32 = 16u; // chemins corrélés plafonnés à DELTA_CAP chemin/pixel par frame
+const F_AMORTIZE: u32 = 16u;
+const F_S2HIST: u32 = 32u;
+const F_ZCAP: u32 = 64u;     // lampe : cellule sans différence mesurée → historique plafonné   // variance par échantillon après correction : au moins celle de l'historique // chemins corrélés plafonnés à DELTA_CAP chemin/pixel par frame
 const DELTA_CAP: f32 = 1.0;
 
 struct Frame {
@@ -98,6 +99,10 @@ struct Frame {
     fwd: vec3<f32>, th: f32,
     right: vec3<f32>, tv: f32,
     up: vec3<f32>, ppp: f32,  // budget : chemins par pixel de surface et par frame
+    pad1: u32,
+    rel_cap: f32,    // variance relative d'allocation plafonnée à rel_cap × médiane (0 : aucun plafond)
+    eps_energy: f32, // seuil de l'effet énergétique attendu (fraction de la luminance de la cellule)
+    n_post: f32,     // poids max d'une estimation corrigée (0 : N_POST) // part du budget répartie uniformément par pixel
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -708,7 +713,7 @@ fn event_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
             let m = bitcast<f32>(ev[110u + s]);
             if (m > 0.0) { dl += freq_of(c, s) * m; }
         }
-        if (dl <= EPS_ENERGY * max(cells[c].lmean, 0.1)) { return; }
+        if (dl <= fr.eps_energy * max(cells[c].lmean, 0.1)) { return; }
     }
     atomicAdd(&ctr[C_SUSPECTS], 1u);
     if (atomicLoad(&acc[b + A_FOOT]) == 0u) {
@@ -866,6 +871,16 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
         add_f32(b + A_FL, xl * m);
         add_f32(b + A_FL2, ld_f32(b + A_PXL2));
         atomicAdd(&ctr[C_DZERO], 1u);
+        // Aucun des m chemins n'a vu la lampe : c'est exact pour ces chemins, pas pour l'espérance
+        // de la cellule (une petite lampe vive peut n'être vue que rarement). L'estimation est
+        // gardée, mais son poids plafonné, pour que l'échantillonnage ordinaire la remette à jour.
+        if ((fr.flags & (F_ZCAP | F_GEOMETRY)) == F_ZCAP) {
+            let np = select(N_POST, fr.n_post, fr.n_post > 0.0);
+            if (cells[c].n > np) {
+                cells[c].m2 *= (np - 1.0) / (cells[c].n - 1.0);
+                cells[c].n = np;
+            }
+        }
         return;
     }
     let sxx = max(ld_f32(b + A_PXL2) - m * xl * xl, 0.0);
@@ -885,10 +900,10 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mu = max(xr - (yr - cell.mean) * beta, vec3<f32>(0.0));
     let mu_l = max(xl - beta * (yl - cell.lmean), 0.0);
     var s2 = max(sxx / (m - 1.0), 1e-12);
-    if (cell.n > 1.0) { s2 = max(s2, cell.m2 / (cell.n - 1.0) * 1e-3); }
+    if (cell.n > 1.0) { s2 = max(s2, cell.m2 / (cell.n - 1.0) * select(1e-3, 1.0, (fr.flags & F_S2HIST) != 0u)); }
     var n_eff = cell.n + m;
     if (var_mu > 0.0) { n_eff = clamp(s2 / var_mu, min(m, 2.0), cell.n + m); }
-    n_eff = min(n_eff, N_POST);
+    n_eff = min(n_eff, select(N_POST, fr.n_post, fr.n_post > 0.0));
     cell.n = n_eff;
     cell.mean = mu;
     cell.lmean = mu_l;
@@ -936,7 +951,12 @@ fn quota(c: u32, lambda: f32, prior: f32) -> u32 {
     let foot = q.x;
     if (foot == 0.0) { return 0u; }
     let n = q.y;
-    let pv = post_var(n, q.z, prior);
+    // Plafond : avec une radiance à queue lourde (petite lampe vive, indirect), une cellule qui vient
+    // de tirer une valeur rare verrait sa variance exploser et serait aussitôt sur-échantillonnée :
+    // la valeur rare serait diluée dans un n qui grandit parce qu'elle a été vue (biais vers le sombre).
+    var rel = q.z;
+    if (fr.rel_cap > 0.0) { rel = min(rel, fr.rel_cap * prior); }
+    let pv = post_var(n, rel, prior);
     let t = (-1.0 + sqrt(1.0 + 4.0 * foot * pv / lambda)) * 0.5;
     // arrondi stochastique (même tirage au balayage et à l'émission) : Σ quotas suit la solution continue
     var k = max(floor(t - n + q.w), 0.0);

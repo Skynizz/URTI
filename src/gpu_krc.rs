@@ -90,6 +90,10 @@ struct FrameU {
     tv: f32,
     up: [f32; 3],
     ppp: f32,
+    pad1: u32,
+    rel_cap: f32,
+    eps_energy: f32,
+    n_post: f32,
 }
 
 const F_EVENT: u32 = 1;
@@ -97,6 +101,8 @@ const F_GEOMETRY: u32 = 2;
 const F_SHARC: u32 = 4;
 const F_PENDING: u32 = 8;
 const F_AMORTIZE: u32 = 16;
+const F_S2HIST: u32 = 32;
+const F_ZCAP: u32 = 64;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -157,6 +163,16 @@ pub struct GpuKrc<'a> {
     pub ppp: f32,
     /// amortir les événements de lampe (chemins corrélés plafonnés par frame)
     pub amortize: bool,
+    /// plafond de la variance relative d'allocation, en multiples de la médiane (0 : aucun)
+    pub rel_cap: f32,
+    /// seuil de l'effet énergétique attendu (fraction de la luminance de la cellule)
+    pub eps_energy: f32,
+    /// poids max d'une estimation corrigée (0 : N_POST du shader)
+    pub n_post: f32,
+    /// variance après correction : au moins celle de l'historique
+    pub s2_hist: bool,
+    /// événement de lampe : historique plafonné aussi pour les cellules sans différence mesurée
+    pub zero_cap: bool,
     pending: Option<GpuEvent>,
 }
 
@@ -342,6 +358,11 @@ impl<'a> GpuKrc<'a> {
             readback: true,
             ppp: 1.0,
             amortize: false,
+            rel_cap: 1.0,
+            eps_energy: 0.01,
+            n_post: 16.0,
+            s2_hist: true,
+            zero_cap: true,
             pending: None,
         }
     }
@@ -369,6 +390,10 @@ impl<'a> GpuKrc<'a> {
             tv: v.tv as f32,
             up: f3(v.up),
             ppp: self.ppp,
+            pad1: 0,
+            rel_cap: self.rel_cap,
+            eps_energy: self.eps_energy,
+            n_post: self.n_post,
         }
     }
 
@@ -577,6 +602,12 @@ impl<'a> GpuKrc<'a> {
         let mut ev_lights = 0;
         if self.amortize {
             flags |= F_AMORTIZE;
+        }
+        if self.s2_hist {
+            flags |= F_S2HIST;
+        }
+        if self.zero_cap {
+            flags |= F_ZCAP;
         }
         if let Some(e) = ev {
             if !self.sharc {

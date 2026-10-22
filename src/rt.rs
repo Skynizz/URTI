@@ -420,12 +420,17 @@ pub fn cornell_setup(size: usize) -> TriSetup {
 
 /// relMSE d'une frame sur les pixels de surface : brute, et sans le 0,1 % de pixels les plus
 /// fautifs (pratique courante du path guiding : une luciole isolée ne doit pas décider seule).
-pub fn frame_err(img: &[V3], kinds: &[u8], r: &[V3]) -> (f64, f64) {
+/// Troisième valeur : luminance totale image / référence, pour voir un biais que la relMSE cache
+/// (avec y² + 0,01 au dénominateur, une scène sombre récompense une image trop sombre).
+pub fn frame_err(img: &[V3], kinds: &[u8], r: &[V3]) -> (f64, f64, f64) {
     let mut px: Vec<f64> = Vec::with_capacity(img.len());
+    let (mut li, mut lr) = (0.0, 0.0);
     for i in 0..img.len() {
         if kinds[i] != 2 {
             continue;
         }
+        li += img[i].lum();
+        lr += r[i].lum();
         let mut e = 0.0;
         for c in 0..3 {
             let (x, y) = (img[i].get(c), r[i].get(c));
@@ -440,7 +445,7 @@ pub fn frame_err(img: &[V3], kinds: &[u8], r: &[V3]) -> (f64, f64) {
         px.select_nth_unstable_by(keep, |a, b| a.total_cmp(b));
     }
     let trim = px[..keep].iter().sum::<f64>() / keep.max(1) as f64;
-    (raw, trim)
+    (raw, trim, li / lr.max(1e-12))
 }
 
 /// `krc cornell|sponza` : la séquence de 120 frames (objet qui bouge, lampe allumée, lampe
@@ -484,27 +489,27 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
     }
     let phases: [(&str, u32, u32); 6] =
         [("tout", 0, 120), ("statique", 30, 40), ("boite", 40, 64), ("apres_boite", 64, 80), ("lampe_on", 80, 100), ("lampe_off", 100, 120)];
-    let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame,trim_mean,trim_std\n");
+    let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame,trim_mean,trim_std,lum_ratio\n");
     for (name, sharc) in [("tri_krc", false), ("tri_sharc", true)] {
         let out = format!("results/{}/{name}", setup.name);
         std::fs::create_dir_all(&out).unwrap();
-        let mut runs: Vec<Vec<(f64, f64, u32, f64)>> = Vec::new();
+        let mut runs: Vec<Vec<(f64, f64, u32, f64, f64)>> = Vec::new();
         for seed in 0..seeds {
             let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 1 + seed as u32);
             let mut prev = at(0);
             let mut rows = Vec::new();
-            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim\n");
+            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio\n");
             for t in 0..FRAMES {
                 let scene = at(t);
                 let f = k.frame_tri(&scene, &prev, t);
                 assert_eq!(f.overflow, 0);
-                let (rel, trim) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+                let (rel, trim, lr) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
                 let paths = f.regular_paths + f.delta_paths + f.probe_rays as u32;
-                csv += &format!("{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e}\n", f.gpu_ms(), f.suspects, f.delta_paths);
+                csv += &format!("{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e},{lr:.4}\n", f.gpu_ms(), f.suspects, f.delta_paths);
                 if seed == 0 && crate::methods::SAVE_FRAMES.contains(&t) {
                     crate::image::save(&format!("{out}/f{t:03}.png"), view.w, view.h, &f.image);
                 }
-                rows.push((rel, f.gpu_ms(), paths, trim));
+                rows.push((rel, f.gpu_ms(), paths, trim, lr));
                 prev = scene;
             }
             let file = if seed == 0 { "metrics.csv".to_string() } else { format!("metrics_s{seed}.csv") };
@@ -522,6 +527,8 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
                 stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.0).sum::<f64>() / (b - a) as f64).collect());
             let (mt, sdt) =
                 stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.3).sum::<f64>() / (b - a) as f64).collect());
+            let (lr, _) =
+                stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.4).sum::<f64>() / (b - a) as f64).collect());
             let ms: f64 = runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.1).sum::<f64>() / (b - a) as f64).sum::<f64>()
                 / runs.len() as f64;
             let paths: f64 = runs
@@ -529,9 +536,9 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
                 .map(|r| r[a as usize..b as usize].iter().map(|x| x.2 as f64).sum::<f64>() / (b - a) as f64)
                 .sum::<f64>()
                 / runs.len() as f64;
-            summary += &format!("{name},{phase},{m:.6e},{sd:.6e},{ms:.4},{paths:.0},{mt:.6e},{sdt:.6e}\n");
+            summary += &format!("{name},{phase},{m:.6e},{sd:.6e},{ms:.4},{paths:.0},{mt:.6e},{sdt:.6e},{lr:.4}\n");
             line += &format!(" | {phase} {m:.2e}±{sd:.0e} {ms:.2}ms");
-            line_t += &format!(" | {phase} {mt:.2e}±{sdt:.0e}");
+            line_t += &format!(" | {phase} {mt:.2e}±{sdt:.0e} lum {lr:.3}");
         }
         println!("{line}");
         println!("{line_t}");
@@ -581,7 +588,7 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
                     let f = k.frame_tri(&scene, &prev, t);
                     prev = scene;
                     if pass == 0 {
-                        let (e, et) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+                        let (e, et, _) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
                         rel.push(e);
                         tr.push(et);
                         if (30..40).contains(&t) {
@@ -783,5 +790,82 @@ pub fn sponza_debug(gpu: &Gpu) {
         let mean = d.iter().sum::<f64>() / d.len().max(1) as f64;
         let near = d.iter().filter(|&&x| x < 0.5).count();
         println!("lampe {j} en {:?} : {} sondes touchent, distance moyenne {:.2} m, {} à moins de 0,5 m", l.center, hits.len(), mean, near);
+    }
+}
+
+/// `krc bias [cornell|sponza]` : luminance moyenne image / référence (Σ sur les pixels de surface),
+/// pour séparer un biais d'un bruit. (a) scène finale statique depuis un cache vide,
+/// (b) séquence complète, KRC et SHaRC.
+pub fn bias(gpu: &Gpu, setup: &TriSetup) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    use crate::scene::{state_at, FRAMES};
+    let (view, at) = (setup.view, setup.at);
+    let grid = Grid::fit(&at(0).bounds);
+    let dir = format!("results/ref_{}", setup.name);
+    let refs: std::collections::HashMap<String, Vec<V3>> = (0..FRAMES)
+        .map(|f| state_at(f).id())
+        .map(|id| (id.clone(), load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes")))
+        .collect();
+    let ratio = |f: &crate::gpu_krc::GpuFrame, r: &[V3]| {
+        let (mut a, mut b) = (0.0, 0.0);
+        for i in 0..view.len() {
+            if f.kinds[i] == 2 {
+                a += f.image[i].lum();
+                b += r[i].lum();
+            }
+        }
+        a / b
+    };
+    let fs: u32 = std::env::var("KRC_BIAS_FRAME").ok().and_then(|s| s.parse().ok()).unwrap_or(FRAMES - 1);
+    let last = at(fs);
+    // (nom, sharc, plafond de variance, n_post, variance d'historique, plafond des cellules sans différence)
+    let variants = [
+        ("krc_avant", false, 0.0f32, 64.0f32, false, false),
+        ("+plafond_var", false, 1.0, 64.0, false, false),
+        ("+zero_cap", false, 1.0, 64.0, false, true),
+        ("krc", false, 1.0, 16.0, true, true),
+        ("sharc", true, 0.0, 0.0, false, false),
+    ];
+    for (name, sharc, cap, np, h, z) in variants {
+        let mut k = GpuKrc::with(gpu, view, grid, Some(&last), sharc, 7);
+        k.rel_cap = cap;
+        k.n_post = np;
+        k.s2_hist = h;
+        k.zero_cap = z;
+        let r = &refs[&state_at(fs).id()];
+        let mut line = format!("(a) {name:<13} statique, état final :");
+        for t in 0..200 {
+            let f = k.frame_tri(&last, &last, t);
+            if [0, 4, 9, 19, 39, 59, 99, 199].contains(&t) {
+                line += &format!(" f{t} {:.3}", ratio(&f, r));
+            }
+        }
+        println!("{line}");
+    }
+    for (name, sharc, cap, np, h, z) in variants {
+        let mut k = GpuKrc::with(gpu, view, grid, Some(&at(0)), sharc, 7);
+        k.rel_cap = cap;
+        k.n_post = np;
+        k.s2_hist = h;
+        k.zero_cap = z;
+        let mut prev = at(0);
+        let mut line = format!("(b) {name:<13} séquence :");
+        let mut err = 0.0;
+        for t in 0..FRAMES {
+            let scene = at(t);
+            let f = k.frame_tri(&scene, &prev, t);
+            prev = scene;
+            let (_, trim, _) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+            err += trim / FRAMES as f64;
+            if [39, 63, 79, 80, 81, 85, 99, 100, 101, 105, 119].contains(&t) {
+                line += &format!(" f{t} {:.3}", ratio(&f, &refs[&state_at(t).id()]));
+            }
+            if t == 80 || t == 100 {
+                line += &format!(" [susp {} zéro {}]", f.suspects, f.delta_zero);
+            }
+        }
+        println!("{line} | relMSE* {err:.3e}");
     }
 }

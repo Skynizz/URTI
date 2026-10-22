@@ -223,6 +223,13 @@ fn main() {
             },
             None => eprintln!("pas de GPU"),
         },
+        Some("bias") => match gpu::Gpu::new() {
+            Some(g) => match args.get(1).map(String::as_str) {
+                Some("cornell") => rt::bias(&g, &rt::cornell_setup(256)),
+                _ => rt::bias(&g, &rt::sponza_setup(480, 270)),
+            },
+            None => eprintln!("pas de GPU"),
+        },
         Some("sponzadebug") => match gpu::Gpu::new() {
             Some(g) => rt::sponza_debug(&g),
             None => eprintln!("pas de GPU"),
