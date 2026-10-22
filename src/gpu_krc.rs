@@ -115,6 +115,8 @@ struct FrameU {
     reset_ratio: f32,
     prev_up: [f32; 3],
     dn_gamma: f32,
+    sh_spp: u32,
+    pad12: [u32; 3],
 }
 
 /// Méthode du pipeline.
@@ -139,6 +141,8 @@ pub struct ShParams {
     /// scènes sont ~30× plus sombres (Sponza), d'où 1e4 pour que la troncature reste < 0,2 %
     pub radiance_scale: f32,
     pub downscale: u32,
+    /// chemins par pixel de la passe Render (l'exemple : samplesPerPixel, 1 par défaut)
+    pub render_spp: u32,
     /// image finale : passe Render (chemin par pixel, cache aux impacts secondaires) au lieu de
     /// la vue du cache au premier impact
     pub render: bool,
@@ -146,7 +150,7 @@ pub struct ShParams {
 
 impl Default for ShParams {
     fn default() -> Self {
-        ShParams { scene_scale: 50.0, accum_frames: 20, stale_frames: 60, radiance_scale: 1e4, downscale: 5, render: false }
+        ShParams { scene_scale: 50.0, accum_frames: 20, stale_frames: 60, radiance_scale: 1e4, downscale: 5, render_spp: 1, render: false }
     }
 }
 
@@ -639,6 +643,8 @@ impl<'a> GpuKrc<'a> {
             reset_ratio: self.reset_ratio,
             prev_up: f3(self.prev_view.up),
             dn_gamma: self.dn_gamma,
+            sh_spp: self.sh.render_spp,
+            pad12: [0; 3],
         }
     }
 

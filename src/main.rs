@@ -297,10 +297,23 @@ fn main() {
                     Some("sponza") => rt::sponza_setup(1280, 720),
                     Some("cornellcam") => rt::cornell_cam_setup(1024),
                     Some("sponzacam480") => rt::sponza_cam_setup(480, 270),
+                    Some("vitrine") => rt::vitrine_setup(960, 540),
                     _ => rt::sponza_cam_setup(1280, 720),
                 };
                 rt::passes(&g, &setup, ppp);
             }
+            None => eprintln!("pas de GPU"),
+        },
+        Some("vitrine") => match gpu::Gpu::new() {
+            Some(g) => rt::vitrine_video(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(960)),
+            None => eprintln!("pas de GPU"),
+        },
+        Some("vitrinems") => match gpu::Gpu::new() {
+            Some(g) => rt::vitrine_ms(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(960)),
+            None => eprintln!("pas de GPU"),
+        },
+        Some("vitrinetest") => match gpu::Gpu::new() {
+            Some(g) => rt::vitrine_test(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(960)),
             None => eprintln!("pas de GPU"),
         },
         Some("sharccheck") => match gpu::Gpu::new() {

@@ -53,7 +53,7 @@ impl Mesh {
     pub fn sphere(albedo: [f32; 3], r: f64, mat: Mat) -> Mesh {
         let mut m = Mesh::new(albedo);
         m.mat = mat;
-        let (nu, nv) = (48u32, 24u32);
+        let (nu, nv) = (384u32, 192u32); // fin : le reflet d'une sphère miroir ne doit pas montrer de facettes
         for j in 0..=nv {
             let th = std::f64::consts::PI * j as f64 / nv as f64;
             for i in 0..=nu {
@@ -1221,6 +1221,7 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         }
         k.demod = env("KRC_DM").is_some();
         k.support = env("KRC_SUP").is_some();
+        k.game = env("KRC_GAME").is_some();
         let mut sum: Vec<(&'static str, f64)> = Vec::new();
         let (mut live, mut total) = (0u32, 0.0);
         let (mut segs, mut paths, mut hits) = (0u64, 0u64, 0u64);
@@ -1613,4 +1614,258 @@ pub fn sponza_pbr() -> &'static (Vec<Mesh>, Aabb, TexArray) {
         }
         (meshes, b.expand(0.1), tex)
     })
+}
+
+/// Vitrine : Sponza texturée (matériaux PBR), sphère chromée qui roule au sol (instance 1),
+/// sphère dorée fixe, panneau de ciel au-dessus du toit (lampe 0 : il « se couche » à la frame
+/// 100), lampe chaude de la galerie (lampe 1 : s'allume à la frame 80), deux lanternes chaudes.
+pub fn vitrine(step: u32, sky_on: bool, l2_on: bool) -> TriScene {
+    let (meshes0, bounds, tex) = sponza_pbr();
+    let mut meshes = meshes0.clone();
+    let mut instances: Vec<Instance> = (0..meshes.len()).map(|m| Instance { mesh: m, offset: V3::default() }).collect();
+    meshes.push(Mesh::sphere([0.95, 0.95, 0.97], 0.7, Mat { tex: -1, rough: 0.04, metal: 1.0, mask: false }));
+    instances.insert(1, Instance { mesh: meshes.len() - 1, offset: v3(3.0 - step as f64 * 0.5, 0.7, -0.7) });
+    meshes.push(Mesh::sphere([1.0, 0.78, 0.34], 0.6, Mat { tex: -1, rough: 0.18, metal: 1.0, mask: false }));
+    instances.push(Instance { mesh: meshes.len() - 1, offset: v3(-4.5, 0.6, 0.9) });
+    let top = bounds.max.y + 0.5;
+    let lights = vec![
+        Light { center: v3(0.0, top, -0.3), hx: 11.0, hz: 2.2, emission: v3(3.2, 3.4, 3.8), on: sky_on },
+        Light { center: v3(-6.0, 2.5, 4.0), hx: 0.4, hz: 0.4, emission: v3(60.0, 45.0, 27.0), on: l2_on },
+        Light { center: v3(-8.5, 6.0, -0.3), hx: 0.3, hz: 0.3, emission: v3(80.0, 52.0, 26.0), on: true },
+        Light { center: v3(8.5, 6.0, -0.3), hx: 0.3, hz: 0.3, emission: v3(80.0, 52.0, 26.0), on: true },
+    ];
+    TriScene { meshes, instances, lights, bounds: *bounds, tex: Some(tex) }
+}
+
+pub fn vitrine_at(frame: u32) -> TriScene {
+    let s = crate::scene::state_at(frame);
+    vitrine(s.box_step, s.l0_on, s.l2_on)
+}
+
+/// Vitrine : on marche dans l'atrium en regardant un peu vers le sol (reflets).
+pub fn vitrine_setup(w: usize, h: usize) -> TriSetup {
+    fn cam(t: u32) -> (V3, V3) {
+        let u = t as f64 / 119.0;
+        let tau = 2.0 * std::f64::consts::PI;
+        let eye = v3(-10.0 + 9.0 * u, 1.7, -0.3 + 0.8 * (tau * t as f64 / 120.0).sin());
+        let yaw = 0.3 * (tau * t as f64 / 90.0).sin();
+        (eye, eye + v3(yaw.cos(), -0.06, yaw.sin()) * 10.0)
+    }
+    let tv = 0.5;
+    let mut view = sponza_setup(w, h).view;
+    view.tv = tv;
+    view.th = tv * w as f64 / h as f64;
+    TriSetup { name: format!("vitrine_{w}x{h}"), view, at: vitrine_at, ref_spp: 8192, cam: Some(cam) }
+}
+
+/// Tone mapping filmique (ACES, approximation de Narkowicz) puis sRGB 8 bits.
+pub fn tonemap(img: &[V3], exposure: f64) -> Vec<u8> {
+    let aces = |x: f64| {
+        let x = x * exposure;
+        ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+    };
+    let srgb = |c: f64| {
+        let v = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    };
+    img.iter().flat_map(|v| [srgb(aces(v.x)), srgb(aces(v.y)), srgb(aces(v.z))]).collect()
+}
+
+/// `krc vitrinetest [w]` : une image de référence et une image de chaque méthode (mode jeu,
+/// frame 30) pour vérifier l'allure de la vitrine.
+pub fn vitrine_test(gpu: &Gpu, w: usize) {
+    use crate::gpu_krc::{GpuKrc, Method};
+    use crate::grid::Grid;
+    let setup = vitrine_setup(w, w * 9 / 16);
+    let (view, at) = (setup.view, setup.at);
+    let scene0 = at(0);
+    eprintln!("vitrine : {} triangles, boîte {:?} → {:?}", scene0.triangles(), scene0.bounds.min, scene0.bounds.max);
+    let grid = Grid::fit(&scene0.bounds);
+    std::fs::create_dir_all("results/vitrine").unwrap();
+    let mut rk = GpuKrc::with(gpu, view, grid, Some(&scene0), false, 0);
+    rk.set_view(setup.view_at(30));
+    let t = std::time::Instant::now();
+    let (r, kinds) = rk.reference_tri(&at(30), 512);
+    eprintln!("référence 512 spp : {:.1} s", t.elapsed().as_secs_f64());
+    let mean = r.iter().zip(&kinds).filter(|(_, k)| **k == 2).map(|(v, _)| v.lum()).sum::<f64>()
+        / kinds.iter().filter(|k| **k == 2).count().max(1) as f64;
+    let exposure = 0.25 / mean.max(1e-6);
+    eprintln!("luminance moyenne {mean:.4}, exposition {exposure:.2}");
+    crate::image::write_png("results/vitrine/test_reference.png", view.w, view.h, &tonemap(&r, exposure)).unwrap();
+    for (name, method) in [("krc", Method::Krc), ("sharc", Method::Sharc)] {
+        let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene0), method, 1);
+        k.game = true;
+        k.ppp = 0.5;
+        let mut prev = at(0);
+        let mut last = Vec::new();
+        for f in 0..=30 {
+            let scene = at(f);
+            k.set_view(setup.view_at(f));
+            let fr = k.frame_tri(&scene, &prev, f);
+            prev = scene;
+            last = fr.image;
+            if f == 30 {
+                eprintln!("{name} : {:.2} ms", fr.passes.iter().map(|p| p.1).sum::<f64>());
+            }
+        }
+        crate::image::write_png(&format!("results/vitrine/test_{name}.png"), view.w, view.h, &tonemap(&last, exposure)).unwrap();
+    }
+}
+
+/// `krc vitrinems [w]` : temps GPU moyen (frames 10–40, sans relecture) de quelques réglages du
+/// mode jeu sur la vitrine, pour choisir des configurations à temps égal.
+pub fn vitrine_ms(gpu: &Gpu, w: usize) {
+    use crate::gpu_krc::{GpuKrc, Method, ShParams};
+    use crate::grid::Grid;
+    let setup = vitrine_setup(w, w * 9 / 16);
+    let at = setup.at;
+    let scene0 = at(0);
+    let grid = Grid::fit(&scene0.bounds);
+    let d = ShParams::default();
+    let cfgs: Vec<(&str, Method, f32, ShParams)> = vec![
+        ("krc 0.25", Method::Krc, 0.25, d),
+        ("krc 0.5", Method::Krc, 0.5, d),
+        ("krc 1", Method::Krc, 1.0, d),
+        ("sharc 5x5 spp1", Method::Sharc, 1.0, d),
+        ("sharc 5x5 spp2", Method::Sharc, 1.0, ShParams { render_spp: 2, ..d }),
+        ("sharc 2x2 spp2", Method::Sharc, 1.0, ShParams { render_spp: 2, downscale: 2, ..d }),
+        ("sharc 5x5 spp3", Method::Sharc, 1.0, ShParams { render_spp: 3, ..d }),
+        ("sharc 2x2 spp3", Method::Sharc, 1.0, ShParams { render_spp: 3, downscale: 2, ..d }),
+    ];
+    for (name, method, ppp, sh) in cfgs {
+        let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&scene0), method, 1);
+        k.game = true;
+        k.ppp = ppp;
+        k.sh = sh;
+        k.readback = false;
+        let mut prev = at(0);
+        let mut ms = 0.0;
+        for f in 0..=40 {
+            let scene = at(f);
+            k.set_view(setup.view_at(f));
+            let fr = k.frame_tri(&scene, &prev, f);
+            prev = scene;
+            if f >= 10 {
+                ms += fr.gpu_ms() / 31.0;
+            }
+        }
+        println!("{name:<16} {ms:.2} ms");
+    }
+}
+
+/// `krc vitrine [w]` : vidéo comparative KRC | SHaRC (NVIDIA) | référence sur la vitrine, même
+/// pipeline de jeu (direct par pixel, reflets, débruiteur commun), à temps GPU égal.
+/// Sorties : results/vitrine/{krc,sharc,reference}/fNNN.png, comparaison.mp4 (24 i/s),
+/// comparaison_lente.mp4 (12 i/s), images fixes aux moments clés, mesures.txt.
+pub fn vitrine_video(gpu: &Gpu, w: usize) {
+    use crate::gpu_krc::{GpuKrc, Method, ShParams};
+    use crate::grid::Grid;
+    use crate::render::{load_raw, save_raw};
+    use crate::scene::FRAMES;
+    let h = w * 9 / 16;
+    let setup = vitrine_setup(w, h);
+    let (view, at) = (setup.view, setup.at);
+    let scene0 = at(0);
+    let grid = Grid::fit(&scene0.bounds);
+    let ref_spp: u32 = std::env::var("KRC_REF_SPP").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let out = "results/vitrine";
+    let refdir = format!("results/ref_{}_{}", setup.name, ref_spp);
+    for d in [format!("{out}/krc"), format!("{out}/sharc"), format!("{out}/reference"), refdir.clone()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    // références (une par frame, gardées sur disque)
+    let mut rk = GpuKrc::with(gpu, view, grid, Some(&scene0), false, 0);
+    let mut refs = Vec::new();
+    for f in 0..FRAMES {
+        let path = format!("{refdir}/f{f:03}.bin");
+        let img = load_raw(&path, view.len()).unwrap_or_else(|| {
+            let t = std::time::Instant::now();
+            rk.set_view(setup.view_at(f));
+            let (img, _) = rk.reference_tri(&at(f), ref_spp);
+            save_raw(&path, &img);
+            eprintln!("référence f{f:03} : {:.1} s", t.elapsed().as_secs_f64());
+            img
+        });
+        refs.push(img);
+    }
+    drop(rk);
+    let (_, kinds0) = {
+        let mut k = GpuKrc::with(gpu, view, grid, Some(&scene0), false, 0);
+        k.set_view(setup.view_at(0));
+        k.reference_tri(&at(0), 1)
+    };
+    let mean = refs[0].iter().zip(&kinds0).filter(|(_, k)| **k == 2).map(|(v, _)| v.lum()).sum::<f64>()
+        / kinds0.iter().filter(|k| **k == 2).count().max(1) as f64;
+    let exposure = 0.25 / mean.max(1e-6);
+    for (f, r) in refs.iter().enumerate() {
+        crate::image::write_png(&format!("{out}/reference/f{f:03}.png"), w, h, &tonemap(r, exposure)).unwrap();
+    }
+    let d = ShParams::default();
+    let methods = [
+        ("krc", "KRC", Method::Krc, 0.5f32, d),
+        ("sharc", "SHaRC NVIDIA", Method::Sharc, 1.0, ShParams { downscale: 2, render_spp: 3, ..d }),
+    ];
+    let mut report = String::new();
+    let mut labels = Vec::new();
+    for (dir, label, method, ppp, sh) in methods {
+        let mut k = GpuKrc::with_method(gpu, view, grid, Some(&scene0), method, 1);
+        k.game = true;
+        k.ppp = ppp;
+        k.sh = sh;
+        k.m_light = 32;
+        let mut prev = at(0);
+        let (mut ms, mut err) = (Vec::new(), 0.0);
+        for f in 0..FRAMES {
+            let scene = at(f);
+            k.set_view(setup.view_at(f));
+            let fr = k.frame_tri(&scene, &prev, f);
+            prev = scene;
+            ms.push(fr.gpu_ms());
+            let (_, e, lr) = frame_err(&fr.image, &fr.kinds, &refs[f as usize]);
+            err += e / FRAMES as f64;
+            if [39u32, 60, 81, 101, 110, 119].contains(&f) {
+                report += &format!("{label} f{f:03} : relMSE* {e:.3e}, lum {lr:.2}\n");
+            }
+            crate::image::write_png(&format!("{out}/{dir}/f{f:03}.png"), w, h, &tonemap(&fr.image, exposure)).unwrap();
+        }
+        let mean_ms = ms.iter().sum::<f64>() / ms.len() as f64;
+        report += &format!("{label} : relMSE* moyenne {err:.3e}, GPU moyen {mean_ms:.2} ms\n");
+        labels.push(format!("{label} - {mean_ms:.1} ms par frame"));
+        eprintln!("{label} : relMSE* {err:.3e}, {mean_ms:.2} ms");
+    }
+    labels.push(format!("Reference - {ref_spp} chemins par pixel"));
+    std::fs::write(format!("{out}/mesures.txt"), &report).unwrap();
+    // vidéo côte à côte, étiquetée
+    let font = "C\\:/Windows/Fonts/arial.ttf";
+    let lab = |i: usize| {
+        format!(
+            "drawtext=fontfile='{font}':text='{}':x=16:y=16:fontsize={}:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=8",
+            labels[i],
+            (h / 22).max(14)
+        )
+    };
+    let filter = format!("[0:v]{}[a];[1:v]{}[b];[2:v]{}[c];[a][b][c]hstack=inputs=3,format=yuv420p[v]", lab(0), lab(1), lab(2));
+    for (fps, name) in [(24, "comparaison.mp4"), (12, "comparaison_lente.mp4")] {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-y", "-loglevel", "error"]);
+        for dir in ["krc", "sharc", "reference"] {
+            cmd.args(["-framerate", &fps.to_string(), "-i", &format!("{out}/{dir}/f%03d.png")]);
+        }
+        cmd.args(["-filter_complex", &filter, "-map", "[v]", "-c:v", "libx264", "-crf", "16", "-preset", "slow"]);
+        cmd.arg(format!("{out}/{name}"));
+        let st = cmd.status().expect("ffmpeg");
+        eprintln!("{name} : {st}");
+    }
+    // images fixes : statique, sphère qui roule, galerie allumée, ciel couché
+    for f in [39u32, 60, 90, 110] {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-y", "-loglevel", "error"]);
+        for dir in ["krc", "sharc", "reference"] {
+            cmd.args(["-i", &format!("{out}/{dir}/f{f:03}.png")]);
+        }
+        let still = format!("[0:v]{}[a];[1:v]{}[b];[2:v]{}[c];[a][b][c]hstack=inputs=3[v]", lab(0), lab(1), lab(2));
+        cmd.args(["-filter_complex", &still, "-map", "[v]", "-frames:v", "1"]);
+        cmd.arg(format!("{out}/comparaison_f{f:03}.png"));
+        cmd.status().expect("ffmpeg");
+    }
 }

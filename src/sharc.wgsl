@@ -454,6 +454,8 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         split = false;
         sel = 0u;
         seed_rng(k, 0x7e4du, fr.frame);
+        let spp = max(fr.sh_spp, 1u);
+        for (var si = 0u; si < spp; si++) {
         var p = g.p;
         var n = g.n;
         var albedo = g.albedo;
@@ -514,6 +516,9 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
                 beta = beta / q;
             }
         }
+        }
+        v /= f32(spp);
+        vs_spec /= f32(spp);
     }
     if ((fr.flags & F_GAME) != 0u) {
         image[k] = vec4<f32>(v, f32(g.kind));

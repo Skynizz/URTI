@@ -13,3 +13,7 @@ results/ref_*/*.bin
 results/*_cam_1024/*/*.png
 results/*_cam_1280x720/*/*.png
 results/ref_*/*.png
+results/vitrine/krc/
+results/vitrine/sharc/
+results/vitrine/reference/
+results/vitrine/test_*.png
