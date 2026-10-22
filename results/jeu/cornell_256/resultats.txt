@@ -1,0 +1,9 @@
+krc 0.25                       relMSE* 6.177e-3 (statique 8.81e-4, dynamique 8.46e-3) | scintillement 0.001 | lum f101 1.09 f103 1.06 f105 1.05 f110 1.03 | GPU moy 0.42 ms, p95 0.84 ms
+krc 0.5                        relMSE* 5.433e-3 (statique 8.13e-4, dynamique 7.56e-3) | scintillement 0.001 | lum f101 1.10 f103 1.07 f105 1.05 f110 1.02 | GPU moy 0.43 ms, p95 0.81 ms
+krc 1                          relMSE* 4.939e-3 (statique 8.02e-4, dynamique 6.93e-3) | scintillement 0.000 | lum f101 1.09 f103 1.05 f105 1.04 f110 1.02 | GPU moy 0.47 ms, p95 0.93 ms
+sharc 1px/5x5                  relMSE* 3.217e-2 (statique 3.87e-3, dynamique 4.63e-2) | scintillement 0.002 | lum f101 1.70 f103 1.60 f105 1.55 f110 1.47 | GPU moy 0.37 ms, p95 0.41 ms
+sharc 1px/2x2                  relMSE* 3.206e-2 (statique 3.74e-3, dynamique 4.62e-2) | scintillement 0.002 | lum f101 1.71 f103 1.61 f105 1.56 f110 1.48 | GPU moy 0.30 ms, p95 0.31 ms
+sharc 1px/1x1                  relMSE* 3.219e-2 (statique 3.79e-3, dynamique 4.64e-2) | scintillement 0.002 | lum f101 1.71 f103 1.61 f105 1.56 f110 1.48 | GPU moy 0.44 ms, p95 0.51 ms
+sharc acc5 1px/1x1             relMSE* 2.787e-2 (statique 3.18e-3, dynamique 4.01e-2) | scintillement 0.003 | lum f101 1.82 f103 1.69 f105 1.59 f110 1.42 | GPU moy 0.36 ms, p95 0.58 ms
+krc 0.5 (brut)                 relMSE* 2.228e-2 (statique 1.32e-2, dynamique 2.61e-2) | scintillement 0.104 | lum f101 0.99 f103 0.99 f105 0.99 f110 1.00 | GPU moy 0.28 ms, p95 0.64 ms
+sharc 1px/1x1 (brut)           relMSE* 1.585e-1 (statique 1.27e-1, dynamique 1.75e-1) | scintillement 0.449 | lum f101 1.50 f103 1.47 f105 1.45 f110 1.39 | GPU moy 0.31 ms, p95 0.32 ms

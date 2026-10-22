@@ -482,3 +482,53 @@ Lecture :
 - **Non testé** : le mode « éclairage réactif » expérimental de SHaRC (non utilisé par
   l'exemple de NVIDIA ; il faut marquer à l'avance les lumières concernées). La fenêtre
   d'accumulation courte en tient lieu ici.
+
+## 14. Test « comme en jeu » : image finale et débruiteur
+
+Dans un jeu, on n'affiche pas le cache : chaque pixel calcule son éclairage direct, le cache
+fournit l'indirect, puis un débruiteur passe. Pipeline identique pour les deux méthodes
+(`krc jeu [scène]`, `src/game.wgsl`, 3 graines) :
+
+- **KRC** : éclairage direct par pixel (une estimation directe par frame) + lumière
+  indirecte lue dans les cellules, qui ne stockent plus que l'indirect ;
+- **SHaRC** : sa passe Render officielle (un chemin par pixel, cache au rebond suivant) ;
+- **débruiteur commun** (SVGF simplifié) : accumulation temporelle de l'illumination
+  démodulée avec reprojection, historique borné par la variance du voisinage 3×3, trois
+  filtres à-trous guidés par la normale et la position. Son coût est compté.
+
+| Image finale débruitée, relMSE* (statique) · GPU | KRC v2 0,5 ch/px | SHaRC 1 px/1×1 | SHaRC acc. 5, 1 px/1×1 | SHaRC 1 px/5×5 |
+|---|---|---|---|---|
+| Sponza caméra fixe | **2,0e-2** (1,7e-2) · 0,89 ms | 3,5e-2 (1,4e-2) · 0,91 ms | 2,8e-2 (**1,2e-2**) · 0,91 ms | 3,8e-2 (2,2e-2) · 0,68 ms |
+| Sponza caméra mobile | **2,1e-2** (2,0e-2) · 1,01 ms | 6,4e-2 (2,0e-2) · 1,03 ms | 4,6e-2 (**1,9e-2**) · 1,04 ms | 5,5e-2 (2,9e-2) · 0,78 ms |
+| Cornell caméra fixe | **5,4e-3** (**8,1e-4**) · 0,43 ms | 3,2e-2 (3,8e-3) · 0,44 ms | 2,8e-2 (3,2e-3) · 0,36 ms | 3,2e-2 (3,9e-3) · 0,37 ms |
+| Cornell caméra mobile | **5,0e-3** (**1,8e-3**) · 0,43 ms | 3,6e-2 (5,2e-3) · 0,39 ms | 3,2e-2 (4,5e-3) · 0,39 ms | 3,4e-2 (5,4e-3) · 0,32 ms |
+
+| Après l'extinction de la grande lampe (lum : 1 = juste) | f101 | f103 | f110 |
+|---|---|---|---|
+| Sponza fixe, KRC 0,5 | 1,00 | 0,84 | 0,73 |
+| Sponza fixe, SHaRC 1×1 | 1,72 | 1,62 | 1,48 |
+| Sponza mobile, KRC 0,5 | 1,43 | 1,08 | 0,87 |
+| Sponza mobile, SHaRC 1×1 | 6,27 | 5,73 | 5,42 |
+| Cornell fixe, KRC 0,5 | 1,10 | 1,07 | 1,02 |
+| Cornell fixe, SHaRC 1×1 | 1,71 | 1,61 | 1,48 |
+
+Lecture :
+
+- **Le débruiteur doit borner son historique.** Sans bornage, il traînait la lampe éteinte
+  (lum 2,4 au lieu de 1,0) et effaçait l'avantage de KRC. Avec, KRC garde sa réactivité.
+- **À temps égal, sur les séquences, KRC v2 gagne** : 1,4 à 3× moins d'erreur sur Sponza
+  (contre le meilleur SHaRC, réactif compris), 4,5 à 5,7× sur la Cornell box.
+- **En statique, c'est partagé** : KRC nettement meilleur sur la Cornell box (2,5 à 3,6×) ;
+  sur Sponza, SHaRC un peu meilleur caméra fixe (1,2 à 1,35×) et à égalité caméra mobile.
+  À l'œil, SHaRC garde un peu plus de détail fin (le rebond tracé par pixel), KRC est plus
+  doux.
+- **Sans débruiteur**, l'image KRC est 2 à 7× moins bruitée (son indirect est lu dans le
+  cache, pas tracé par pixel) : 1,5e-1 contre 2,9e-1 sur Sponza, 2,2e-2 contre 1,6e-1 sur
+  la Cornell box.
+- **Défaut visible de KRC** : après l'extinction de la grande lampe de Sponza, l'image est
+  plus juste en moyenne mais **tachée** (chaque cellule corrigée par 8 chemins corrélés
+  garde son propre bruit) et dérive vers le sombre (0,73 à f110 ; le bornage du débruiteur,
+  sur une entrée à queue lourde, y contribue). SHaRC est uniformément trop clair mais
+  propre. Un joueur verrait les taches.
+- Limites du test : débruiteur simple (pas NRD), 480×270 et 256², scintillement mesuré
+  seulement caméra fixe (KRC 0,004 contre 0,005–0,007 pour SHaRC sur Sponza).

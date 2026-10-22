@@ -257,3 +257,19 @@ Tests courts (`krc duel`, `krc statique` : 480×270 ou 256², 3 graines) pour d�
   (caméra fixe ou mobile), y compris contre un SHaRC réglé pour réagir vite (accumulation
   5 frames), et 20 à 27× moins sur la Cornell box. Reste en faveur de SHaRC : le statique
   avec caméra mobile en haute résolution (≈2×), et son coût minimal plus bas.
+
+## v13 — Test 1 « comme en jeu » (commit d6e9be2 → …)
+
+- Pipeline identique pour les deux méthodes : image finale par pixel puis débruiteur commun
+  (SVGF simplifié : accumulation temporelle reprojetée, historique borné par la variance du
+  voisinage, trois filtres à-trous). KRC : direct par pixel + indirect des cellules (les
+  cellules ne stockent plus que l'indirect). SHaRC : sa passe Render officielle.
+- Sans bornage de l'historique, le débruiteur traîne une lampe éteinte 2× trop claire
+  pendant 10 frames et efface l'avantage de KRC : le bornage est indispensable (c'est ce que
+  font A-SVGF et les débruiteurs de jeu).
+- À temps GPU égal, image finale débruitée : KRC 1,4 à 3× moins d'erreur sur Sponza, 4,5 à
+  5,7× sur la Cornell box. Statique : KRC meilleur sur Cornell (2,5 à 3,6×), SHaRC un peu
+  meilleur sur Sponza (1,2 à 1,35× caméra fixe, à égalité caméra mobile).
+- **À l'œil**, après l'extinction de la grande lampe de Sponza : SHaRC trop clair mais
+  propre ; KRC plus juste en moyenne mais **taché** (chaque cellule corrigée par 8 chemins
+  corrélés garde son propre bruit) et un peu trop sombre. C'est le prochain défaut à régler.

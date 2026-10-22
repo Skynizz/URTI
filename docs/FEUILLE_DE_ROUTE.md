@@ -17,6 +17,19 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Caméra mobile | ✅ qualité ; ⚠️ coût minimal 3 ms à 1280×720 (KRC v2) |
 | Spéculaire | à faire |
 
+## Après le test « comme en jeu » (RESULTATS §14)
+
+KRC v2 garde l'avantage dans un pipeline de jeu avec débruiteur (1,4 à 5,7× à temps égal
+sur les séquences). Défauts à régler avant une démo :
+1. **Taches après un changement de lumière** : corrections par cellule trop bruitées
+   (8 chemins corrélés). Pistes : plus de chemins corrélés pour les lampes, débruiter le
+   champ des corrections (les deltas de cellules voisines sont corrélés), priorité
+   d'échantillonnage aux cellules corrigées.
+2. Dérive sombre après l'extinction (0,73).
+3. Statique Sponza : SHaRC un peu meilleur (1,2 à 1,35×).
+4. Puis tests 2 à 4 : retard et scintillement en caméra mobile, scènes de jeu (beaucoup
+   d'objets et de lumières), budget 1080p.
+
 ## Prochaine décision (après KRC v2)
 
 KRC v2 bat SHaRC sur les séquences dynamiques. Pour aller plus loin :
