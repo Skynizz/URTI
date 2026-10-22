@@ -1123,6 +1123,35 @@ pub struct DuelCfg {
     pub tau: f32,
     pub multi: bool,
     pub sh: crate::gpu_krc::ShParams,
+    /// réglages des correctifs (voir GpuKrc) : chemins corrélés de lampe, remboursement,
+    /// remise à zéro, bornage du débruiteur
+    pub m_light: u32,
+    pub debt_rate: f32,
+    pub reset_ratio: f32,
+    pub dn_gamma: f32,
+}
+
+impl Default for DuelCfg {
+    fn default() -> Self {
+        DuelCfg {
+            name: "",
+            method: crate::gpu_krc::Method::Krc,
+            ppp: 1.0,
+            resample: true,
+            cell_px: 8.0,
+            reuse: false,
+            demod: true,
+            seed: true,
+            support: false,
+            tau: 0.05,
+            multi: false,
+            sh: crate::gpu_krc::ShParams::default(),
+            m_light: 0,
+            debt_rate: -1.0,
+            reset_ratio: 0.0,
+            dn_gamma: 0.0,
+        }
+    }
 }
 
 /// `krc duel [sponzacam|sponza|cornellcam|cornell]` : test court, 1 graine, 120 frames.
@@ -1278,6 +1307,11 @@ pub fn game_eval(gpu: &Gpu, setup: &TriSetup, cfgs: &[(DuelCfg, bool)]) {
             k.sh = c.sh;
             k.game = true;
             k.denoise = *denoise;
+            k.m_light = c.m_light;
+            k.debt_rate = c.debt_rate;
+            k.reset_ratio = c.reset_ratio;
+            k.dn_gamma = c.dn_gamma;
+            k.dn_wide = std::env::var("KRC_DN5").is_ok();
             for pass in 0..2 {
                 k.readback = pass == 0;
                 let mut prev = at(0);

@@ -49,8 +49,8 @@ pub struct GpuEvent {
 const PROBES: usize = 1024;
 
 const K: usize = 4;
-const ACC: usize = 44;
-const CELL_BYTES: usize = 144;
+const ACC: usize = 52;
+const CELL_BYTES: usize = 160;
 const CTR: usize = 256;
 
 // indices des compteurs (doivent suivre krc_gpu.wgsl)
@@ -108,13 +108,13 @@ struct FrameU {
     rec_every: u32,
     tau: f32,
     prev_eye: [f32; 3],
-    pad8: u32,
+    m_light: u32,
     prev_fwd: [f32; 3],
-    pad9: u32,
+    debt_rate: f32,
     prev_right: [f32; 3],
-    pad10: u32,
+    reset_ratio: f32,
     prev_up: [f32; 3],
-    pad11: u32,
+    dn_gamma: f32,
 }
 
 /// Méthode du pipeline.
@@ -166,6 +166,7 @@ const F_SEED: u32 = 1024;
 const F_SUPPORT: u32 = 2048;
 const F_MULTI: u32 = 4096;
 const F_INDIRECT: u32 = 8192;
+const F_DSPLIT: u32 = 16384;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -266,6 +267,18 @@ pub struct GpuKrc<'a> {
     pub game: bool,
     /// débruiteur du pipeline de jeu
     pub denoise: bool,
+    /// mode jeu, ancienne variante : cellules « indirect seulement »
+    pub indirect_only: bool,
+    /// débruiteur à 5 passages à-trous (pas 1 à 16) au lieu de 3
+    pub dn_wide: bool,
+    /// chemins corrélés par cellule pour un événement de lampe (0 : 8)
+    pub m_light: u32,
+    /// part du budget qui rembourse les chemins d'événement (< 0 : 0,5)
+    pub debt_rate: f32,
+    /// changement relatif au-delà duquel une cellule corrigée repart de zéro (0 : jamais)
+    pub reset_ratio: f32,
+    /// bornage de l'historique du débruiteur, en écarts-types (0 : 1,5)
+    pub dn_gamma: f32,
     prev_view: View,
     pending: Option<GpuEvent>,
     _free_buf: wgpu::Buffer,
@@ -283,7 +296,10 @@ pub struct GpuKrc<'a> {
     sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 43] = [
+const ENTRIES: [&str; 46] = [
+    "dn_atrous3b",
+    "dn_atrous4",
+    "dn_atrous5",
     "krc_final",
     "dn_temporal",
     "dn_store",
@@ -520,6 +536,12 @@ impl<'a> GpuKrc<'a> {
             multi: false,
             game: false,
             denoise: true,
+            indirect_only: false,
+            dn_wide: false,
+            m_light: 0,
+            debt_rate: -1.0,
+            reset_ratio: 0.0,
+            dn_gamma: 0.0,
             prev_view: view,
             pending: None,
             clock: 0,
@@ -579,13 +601,13 @@ impl<'a> GpuKrc<'a> {
             rec_every: self.rec_every,
             tau: self.tau,
             prev_eye: f3(self.prev_view.eye),
-            pad8: 0,
+            m_light: self.m_light,
             prev_fwd: f3(self.prev_view.fwd),
-            pad9: 0,
+            debt_rate: self.debt_rate,
             prev_right: f3(self.prev_view.right),
-            pad10: 0,
+            reset_ratio: self.reset_ratio,
             prev_up: f3(self.prev_view.up),
-            pad11: 0,
+            dn_gamma: self.dn_gamma,
         }
     }
 
@@ -821,7 +843,9 @@ impl<'a> GpuKrc<'a> {
             flags |= F_MULTI;
         }
         if self.game {
-            flags |= F_INDIRECT;
+            // F_INDIRECT (cellules « indirect seulement ») reste disponible mais n'est plus utilisé :
+            // il recalculait l'éclairage direct au sommet relu, bruité (voir JOURNAL v14)
+            flags |= if self.indirect_only { F_INDIRECT } else { F_DSPLIT };
         }
         if let Some(e) = ev {
             if !self.sharc {
@@ -903,7 +927,12 @@ impl<'a> GpuKrc<'a> {
         }
 
         if self.game && self.denoise {
-            for name in ["dn_temporal", "dn_store", "dn_atrous1", "dn_atrous2", "dn_atrous3"] {
+            let passes: &[&'static str] = if self.dn_wide {
+                &["dn_temporal", "dn_store", "dn_atrous1", "dn_atrous2", "dn_atrous3b", "dn_atrous4", "dn_atrous5"]
+            } else {
+                &["dn_temporal", "dn_store", "dn_atrous1", "dn_atrous2", "dn_atrous3"]
+            };
+            for name in passes {
                 plan.push((name, px));
             }
         }

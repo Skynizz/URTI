@@ -69,7 +69,7 @@ const C_HIST: u32 = 32u;     // 64 cases
 const C_SCAN: u32 = 96u;     // 3 × 32 sommes de quotas candidates (trois balayages)
 
 // accumulateurs atomiques par cellule (acc), en mots
-const ACC: u32 = 44u;
+const ACC: u32 = 52u;
 const A_FOOT: u32 = 0u;
 const A_REF: u32 = 1u;
 const A_FN: u32 = 2u;
@@ -90,6 +90,8 @@ const A_PXL2: u32 = 40u;
 const A_PYL2: u32 = 41u;
 const A_PXYL: u32 = 42u;
 const A_SUSP: u32 = 43u;
+const A_FD: u32 = 44u;        // 44, 45, 46 : Σ part directe au premier sommet (mode jeu)
+const A_PD: u32 = 47u;        // 47, 48, 49 : Σ (direct nouveau − direct ancien) des chemins corrélés
 
 // fr.flags
 const F_EVENT: u32 = 1u;
@@ -122,6 +124,10 @@ const F_SUPPORT: u32 = 2048u;
 const F_MULTI: u32 = 4096u;
 // les cellules ne stockent que la lumière indirecte (le direct est calculé par pixel)
 const F_INDIRECT: u32 = 8192u;
+// mode jeu : les cellules gardent la radiance totale (relue par le rééchantillonnage, comme
+// SHaRC) et, à part, la moyenne de leur part directe ; l'image finale prend l'indirect
+// = total − direct moyen, et le direct par pixel
+const F_DSPLIT: u32 = 16384u;
 const MULTI_N: f32 = 32.0;
 
 fn slot_dist(dist: f32, slot: u32) -> f32 {
@@ -153,10 +159,10 @@ struct Frame {
     sh_rscale: f32, sh_cap: u32, sh_accum: u32, sh_stale: u32,
     sh_down: u32, cell_px: f32, rec_every: u32, tau: f32, // cell_px : largeur d'une cellule en pixels ; rec_every : 1 chemin ordinaire sur N enregistre ses dépendances
     // caméra de la frame précédente (reprojection du débruiteur, game.wgsl)
-    prev_eye: vec3<f32>, pad8: u32,
-    prev_fwd: vec3<f32>, pad9: u32,
-    prev_right: vec3<f32>, pad10: u32,
-    prev_up: vec3<f32>, pad11: u32,
+    prev_eye: vec3<f32>, m_light: u32,     // m_light : chemins corrélés par cellule pour une lampe (0 : M_DELTA)
+    prev_fwd: vec3<f32>, debt_rate: f32,   // part du budget qui rembourse les chemins d'événement (< 0 : DEBT_RATE)
+    prev_right: vec3<f32>, reset_ratio: f32, // changement relatif au-delà duquel on repart de zéro (0 : jamais)
+    prev_up: vec3<f32>, dn_gamma: f32,     // bornage de l'historique du débruiteur (0 : DN_GAMMA)
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -166,6 +172,7 @@ struct Cell {
     mean: vec3<f32>, rn: f32,
     rl: f32, rm2: f32, ns_prev: u32, seen: u32, // seen : dernière frame (clock) où la cellule était visible
     deps_prev: vec2<u32>, key: u32, slot: u32,   // slot : indice dans la table + 1 (0 : cellule libre)
+    dmean: vec3<f32>, p2: f32,                   // moyenne de la part directe au premier sommet (mode jeu)
     freq_prev: array<u32, 18>,
 };
 
@@ -777,6 +784,7 @@ fn seed_cell(c: u32, p: vec3<f32>, n: vec3<f32>, dist: f32, j: vec2<f32>) {
         if (par.n < 1.0) { continue; }
         let ns = min(par.n, SEED_N);
         cells[c].mean = par.mean;
+        cells[c].dmean = par.dmean;
         cells[c].lmean = par.lmean;
         cells[c].n = ns;
         cells[c].m2 = select(0.0, par.m2 / (par.n - 1.0) * (ns - 1.0), par.n > 1.0);
@@ -970,6 +978,7 @@ fn clear_cell(c: u32) {
     cells[c].rm2 = 0.0;
     cells[c].ns_prev = 0u;
     cells[c].deps_prev = vec2<u32>(0u);
+    cells[c].dmean = vec3<f32>(0.0);
     for (var w = 0u; w < 18u; w++) {
         cells[c].freq_prev[w] = 0u;
         atomicStore(&acc[b + A_FREQ + w], 0u);
@@ -1032,8 +1041,10 @@ fn pending_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicAdd(&ctr[C_HARD], 1u);
         return;
     }
-    start_delta(c, M_DELTA);
+    start_delta(c, m_light());
 }
+
+fn m_light() -> u32 { return select(M_DELTA, fr.m_light, fr.m_light > 0u); }
 
 // suspects : dépendances L2 ET (géométrie, ou effet énergétique attendu > 1 %)
 @compute @workgroup_size(64)
@@ -1071,7 +1082,7 @@ fn event_mark(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicStore(&acc[b + A_SUSP], 1u);
         push_tasks(c, M_DELTA0, 1u);
     } else {
-        start_delta(c, M_DELTA);
+        start_delta(c, m_light());
     }
 }
 
@@ -1188,6 +1199,14 @@ fn delta_trace(g: u32, round: u32) {
         x = x - x_d0;
         y = y - y_d0;
     }
+    if ((fr.flags & F_DSPLIT) != 0u) {
+        let pd = (x_d0 - y_d0) / demod(gx.albedo);
+        if (any(pd != vec3<f32>(0.0))) {
+            add_f32(c * ACC + A_PD, pd.x);
+            add_f32(c * ACC + A_PD + 1u, pd.y);
+            add_f32(c * ACC + A_PD + 2u, pd.z);
+        }
+    }
     x = x / demod(gx.albedo);
     y = y / demod(gx.albedo);
     let b = c * ACC;
@@ -1268,6 +1287,9 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var var_mu = max(sxx - 2.0 * beta * sxy + beta * beta * syy, 0.0) / mm;
     if (beta > 0.0) { var_mu += beta * beta * var_hist; }
+    let cell_old_l = cell.lmean;
+    let pdm = vec3<f32>(ld_f32(b + A_PD), ld_f32(b + A_PD + 1u), ld_f32(b + A_PD + 2u)) / m;
+    cell.dmean = max(cell.dmean + pdm, vec3<f32>(0.0));
     let mu = max(xr - (yr - cell.mean) * beta, vec3<f32>(0.0));
     let mu_l = max(xl - beta * (yl - cell.lmean), 0.0);
     var s2 = max(sxx / (m - 1.0), 1e-12);
@@ -1279,6 +1301,14 @@ fn delta_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     cell.mean = mu;
     cell.lmean = mu_l;
     cell.m2 = s2 * (n_eff - 1.0);
+    // changement énorme : l'historique ne sert plus, on repart des seuls nouveaux échantillons
+    // (la cellule redevient prioritaire pour l'allocation)
+    if (fr.reset_ratio > 0.0 && abs(mu_l - cell_old_l) > fr.reset_ratio * max(cell_old_l, 1e-6)) {
+        cell.n = m;
+        cell.mean = xr;
+        cell.lmean = xl;
+        cell.m2 = sxx;
+    }
     cell.rn = 0.0;
     cell.rl = 0.0;
     cell.rm2 = 0.0;
@@ -1367,7 +1397,8 @@ fn alloc_prep() {
     let surf = atomicLoad(&ctr[C_SURF]);
     let debt = atomicLoad(&ctr[C_DEBT]) + atomicLoad(&ctr[C_DPATHS]);
     let budget = f32(surf) * fr.ppp;
-    let pay = min(debt, u32(budget * DEBT_RATE));
+    let rate = select(DEBT_RATE, fr.debt_rate, fr.debt_rate >= 0.0);
+    let pay = min(debt, u32(budget * rate));
     atomicStore(&ctr[C_DEBT], debt - pay);
     scal[1] = prior;
     scal[2] = max(budget - f32(pay) - f32(atomicLoad(&ctr[C_EXPLORE])), 0.0);
@@ -1502,6 +1533,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         add_f32(bs + A_FL2, ls * ls);
     }
     let v = (v_raw - select(vec3<f32>(0.0), d0_l, (fr.flags & F_INDIRECT) != 0u)) / demod(gx.albedo);
+    if ((fr.flags & F_DSPLIT) != 0u) {
+        let dd = d0_l / demod(gx.albedo);
+        add_fx(c * ACC + A_FD, dd.x);
+        add_fx(c * ACC + A_FD + 1u, dd.y);
+        add_fx(c * ACC + A_FD + 2u, dd.z);
+    }
     let b = c * ACC;
     if (rec_on) { commit_deps(c); }
     if (ru_cell != 0xffffffffu && all(ru_beta > vec3<f32>(0.0))) {
@@ -1567,6 +1604,10 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
             let n = cell.n + fn_;
             let dl = fl - cell.lmean;
             cell.mean += (fm - cell.mean) * (fn_ / n);
+            if ((fr.flags & F_DSPLIT) != 0u) {
+                let fdm = vec3<f32>(ld_fx(b + A_FD), ld_fx(b + A_FD + 1u), ld_fx(b + A_FD + 2u)) / fn_;
+                cell.dmean += (fdm - cell.dmean) * (fn_ / n);
+            }
             cell.m2 += fm2 + dl * dl * cell.n * fn_ / n;
             cell.lmean += dl * (fn_ / n);
             cell.n = n;
@@ -1627,6 +1668,7 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&acc[b + A_FN], 0u);
     for (var w = A_FR; w <= A_FL2; w++) { atomicStore(&acc[b + w], 0u); }
     for (var w = A_PM; w < A_SUSP; w++) { atomicStore(&acc[b + w], 0u); }
+    for (var w = A_FD; w < A_PD + 3u; w++) { atomicStore(&acc[b + w], 0u); }
     if (susp == 1u) { atomicStore(&acc[b + A_SUSP], 0u); } // 2 (en attente) persiste
 }
 

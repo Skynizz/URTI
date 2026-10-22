@@ -343,6 +343,10 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
         tau: 0.0,
         multi: false,
         sh: d,
+        m_light: 0,
+        debt_rate: -1.0,
+        reset_ratio: 0.0,
+        dn_gamma: 0.0,
     };
     let krcd = |name, ppp, resample, cell_px, reuse, demod| krcs(name, ppp, resample, cell_px, reuse, demod, false);
     let krcr = |name, ppp, resample, cell_px, reuse| krcd(name, ppp, resample, cell_px, reuse, false);
@@ -361,6 +365,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
         tau: 0.0,
         multi: false,
         sh: ShParams { downscale: down, ..d },
+        ..Default::default()
     };
     let all = [
         krc("krc 1", 1.0, false),
@@ -408,6 +413,10 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             tau: 0.0,
             multi: false,
             sh: ShParams { downscale: down, accum_frames: acc, ..d },
+            m_light: 0,
+            debt_rate: -1.0,
+            reset_ratio: 0.0,
+            dn_gamma: 0.0,
         });
     }
     for (name, cell, ppp) in [("v2m cell4 0.5", 4.0f32, 0.5f32), ("v2m cell4 1", 4.0, 1.0), ("v2m cell6 0.5", 6.0, 0.5), ("v2m cell6 0.25", 6.0, 0.25)] {
@@ -424,6 +433,10 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             tau: 0.05,
             multi: true,
             sh: d,
+            m_light: 0,
+            debt_rate: -1.0,
+            reset_ratio: 0.0,
+            dn_gamma: 0.0,
         });
     }
     for (name, cell, ppp) in [
@@ -448,6 +461,10 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             tau: 0.05,
             multi: false,
             sh: d,
+            m_light: 0,
+            debt_rate: -1.0,
+            reset_ratio: 0.0,
+            dn_gamma: 0.0,
         });
     }
     for (name, tau) in [("krc+cible 3% cell4", 0.03f32), ("krc+cible 5% cell4", 0.05), ("krc+cible 8% cell4", 0.08)] {
@@ -464,6 +481,10 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             tau,
             multi: false,
             sh: d,
+            m_light: 0,
+            debt_rate: -1.0,
+            reset_ratio: 0.0,
+            dn_gamma: 0.0,
         });
     }
     for (name, ppp, cell) in [("krc+sup cell4 1", 1.0f32, 4.0f32), ("krc+sup cell6 0.5", 0.5, 6.0), ("krc+sup cell8 0.25", 0.25, 8.0), ("krc+sup cell6 1", 1.0, 6.0)] {
@@ -480,6 +501,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
             tau: 0.0,
         multi: false,
             sh: d,
+            ..Default::default()
         });
     }
     for down in [3u32, 2] {
@@ -496,6 +518,7 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
         tau: 0.0,
         multi: false,
             sh: ShParams { downscale: down, ..d },
+            ..Default::default()
         });
     }
     v
@@ -519,10 +542,47 @@ fn game_cfgs() -> Vec<(rt::DuelCfg, bool)> {
         tau: 0.05,
         multi: false,
         sh: d,
+        m_light: 0,
+        debt_rate: -1.0,
+        reset_ratio: 0.0,
+        dn_gamma: 0.0,
     };
     let krc = |name, ppp| rt::DuelCfg { name, ppp, ..base };
     let sh = |name, down, acc| rt::DuelCfg { name, method: Method::Sharc, sh: ShParams { downscale: down, accum_frames: acc, ..d }, ..base };
+    let fix = |name, cell_px, m_light, debt_rate, reset_ratio, dn_gamma| rt::DuelCfg {
+        name,
+        ppp: 0.5,
+        cell_px,
+        m_light,
+        debt_rate,
+        reset_ratio,
+        dn_gamma,
+        ..base
+    };
+    let shg = |name, dn_gamma| rt::DuelCfg { name, dn_gamma, ..sh("", 1, 20) };
     vec![
+        // correctifs (KRC 0,5 chemin/px), un à la fois puis ensemble
+        // campagne finale : KRC jeu (32 chemins corrélés de lampe), SHaRC, bornage 1,5 et 3
+        (fix("final krc 0.5 g3", 8.0, 32, -1.0, 0.0, 3.0), true),
+        (rt::DuelCfg { ppp: 0.25, ..fix("final krc 0.25 g3", 8.0, 32, -1.0, 0.0, 3.0) }, true),
+        (fix("final krc 0.5 g1.5", 8.0, 32, -1.0, 0.0, 0.0), true),
+        (shg("final sharc 1x1 g3", 3.0), true),
+        (shg("final sharc 1x1 g1.5", 0.0), true),
+        (rt::DuelCfg { name: "final sharc acc5 g3", dn_gamma: 3.0, ..sh("", 1, 5) }, true),
+        (rt::DuelCfg { name: "final sharc acc5 g1.5", ..sh("", 1, 5) }, true),
+        (rt::DuelCfg { name: "final sharc 5x5 g3", dn_gamma: 3.0, ..sh("", 5, 20) }, true),
+        (shg("fix2 sharc g3", 3.0), true),
+        (fix("fix2 c16g3", 16.0, 0, -1.0, 0.0, 3.0), true),
+        (fix("fix2 m32g3", 8.0, 32, -1.0, 0.0, 3.0), true),
+        (fix("fix2 c16m32g3", 16.0, 32, -1.0, 0.0, 3.0), true),
+        (fix("fix2 c12m32g3", 12.0, 32, -1.0, 0.0, 3.0), true),
+        (fix("fix cell12", 12.0, 0, -1.0, 0.0, 0.0), true),
+        (fix("fix cell16", 16.0, 0, -1.0, 0.0, 0.0), true),
+        (fix("fix m32", 8.0, 32, -1.0, 0.0, 0.0), true),
+        (fix("fix sansdette", 8.0, 0, 0.0, 0.0, 0.0), true),
+        (fix("fix reset50", 8.0, 0, -1.0, 0.5, 0.0), true),
+        (fix("fix gamma3", 8.0, 0, -1.0, 0.0, 3.0), true),
+        (shg("fix sharc gamma3", 3.0), true),
         (krc("krc 0.25", 0.25), true),
         (krc("krc 0.5", 0.5), true),
         (krc("krc 1", 1.0), true),

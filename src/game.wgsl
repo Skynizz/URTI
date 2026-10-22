@@ -38,7 +38,11 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var s = 0u; s < K; s++) {
             let c = pix_cells[k * K + s];
             if (c != 0xffffffffu && cells[c].n > 0.0) {
-                ind += cells[c].mean;
+                if ((fr.flags & F_DSPLIT) != 0u) {
+                    ind += max(cells[c].mean - cells[c].dmean, vec3<f32>(0.0));
+                } else {
+                    ind += cells[c].mean;
+                }
                 w += 1.0;
             }
         }
@@ -114,7 +118,8 @@ fn dn_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // A-SVGF) : un changement d'éclairage net rejette l'ancien historique au lieu de le traîner
                 let mo = dn_moments(k);
                 let sd = sqrt(max(mo.m2 - mo.m1 * mo.m1, vec3<f32>(0.0)));
-                let hc = clamp(h.rgb, mo.m1 - DN_GAMMA * sd, mo.m1 + DN_GAMMA * sd);
+                let gam = select(DN_GAMMA, fr.dn_gamma, fr.dn_gamma > 0.0);
+                let hc = clamp(h.rgb, mo.m1 - gam * sd, mo.m1 + gam * sd);
                 out = vec4<f32>(mix(hc, cur, 1.0 / len), len);
             }
         }
@@ -178,6 +183,31 @@ fn dn_atrous2(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x;
     if (k >= fr.w * fr.h) { return; }
     dn_t1[k] = vec4<f32>(dn_atrous(k, 2, 2u), 0.0);
+}
+
+// itérations supplémentaires (débruiteur à 5 passages, comme SVGF) : pas 4 et 8, puis 16
+@compute @workgroup_size(64)
+fn dn_atrous3b(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    dn_t2[k] = vec4<f32>(dn_atrous(k, 4, 1u), 0.0);
+}
+
+@compute @workgroup_size(64)
+fn dn_atrous4(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    dn_t1[k] = vec4<f32>(dn_atrous(k, 8, 2u), 0.0);
+}
+
+@compute @workgroup_size(64)
+fn dn_atrous5(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    let g = gbuf[k];
+    var v = dn_atrous(k, 16, 1u);
+    if (g.kind == 2u) { v *= dn_demod(g.albedo); }
+    image[k] = vec4<f32>(v, f32(g.kind));
 }
 
 // dernier passage : remodulation par l'albédo, image finale
