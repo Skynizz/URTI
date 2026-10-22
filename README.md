@@ -12,9 +12,10 @@ l'erreur est 3× plus faible qu'un cache avec reset et 21× plus faible que le p
 tracing accumulé sur une séquence dynamique. Une scène statique converge vers ~0,01
 chemin/pixel/frame, et le coût d'un objet qui bouge ne croît pas avec la taille de la
 scène. Sur de vrais triangles (Cornell box, Sponza) avec ray tracing matériel, comparé au vrai
-SHaRC de NVIDIA (portage WGSL validé) : KRC gagne nettement sur les changements de lumière,
-mais perd en statique, où SHaRC obtient la même qualité pour 3 à 25× moins de temps GPU.
-Voir RESULTATS §12.
+SHaRC de NVIDIA (portage WGSL validé) : KRC v2 a 2 à 4× moins d'erreur à temps GPU égal
+sur les séquences dynamiques de Sponza (caméra fixe ou mobile) et 20× sur la Cornell box ;
+SHaRC reste meilleur en statique avec caméra mobile en haute résolution, et son coût
+minimal est plus bas. Voir RESULTATS §12–13.
 
 - Hypothèse, critique de l'idée initiale et protocole : [docs/HYPOTHESE.md](docs/HYPOTHESE.md)
 - Journal de bord : [docs/JOURNAL.md](docs/JOURNAL.md)
@@ -38,6 +39,8 @@ cargo run --release -- bias [cornell]   # luminance image / référence (biais)
 cargo run --release -- sponzacam 480    # caméra mobile (aussi cornellcam), KRC et SHaRC officiel
 cargo run --release -- sharccheck       # validation du portage SHaRC
 cargo run --release -- passes sponzacam # temps GPU par passe
+cargo run --release -- duel sponzacam   # test court KRC contre SHaRC (KRC_DUEL filtre)
+cargo run --release -- statique sponza  # convergence en scène statique
 python tools/plots.py           # graphiques SVG dans results/
 ```
 

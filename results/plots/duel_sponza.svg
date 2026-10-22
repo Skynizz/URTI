@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="system-ui, sans-serif" font-size="12">
+<rect width="760" height="400" fill="#fcfcfb"/>
+<text x="80" y="22" font-size="15" font-weight="600" fill="#0b0b0b">KRC v2 contre SHaRC : Sponza, caméra fixe</text>
+<text x="80" y="40" fill="#52514e">séquence de 120 frames, 3 graines, RTX 4070 ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux</text>
+<line x1="80" x2="590" y1="350.0" y2="350.0" stroke="#e4e3df"/>
+<text x="72" y="354.0" text-anchor="end" fill="#52514e">1e-2</text>
+<line x1="80" x2="590" y1="204.0" y2="204.0" stroke="#e4e3df"/>
+<text x="72" y="208.0" text-anchor="end" fill="#52514e">1e-1</text>
+<line x1="80" x2="590" y1="58.0" y2="58.0" stroke="#e4e3df"/>
+<text x="72" y="62.0" text-anchor="end" fill="#52514e">1e0</text>
+<line x1="80.0" x2="80.0" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="80.0" y="368" text-anchor="middle" fill="#52514e">0.1</text>
+<line x1="156.8" x2="156.8" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="156.8" y="368" text-anchor="middle" fill="#52514e">0.2</text>
+<line x1="258.2" x2="258.2" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="258.2" y="368" text-anchor="middle" fill="#52514e">0.5</text>
+<line x1="335.0" x2="335.0" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="335.0" y="368" text-anchor="middle" fill="#52514e">1</text>
+<line x1="411.8" x2="411.8" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="411.8" y="368" text-anchor="middle" fill="#52514e">2</text>
+<line x1="456.7" x2="456.7" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="456.7" y="368" text-anchor="middle" fill="#52514e">3</text>
+<line x1="513.2" x2="513.2" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="513.2" y="368" text-anchor="middle" fill="#52514e">5</text>
+<line x1="590.0" x2="590.0" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="590.0" y="368" text-anchor="middle" fill="#52514e">10</text>
+<text x="335.0" y="392" text-anchor="middle" fill="#52514e">temps GPU moyen par frame (ms)</text>
+<text transform="translate(18 204.0) rotate(-90)" text-anchor="middle" fill="#52514e">relMSE sur la séquence</text>
+<polyline points="258.2,284.7 278.4,299.1 315.7,315.1 340.4,328.2" fill="none" stroke="#2a78d6" stroke-width="2"/>
+<circle cx="258.2" cy="284.7" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="265.2" y="278.7" fill="#52514e" font-size="10">0.25 ch/px</text>
+<circle cx="278.4" cy="299.1" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="285.4" y="293.1" fill="#52514e" font-size="10">0.5 ch/px</text>
+<circle cx="315.7" cy="315.1" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="322.7" y="309.1" fill="#52514e" font-size="10">1 ch/px</text>
+<circle cx="340.4" cy="328.2" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="347.4" y="322.2" fill="#52514e" font-size="10">2 ch/px</text>
+<polyline points="212.2,196.0 218.7,168.4 244.1,210.0 276.6,221.9" fill="none" stroke="#eb6834" stroke-width="2"/>
+<circle cx="212.2" cy="196.0" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="219.2" y="190.0" fill="#52514e" font-size="10">1px/3x3</text>
+<circle cx="218.7" cy="168.4" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="225.7" y="162.4" fill="#52514e" font-size="10">1px/5x5</text>
+<circle cx="244.1" cy="210.0" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="251.1" y="204.0" fill="#52514e" font-size="10">1px/2x2</text>
+<circle cx="276.6" cy="221.9" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="283.6" y="215.9" fill="#52514e" font-size="10">1px/1x1</text>
+<polyline points="224.9,225.4 276.6,258.2" fill="none" stroke="#1baf7a" stroke-width="2"/>
+<circle cx="224.9" cy="225.4" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="231.9" y="219.4" fill="#52514e" font-size="10">1px/2x2</text>
+<circle cx="276.6" cy="258.2" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="283.6" y="252.2" fill="#52514e" font-size="10">1px/1x1</text>
+<rect x="598" y="216.9" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="612" y="225.9" fill="#0b0b0b">SHaRC NVIDIA (défaut)</text>
+<rect x="598" y="253.2" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="612" y="262.2" fill="#0b0b0b">SHaRC NVIDIA, accumulation 5</text>
+<rect x="598" y="323.2" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="612" y="332.2" fill="#0b0b0b">KRC v2</text>
+</svg>

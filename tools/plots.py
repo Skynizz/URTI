@@ -124,6 +124,7 @@ def main():
     out = os.path.join(ROOT, "plots")
     os.makedirs(out, exist_ok=True)
     pareto_plot(out)
+    duel_plot(out)
     fixed = ["pt_reset", "cache_reset", "krc_hard", "krc"]
     line_chart(os.path.join(out, "erreur_par_frame.svg"), "Erreur par frame à budget égal (1 chemin/pixel/frame)",
                "relMSE moyenne sur 5 graines, échelle log ; plus bas = mieux",
@@ -196,7 +197,7 @@ def scatter_lines(path, title, subtitle, series, xlabel, ylabel):
         y = gy(10 ** e)
         o.append(f'<line x1="{L}" x2="{L + pw}" y1="{y:.1f}" y2="{y:.1f}" stroke="{GRID}"/>')
         o.append(f'<text x="{L - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{INK2}">1e{e}</text>')
-    for v in [0.2, 0.5, 1, 2, 3, 5, 10, 20, 30]:
+    for v in [0.1, 0.2, 0.5, 1, 2, 3, 5, 10, 20, 30]:
         if xlo <= v <= xhi:
             x = gx(v)
             o.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{T}" y2="{T + ph}" stroke="{GRID}"/>')
@@ -269,6 +270,35 @@ def pareto_plot(out):
             continue
         scatter_lines(os.path.join(out, svg), "Erreur contre temps GPU : " + title,
                       "RTX 4070, ray tracing matériel ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux",
+                      series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
+
+
+
+def duel_plot(out):
+    """KRC v2 contre SHaRC officiel : erreur de la séquence contre temps GPU (results/campagne_v2)."""
+    import re
+    figs = [("sponza", "Sponza, caméra fixe"), ("sponzacam", "Sponza, caméra mobile"),
+            ("cornell", "Cornell box, caméra fixe"), ("cornellcam", "Cornell box, caméra mobile")]
+    pat = re.compile(r"^(.*?)\s+relMSE\* ([0-9.e+-]+) .*GPU moy ([0-9.]+) ms")
+    for key, title in figs:
+        rows = []
+        for f in (f"duel_{key}.txt", f"duel_{key}_reactif.txt"):
+            p = os.path.join(ROOT, "campagne_v2", f)
+            if os.path.exists(p):
+                for line in open(p, encoding="utf8"):
+                    m = pat.match(line.strip())
+                    if m:
+                        rows.append((m.group(1).strip(), float(m.group(2)), float(m.group(3))))
+        if not rows:
+            continue
+        groups = [
+            ("KRC v2", lambda n: n.startswith("v2 cell8"), lambda n: n.split()[-1] + " ch/px"),
+            ("SHaRC NVIDIA (défaut)", lambda n: n.startswith("sharc_nv 1px"), lambda n: n.split()[-1]),
+            ("SHaRC NVIDIA, accumulation 5", lambda n: n.startswith("sharc_nv acc5"), lambda n: n.split()[-1]),
+        ]
+        series = [(label, [(ms, e, lab(n)) for n, e, ms in rows if sel(n)]) for label, sel, lab in groups]
+        scatter_lines(os.path.join(out, f"duel_{key}.svg"), "KRC v2 contre SHaRC : " + title,
+                      "séquence de 120 frames, 3 graines, RTX 4070 ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux",
                       series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
 
 

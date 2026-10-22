@@ -27,8 +27,14 @@ remboursés sur les frames suivantes. Reproduire : `cargo run --release -- all`,
    et ce coût ne croît plus avec la scène au-delà des pièces réellement éclairées.
 6. **Tout le pipeline tourne sur GPU** (RTX 4070), validé contre le CPU, stable sur
    12 000 frames (§7, §8).
-7. **Contre le vrai SHaRC de NVIDIA** (portage WGSL validé, §12), l'avantage de KRC se
-   réduit aux **changements de lumière** : sur la séquence complète, 3 à 18× moins
+7. **KRC v2 bat le vrai SHaRC de NVIDIA à temps GPU égal sur les séquences dynamiques**
+   (§13) : 2 à 4× moins d'erreur sur Sponza, caméra fixe ou mobile, y compris contre un
+   SHaRC réglé pour réagir vite, et 20 à 27× moins sur la Cornell box. KRC v2 reprend à
+   SHaRC le rééchantillonnage du cache et garde ses chemins corrélés et sa qualité cible.
+   Reste en faveur de SHaRC : le statique avec caméra mobile en 1280×720 (≈2×) et un coût
+   minimal plus bas (0,9 ms contre 3 ms en 1280×720).
+   *Avant KRC v2* (§12), contre le vrai SHaRC, l'avantage de KRC se réduisait aux
+   **changements de lumière** : sur la séquence complète, 3 à 18× moins
    d'erreur, presque entièrement parce que SHaRC garde une lampe éteinte des dizaines de
    frames (7× trop clair). **En statique, caméra fixe ou mobile, SHaRC est aussi bon ou
    meilleur pour 3 à 25× moins de temps GPU.** Les « 2,7 à 2,9× moins d'erreur à temps égal »
@@ -171,8 +177,8 @@ contre 1,61e-3 à N = 8. Mémoire : 72 octets de compteurs par cellule.
 | Affirmation de départ | Verdict |
 |---|---|
 | Une scène statique converge et finit par ne plus rien coûter | ✅ ~0,01 chemin/pixel/frame (plancher d'exploration) |
-| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ❌ contre le vrai SHaRC : perd en statique (même qualité pour 3 à 25× plus de temps) ; ✅ gagne nettement sur les changements de lumière (à confirmer contre le mode réactif de SHaRC) |
-| Tient avec une caméra mobile | ✅ qualité ; ❌ coût (12,6 ms et 1,35 M cellules à 1280×720) |
+| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ✅ KRC v2 contre le vrai SHaRC : 2 à 4× moins d'erreur à temps égal sur les séquences dynamiques (Sponza), 20× sur la Cornell box ; ⚠️ statique en caméra mobile et coût minimal en faveur de SHaRC (§13) |
+| Tient avec une caméra mobile | ✅ qualité ; ⚠️ coût (KRC v2 : 3 ms minimum en 1280×720, contre 0,9 ms pour SHaRC) |
 | Le coût d'une scène dynamique suit ce qui change, pas la taille de la scène | ✅ pour les objets ; ✅ pour la lumière avec la pondération par l'énergie (le coût suit la zone réellement éclairée) |
 | Le graphe de dépendances par objets touchés suffit | ❌ faux négatifs (lampe allumée, nouvelle ombre) ; les régions traversées le battent |
 | Invalider les cellules dépendantes | ⚠️ invalider coûte cher ; **mesurer le delta par chemins corrélés et corriger** est 2 à 5× meilleur |
@@ -420,3 +426,59 @@ général : l'allocation par l'incertitude coûte plus qu'elle ne rapporte face 
 courts et peu nombreux de SHaRC. Ce qui reste solide, c'est la **mise à jour différentielle
 par chemins corrélés** face aux changements d'éclairage. Hypothèse suivante : un SHaRC
 standard pour l'état stable, et les corrections corrélées de KRC seulement aux événements.
+
+## 13. KRC v2 contre le vrai SHaRC
+
+Après §12, KRC a été affiné avec des tests courts (`krc duel`, `krc statique` ; 480×270 ou
+256², 3 graines, erreur puis temps GPU sans relecture). Changements retenus (KRC v2, défaut) :
+
+| Changement | Origine | Effet |
+|---|---|---|
+| Insertion sans CAS inutile, liste des cellules visibles, éviction par balayage | coût | 12,6 → 4,4 ms en caméra mobile 1280×720 |
+| Rééchantillonnage : arrêt au 1er/2e rebond sur une cellule (dépendances héritées) | SHaRC | −25 % d'erreur, −40 % de temps |
+| Cellules de 8 px au lieu de 4 | SHaRC (voxels plus gros) | plus de chemins par cellule |
+| A priori du niveau voisin pour une cellule neuve | SHaRC (fusion des niveaux) | léger, caméra mobile |
+| Démodulation matériau | SHaRC | léger |
+| Qualité cible sur GPU (τ = 5 %) | KRC | statique : coût en baisse une fois convergé |
+
+Essayés sans gain (options désactivées) : réutilisation des sommets, cellules de support
+hors champ, K = 2, cache à deux résolutions, enregistrement partiel des dépendances.
+
+**Séquences complètes** (relMSE*, temps GPU moyen par frame) :
+
+![Sponza, caméra mobile](../results/plots/duel_sponzacam.svg)
+
+| À temps égal | KRC v2 | SHaRC NVIDIA, défaut | SHaRC NVIDIA, accumulation 5 | Rapport |
+|---|---|---|---|---|
+| Sponza caméra fixe, ~0,6 ms | **2,2e-2** | 7,5e-2 | 4,3e-2 | 1,9 à 3,4× |
+| Sponza caméra mobile, ~0,7 ms | **2,9e-2** | 1,2e-1 | 6,7e-2 | 2,3 à 4,2× |
+| Cornell caméra fixe, ~0,3 ms | **2,6e-3** | 6,9e-2 | — | 27× |
+| Cornell caméra mobile, ~0,3 ms | **3,2e-3** | 9,0e-2 | — | 28× |
+| Sponza caméra mobile 1280×720, ~3 ms | **2,7e-2** (p95 5,0 ms) | 1,2e-1 (3,3 ms) | — | 4,4× |
+
+**Statique long** (scène fixe, caméra fixe, 300 frames, `krc statique`) :
+
+| | relMSE* f29 | f299 | ms/frame convergé |
+|---|---|---|---|
+| Sponza, SHaRC 1 px/1×1 | **9,2e-3** | **6,1e-3** | 0,59 |
+| Sponza, SHaRC 1 px/2×2 | 1,9e-2 | 1,2e-2 | 0,40 |
+| Sponza, KRC v2 (8 px) | 1,1e-2 | 9,9e-3 | **0,34** |
+| Sponza, KRC v2, cellules de 4 px | 1,1e-2 | 7,2e-3 | 0,47 |
+| Cornell, SHaRC 1 px/1×1 | 5,5e-3 | 4,6e-3 | 0,17 |
+| Cornell, KRC v2 | **2,0e-3** | **1,7e-3** | 0,17 |
+
+Lecture :
+
+- **Sur les séquences dynamiques, KRC v2 gagne à temps égal, partout**, y compris contre
+  un SHaRC réglé pour réagir vite. Le gain vient des chemins corrélés aux événements, et le
+  rééchantillonnage a supprimé l'essentiel de son retard de coût.
+- **En statique, c'est partagé.** Cornell : KRC 2,7× meilleur au même coût. Sponza :
+  KRC un peu meilleur à bas coût (0,34 ms), SHaRC meilleur à 0,6 ms (6,1e-3 contre ~7e-3).
+  En caméra mobile 1280×720, la phase statique reste en faveur de SHaRC (9,0e-3 contre
+  2,0e-2 à 3 ms).
+- **Coût minimal** : en 1280×720, KRC v2 ne descend pas sous ~3 ms (G-buffer, table,
+  résolution, affichage), SHaRC tourne dès 0,9 ms. Les pics d'événement restent (p95 5 ms
+  à 0,25 chemin/px).
+- **Non testé** : le mode « éclairage réactif » expérimental de SHaRC (non utilisé par
+  l'exemple de NVIDIA ; il faut marquer à l'avance les lumières concernées). La fenêtre
+  d'accumulation courte en tient lieu ici.

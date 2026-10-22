@@ -12,12 +12,20 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Cache, allocation, événements sur GPU | ✅ pipeline entièrement GPU, stable sur 12 000 frames |
 | Rayons matériels (cœurs RT) | ✅ ray query Vulkan, BLAS/TLAS, deux TLAS (avant/après) |
 | Géométrie réelle (triangles, BVH) | ✅ Cornell box, Sponza (262 k triangles) |
-| Comparaison en ms contre un cache standard | ⚠️ contre le vrai SHaRC (portage validé) : KRC perd en statique (3 à 25× plus cher), gagne nettement sur les changements de lumière |
+| Comparaison en ms contre un cache standard | ✅ KRC v2 contre le vrai SHaRC : 2 à 4× moins d'erreur à temps égal (Sponza), 20× (Cornell) ; ⚠️ statique en caméra mobile et coût minimal en faveur de SHaRC |
 | Absence de biais sur radiance à queue lourde | ⚠️ deux biais corrigés ; ~3 % résiduel en statique, retour lent après extinction |
-| Caméra mobile | ✅ qualité ; ❌ coût (12,6 ms, 1,35 M cellules à 1280×720) |
+| Caméra mobile | ✅ qualité ; ⚠️ coût minimal 3 ms à 1280×720 (KRC v2) |
 | Spéculaire | à faire |
 
-## Prochaine décision (après la comparaison au vrai SHaRC)
+## Prochaine décision (après KRC v2)
+
+KRC v2 bat SHaRC sur les séquences dynamiques. Pour aller plus loin :
+1. Statique en caméra mobile : la phase statique reste ≈2× en faveur de SHaRC en
+   1280×720 (ses voxels existent déjà hors champ quand une surface apparaît).
+2. Coût minimal de KRC (~3 ms en 1280×720) et pics d'événement (p95 5 ms).
+3. Démo dans un moteur (Bevy).
+
+### Ancienne décision (avant KRC v2)
 
 1. Tester le mode « éclairage réactif » de SHaRC : si KRC garde son avantage sur les lampes,
    la piste continue.

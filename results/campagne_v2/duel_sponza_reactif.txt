@@ -1,0 +1,3 @@
+sharc_nv acc5 1px/1x1        relMSE* 4.252e-2 (statique 1.30e-2, dynamique 5.49e-2) lum min 0.81 | GPU moy 0.59 ms, p95 0.64 ms
+sharc_nv acc5 1px/2x2        relMSE* 7.136e-2 (statique 3.49e-2, dynamique 8.31e-2) lum min 0.80 | GPU moy 0.37 ms, p95 0.40 ms
+sharc_nv acc10 1px/1x1       relMSE* 5.597e-2 (statique 9.41e-3, dynamique 7.59e-2) lum min 0.81 | GPU moy 0.63 ms, p95 0.80 ms

@@ -375,6 +375,23 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
         nv("sharc_nv 1px/1x1", 1),
     ];
     let mut v = all.to_vec();
+    // SHaRC réglé pour la réactivité (fenêtre d'accumulation courte, réglage exposé par l'exemple)
+    for (name, down, acc) in [("sharc_nv acc5 1px/1x1", 1u32, 5u32), ("sharc_nv acc5 1px/2x2", 2, 5), ("sharc_nv acc10 1px/1x1", 1, 10)] {
+        v.push(rt::DuelCfg {
+            name,
+            method: Method::Sharc,
+            ppp: 1.0,
+            resample: false,
+            cell_px: 4.0,
+            reuse: false,
+            demod: false,
+            seed: false,
+            support: false,
+            tau: 0.0,
+            multi: false,
+            sh: ShParams { downscale: down, accum_frames: acc, ..d },
+        });
+    }
     for (name, cell, ppp) in [("v2m cell4 0.5", 4.0f32, 0.5f32), ("v2m cell4 1", 4.0, 1.0), ("v2m cell6 0.5", 6.0, 0.5), ("v2m cell6 0.25", 6.0, 0.25)] {
         v.push(rt::DuelCfg {
             name,

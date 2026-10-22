@@ -234,3 +234,26 @@
 - **Coût de KRC en caméra mobile** : 12,6 ms par frame à 0,25 chemin/px en 1280×720, dont
   5,8 ms d'insertion dans la table (pierres tombales, 3,7 M insertions par frame) et 3,6 ms
   de résolution (toutes les cellules, visibles ou non, à chaque frame). Caméra fixe : 3,9 ms.
+
+## v12 — KRC v2 : affiner KRC pour battre le vrai SHaRC (commits 7ecba68 → …)
+
+Tests courts (`krc duel`, `krc statique` : 480×270 ou 256², 3 graines) pour décider vite.
+
+- **Coût fixe** divisé par 3 en caméra mobile (12,6 → 4,4 ms en 1280×720) : insertion sans
+  CAS inutile ni compteur partagé, liste des cellules visibles pour l'allocation et la
+  résolution, éviction par balayage.
+- **Repris de SHaRC, et utile** :
+  - rééchantillonnage du cache : un chemin ordinaire s'arrête au 1er ou 2e rebond sur une
+    cellule, en héritant de ses dépendances (les chemins corrélés restent complets) ;
+  - cellules plus grandes (8 px au lieu de 4) ;
+  - a priori d'une cellule neuve depuis le niveau voisin (caméra qui avance) ;
+  - démodulation matériau.
+- **Propre à KRC, et utile** : la qualité cible sur GPU. En statique, KRC cesse
+  d'échantillonner les cellules convergées, alors que SHaRC dépense son budget à chaque frame.
+- **Essayé, sans gain** : réutilisation des sommets, cellules de support hors champ
+  (mémoire ×3, débordement), K = 2, cache à deux résolutions, enregistrement partiel des
+  dépendances. Gardés en options désactivées.
+- **Résultat** : à temps GPU égal, KRC v2 a 2 à 4× moins d'erreur que SHaRC sur Sponza
+  (caméra fixe ou mobile), y compris contre un SHaRC réglé pour réagir vite (accumulation
+  5 frames), et 20 à 27× moins sur la Cornell box. Reste en faveur de SHaRC : le statique
+  avec caméra mobile en haute résolution (≈2×), et son coût minimal plus bas.

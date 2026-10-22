@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="system-ui, sans-serif" font-size="12">
+<rect width="760" height="400" fill="#fcfcfb"/>
+<text x="80" y="22" font-size="15" font-weight="600" fill="#0b0b0b">KRC v2 contre SHaRC : Cornell box, caméra mobile</text>
+<text x="80" y="40" fill="#52514e">séquence de 120 frames, 3 graines, RTX 4070 ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux</text>
+<line x1="80" x2="590" y1="350.0" y2="350.0" stroke="#e4e3df"/>
+<text x="72" y="354.0" text-anchor="end" fill="#52514e">1e-3</text>
+<line x1="80" x2="590" y1="204.0" y2="204.0" stroke="#e4e3df"/>
+<text x="72" y="208.0" text-anchor="end" fill="#52514e">1e-2</text>
+<line x1="80" x2="590" y1="58.0" y2="58.0" stroke="#e4e3df"/>
+<text x="72" y="62.0" text-anchor="end" fill="#52514e">1e-1</text>
+<line x1="80.0" x2="80.0" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="80.0" y="368" text-anchor="middle" fill="#52514e">0.1</text>
+<line x1="233.5" x2="233.5" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="233.5" y="368" text-anchor="middle" fill="#52514e">0.2</text>
+<line x1="436.5" x2="436.5" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="436.5" y="368" text-anchor="middle" fill="#52514e">0.5</text>
+<line x1="590.0" x2="590.0" y1="58" y2="350" stroke="#e4e3df"/>
+<text x="590.0" y="368" text-anchor="middle" fill="#52514e">1</text>
+<text x="335.0" y="392" text-anchor="middle" fill="#52514e">temps GPU moyen par frame (ms)</text>
+<text transform="translate(18 204.0) rotate(-90)" text-anchor="middle" fill="#52514e">relMSE sur la séquence</text>
+<polyline points="330.6,276.4 337.6,248.3 357.5,296.9 387.1,309.1" fill="none" stroke="#2a78d6" stroke-width="2"/>
+<circle cx="330.6" cy="276.4" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="337.6" y="270.4" fill="#52514e" font-size="10">0.5 ch/px</text>
+<circle cx="337.6" cy="248.3" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="344.6" y="242.3" fill="#52514e" font-size="10">0.25 ch/px</text>
+<circle cx="357.5" cy="296.9" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="364.5" y="290.9" fill="#52514e" font-size="10">1 ch/px</text>
+<circle cx="387.1" cy="309.1" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="394.1" y="303.1" fill="#52514e" font-size="10">2 ch/px</text>
+<polyline points="120.4,58.1 254.6,64.7 254.6,64.4 273.9,66.2" fill="none" stroke="#eb6834" stroke-width="2"/>
+<circle cx="120.4" cy="58.1" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="127.4" y="52.1" fill="#52514e" font-size="10">1px/5x5</text>
+<circle cx="254.6" cy="64.7" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="261.6" y="58.7" fill="#52514e" font-size="10">1px/3x3</text>
+<circle cx="254.6" cy="64.4" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="261.6" y="58.4" fill="#52514e" font-size="10">1px/1x1</text>
+<circle cx="273.9" cy="66.2" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="280.9" y="60.2" fill="#52514e" font-size="10">1px/2x2</text>
+<rect x="598" y="61.2" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="612" y="70.2" fill="#0b0b0b">SHaRC NVIDIA (défaut)</text>
+<rect x="598" y="304.1" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="612" y="313.1" fill="#0b0b0b">KRC v2</text>
+</svg>

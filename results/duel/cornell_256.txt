@@ -1,0 +1,9 @@
+sharc_nv 1px/5x5             relMSE* 8.004e-2 (statique 1.01e-2, dynamique 1.07e-1) lum min 0.63 | GPU moy 0.12 ms, p95 0.17 ms
+sharc_nv 1px/1x1             relMSE* 6.944e-2 (statique 5.12e-3, dynamique 1.00e-1) lum min 0.63 | GPU moy 0.27 ms, p95 0.28 ms
+v2 cell8 0.25                relMSE* 5.589e-3 (statique 2.46e-3, dynamique 5.80e-3) lum min 0.96 | GPU moy 0.37 ms, p95 0.97 ms
+v2 cell8 2                   relMSE* 2.233e-3 (statique 2.20e-3, dynamique 2.14e-3) lum min 0.98 | GPU moy 0.39 ms, p95 1.17 ms
+v2 cell4 1                   relMSE* 4.757e-3 (statique 2.08e-3, dynamique 4.87e-3) lum min 0.97 | GPU moy 0.54 ms, p95 1.55 ms
+v2 cell8 0.5                 relMSE* 3.514e-3 (statique 2.12e-3, dynamique 3.57e-3) lum min 0.97 | GPU moy 0.29 ms, p95 0.70 ms
+v2 cell8 1                   relMSE* 2.564e-3 (statique 2.05e-3, dynamique 2.56e-3) lum min 0.97 | GPU moy 0.32 ms, p95 0.89 ms
+sharc_nv 1px/3x3             relMSE* 7.061e-2 (statique 5.52e-3, dynamique 1.00e-1) lum min 0.63 | GPU moy 0.10 ms, p95 0.10 ms
+sharc_nv 1px/2x2             relMSE* 6.799e-2 (statique 4.19e-3, dynamique 9.83e-2) lum min 0.63 | GPU moy 0.11 ms, p95 0.11 ms
