@@ -27,14 +27,21 @@ remboursés sur les frames suivantes. Reproduire : `cargo run --release -- all`,
    et ce coût ne croît plus avec la scène au-delà des pièces réellement éclairées.
 6. **Tout le pipeline tourne sur GPU** (RTX 4070), validé contre le CPU, stable sur
    12 000 frames (§7, §8).
-7. **Sur de vrais triangles avec ray tracing matériel** (Cornell box), à temps GPU égal,
-   KRC a **2,4 à 2,9× moins d'erreur** que le cache SHaRC-like, et à erreur égale il est
-   ~2× plus rapide. Contrepartie : des pics de 12 à 16 ms les frames d'événement (§9).
-8. **Échecs documentés** : le z-test de vérification (sous-puissant), les dépendances
+7. **Sur de vrais triangles avec ray tracing matériel**, à temps GPU moyen égal, KRC a
+   **2,7× (Cornell box) à 2,9× (Sponza) moins d'erreur** que le cache SHaRC-like ; à
+   erreur égale il est 1,7× (Cornell) à 3,6× (Sponza) plus rapide. Contrepartie : des
+   pics les frames d'événement (p95 9,6 à 13 ms contre un coût plat pour SHaRC) (§9, §10).
+8. **Sponza a révélé deux biais vers le sombre** que la relMSE récompensait (§11) :
+   l'allocation de Neyman dilue les valeurs rares d'une radiance à queue lourde, et les
+   cellules « sans différence mesurée » à l'allumage d'une petite lampe gardaient leur
+   historique. Corrigés ; il reste ~3 % de biais statique et un retour plus lent après
+   l'extinction de la lampe principale (0,79 → 0,91 en 20 frames, contre 2,45 → 1,56
+   pour SHaRC).
+9. **Échecs documentés** : le z-test de vérification (sous-puissant), les dépendances
    « objets touchés » de l'idée initiale (faux négatifs à l'allumage d'une lampe), le
    graphe binaire face à la lumière (il sature au fil des portes), deux tentatives de
-   pondération (sketch haché, fréquences de traversée), et l'amortissement simple des
-   événements de lampe.
+   pondération (sketch haché, fréquences de traversée), l'amortissement simple des
+   événements de lampe, et la part défensive uniforme contre le biais d'allocation.
 
 ## 1. Séquence principale (2 pièces, 120 frames)
 
@@ -159,11 +166,11 @@ contre 1,61e-3 à N = 8. Mémoire : 72 octets de compteurs par cellule.
 | Affirmation de départ | Verdict |
 |---|---|
 | Une scène statique converge et finit par ne plus rien coûter | ✅ ~0,01 chemin/pixel/frame (plancher d'exploration) |
-| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ✅ 2,4–2,9× moins d'erreur à temps moyen égal ; ⚠️ pics de 12–16 ms les frames d'événement |
+| Gagne contre un cache temps réel standard, en ms, sur de vrais triangles | ✅ Cornell et Sponza : 2,7–2,9× moins d'erreur à temps moyen égal ; ⚠️ pics les frames d'événement (p95 9,6–13 ms) |
 | Le coût d'une scène dynamique suit ce qui change, pas la taille de la scène | ✅ pour les objets ; ✅ pour la lumière avec la pondération par l'énergie (le coût suit la zone réellement éclairée) |
 | Le graphe de dépendances par objets touchés suffit | ❌ faux négatifs (lampe allumée, nouvelle ombre) ; les régions traversées le battent |
 | Invalider les cellules dépendantes | ⚠️ invalider coûte cher ; **mesurer le delta par chemins corrélés et corriger** est 2 à 5× meilleur |
-| Allouer les rayons vers l'incertitude | ✅ Neyman + a priori bayésien ; l'a priori doit avoir un plancher (bug de famine trouvé) |
+| Allouer les rayons vers l'incertitude | ✅ Neyman + a priori bayésien ; l'a priori doit avoir un plancher (bug de famine trouvé) ; ⚠️ avec une radiance à queue lourde, la variance doit être plafonnée, sinon biais vers le sombre (§11) |
 
 ## 5. Limites du prototype
 
@@ -227,25 +234,108 @@ l'événement, puis relit l'image pour l'évaluation seulement, hors chronométr
 ## 9. Triangles et ray tracing matériel : comparaison en ms contre SHaRC
 
 Cornell box en triangles, ray query Vulkan sur la RTX 4070, même séquence de 120 frames.
+Chiffres après les correctifs de biais du §11. relMSE* : sans le 0,1 % de pixels les plus
+fautifs ; « lum » : luminance totale image / référence (1 = pas de biais).
 
-| 256×256, 5 graines | Séquence | Statique | Boîte | Lampe allumée | Lampe éteinte |
+| 256×256, 5 graines, relMSE* | Séquence | Statique | Boîte | Lampe allumée | Lampe éteinte |
 |---|---|---|---|---|---|
-| `tri_sharc` | 3,91e-2 | 2,02e-3 | 8,80e-3 | 3,86e-2 | 1,66e-1 |
-| **`tri_krc`** | **5,03e-3** | **1,38e-3** | **2,48e-3** | **8,75e-3** | **7,01e-3** |
+| `tri_sharc` | 3,80e-2 | 1,95e-3 | 7,28e-3 | 3,83e-2 (lum 0,79) | 1,63e-1 (lum 1,59) |
+| **`tri_krc`** | **5,20e-3** | **1,43e-3** | **3,19e-3** | **9,21e-3** (lum 0,98) | **6,16e-3** (lum 0,99) |
 
 ![Erreur contre temps GPU](../results/plots/pareto_cornell.svg)
 
-| 1024×1024 | Budget | relMSE | GPU moyen | GPU médian | p95 |
+| 1024×1024 | Budget | relMSE* | GPU moyen | GPU médian | p95 |
 |---|---|---|---|---|---|
-| SHaRC | 4 chemins/px | 1,35e-2 | 5,8 ms | 5,8 ms | 6,4 ms |
-| SHaRC | 8 chemins/px | 6,7e-3 | 9,1 ms | 9,0 ms | 9,7 ms |
-| **KRC** | 1 chemin/px | **4,7e-3** | **5,2 ms** | 4,2 ms | 13,1 ms |
-| **KRC** | 2 chemins/px | **2,8e-3** | 6,3 ms | 5,4 ms | 13,7 ms |
+| SHaRC | 4 chemins/px | 1,30e-2 | 5,9 ms | 5,8 ms | 6,6 ms |
+| SHaRC | 8 chemins/px | 6,4e-3 | 9,1 ms | 9,1 ms | 9,3 ms |
+| **KRC** | 1 chemin/px | **4,9e-3** | **5,2 ms** | 4,2 ms | 13,1 ms |
+| **KRC** | 2 chemins/px | **2,7e-3** | 6,3 ms | 5,4 ms | 13,5 ms |
 
-- **À temps moyen égal, KRC a 2,4 à 2,9× moins d'erreur ; à erreur égale, il est ~2×
+- **À temps moyen égal, KRC a ~2,7× moins d'erreur ; à erreur égale, il est ~1,7×
   plus rapide.**
 - **Mais le temps de KRC n'est pas constant.** Les frames d'événement coûtent 12 ms (pas
   de boîte) à 16 ms (lampe), parce que dans une seule pièce tout change vraiment et que
   chaque cellule reçoit ses chemins corrélés dans la frame. SHaRC a un coût plat.
 - Amortir les événements de lampe sur plusieurs frames divise bien le pic par deux, mais
   l'erreur augmente de 2,5× (cellules périmées affichées) : résultat négatif.
+
+## 10. Sponza : scène réelle, comparaison en ms contre SHaRC
+
+Sponza (Crytek, 262 k triangles), 4 lampes, une boîte de 1,4 m qui se déplace, même
+séquence de 120 frames : statique, la boîte avance (frames 40–63), la petite lampe chaude de
+la galerie s'allume (80), la grande lampe au-dessus de l'atrium s'éteint (100). Références
+à 16 384 spp. La relMSE brute est inutilisable ici (dominée par quelques lucioles,
+~70 % d'écart entre graines) : on donne la relMSE* sans le 0,1 % de pixels les plus fautifs,
+et le rapport de luminance.
+
+| 480×270, 5 graines, relMSE* | Séquence | Statique | Boîte | Lampe allumée | Lampe éteinte |
+|---|---|---|---|---|---|
+| `tri_sharc` | 9,03e-2 (lum 1,15) | 1,75e-2 | 1,79e-2 | **3,67e-2** (lum 0,92) | 4,02e-1 (lum 1,94) |
+| **`tri_krc`** | **2,47e-2** ± 6e-4 (lum 0,96) | **1,31e-2** | **1,29e-2** | 3,91e-2 (lum 0,94) | **3,08e-2** (lum 0,86) |
+
+![Erreur contre temps GPU, Sponza](../results/plots/pareto_sponza.svg)
+
+| 1280×720 | Budget | relMSE* | GPU moyen | GPU médian | p95 |
+|---|---|---|---|---|---|
+| SHaRC | 1 chemin/px | 8,1e-2 | 4,4 ms | 4,4 ms | 4,5 ms |
+| SHaRC | 2 chemins/px | 5,5e-2 | 6,5 ms | 6,5 ms | 6,6 ms |
+| SHaRC | 8 chemins/px | 2,6e-2 | 19,6 ms | 19,7 ms | 19,8 ms |
+| **KRC** | 0,5 chemin/px | **3,3e-2** | **4,2 ms** | 3,4 ms | 8,9 ms |
+| **KRC** | 1 chemin/px | **2,3e-2** | 5,4 ms | 5,1 ms | 9,6 ms |
+| **KRC** | 2 chemins/px | **1,7e-2** | 7,7 ms | 7,4 ms | 10,8 ms |
+
+- **À temps moyen égal, KRC a 2,7 à 2,9× moins d'erreur ; pour atteindre l'erreur de KRC
+  à 1 chemin/px (5,4 ms), SHaRC a besoin de 8 chemins/px et 19,6 ms (3,6×).**
+- Le gain vient surtout des changements : l'extinction de la lampe principale (13× moins
+  d'erreur) et la boîte. En statique, l'écart n'est que de 1,3× ; à l'allumage de la petite
+  lampe, SHaRC fait un peu mieux (3,67e-2 contre 3,91e-2) : sa lumière n'atteint la plupart des
+  cellules que par plusieurs rebonds, et 8 chemins corrélés la voient rarement (§11).
+- Les pics restent : p95 de 9,6 ms à 1 chemin/px, contre un coût plat pour SHaRC.
+- L'amortissement des événements de lampe reste négatif (1 chemin/px : 2,65e-2, p95 9,0 ms).
+
+## 11. Biais vers le sombre : diagnostic et correctifs
+
+En regardant les images de Sponza (et non seulement la relMSE), l'image KRC était 2×
+trop sombre 20 frames après l'extinction de la grande lampe. Indicateur : luminance totale
+image / référence sur les pixels de surface (`krc bias`, `results/biais/`).
+
+**Cause 1 : l'allocation dilue les valeurs rares.** Avec une radiance à queue lourde (petite
+lampe vive, indirect), une cellule qui tire une valeur rare voit sa variance exploser et est
+aussitôt sur-échantillonnée : la valeur rare est diluée dans un n qui grandit *parce
+qu'elle a été vue*. En moyenne, les valeurs rares sont sous-pondérées. Ce n'est pas de la
+famine : une part défensive uniforme n'y change presque rien.
+
+| Sponza statique (état final), cache vide, lum à la frame | f4 | f59 | f199 |
+|---|---|---|---|
+| KRC avant | 0,68 | 0,81 | 0,84 |
+| KRC, 50 % du budget uniforme | 0,74 | 0,86 | — |
+| KRC, 100 % uniforme (sans Neyman) | 0,98 | 0,99 | — |
+| **KRC, variance d'allocation plafonnée à la médiane** | **0,93** | **0,96** | **0,96** |
+| SHaRC | 1,00 | 1,00 | 1,03 |
+
+**Cause 2 : les cellules « sans différence » à l'allumage d'une petite lampe.** 81 % des
+suspects n'avaient vu la lampe sur aucun de leurs 8 chemins corrélés et étaient déclarés
+inchangés, avec jusqu'à 1 024 échantillons d'historique sans la lampe. Correctifs : ces
+cellules gardent leur estimation avec un poids plafonné, le poids max d'une correction
+passe de 64 à 16, et la variance après correction est au moins celle de l'historique (elle
+a vu la queue lourde, pas les 8 chemins).
+
+| Sponza, séquence, lum | f79 statique | f99 (19 après l'allumage) | f101 (1 après l'extinction) | f119 |
+|---|---|---|---|---|
+| KRC avant | 0,97 | 0,87 | 0,64 | 0,66 |
+| + variance plafonnée | 1,00 | 0,90 | 0,68 | 0,80 |
+| + cellules sans différence plafonnées | 0,99 | 0,94 | 0,71 | 0,78 |
+| **+ poids 16, variance d'historique (retenu)** | **0,99** | **0,96** | **0,79** | **0,91** |
+| SHaRC | 1,01 | 0,96 | 2,45 | 1,56 |
+
+- La Cornell box, à grosses lampes, n'était presque pas touchée (0,97 au pire avant,
+  0,97–0,99 après).
+- Prix : relMSE* de Sponza 1,85e-2 → 2,47e-2 (l'ancienne valeur profitait du biais),
+  Cornell +8 %, scène de boîtes +13 % (`gpu_krc` 4,14e-3 → 4,67e-3, toujours 10× mieux
+  que `gpu_sharc`, `results/gpu_pipeline`).
+- **Reste** : ~3–4 % de biais statique dans Sponza, et un retour lent après l'extinction de
+  la lampe principale. Pistes : variance d'allocation robuste (luminance écrêtée pour
+  l'allocation seulement), échantillonnage explicite des lampes changées dans les chemins
+  corrélés.
+- Leçon de méthode : **toute évaluation doit regarder un indicateur de biais**, pas
+  seulement une erreur quadratique relative ; elle peut préférer une image fausse.

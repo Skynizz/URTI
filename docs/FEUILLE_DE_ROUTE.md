@@ -11,8 +11,9 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Traçage des chemins sur GPU | ✅ validé (identique au CPU statistiquement) |
 | Cache, allocation, événements sur GPU | ✅ pipeline entièrement GPU, stable sur 12 000 frames |
 | Rayons matériels (cœurs RT) | ✅ ray query Vulkan, BLAS/TLAS, deux TLAS (avant/après) |
-| Géométrie réelle (triangles, BVH) | ✅ Cornell box ; Sponza à faire |
-| Comparaison en ms contre un cache standard | ✅ 2,4–2,9× moins d'erreur à temps égal ; pics d'événement à résoudre |
+| Géométrie réelle (triangles, BVH) | ✅ Cornell box, Sponza (262 k triangles) |
+| Comparaison en ms contre un cache standard | ✅ 2,7–2,9× moins d'erreur à temps égal (Cornell, Sponza) ; pics d'événement à résoudre |
+| Absence de biais sur radiance à queue lourde | ⚠️ deux biais corrigés ; ~3 % résiduel en statique, retour lent après extinction |
 | Caméra mobile, spéculaire | à faire |
 
 ## Étapes, dans l'ordre
@@ -45,5 +46,8 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 - **Coût d'un événement de lumière** : même pondéré par l'énergie, allumer une lampe forte
   reste un vrai changement global. Il faudra l'étaler sur plusieurs frames (budget plafonné,
   cellules les plus visibles d'abord).
+- **Radiance à queue lourde** (petites lampes vives, indirect) : l'allocation adaptative et
+  les chemins corrélés y sont biaisés vers le sombre (RESULTATS §11). Il faudra une variance
+  d'allocation robuste et un échantillonnage explicite des lampes changées.
 - **Scènes très dynamiques** (feuillage, foule) : beaucoup de petits changements simultanés ;
   il faudra mesurer quand le delta corrélé cesse d'être rentable face à l'hystérésis simple.

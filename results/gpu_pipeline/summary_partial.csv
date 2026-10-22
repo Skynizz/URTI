@@ -1,0 +1,13 @@
+method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame
+gpu_krc,tout,4.665393e-3,8.846379e-5,1.180259e-2,10534.4
+gpu_krc,statique,1.511284e-3,1.924988e-5,5.614371e-3,10426.1
+gpu_krc,boite,2.046266e-3,2.671062e-5,6.723077e-3,10608.4
+gpu_krc,apres_boite,1.609430e-3,7.984511e-5,5.786068e-3,10419.1
+gpu_krc,lampe_on,1.049151e-2,3.713320e-4,2.444506e-2,10580.5
+gpu_krc,lampe_off,4.751013e-3,2.668690e-4,1.662076e-2,10577.3
+gpu_sharc,tout,4.600634e-2,1.053029e-4,2.668513e-2,10597.1
+gpu_sharc,statique,2.238929e-3,5.251558e-5,6.778603e-3,10580.0
+gpu_sharc,boite,4.418660e-3,1.023488e-4,8.948834e-3,10580.0
+gpu_sharc,apres_boite,3.391098e-3,7.699790e-5,7.813592e-3,10580.0
+gpu_sharc,lampe_on,5.045903e-2,4.028362e-4,7.349110e-2,10631.2
+gpu_sharc,lampe_off,2.059652e-1,2.916874e-4,5.028859e-2,10631.2

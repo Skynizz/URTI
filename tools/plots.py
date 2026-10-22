@@ -228,9 +228,21 @@ def pareto_plot(out):
         return
     rows = read_csv(p)
     names = ["tri_sharc", "tri_krc"]
-    series = [(n, [(float(r["ms_mean"]), float(r["relmse"]), r["ppp"] + " ch/px") for r in rows if r["method"] == n]) for n in names]
+    col = "trim" if "trim" in rows[0] else "relmse"
+    series = [(n, [(float(r["ms_mean"]), float(r[col]), r["ppp"] + " ch/px") for r in rows if r["method"] == n]) for n in names]
     scatter_lines(os.path.join(out, "pareto_cornell.svg"), "Erreur contre temps GPU : Cornell box en triangles, 1024×1024",
-                  "ray tracing matériel (RTX 4070) ; budget variable en chemins par pixel ; en bas à gauche = mieux",
+                  "ray tracing matériel (RTX 4070) ; " + ("relMSE sans le 0,1 % de pixels les plus fautifs ; " if col == "trim" else "")
+                  + "en bas à gauche = mieux",
+                  series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
+    p = os.path.join(ROOT, "sponza_1280x720", "pareto.csv")
+    if not os.path.exists(p):
+        return
+    rows = read_csv(p)
+    if "trim" not in rows[0]:
+        return
+    series = [(n, [(float(r["ms_mean"]), float(r["trim"]), r["ppp"] + " ch/px") for r in rows if r["method"] == n]) for n in names]
+    scatter_lines(os.path.join(out, "pareto_sponza.svg"), "Erreur contre temps GPU : Sponza, 1280×720",
+                  "ray tracing matériel (RTX 4070) ; relMSE sans le 0,1 % de pixels les plus fautifs ; en bas à gauche = mieux",
                   series, "temps GPU moyen par frame (ms)", "relMSE sur la séquence")
 
 

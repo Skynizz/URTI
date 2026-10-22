@@ -1,0 +1,10 @@
+(a) krc_avant     statique, état final : f0 0.999 f4 0.979 f9 0.985 f19 0.989 f39 0.993 f59 0.996 f99 0.997 f199 0.997
+(a) +plafond_var  statique, état final : f0 1.000 f4 0.989 f9 0.991 f19 0.994 f39 0.996 f59 0.997 f99 0.998 f199 0.998
+(a) +zero_cap     statique, état final : f0 1.000 f4 0.987 f9 0.991 f19 0.994 f39 0.996 f59 0.997 f99 0.998 f199 0.998
+(a) krc           statique, état final : f0 1.000 f4 0.988 f9 0.991 f19 0.994 f39 0.996 f59 0.997 f99 0.998 f199 0.998
+(a) sharc         statique, état final : f0 1.000 f4 1.004 f9 1.004 f19 1.002 f39 1.001 f59 1.000 f99 1.001 f199 1.000
+(b) krc_avant     séquence : f39 0.993 f63 0.982 f79 0.985 f80 0.966 [susp 22908 zéro 168] f81 0.966 f85 0.966 f99 0.974 f100 0.986 [susp 22908 zéro 287] f101 0.985 f105 0.990 f119 0.993 | relMSE* 4.806e-3
+(b) +plafond_var  séquence : f39 0.998 f63 0.984 f79 0.988 f80 0.967 [susp 22912 zéro 143] f81 0.968 f85 0.971 f99 0.978 f100 0.986 [susp 22912 zéro 294] f101 0.990 f105 0.998 f119 1.003 | relMSE* 5.089e-3
+(b) +zero_cap     séquence : f39 0.997 f63 0.984 f79 0.988 f80 0.970 [susp 22911 zéro 174] f81 0.969 f85 0.971 f99 0.978 f100 0.986 [susp 22911 zéro 290] f101 0.990 f105 0.998 f119 1.001 | relMSE* 5.139e-3
+(b) krc           séquence : f39 0.997 f63 0.983 f79 0.988 f80 0.966 [susp 22907 zéro 152] f81 0.968 f85 0.975 f99 0.985 f100 0.981 [susp 22908 zéro 283] f101 0.982 f105 0.985 f119 0.992 | relMSE* 5.170e-3
+(b) sharc         séquence : f39 1.000 f63 0.991 f79 0.997 f80 0.652 [susp 0 zéro 0] f81 0.676 f85 0.749 f99 0.873 f100 2.195 [susp 0 zéro 0] f101 2.071 f105 1.725 f119 1.297 | relMSE* 3.801e-2

@@ -1,0 +1,11 @@
+pass,mean_ms,frames
+reset_ctr,0.0027,120
+gbuffer,0.0222,120
+insert,0.0084,120
+lookup,0.0128,120
+prep_cells,0.0031,120
+sharc_emit,0.0052,120
+prep_reg,0.0031,120
+trace,0.0909,120
+resolve,0.0388,120
+display,0.0080,120

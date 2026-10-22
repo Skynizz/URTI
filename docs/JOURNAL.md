@@ -177,3 +177,35 @@
   monte de 4,7e-3 à 1,19e-2 : des cellules très fausses restent affichées pendant
   2 frames. Le p95 reste de toute façon fixé par les pas de la boîte. Option conservée,
   désactivée.
+
+## v10 — Sponza, et deux biais que la relMSE cachait (commits c2293d4 → …)
+
+- **Sponza** (glTF Crytek, 262 k triangles, échelle 0,008) : 4 lampes (une grande au-dessus
+  de l'atrium, une petite lampe chaude dans la galerie, deux de chaque côté), une boîte
+  de 1,4 m qui se déplace, même séquence de 120 frames. Références à 16 384 spp sur GPU
+  (les petites lampes près des murs donnent des lucioles à 4 096 spp).
+- **Métrique** : la relMSE brute de Sponza est dominée par quelques lucioles (une frame
+  à 117 suffit à décider de la moyenne, écart-type entre graines ~70 %). Ajout de la
+  relMSE sans le 0,1 % de pixels les plus fautifs (pratique du path guiding) : écart-type
+  entre graines ~2 %, monotone avec le budget.
+- **Biais trouvé en regardant les images** : 20 frames après l'extinction de la grande
+  lampe, l'image KRC était 2× trop sombre et ne récupérait pas. La relMSE le récompensait
+  (avec y² + 0,01 au dénominateur, une scène sombre favorise une image trop sombre).
+  Nouvel indicateur : luminance totale image / référence. Commande `krc bias`.
+  1. **Allocation** : depuis un cache vide, KRC statique tombe à 0,68 en 4 frames
+     (SHaRC 1,00 ; KRC 100 % uniforme 0,98). Une cellule qui tire une valeur rare (queue
+     lourde : petite lampe vive, indirect) voit sa variance exploser, est aussitôt
+     sur-échantillonnée, et la valeur rare est diluée dans un n qui grandit *parce qu'elle
+     a été vue*. Une part défensive uniforme n'y fait presque rien (50 % : 0,74).
+     Correctif : variance relative d'allocation plafonnée à la médiane → 0,93 à f4,
+     0,96–0,97 ensuite.
+  2. **Événements de lampe** : à l'allumage de la petite lampe, 81 % des suspects n'ont
+     vu aucune différence sur leurs 8 chemins corrélés et gardaient 1 024 échantillons sans
+     la lampe. La sortie anticipée est exacte pour les chemins, pas pour l'espérance de la
+     cellule. Correctif : ces cellules gardent leur estimation avec un poids plafonné ;
+     poids max d'une correction 16 (au lieu de 64) ; variance après correction au moins
+     celle de l'historique.
+- Prix des correctifs : relMSE* Sponza 1,85e-2 → 2,47e-2 (l'ancienne valeur profitait du
+  biais), Cornell +8 %, scène de boîtes +13 % (4,14e-3 → 4,67e-3).
+- **Résultat Sponza 1280×720** : à temps moyen égal, KRC a 2,7 à 2,9× moins d'erreur que
+  SHaRC ; à erreur égale, il est 3,6× plus rapide. Pics : p95 9,6 ms contre 4,5 ms.
