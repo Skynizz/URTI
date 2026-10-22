@@ -7,3 +7,11 @@ sharc 1px/1x1                  relMSE* 3.219e-2 (statique 3.79e-3, dynamique 4.6
 sharc acc5 1px/1x1             relMSE* 2.787e-2 (statique 3.18e-3, dynamique 4.01e-2) | scintillement 0.003 | lum f101 1.82 f103 1.69 f105 1.59 f110 1.42 | GPU moy 0.36 ms, p95 0.58 ms
 krc 0.5 (brut)                 relMSE* 2.228e-2 (statique 1.32e-2, dynamique 2.61e-2) | scintillement 0.104 | lum f101 0.99 f103 0.99 f105 0.99 f110 1.00 | GPU moy 0.28 ms, p95 0.64 ms
 sharc 1px/1x1 (brut)           relMSE* 1.585e-1 (statique 1.27e-1, dynamique 1.75e-1) | scintillement 0.449 | lum f101 1.50 f103 1.47 f105 1.45 f110 1.39 | GPU moy 0.31 ms, p95 0.32 ms
+final krc 0.5 g3               relMSE* 8.700e-3 (statique 9.86e-4, dynamique 1.24e-2) | scintillement 0.000 | lum f101 1.17 f103 1.14 f105 1.12 f110 1.09 | GPU moy 0.76 ms, p95 1.90 ms
+final krc 0.25 g3              relMSE* 1.054e-2 (statique 1.05e-3, dynamique 1.49e-2) | scintillement 0.000 | lum f101 1.24 f103 1.20 f105 1.18 f110 1.14 | GPU moy 0.50 ms, p95 0.97 ms
+final krc 0.5 g1.5             relMSE* 5.307e-3 (statique 9.48e-4, dynamique 7.34e-3) | scintillement 0.001 | lum f101 1.10 f103 1.07 f105 1.06 f110 1.04 | GPU moy 0.48 ms, p95 0.97 ms
+final sharc 1x1 g3             relMSE* 4.860e-2 (statique 2.20e-3, dynamique 7.17e-2) | scintillement 0.002 | lum f101 1.87 f103 1.80 f105 1.75 f110 1.66 | GPU moy 0.37 ms, p95 0.38 ms
+final sharc 1x1 g1.5           relMSE* 3.220e-2 (statique 3.80e-3, dynamique 4.64e-2) | scintillement 0.002 | lum f101 1.71 f103 1.61 f105 1.56 f110 1.48 | GPU moy 0.45 ms, p95 0.50 ms
+final sharc acc5 g3            relMSE* 4.335e-2 (statique 1.80e-3, dynamique 6.39e-2) | scintillement 0.002 | lum f101 1.97 f103 1.88 f105 1.80 f110 1.61 | GPU moy 0.38 ms, p95 0.38 ms
+final sharc acc5 g1.5          relMSE* 2.788e-2 (statique 3.18e-3, dynamique 4.01e-2) | scintillement 0.003 | lum f101 1.82 f103 1.69 f105 1.59 f110 1.42 | GPU moy 0.46 ms, p95 0.51 ms
+final sharc 5x5 g3             relMSE* 4.842e-2 (statique 2.16e-3, dynamique 7.15e-2) | scintillement 0.002 | lum f101 1.86 f103 1.79 f105 1.74 f110 1.65 | GPU moy 0.41 ms, p95 0.42 ms

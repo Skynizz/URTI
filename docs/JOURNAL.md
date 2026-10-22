@@ -273,3 +273,21 @@ Tests courts (`krc duel`, `krc statique` : 480×270 ou 256², 3 graines) pour d�
 - **À l'œil**, après l'extinction de la grande lampe de Sponza : SHaRC trop clair mais
   propre ; KRC plus juste en moyenne mais **taché** (chaque cellule corrigée par 8 chemins
   corrélés garde son propre bruit) et un peu trop sombre. C'est le prochain défaut à régler.
+
+## v14 — corriger les défauts du test « comme en jeu »
+
+- **Cause des taches trouvée** : en mode « indirect seulement », un chemin qui relisait une
+  cellule au rebond suivant recalculait l'éclairage direct de ce sommet avec un seul tirage
+  (la queue lourde des petites lampes). Correctif : les cellules gardent la radiance totale
+  (relue comme le fait SHaRC) et la moyenne de leur part directe ; image finale = direct par
+  pixel + (total − direct moyen). Lors d'un événement, la part directe est corrigée par les
+  mêmes chemins corrélés.
+- 32 chemins corrélés par cellule pour un événement de lampe (au lieu de 8).
+- Testés sans gain net : cellules 12 et 16 px, pas de remboursement des événements, remise
+  à zéro sur grand changement, débruiteur à 5 passages (floute trop sans arrêt sur la
+  luminance).
+- Bornage de l'historique du débruiteur : 3 écarts-types aide KRC sur Sponza mais le rend
+  plus lent sur la Cornell box ; comparaisons faites aux deux réglages, pour les deux
+  méthodes.
+- Résultat : taches nettement réduites mais pas disparues ; dérive sombre après l'extinction
+  0,74–0,81 (réglage du débruiteur) ; statique Sponza toujours légèrement en faveur de SHaRC.

@@ -532,3 +532,32 @@ Lecture :
   propre. Un joueur verrait les taches.
 - Limites du test : débruiteur simple (pas NRD), 480×270 et 256², scintillement mesuré
   seulement caméra fixe (KRC 0,004 contre 0,005–0,007 pour SHaRC sur Sponza).
+
+## 15. Pipeline de jeu après correctifs
+
+Correctifs (JOURNAL v14) : cellules « total + part directe » au lieu de « indirect
+seulement » (le direct recalculé au sommet relu ajoutait un bruit inutile), 32 chemins
+corrélés par cellule pour une lampe. Même débruiteur pour les deux méthodes, à deux
+réglages du bornage de l'historique (1,5 et 3 écarts-types). 3 graines, `results/jeu_final`.
+
+| Image finale, relMSE* séquence (statique) | KRC 0,5 ch/px | SHaRC 1×1 | SHaRC accumulation 5, 1×1 | Rapport séquence |
+|---|---|---|---|---|
+| Sponza fixe, bornage 1,5 | **1,59e-2** (1,42e-2) · 0,88 ms | 3,46e-2 (1,36e-2) · 0,90 ms | 2,76e-2 (**1,25e-2**) · 0,89 ms | 1,7× |
+| Sponza fixe, bornage 3 | **1,58e-2** (1,24e-2) · 0,94 ms | 4,18e-2 (8,4e-3) · 0,90 ms | 3,28e-2 (**7,8e-3**) · 0,89 ms | 2,1× |
+| Sponza mobile, bornage 1,5 | **2,10e-2** (1,99e-2) · 1,01 ms | 6,38e-2 (1,96e-2) · 1,03 ms | 4,59e-2 (**1,86e-2**) · 1,02 ms | 2,2× |
+| Sponza mobile, bornage 3 | **1,85e-2** (1,83e-2) · 1,03 ms | 8,08e-2 (1,60e-2) · 1,03 ms | 6,11e-2 (**1,55e-2**) · 1,02 ms | 3,3× |
+| Cornell fixe, bornage 1,5 | **5,3e-3** (**9,5e-4**) · 0,48 ms | 3,2e-2 (3,8e-3) · 0,45 ms | 2,8e-2 (3,2e-3) · 0,46 ms | 5,3× |
+| Cornell mobile, bornage 1,5 | **5,1e-3** (**2,0e-3**) · 0,48 ms | 3,6e-2 (5,2e-3) · 0,38 ms | 3,2e-2 (4,5e-3) · 0,37 ms | 6,3× |
+
+Lecture :
+
+- **Sur les séquences, KRC gagne à temps égal partout** : 1,7 à 3,3× sur Sponza, 5 à 6×
+  sur la Cornell box, contre le meilleur SHaRC (réactif compris), au même réglage du
+  débruiteur.
+- **En statique** : KRC 1,9 à 4× meilleur sur la Cornell box ; sur Sponza, SHaRC reste
+  meilleur, de 1,1× (bornage 1,5) à 1,6× (bornage 3).
+- **Après l'extinction de la grande lampe** : KRC à la bonne luminance en 1 frame
+  (1,00–1,16) puis une dérive sombre (0,74–0,81 à f110) ; SHaRC 1,5 à 7× trop clair
+  pendant des dizaines de frames. Les taches de KRC ont nettement diminué mais restent
+  visibles à f119.
+- **Pics** : p95 de KRC 1,3 à 1,9 ms contre 0,9 ms pour SHaRC à 480×270.

@@ -21,8 +21,9 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 
 KRC v2 garde l'avantage dans un pipeline de jeu avec débruiteur (1,4 à 5,7× à temps égal
 sur les séquences). Défauts à régler avant une démo :
-1. **Taches après un changement de lumière** : corrections par cellule trop bruitées
-   (8 chemins corrélés). Pistes : plus de chemins corrélés pour les lampes, débruiter le
+1. **Taches après un changement de lumière** : réduites (RESULTATS §15 : cellules
+   « total + part directe », 32 chemins corrélés), pas disparues. Corrections par cellule
+   encore bruitées (8 chemins corrélés au départ). Pistes : plus de chemins corrélés pour les lampes, débruiter le
    champ des corrections (les deltas de cellules voisines sont corrélés), priorité
    d'échantillonnage aux cellules corrigées.
 2. Dérive sombre après l'extinction (0,73).
