@@ -253,6 +253,24 @@ fn main() {
             },
             None => eprintln!("pas de GPU"),
         },
+        Some("jeu") => match gpu::Gpu::new() {
+            Some(g) => {
+                let setup = match args.get(1).map(String::as_str) {
+                    Some("sponza") => rt::sponza_setup(480, 270),
+                    Some("cornellcam") => rt::cornell_cam_setup(256),
+                    Some("cornell") => rt::cornell_setup(256),
+                    Some("sponzacam720") => rt::sponza_cam_setup(1280, 720),
+                    _ => rt::sponza_cam_setup(480, 270),
+                };
+                let only = std::env::var("KRC_DUEL").ok();
+                let cfgs: Vec<(rt::DuelCfg, bool)> = game_cfgs()
+                    .into_iter()
+                    .filter(|(c, _)| only.as_ref().is_none_or(|o| o.split(',').any(|x| c.name.starts_with(x))))
+                    .collect();
+                rt::game_eval(&g, &setup, &cfgs);
+            }
+            None => eprintln!("pas de GPU"),
+        },
         Some("duel") | Some("statique") => match gpu::Gpu::new() {
             Some(g) => {
                 let setup = match args.get(1).map(String::as_str) {
@@ -481,4 +499,38 @@ fn duel_cfgs() -> Vec<rt::DuelCfg> {
         });
     }
     v
+}
+
+/// Configurations du pipeline de jeu : KRC v2 (direct par pixel + indirect des cellules) et
+/// SHaRC officiel (passe Render), avec débruiteur ; deux variantes brutes pour référence.
+fn game_cfgs() -> Vec<(rt::DuelCfg, bool)> {
+    use gpu_krc::{Method, ShParams};
+    let d = ShParams::default();
+    let base = rt::DuelCfg {
+        name: "",
+        method: Method::Krc,
+        ppp: 1.0,
+        resample: true,
+        cell_px: 8.0,
+        reuse: false,
+        demod: true,
+        seed: true,
+        support: false,
+        tau: 0.05,
+        multi: false,
+        sh: d,
+    };
+    let krc = |name, ppp| rt::DuelCfg { name, ppp, ..base };
+    let sh = |name, down, acc| rt::DuelCfg { name, method: Method::Sharc, sh: ShParams { downscale: down, accum_frames: acc, ..d }, ..base };
+    vec![
+        (krc("krc 0.25", 0.25), true),
+        (krc("krc 0.5", 0.5), true),
+        (krc("krc 1", 1.0), true),
+        (sh("sharc 1px/5x5", 5, 20), true),
+        (sh("sharc 1px/2x2", 2, 20), true),
+        (sh("sharc 1px/1x1", 1, 20), true),
+        (sh("sharc acc5 1px/1x1", 1, 5), true),
+        (krc("krc 0.5", 0.5), false),
+        (sh("sharc 1px/1x1", 1, 20), false),
+    ]
 }

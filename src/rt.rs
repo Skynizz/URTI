@@ -1245,3 +1245,101 @@ pub fn static_conv(gpu: &Gpu, setup: &TriSetup, cfgs: &[DuelCfg]) {
     let prev = std::fs::read_to_string(&path).unwrap_or_default();
     std::fs::write(path, prev + &out).unwrap();
 }
+
+/// `krc jeu [scène]` : pipeline comme en jeu (image finale par pixel + débruiteur commun),
+/// 3 graines. Erreur de l'image finale, scintillement (frames 31–39, différence relative
+/// d'une frame à l'autre dans la phase statique), luminance après l'extinction de la grande
+/// lampe (retard), temps GPU complet (débruiteur compris).
+pub fn game_eval(gpu: &Gpu, setup: &TriSetup, cfgs: &[(DuelCfg, bool)]) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    use crate::scene::FRAMES;
+    let at = setup.at;
+    let grid = Grid::fit(&at(0).bounds);
+    let dir = format!("results/ref_{}", setup.name);
+    let refs: Vec<Vec<V3>> = (0..FRAMES)
+        .map(|f| load_raw(&format!("{dir}/{}.bin", setup.ref_key(f)), setup.view.len()).expect("références manquantes"))
+        .collect();
+    let seeds: u32 = std::env::var("KRC_DUEL_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let out_dir = format!("results/jeu/{}", setup.name);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut out = String::new();
+    for (c, denoise) in cfgs {
+        let w = 1.0 / seeds as f64;
+        let (mut all, mut stat, mut dynm, mut flick) = (0.0, 0.0, 0.0, 0.0);
+        let mut lum = [0.0f64; 4];
+        let mut ms = Vec::new();
+        for seed in 0..seeds {
+            let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&at(0)), c.method, 3 + seed);
+            k.ppp = c.ppp;
+            k.cell_px = c.cell_px;
+            k.tau = c.tau;
+            k.sh = c.sh;
+            k.game = true;
+            k.denoise = *denoise;
+            for pass in 0..2 {
+                k.readback = pass == 0;
+                let mut prev = at(0);
+                let mut last_img: Vec<V3> = Vec::new();
+                for t in 0..FRAMES {
+                    let scene = at(t);
+                    k.set_view(setup.view_at(t));
+                    let f = k.frame_tri(&scene, &prev, t);
+                    prev = scene;
+                    if pass == 1 {
+                        ms.push(f.gpu_ms());
+                        continue;
+                    }
+                    let r = &refs[t as usize];
+                    let (_, e, lr) = frame_err(&f.image, &f.kinds, r);
+                    all += w * e / FRAMES as f64;
+                    if (30..40).contains(&t) {
+                        stat += w * e / 10.0;
+                    }
+                    if t >= 40 {
+                        dynm += w * e / 80.0;
+                    }
+                    for (i, ft) in [101u32, 103, 105, 110].iter().enumerate() {
+                        if t == *ft {
+                            lum[i] += w * lr;
+                        }
+                    }
+                    if (31..40).contains(&t) && !last_img.is_empty() {
+                        let (mut d, mut n) = (0.0f64, 0.0f64);
+                        for i in 0..r.len() {
+                            if f.kinds[i] == 2 {
+                                d += (f.image[i].lum() - last_img[i].lum()).abs() / (r[i].lum() + 0.02);
+                                n += 1.0;
+                            }
+                        }
+                        flick += w * d / n.max(1.0) / 9.0;
+                    }
+                    if seed == 0 && [39u32, 101, 119].contains(&t) {
+                        let tag = c.name.replace([' ', '/'], "_");
+                        let suffix = if *denoise { "" } else { "_brut" };
+                        crate::image::save(&format!("{out_dir}/{tag}{suffix}_f{t:03}.png"), setup.view.w, setup.view.h, &f.image);
+                    }
+                    last_img = f.image.clone();
+                }
+            }
+        }
+        ms.sort_by(|a, b| a.total_cmp(b));
+        let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+        let name = format!("{}{}", c.name, if *denoise { "" } else { " (brut)" });
+        let line = format!(
+            "{name:<30} relMSE* {all:.3e} (statique {stat:.2e}, dynamique {dynm:.2e}) | scintillement {flick:.3} | lum f101 {:.2} f103 {:.2} f105 {:.2} f110 {:.2} | GPU moy {mean:.2} ms, p95 {:.2} ms",
+            lum[0],
+            lum[1],
+            lum[2],
+            lum[3],
+            ms[ms.len() * 95 / 100]
+        );
+        println!("{line}");
+        out += &line;
+        out += "\n";
+    }
+    let path = format!("{out_dir}/resultats.txt");
+    let prev = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(path, prev + &out).unwrap();
+}

@@ -120,6 +120,8 @@ const F_SUPPORT: u32 = 2048u;
 // les K/2 suivants des cellules 2× plus grandes ; chaque chemin nourrit les deux niveaux ;
 // l'affichage passe du grossier au fin quand le fin a assez d'échantillons
 const F_MULTI: u32 = 4096u;
+// les cellules ne stockent que la lumière indirecte (le direct est calculé par pixel)
+const F_INDIRECT: u32 = 8192u;
 const MULTI_N: f32 = 32.0;
 
 fn slot_dist(dist: f32, slot: u32) -> f32 {
@@ -150,6 +152,11 @@ struct Frame {
     sh_cam_prev: vec3<f32>, sh_scene_scale: f32,
     sh_rscale: f32, sh_cap: u32, sh_accum: u32, sh_stale: u32,
     sh_down: u32, cell_px: f32, rec_every: u32, tau: f32, // cell_px : largeur d'une cellule en pixels ; rec_every : 1 chemin ordinaire sur N enregistre ses dépendances
+    // caméra de la frame précédente (reprojection du débruiteur, game.wgsl)
+    prev_eye: vec3<f32>, pad8: u32,
+    prev_fwd: vec3<f32>, pad9: u32,
+    prev_right: vec3<f32>, pad10: u32,
+    prev_up: vec3<f32>, pad11: u32,
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -198,6 +205,9 @@ var<private> m_lights: u32;
 var<private> m_aff: bool;     // le chemin touche-t-il une région de l'événement ?
 var<private> resample: bool;  // chemins ordinaires seulement (jamais les chemins corrélés)
 var<private> rs_depth: u32;
+var<private> d0_l: vec3<f32>;   // contribution directe au premier sommet (mode indirect)
+var<private> d0_dl: vec3<f32>;
+var<private> rs_stop: bool;     // mode indirect : cellule lue, on s'arrête après l'éclairage direct du sommet
 var<private> n_segs: u32;
 var<private> sp_cell: u32;
 var<private> sp_prefix: vec3<f32>;
@@ -492,6 +502,9 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
     var res: LL;
     res.l = vec3<f32>(0.0);
     res.dl = vec3<f32>(0.0);
+    rs_stop = false;
+    d0_l = vec3<f32>(0.0);
+    d0_dl = vec3<f32>(0.0);
     mark_vertex(p0);
     for (var depth = 0u; depth < MAX_DEPTH; depth++) {
         let origin = p + n * OFFSET;
@@ -538,6 +551,11 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
                 }
             }
         }
+        if (depth == 0u) {
+            d0_l = res.l;
+            d0_dl = res.dl;
+        }
+        if (rs_stop) { break; }
         let d = cosine_dir(n);
         beta = beta * albedo;
         n_segs++;
@@ -608,11 +626,17 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
                         m_trav = m_trav | ch.deps;
                         m_vsup = m_vsup | ch.deps;
                     }
-                    break;
+                    // cellules « indirect seulement » : il manque l'éclairage direct de ce sommet,
+                    // calculé au tour suivant avant l'arrêt
+                    if ((fr.flags & F_INDIRECT) != 0u) {
+                        rs_stop = true;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
-        if (depth >= 2u) {
+        if (depth >= 2u && !rs_stop) {
             let q = clamp(max(beta.x, max(beta.y, beta.z)), 0.05, 0.95);
             if (rnd() > q) { break; }
             beta = beta / q;
@@ -1136,6 +1160,8 @@ fn delta_trace(g: u32, round: u32) {
     let r = radiance(gx.p, gx.n, gx.albedo);
     var x = r.l;
     var y = r.l + r.dl;
+    let x_d0 = d0_l;
+    var y_d0 = d0_l + d0_dl;
     var affected = (m_lights & fr.ev_lights) != 0u;
     var retraced = 0u;
     if (geometry) {
@@ -1149,6 +1175,7 @@ fn delta_trace(g: u32, round: u32) {
             sel = 1u;
             rng = s0;
             y = radiance(gx.p, gx.n, gx.albedo).l;
+            y_d0 = d0_l;
             sel = 0u;
             rec_on = true;
             m_trav = keep_trav;
@@ -1157,6 +1184,10 @@ fn delta_trace(g: u32, round: u32) {
         }
     }
     commit_deps(c);
+    if ((fr.flags & F_INDIRECT) != 0u) {
+        x = x - x_d0;
+        y = y - y_d0;
+    }
     x = x / demod(gx.albedo);
     y = y / demod(gx.albedo);
     let b = c * ACC;
@@ -1470,7 +1501,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         add_fx(bs + A_FL, ls);
         add_f32(bs + A_FL2, ls * ls);
     }
-    let v = v_raw / demod(gx.albedo);
+    let v = (v_raw - select(vec3<f32>(0.0), d0_l, (fr.flags & F_INDIRECT) != 0u)) / demod(gx.albedo);
     let b = c * ACC;
     if (rec_on) { commit_deps(c); }
     if (ru_cell != 0xffffffffu && all(ru_beta > vec3<f32>(0.0))) {

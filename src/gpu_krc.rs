@@ -107,6 +107,14 @@ struct FrameU {
     cell_px: f32,
     rec_every: u32,
     tau: f32,
+    prev_eye: [f32; 3],
+    pad8: u32,
+    prev_fwd: [f32; 3],
+    pad9: u32,
+    prev_right: [f32; 3],
+    pad10: u32,
+    prev_up: [f32; 3],
+    pad11: u32,
 }
 
 /// Méthode du pipeline.
@@ -157,6 +165,7 @@ const F_DEMOD: u32 = 512;
 const F_SEED: u32 = 1024;
 const F_SUPPORT: u32 = 2048;
 const F_MULTI: u32 = 4096;
+const F_INDIRECT: u32 = 8192;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -252,10 +261,17 @@ pub struct GpuKrc<'a> {
     pub support: bool,
     /// cache à deux résolutions (cellules fines et 2× plus grandes)
     pub multi: bool,
+    /// pipeline « comme en jeu » : image finale par pixel (KRC : direct par pixel + indirect des
+    /// cellules ; SHaRC : passe Render), puis débruiteur commun (game.wgsl)
+    pub game: bool,
+    /// débruiteur du pipeline de jeu
+    pub denoise: bool,
+    prev_view: View,
     pending: Option<GpuEvent>,
     _free_buf: wgpu::Buffer,
     _vis_buf: wgpu::Buffer,
     _sh_bufs: [wgpu::Buffer; 4],
+    _dn_bufs: [wgpu::Buffer; 4],
     /// compteur de frames monotone (éviction des cellules invisibles)
     clock: u32,
     /// la table de hachage a trop de pierres tombales : reconstruction au début de la frame suivante
@@ -267,7 +283,13 @@ pub struct GpuKrc<'a> {
     sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 37] = [
+const ENTRIES: [&str; 43] = [
+    "krc_final",
+    "dn_temporal",
+    "dn_store",
+    "dn_atrous1",
+    "dn_atrous2",
+    "dn_atrous3",
     "prep_vis2",
     "evict_sweep",
     "sharc_update",
@@ -306,7 +328,7 @@ const ENTRIES: [&str; 37] = [
     "resolve",
     "display",
 ];
-const MAX_PASSES: u32 = 32;
+const MAX_PASSES: u32 = 48;
 
 impl<'a> GpuKrc<'a> {
     /// Pièces en enfilade (boîtes alignées), grille fixe.
@@ -336,7 +358,7 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..28u32 {
+        for b in 0..32u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -356,7 +378,7 @@ impl<'a> GpuKrc<'a> {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let mut src = grid.template(include_str!("krc_gpu.wgsl")) + include_str!("sharc.wgsl");
+        let mut src = grid.template(include_str!("krc_gpu.wgsl")) + include_str!("sharc.wgsl") + include_str!("game.wgsl");
         if tri.is_some() {
             let (a, b) = (src.find("// <geometrie>").unwrap(), src.find("// </geometrie>").unwrap());
             src = format!("{}{}{}", &src[..a], crate::rt::TRI_GEOMETRY, &src[b..]);
@@ -418,6 +440,8 @@ impl<'a> GpuKrc<'a> {
         let probe_buf = mk((PROBES * 32) as u64, st);
         let free_buf = mk(cell_cap as u64 * 4, st);
         let vis_buf = mk(cell_cap as u64 * 4, st);
+        // débruiteur : historique, deux tampons de travail, G-buffer précédent (2 vec4 par pixel)
+        let dn_bufs = [16u64, 16, 16, 32].map(|b| mk(len as u64 * b, st));
         // SHaRC : clés 64 bits, verrous, accumulation (uint4), résolu (half4 + 2 u32)
         let sh_bufs = [8u64, 4, 16, 16].map(|b| mk(sh_cap as u64 * b, st));
         let accel = tri.map(|t| Accel::new(gpu, t));
@@ -441,6 +465,9 @@ impl<'a> GpuKrc<'a> {
                 e.push(wgpu::BindGroupEntry { binding: 21, resource: probe_buf.as_entire_binding() });
                 e.push(wgpu::BindGroupEntry { binding: 22, resource: free_buf.as_entire_binding() });
                 e.push(wgpu::BindGroupEntry { binding: 27, resource: vis_buf.as_entire_binding() });
+                for (i, b) in dn_bufs.iter().enumerate() {
+                    e.push(wgpu::BindGroupEntry { binding: 28 + i as u32, resource: b.as_entire_binding() });
+                }
                 for (i, b) in sh_bufs.iter().enumerate() {
                     e.push(wgpu::BindGroupEntry { binding: 23 + i as u32, resource: b.as_entire_binding() });
                 }
@@ -491,12 +518,16 @@ impl<'a> GpuKrc<'a> {
             seed_levels: true,
             support: false,
             multi: false,
+            game: false,
+            denoise: true,
+            prev_view: view,
             pending: None,
             clock: 0,
             rebuild: false,
             _free_buf: free_buf,
             _vis_buf: vis_buf,
             _sh_bufs: sh_bufs,
+            _dn_bufs: dn_bufs,
             method,
             sh: ShParams::default(),
             sh_cap: sh_cap as u32,
@@ -547,6 +578,14 @@ impl<'a> GpuKrc<'a> {
             cell_px: self.cell_px,
             rec_every: self.rec_every,
             tau: self.tau,
+            prev_eye: f3(self.prev_view.eye),
+            pad8: 0,
+            prev_fwd: f3(self.prev_view.fwd),
+            pad9: 0,
+            prev_right: f3(self.prev_view.right),
+            pad10: 0,
+            prev_up: f3(self.prev_view.up),
+            pad11: 0,
         }
     }
 
@@ -781,6 +820,9 @@ impl<'a> GpuKrc<'a> {
         if self.multi {
             flags |= F_MULTI;
         }
+        if self.game {
+            flags |= F_INDIRECT;
+        }
         if let Some(e) = ev {
             if !self.sharc {
                 flags |= F_EVENT;
@@ -817,7 +859,7 @@ impl<'a> GpuKrc<'a> {
             let blocks = self.view.w.div_ceil(d as usize) as u32 * self.view.h.div_ceil(d as usize) as u32;
             plan.push(("sharc_update", Dispatch::Direct(blocks.div_ceil(64))));
             plan.push(("sharc_resolve", Dispatch::Direct(self.sh_cap.div_ceil(256))));
-            plan.push((if self.sh.render { "sharc_render" } else { "sharc_query" }, px));
+            plan.push((if self.sh.render || self.game { "sharc_render" } else { "sharc_query" }, px));
         } else {
             plan.push(("insert", slots));
             plan.push(("lookup", slots));
@@ -857,9 +899,14 @@ impl<'a> GpuKrc<'a> {
             plan.push(("prep_vis2", Dispatch::Direct(1)));
             plan.push(("evict_sweep", Dispatch::Direct(self.cell_cap.div_ceil(8 * 64))));
             plan.push(("resolve", vis));
-            plan.push(("display", px));
+            plan.push((if self.game { "krc_final" } else { "display" }, px));
         }
 
+        if self.game && self.denoise {
+            for name in ["dn_temporal", "dn_store", "dn_atrous1", "dn_atrous2", "dn_atrous3"] {
+                plan.push((name, px));
+            }
+        }
         let dev = &self.gpu.device;
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("krc frame") });
         for (i, (name, d)) in plan.iter().enumerate() {
@@ -903,6 +950,7 @@ impl<'a> GpuKrc<'a> {
         self.rebuild = ctr[C_TOMB] as u64 * 4 > self.table_mask as u64 + 1;
         self.clock += 1;
         self.sh_cam_prev = self.view.eye;
+        self.prev_view = self.view;
         GpuFrame {
             image: (0..img.len() / 4).map(|k| v3(img[4 * k] as f64, img[4 * k + 1] as f64, img[4 * k + 2] as f64)).collect(),
             kinds: (0..img.len() / 4).map(|k| img[4 * k + 3] as u8).collect(),
