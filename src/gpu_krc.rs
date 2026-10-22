@@ -167,6 +167,7 @@ const F_SUPPORT: u32 = 2048;
 const F_MULTI: u32 = 4096;
 const F_INDIRECT: u32 = 8192;
 const F_DSPLIT: u32 = 16384;
+const F_GAME: u32 = 32768;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -285,6 +286,8 @@ pub struct GpuKrc<'a> {
     _vis_buf: wgpu::Buffer,
     _sh_bufs: [wgpu::Buffer; 4],
     _dn_bufs: [wgpu::Buffer; 4],
+    _spec_bufs: [wgpu::Buffer; 3],
+    _sampler: wgpu::Sampler,
     /// compteur de frames monotone (éviction des cellules invisibles)
     clock: u32,
     /// la table de hachage a trop de pierres tombales : reconstruction au début de la frame suivante
@@ -296,7 +299,9 @@ pub struct GpuKrc<'a> {
     sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 46] = [
+const ENTRIES: [&str; 48] = [
+    "dn_spec",
+    "dn_spec_store",
     "dn_atrous3b",
     "dn_atrous4",
     "dn_atrous5",
@@ -374,7 +379,7 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..32u32 {
+        for b in 0..38u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -382,7 +387,14 @@ impl<'a> GpuKrc<'a> {
                     min_binding_size: None,
                 },
                 1 | 3 if tri.is_some() => wgpu::BindingType::AccelerationStructure,
-                18..=20 if tri.is_none() => continue,
+                18..=20 | 32..=34 if tri.is_none() => continue,
+                32 => wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                33 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                34 => storage(true),
                 1..=4 | 14 | 18..=20 => storage(true),
                 _ => storage(false),
             };
@@ -461,6 +473,17 @@ impl<'a> GpuKrc<'a> {
         // SHaRC : clés 64 bits, verrous, accumulation (uint4), résolu (half4 + 2 u32)
         let sh_bufs = [8u64, 4, 16, 16].map(|b| mk(sh_cap as u64 * b, st));
         let accel = tri.map(|t| Accel::new(gpu, t));
+        let sampler = dev.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("textures"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // mode jeu : partie spéculaire de l'image (courante, historique, travail)
+        let spec_bufs = [16u64, 16, 16].map(|b| mk(len as u64 * b, st));
         let n_binds = if accel.is_some() { 2 } else { 1 };
         let binds = (0..n_binds)
             .map(|k| {
@@ -477,6 +500,12 @@ impl<'a> GpuKrc<'a> {
                     e.push(wgpu::BindGroupEntry { binding: 18, resource: a.verts.as_entire_binding() });
                     e.push(wgpu::BindGroupEntry { binding: 19, resource: a.idx.as_entire_binding() });
                     e.push(wgpu::BindGroupEntry { binding: 20, resource: a.mesh_table.as_entire_binding() });
+                    e.push(wgpu::BindGroupEntry { binding: 32, resource: wgpu::BindingResource::TextureView(&a.tex_view) });
+                    e.push(wgpu::BindGroupEntry { binding: 33, resource: wgpu::BindingResource::Sampler(&sampler) });
+                    e.push(wgpu::BindGroupEntry { binding: 34, resource: a.uvs.as_entire_binding() });
+                }
+                for (i, b) in spec_bufs.iter().enumerate() {
+                    e.push(wgpu::BindGroupEntry { binding: 35 + i as u32, resource: b.as_entire_binding() });
                 }
                 e.push(wgpu::BindGroupEntry { binding: 21, resource: probe_buf.as_entire_binding() });
                 e.push(wgpu::BindGroupEntry { binding: 22, resource: free_buf.as_entire_binding() });
@@ -550,6 +579,8 @@ impl<'a> GpuKrc<'a> {
             _vis_buf: vis_buf,
             _sh_bufs: sh_bufs,
             _dn_bufs: dn_bufs,
+            _spec_bufs: spec_bufs,
+            _sampler: sampler,
             method,
             sh: ShParams::default(),
             sh_cap: sh_cap as u32,
@@ -846,6 +877,7 @@ impl<'a> GpuKrc<'a> {
             // F_INDIRECT (cellules « indirect seulement ») reste disponible mais n'est plus utilisé :
             // il recalculait l'éclairage direct au sommet relu, bruité (voir JOURNAL v14)
             flags |= if self.indirect_only { F_INDIRECT } else { F_DSPLIT };
+            flags |= F_GAME;
         }
         if let Some(e) = ev {
             if !self.sharc {
@@ -928,9 +960,9 @@ impl<'a> GpuKrc<'a> {
 
         if self.game && self.denoise {
             let passes: &[&'static str] = if self.dn_wide {
-                &["dn_temporal", "dn_store", "dn_atrous1", "dn_atrous2", "dn_atrous3b", "dn_atrous4", "dn_atrous5"]
+                &["dn_temporal", "dn_spec", "dn_store", "dn_spec_store", "dn_atrous1", "dn_atrous2", "dn_atrous3b", "dn_atrous4", "dn_atrous5"]
             } else {
-                &["dn_temporal", "dn_store", "dn_atrous1", "dn_atrous2", "dn_atrous3"]
+                &["dn_temporal", "dn_spec", "dn_store", "dn_spec_store", "dn_atrous1", "dn_atrous2", "dn_atrous3"]
             };
             for name in passes {
                 plan.push((name, px));

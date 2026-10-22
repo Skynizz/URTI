@@ -353,41 +353,20 @@ fn sharc_resolve(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
 
 // --- intégration (équivalent de Pathtracer.hlsl de l'exemple) ---
 
-// éclairage direct d'un sommet : même estimateur que `radiance` (une lampe tirée selon sa puissance)
+// éclairage direct d'un sommet lambertien (nee_split, krc_gpu.wgsl)
 fn sharc_nee(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
-    let origin = p + n * OFFSET;
-    var total = 0.0;
-    for (var j = 0u; j < n_lights(); j++) { total += light_power(j); }
-    if (total <= 0.0) { return vec3<f32>(0.0); }
-    var u = rnd() * total;
-    var s = n_lights();
-    var pmf = 0.0;
-    for (var j = 0u; j < n_lights(); j++) {
-        let pw = light_power(j);
-        if (pw > 0.0 && (u < pw || j == n_lights() - 1u)) {
-            s = j;
-            pmf = pw / total;
-            break;
-        }
-        u -= pw;
-    }
-    if (s >= n_lights()) { return vec3<f32>(0.0); }
-    let li = light_at(s);
-    let q = li.center + vec3<f32>((2.0 * rnd() - 1.0) * li.hx, 0.0, (2.0 * rnd() - 1.0) * li.hz);
-    let w = q - origin;
-    let dist2 = dot(w, w);
-    let dist = sqrt(dist2);
-    let wd = w / dist;
-    let cos_x = dot(n, wd);
-    let cos_l = wd.y;
-    if (cos_x <= 0.0 || cos_l <= 0.0 || li.on < 0.5) { return vec3<f32>(0.0); }
-    if (occluder(origin, wd, dist - 1e-4).found) { return vec3<f32>(0.0); }
-    let g = cos_x * cos_l / dist2 * (4.0 * li.hx * li.hz) / pmf / PI;
-    return albedo * li.emission * g;
+    return nee_split(p, n, n, albedo, 1.0, 0.0).d;
 }
 
-// SHARC_MATERIAL_DEMODULATION de l'exemple : max(albédo diffus, 0,05) (matériaux lambertiens)
+// SHARC_MATERIAL_DEMODULATION de l'exemple : max(albédo diffus, 0,05) + max(F0, 0,02) × luminance
+// de l'albédo spéculaire moyen (lambertien pur : max(albédo, 0,05))
 fn sharc_demod(albedo: vec3<f32>) -> vec3<f32> { return max(albedo, vec3<f32>(0.05)); }
+fn sharc_demod2(base: vec3<f32>, rough: f32, metal: f32) -> vec3<f32> {
+    if (is_diffuse(rough, metal)) { return sharc_demod(base); }
+    let f0 = f0_of(base, metal);
+    let favg = f0 + (vec3<f32>(1.0) - f0) / 21.0;
+    return max(diff_albedo(base, metal), vec3<f32>(0.05)) + max(f0, vec3<f32>(0.02)) * lum(favg);
+}
 
 // Passe Update : un pixel tiré au hasard par bloc sh_down × sh_down, chemin dont chaque segment
 // alimente le cache (débit remis à 1 à chaque rebond, propagation par SharcSetThroughput)
@@ -412,11 +391,22 @@ fn sharc_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var p = g.p;
     var n = g.n;
     var albedo = g.albedo;
+    var rough = g_rough(g);
+    var metal = g_metal(g);
+    var wo = normalize(fr.eye - g.p);
     for (var depth = 0u; depth < MAX_DEPTH; depth++) {
-        let direct = sharc_nee(p, n, albedo);
-        if (!sharc_update_hit(p, n, direct, rnd(), sharc_demod(albedo))) { break; }
-        let d = cosine_dir(n);
-        sharc_set_throughput(albedo); // poids BRDF lambertien, échantillonnage en cosinus
+        let ns = nee_split(p, n, wo, albedo, rough, metal);
+        if (!sharc_update_hit(p, n, ns.d + ns.s, rnd(), sharc_demod2(albedo, rough, metal))) { break; }
+        var d: vec3<f32>;
+        if (is_diffuse(rough, metal)) {
+            d = cosine_dir(n);
+            sharc_set_throughput(albedo); // poids BRDF lambertien, échantillonnage en cosinus
+        } else {
+            let bs = bsdf_sample(n, wo, albedo, rough, metal, false);
+            if (!bs.ok) { break; }
+            d = bs.wi;
+            sharc_set_throughput(bs.w);
+        }
         let h = intersect(p + n * OFFSET, d);
         if (!h.found || h.light >= 0) {
             sharc_update_miss(vec3<f32>(0.0)); // ciel noir ; lampes comptées par l'éclairage direct
@@ -425,6 +415,9 @@ fn sharc_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         p = h.p;
         n = h.n;
         albedo = h.albedo;
+        rough = h.rough;
+        metal = h.metal;
+        wo = -d;
     }
 }
 
@@ -438,7 +431,7 @@ fn sharc_query(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (g.kind == 1u) {
         v = g.albedo;
     } else if (g.kind == 2u) {
-        let q = sharc_get_cached(g.p, g.n, sharc_demod(g.albedo));
+        let q = sharc_get_cached(g.p, g.n, sharc_demod2(g.albedo, g_rough(g), g_metal(g)));
         if (q.found) { v = q.rad; }
     }
     image[k] = vec4<f32>(v, f32(g.kind));
@@ -452,6 +445,7 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (k >= fr.w * fr.h) { return; }
     let g = gbuf[k];
     var v = vec3<f32>(0.0);
+    var vs_spec = vec3<f32>(0.0); // mode jeu : partie spéculaire (premier lobe spéculaire)
     if (g.kind == 1u) {
         v = g.albedo;
     } else if (g.kind == 2u) {
@@ -463,9 +457,13 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
         var p = g.p;
         var n = g.n;
         var albedo = g.albedo;
+        var rough = g_rough(g);
+        var metal = g_metal(g);
+        var wo = normalize(fr.eye - g.p);
         var beta = vec3<f32>(1.0);
         var seg = 0.0;
         var rough_prev = 0.0;
+        var to_spec = false;
         for (var depth = 0u; depth < MAX_DEPTH; depth++) {
             let vs = hg_voxel_size(hg_level(p));
             var valid = seg > vs * sqrt(3.0);
@@ -473,22 +471,43 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
             let alpha = rp * rp;
             valid = valid && seg * sqrt(0.5 * alpha * alpha / (1.0 - alpha * alpha)) > vs;
             if (valid) {
-                let q = sharc_get_cached(p, n, sharc_demod(albedo));
+                let q = sharc_get_cached(p, n, sharc_demod2(albedo, rough, metal));
                 if (q.found) {
-                    v += beta * q.rad;
+                    if (to_spec) { vs_spec += beta * q.rad; } else { v += beta * q.rad; }
                     break;
                 }
             }
-            v += beta * sharc_nee(p, n, albedo);
-            rough_prev += 1.0; // lobe diffus
-            let d = cosine_dir(n);
-            beta = beta * albedo;
+            let ns = nee_split(p, n, wo, albedo, rough, metal);
+            if (depth == 0u) {
+                v += ns.d;
+                vs_spec += ns.s;
+            } else if (to_spec) {
+                vs_spec += beta * (ns.d + ns.s);
+            } else {
+                v += beta * (ns.d + ns.s);
+            }
+            var d: vec3<f32>;
+            if (is_diffuse(rough, metal)) {
+                rough_prev += 1.0; // lobe diffus
+                d = cosine_dir(n);
+                beta = beta * albedo;
+            } else {
+                let bs = bsdf_sample(n, wo, albedo, rough, metal, false);
+                if (!bs.ok) { break; }
+                rough_prev += bs.lobe_rough;
+                if (depth == 0u) { to_spec = bs.spec; }
+                d = bs.wi;
+                beta = beta * bs.w;
+            }
             let h = intersect(p + n * OFFSET, d);
             if (!h.found || h.light >= 0) { break; }
             seg = h.t;
             p = h.p;
             n = h.n;
             albedo = h.albedo;
+            rough = h.rough;
+            metal = h.metal;
+            wo = -d;
             if (depth >= 2u) {
                 let q = clamp(max(beta.x, max(beta.y, beta.z)), 0.05, 0.95);
                 if (rnd() > q) { break; }
@@ -496,5 +515,10 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    image[k] = vec4<f32>(v, f32(g.kind));
+    if ((fr.flags & F_GAME) != 0u) {
+        image[k] = vec4<f32>(v, f32(g.kind));
+        spec_img[k] = vec4<f32>(vs_spec, 0.0);
+    } else {
+        image[k] = vec4<f32>(v + vs_spec, f32(g.kind));
+    }
 }

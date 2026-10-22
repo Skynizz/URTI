@@ -128,6 +128,7 @@ const F_INDIRECT: u32 = 8192u;
 // SHaRC) et, à part, la moyenne de leur part directe ; l'image finale prend l'indirect
 // = total − direct moyen, et le direct par pixel
 const F_DSPLIT: u32 = 16384u;
+const F_GAME: u32 = 32768u;   // pipeline de jeu (parties diffuse / spéculaire séparées, game.wgsl)
 const MULTI_N: f32 = 32.0;
 
 fn slot_dist(dist: f32, slot: u32) -> f32 {
@@ -215,6 +216,11 @@ var<private> rs_depth: u32;
 var<private> d0_l: vec3<f32>;   // contribution directe au premier sommet (mode indirect)
 var<private> d0_dl: vec3<f32>;
 var<private> rs_stop: bool;     // mode indirect : cellule lue, on s'arrête après l'éclairage direct du sommet
+var<private> pm_wo: vec3<f32>;      // premier sommet de radiance() : direction de sortie, matériau
+var<private> pm_rough: f32;
+var<private> pm_metal: f32;
+var<private> pm_diffuse_only: bool; // cellules KRC : seul le lobe diffuse au premier sommet
+var<private> nee_spec_only: bool;   // sommet relu dans le cache : il manque seulement le spéculaire direct
 var<private> n_segs: u32;
 var<private> sp_cell: u32;
 var<private> sp_prefix: vec3<f32>;
@@ -348,7 +354,8 @@ fn mark_segment(a: vec3<f32>, b: vec3<f32>) {
 }
 
 // ---------------------------------------------------------------- géométrie
-struct Hit { found: bool, t: f32, p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, light: i32 };
+// albedo : couleur de base ; rough ≥ 1 et metal = 0 : lambertien pur (scènes d'avant la vitrine)
+struct Hit { found: bool, t: f32, p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, light: i32, rough: f32, metal: f32 };
 struct Occ { found: bool, t: f32 };
 
 // <geometrie> (boîtes alignées ; remplacé par la version triangles + ray query, cf. rt.rs)
@@ -380,6 +387,8 @@ fn scene_hit(o: vec3<f32>, d: vec3<f32>) -> Hit {
     h.found = false;
     h.t = 1e30;
     h.light = -1;
+    h.rough = 1.0;
+    h.metal = 0.0;
     let inv = 1.0 / safe_dir(d);
     var axis = 0u;
     var id = 0u;
@@ -434,11 +443,162 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
                 h.found = true;
                 h.n = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), d.y > 0.0);
                 h.albedo = vec3<f32>(0.0);
+                h.rough = 1.0;
+                h.metal = 0.0;
             }
         }
     }
     if (h.found) { h.p = o + d * h.t; }
     return h;
+}
+
+// ---------------------------------------------------------------- matériaux (vitrine)
+// BRDF : lambertien (1 − métal)·base/π + GGX (Smith, Schlick, F0 = mix(0,04, base, métal)).
+// Un matériau lambertien pur (rough ≥ 1, metal = 0) suit exactement l'ancien chemin de code,
+// mêmes tirages aléatoires compris.
+fn g_rough(g: Gpx) -> f32 { return select(1.0, unpack2x16unorm(g.p0).x, g.kind == 2u); }
+fn g_metal(g: Gpx) -> f32 { return select(0.0, unpack2x16unorm(g.p0).y, g.kind == 2u); }
+fn is_diffuse(rough: f32, metal: f32) -> bool { return rough >= 0.999 && metal <= 0.0; }
+fn diff_albedo(base: vec3<f32>, metal: f32) -> vec3<f32> { return base * (1.0 - metal); }
+fn f0_of(base: vec3<f32>, metal: f32) -> vec3<f32> { return mix(vec3<f32>(0.04), base, metal); }
+fn fresnel(f0: vec3<f32>, vh: f32) -> vec3<f32> { return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - clamp(vh, 0.0, 1.0), 5.0); }
+fn ggx_a2(rough: f32) -> f32 { let a = max(rough * rough, 0.002); return a * a; }
+fn ggx_d(nh: f32, a2: f32) -> f32 { let t = nh * nh * (a2 - 1.0) + 1.0; return a2 / (PI * t * t); }
+fn smith_g1(nv: f32, a2: f32) -> f32 { return 2.0 * nv / (nv + sqrt(a2 + (1.0 - a2) * nv * nv)); }
+
+// BRDF × cos, séparée en parties diffuse et spéculaire
+struct Brdf2 { d: vec3<f32>, s: vec3<f32> };
+fn brdf_cos(n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> Brdf2 {
+    var r: Brdf2;
+    r.d = vec3<f32>(0.0);
+    r.s = vec3<f32>(0.0);
+    let nl = dot(n, wi);
+    if (nl <= 0.0) { return r; }
+    r.d = diff_albedo(base, metal) / PI * nl;
+    if (is_diffuse(rough, metal)) { return r; }
+    let nv = dot(n, wo);
+    if (nv <= 0.0) { return r; }
+    let h = normalize(wo + wi);
+    let a2 = ggx_a2(rough);
+    let d = ggx_d(max(dot(n, h), 0.0), a2);
+    let g = smith_g1(nv, a2) * smith_g1(nl, a2);
+    r.s = fresnel(f0_of(base, metal), dot(wo, h)) * (d * g / (4.0 * nv));
+    return r;
+}
+
+fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
+    let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.x) > 0.9);
+    let t = normalize(cross(n, a));
+    return mat3x3<f32>(t, cross(n, t), n);
+}
+
+// probabilité de tirer le lobe spéculaire
+fn spec_prob(n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> f32 {
+    if (is_diffuse(rough, metal)) { return 0.0; }
+    let fs = lum(fresnel(f0_of(base, metal), max(dot(n, wo), 0.0)));
+    let fd = lum(diff_albedo(base, metal));
+    return clamp(fs / max(fs + fd, 1e-4), 0.1, 0.95);
+}
+
+// direction GGX (demi-vecteur tiré selon D), réfléchie autour du demi-vecteur
+fn ggx_dir(n: vec3<f32>, wo: vec3<f32>, rough: f32) -> vec3<f32> {
+    let a2 = ggx_a2(rough);
+    let u1 = rnd();
+    let u2 = rnd();
+    let ct = sqrt((1.0 - u2) / (1.0 + (a2 - 1.0) * u2));
+    let st = sqrt(max(0.0, 1.0 - ct * ct));
+    let phi = 2.0 * PI * u1;
+    let h = tangent_frame(n) * vec3<f32>(st * cos(phi), st * sin(phi), ct);
+    return reflect(-wo, h);
+}
+
+fn pdf_spec(n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, rough: f32) -> f32 {
+    let h = normalize(wo + wi);
+    let vh = dot(wo, h);
+    if (vh <= 0.0) { return 0.0; }
+    return ggx_d(max(dot(n, h), 0.0), ggx_a2(rough)) * max(dot(n, h), 0.0) / (4.0 * vh);
+}
+
+// échantillon du BSDF : direction, poids f·cos/pdf (parties diffuse + spéculaire), lobe tiré
+struct Bs { ok: bool, wi: vec3<f32>, w: vec3<f32>, spec: bool, lobe_rough: f32 };
+fn bsdf_sample(n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32, diffuse_only: bool) -> Bs {
+    var b: Bs;
+    b.ok = true;
+    b.spec = false;
+    b.lobe_rough = 1.0;
+    if (is_diffuse(rough, metal) || diffuse_only) {
+        b.wi = cosine_dir(n);
+        b.w = diff_albedo(base, metal);
+        return b;
+    }
+    let ps = spec_prob(n, wo, base, rough, metal);
+    if (rnd() < ps) {
+        b.wi = ggx_dir(n, wo, rough);
+        b.spec = true;
+        b.lobe_rough = rough;
+    } else {
+        b.wi = cosine_dir(n);
+    }
+    let nl = dot(n, b.wi);
+    if (nl <= 0.0) {
+        b.ok = false;
+        return b;
+    }
+    let pdf = (1.0 - ps) * nl / PI + ps * pdf_spec(n, wo, b.wi, rough);
+    let f = brdf_cos(n, wo, b.wi, base, rough, metal);
+    b.w = (f.d + f.s) / max(pdf, 1e-8);
+    return b;
+}
+
+// échantillon du seul lobe spéculaire (reflets par pixel du mode jeu)
+fn spec_sample(n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> Bs {
+    var b: Bs;
+    b.spec = true;
+    b.lobe_rough = rough;
+    b.wi = ggx_dir(n, wo, rough);
+    b.ok = dot(n, b.wi) > 0.0;
+    if (!b.ok) { return b; }
+    let f = brdf_cos(n, wo, b.wi, base, rough, metal);
+    b.w = f.s / max(pdf_spec(n, wo, b.wi, rough), 1e-8);
+    return b;
+}
+
+// éclairage direct d'un sommet (une lampe tirée selon sa puissance), parties diffuse et spéculaire
+fn nee_split(p: vec3<f32>, n: vec3<f32>, wo: vec3<f32>, base: vec3<f32>, rough: f32, metal: f32) -> Brdf2 {
+    var r: Brdf2;
+    r.d = vec3<f32>(0.0);
+    r.s = vec3<f32>(0.0);
+    let origin = p + n * OFFSET;
+    var total = 0.0;
+    for (var j = 0u; j < n_lights(); j++) { total += light_power(j); }
+    if (total <= 0.0) { return r; }
+    var u = rnd() * total;
+    var s = n_lights();
+    var pmf = 0.0;
+    for (var j = 0u; j < n_lights(); j++) {
+        let pw = light_power(j);
+        if (pw > 0.0 && (u < pw || j == n_lights() - 1u)) {
+            s = j;
+            pmf = pw / total;
+            break;
+        }
+        u -= pw;
+    }
+    if (s >= n_lights()) { return r; }
+    let li = light_at(s);
+    let q = li.center + vec3<f32>((2.0 * rnd() - 1.0) * li.hx, 0.0, (2.0 * rnd() - 1.0) * li.hz);
+    let w = q - origin;
+    let dist2 = dot(w, w);
+    let dist = sqrt(dist2);
+    let wd = w / dist;
+    let cos_l = wd.y;
+    if (dot(n, wd) <= 0.0 || cos_l <= 0.0 || li.on < 0.5) { return r; }
+    if (occluder(origin, wd, dist - 1e-4).found) { return r; }
+    let f = brdf_cos(n, wo, wd, base, rough, metal);
+    let k = li.emission * (cos_l / dist2 * (4.0 * li.hx * li.hz) / pmf);
+    r.d = f.d * k;
+    r.s = f.s * k;
+    return r;
 }
 
 fn cosine_dir(n: vec3<f32>) -> vec3<f32> {
@@ -463,6 +623,14 @@ fn toggle_w(j: u32) -> f32 {
 }
 
 struct LL { l: vec3<f32>, dl: vec3<f32> };
+
+// matériau et direction de sortie (vers la caméra) du premier sommet de radiance()
+fn set_primary(g: Gpx, diffuse_only: bool) {
+    pm_wo = normalize(fr.eye - g.p);
+    pm_rough = g_rough(g);
+    pm_metal = g_metal(g);
+    pm_diffuse_only = diffuse_only;
+}
 
 struct CacheHit { found: bool, mean: vec3<f32>, deps: vec2<u32> };
 
@@ -510,8 +678,12 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
     res.l = vec3<f32>(0.0);
     res.dl = vec3<f32>(0.0);
     rs_stop = false;
+    nee_spec_only = false;
     d0_l = vec3<f32>(0.0);
     d0_dl = vec3<f32>(0.0);
+    var wo = pm_wo;
+    var rough = select(pm_rough, 1.0, pm_rough <= 0.0 && pm_metal <= 0.0);
+    var metal = pm_metal;
     mark_vertex(p0);
     for (var depth = 0u; depth < MAX_DEPTH; depth++) {
         let origin = p + n * OFFSET;
@@ -550,8 +722,17 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
                         mark_segment(origin, origin + wd * occ.t);
                     } else {
                         mark_segment(origin, q);
-                        let g = cos_x * cos_l / dist2 * (4.0 * li.hx * li.hz) / pmf / PI;
-                        let c = beta * albedo * li.emission * g;
+                        var c: vec3<f32>;
+                        if (is_diffuse(rough, metal)) {
+                            let g = cos_x * cos_l / dist2 * (4.0 * li.hx * li.hz) / pmf / PI;
+                            c = beta * albedo * li.emission * g;
+                        } else {
+                            let f = brdf_cos(n, wo, wd, albedo, rough, metal);
+                            var fc = f.d + f.s;
+                            if (depth == 0u && pm_diffuse_only) { fc = f.d; }
+                            if (nee_spec_only) { fc = f.s; }
+                            c = beta * fc * li.emission * (cos_l / dist2 * (4.0 * li.hx * li.hz) / pmf);
+                        }
                         if (on) { res.l += c; }
                         res.dl += c * tw;
                     }
@@ -563,8 +744,16 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
             d0_dl = res.dl;
         }
         if (rs_stop) { break; }
-        let d = cosine_dir(n);
-        beta = beta * albedo;
+        var d: vec3<f32>;
+        if (is_diffuse(rough, metal)) {
+            d = cosine_dir(n);
+            beta = beta * albedo;
+        } else {
+            let bs = bsdf_sample(n, wo, albedo, rough, metal, depth == 0u && pm_diffuse_only);
+            if (!bs.ok) { break; }
+            d = bs.wi;
+            beta = beta * bs.w;
+        }
         n_segs++;
         let h = intersect(origin, d);
         if (!h.found) {
@@ -577,6 +766,9 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
         p = h.p;
         n = h.n;
         albedo = h.albedo;
+        rough = h.rough;
+        metal = h.metal;
+        wo = -d;
         // réutilisation : la cellule visible du 1er rebond (assez loin pour ne pas être la sienne)
         if (reuse && depth == 0u) {
             let dist = length(p - fr.eye);
@@ -622,7 +814,7 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
                 }
                 var ch: CacheHit;
                 ch.found = false;
-                if ((fr.flags & F_SUPPORT) == 0u) { ch = cache_at(p, n, dist, albedo); }
+                if ((fr.flags & F_SUPPORT) == 0u) { ch = cache_at(p, n, dist, diff_albedo(albedo, metal)); }
                 if (ch.found) {
                     // arrêt sur le cache au 1er rebond : la suite n'est pas un échantillon neuf de la
                     // cellule touchée (SHaRC ne compte pas non plus d'échantillon dans ce cas)
@@ -634,9 +826,13 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
                         m_vsup = m_vsup | ch.deps;
                     }
                     // cellules « indirect seulement » : il manque l'éclairage direct de ce sommet,
-                    // calculé au tour suivant avant l'arrêt
+                    // calculé au tour suivant avant l'arrêt ; sommet brillant : la cellule ne porte que
+                    // le diffus, il manque le spéculaire direct
                     if ((fr.flags & F_INDIRECT) != 0u) {
                         rs_stop = true;
+                    } else if (!is_diffuse(rough, metal)) {
+                        rs_stop = true;
+                        nee_spec_only = true;
                     } else {
                         break;
                     }
@@ -715,6 +911,7 @@ fn gbuffer(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             g.kind = 2u;
             g.albedo = h.albedo;
+            g.p0 = pack2x16unorm(vec2<f32>(h.rough, h.metal));
             atomicAdd(&ctr[C_SURF], 1u);
         }
     }
@@ -1168,6 +1365,7 @@ fn delta_trace(g: u32, round: u32) {
     sel = 0u;
     seed_rng(t.z, i, fr.frame);
     let s0 = rng;
+    set_primary(gx, true);
     let r = radiance(gx.p, gx.n, gx.albedo);
     var x = r.l;
     var y = r.l + r.dl;
@@ -1200,15 +1398,15 @@ fn delta_trace(g: u32, round: u32) {
         y = y - y_d0;
     }
     if ((fr.flags & F_DSPLIT) != 0u) {
-        let pd = (x_d0 - y_d0) / demod(gx.albedo);
+        let pd = (x_d0 - y_d0) / demod(diff_albedo(gx.albedo, g_metal(gx)));
         if (any(pd != vec3<f32>(0.0))) {
             add_f32(c * ACC + A_PD, pd.x);
             add_f32(c * ACC + A_PD + 1u, pd.y);
             add_f32(c * ACC + A_PD + 2u, pd.z);
         }
     }
-    x = x / demod(gx.albedo);
-    y = y / demod(gx.albedo);
+    x = x / demod(diff_albedo(gx.albedo, g_metal(gx)));
+    y = y / demod(diff_albedo(gx.albedo, g_metal(gx)));
     let b = c * ACC;
     atomicAdd(&acc[b + A_PM], 1u);
     if (any(x != y)) { atomicStore(&acc[b + A_PDIFF], 1u); }
@@ -1514,6 +1712,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     n_segs = 0u;
     rs_hit = false;
     sp_cell = 0xffffffffu;
+    set_primary(gx, true);
     let v_raw = radiance(gx.p, gx.n, gx.albedo).l;
     atomicAdd(&ctr[C_SEGS], n_segs);
     if (rs_hit) { atomicAdd(&ctr[C_RSHIT], 1u); }
@@ -1532,9 +1731,10 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         add_fx(bs + A_FL, ls);
         add_f32(bs + A_FL2, ls * ls);
     }
-    let v = (v_raw - select(vec3<f32>(0.0), d0_l, (fr.flags & F_INDIRECT) != 0u)) / demod(gx.albedo);
+    let gda = diff_albedo(gx.albedo, g_metal(gx));
+    let v = (v_raw - select(vec3<f32>(0.0), d0_l, (fr.flags & F_INDIRECT) != 0u)) / demod(gda);
     if ((fr.flags & F_DSPLIT) != 0u) {
-        let dd = d0_l / demod(gx.albedo);
+        let dd = d0_l / demod(gda);
         add_fx(c * ACC + A_FD, dd.x);
         add_fx(c * ACC + A_FD + 1u, dd.y);
         add_fx(c * ACC + A_FD + 2u, dd.z);
@@ -1767,6 +1967,7 @@ fn reference_acc(@builtin(global_invocation_id) gid: vec3<u32>) {
     split = false;
     sel = 0u;
     seed_rng(k, 0x51u, fr.frame);
+    set_primary(g, false);
     var acc3 = vec3<f32>(0.0);
     for (var s = 0u; s < fr.pad0; s++) { acc3 += radiance(g.p, g.n, g.albedo).l; }
     image[k] += vec4<f32>(acc3, 0.0);

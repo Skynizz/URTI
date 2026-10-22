@@ -13,9 +13,18 @@
 @group(0) @binding(30) var<storage, read_write> dn_t2: array<vec4<f32>>;
 @group(0) @binding(31) var<storage, read_write> dn_prevg: array<vec4<f32>>; // frame précédente : (position, genre), (normale, -)
 
+// partie spéculaire de l'image (le débruiteur la traite à part : pas de démodulation par l'albédo
+// diffus, historique court, peu de filtrage spatial pour garder les reflets nets)
+@group(0) @binding(35) var<storage, read_write> spec_img: array<vec4<f32>>;
+@group(0) @binding(36) var<storage, read_write> spec_hist: array<vec4<f32>>;
+@group(0) @binding(37) var<storage, read_write> spec_t: array<vec4<f32>>;
+
 const DN_HIST_MAX: f32 = 32.0;
+const DN_SPEC_HIST_MAX: f32 = 4.0;
 
 fn dn_demod(a: vec3<f32>) -> vec3<f32> { return max(a, vec3<f32>(0.05)); }
+// albédo diffus du pixel (démodulation de la partie diffuse)
+fn dn_dalb(g: Gpx) -> vec3<f32> { return dn_demod(diff_albedo(g.albedo, g_metal(g))); }
 
 // image finale KRC : direct par pixel + indirect des cellules
 @compute @workgroup_size(64)
@@ -32,7 +41,29 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         split = false;
         sel = 0u;
         seed_rng(k, 0x91d3u, fr.frame);
-        v = sharc_nee(g.p, g.n, g.albedo);
+        let rough = g_rough(g);
+        let metal = g_metal(g);
+        let wo = normalize(fr.eye - g.p);
+        let ns = nee_split(g.p, g.n, wo, g.albedo, rough, metal);
+        v = ns.d;
+        var sp = ns.s;
+        if (!is_diffuse(rough, metal)) {
+            // reflet : un rayon du lobe spéculaire ; au point touché, radiance avec lecture du cache
+            let bs = spec_sample(g.n, wo, g.albedo, rough, metal);
+            if (bs.ok) {
+                let h = intersect(g.p + g.n * OFFSET, bs.wi);
+                if (h.found && h.light < 0) {
+                    pm_wo = -bs.wi;
+                    pm_rough = h.rough;
+                    pm_metal = h.metal;
+                    pm_diffuse_only = false;
+                    resample = (fr.flags & F_RESAMPLE) != 0u;
+                    rs_depth = 1u;
+                    sp += bs.w * radiance(h.p, h.n, h.albedo).l;
+                }
+            }
+        }
+        spec_img[k] = vec4<f32>(sp, 0.0);
         var ind = vec3<f32>(0.0);
         var w = 0.0;
         for (var s = 0u; s < K; s++) {
@@ -46,7 +77,9 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
                 w += 1.0;
             }
         }
-        if (w > 0.0) { v += ind / w * demod(g.albedo); }
+        if (w > 0.0) { v += ind / w * demod(diff_albedo(g.albedo, metal)); }
+    } else {
+        spec_img[k] = vec4<f32>(0.0);
     }
     image[k] = vec4<f32>(v, f32(g.kind));
 }
@@ -80,7 +113,7 @@ fn dn_moments(k: u32) -> Moments {
             let qi = u32(qy) * fr.w + u32(qx);
             let gq = gbuf[qi];
             if (gq.kind != 2u) { continue; }
-            let v = image[qi].rgb / dn_demod(gq.albedo);
+            let v = image[qi].rgb / dn_dalb(gq);
             m.m1 += v;
             m.m2 += v * v;
             n += 1.0;
@@ -100,7 +133,7 @@ fn dn_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
         dn_t1[k] = vec4<f32>(image[k].rgb, 0.0);
         return;
     }
-    let cur = image[k].rgb / dn_demod(g.albedo);
+    let cur = image[k].rgb / dn_dalb(g);
     var out = vec4<f32>(cur, 1.0);
     let q = dn_prev_px(g.p);
     if (q.x >= 0.0) {
@@ -125,6 +158,87 @@ fn dn_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     dn_t1[k] = out;
+}
+
+// partie spéculaire : accumulation temporelle courte (historique ≤ 4, borné par le voisinage)
+@compute @workgroup_size(64)
+fn dn_spec(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    let g = gbuf[k];
+    let cur = spec_img[k].rgb;
+    var out = vec4<f32>(cur, 1.0);
+    if (g.kind == 2u && !is_diffuse(g_rough(g), g_metal(g))) {
+        let q = dn_prev_px(g.p);
+        if (q.x >= 0.0) {
+            let i = i32(round(q.x));
+            let j = i32(round(q.y));
+            if (i >= 0 && j >= 0 && i < i32(fr.w) && j < i32(fr.h)) {
+                let idx = u32(j) * fr.w + u32(i);
+                let pg = dn_prevg[2u * idx];
+                let tol = max(0.02, 4.0 * g.dist * fr.px_angle);
+                if (pg.w == 2.0 && length(pg.xyz - g.p) < tol) {
+                    var m1 = vec3<f32>(0.0);
+                    var m2 = vec3<f32>(0.0);
+                    var nn = 0.0;
+                    let x = i32(k % fr.w);
+                    let y = i32(k / fr.w);
+                    for (var dy = -1; dy <= 1; dy++) {
+                        for (var dx = -1; dx <= 1; dx++) {
+                            let qx = x + dx;
+                            let qy = y + dy;
+                            if (qx < 0 || qy < 0 || qx >= i32(fr.w) || qy >= i32(fr.h)) { continue; }
+                            let sv = spec_img[u32(qy) * fr.w + u32(qx)].rgb;
+                            m1 += sv;
+                            m2 += sv * sv;
+                            nn += 1.0;
+                        }
+                    }
+                    m1 /= nn;
+                    m2 /= nn;
+                    let sd = sqrt(max(m2 - m1 * m1, vec3<f32>(0.0)));
+                    let h = spec_hist[idx];
+                    let len = min(h.w + 1.0, DN_SPEC_HIST_MAX);
+                    let hc = clamp(h.rgb, m1 - DN_GAMMA * sd, m1 + DN_GAMMA * sd);
+                    out = vec4<f32>(mix(hc, cur, 1.0 / len), len);
+                }
+            }
+        }
+    }
+    spec_t[k] = out;
+}
+
+@compute @workgroup_size(64)
+fn dn_spec_store(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= fr.w * fr.h) { return; }
+    spec_hist[k] = spec_t[k];
+}
+
+// partie spéculaire finale : nette pour les surfaces lisses, moyenne 3×3 (même normale) au-delà
+fn dn_spec_out(k: u32) -> vec3<f32> {
+    let g = gbuf[k];
+    let rough = g_rough(g);
+    if (is_diffuse(rough, g_metal(g))) { return vec3<f32>(0.0); }
+    if (rough < 0.2) { return spec_t[k].rgb; }
+    let x = i32(k % fr.w);
+    let y = i32(k / fr.w);
+    var acc = vec3<f32>(0.0);
+    var ws = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let qx = x + dx;
+            let qy = y + dy;
+            if (qx < 0 || qy < 0 || qx >= i32(fr.w) || qy >= i32(fr.h)) { continue; }
+            let qi = u32(qy) * fr.w + u32(qx);
+            let gq = gbuf[qi];
+            if (gq.kind != 2u) { continue; }
+            let w = pow(max(dot(g.n, gq.n), 0.0), 32.0);
+            acc += w * spec_t[qi].rgb;
+            ws += w;
+        }
+    }
+    return acc / max(ws, 1e-6);
 }
 
 // historique de la frame suivante, et G-buffer « précédent »
@@ -206,7 +320,7 @@ fn dn_atrous5(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (k >= fr.w * fr.h) { return; }
     let g = gbuf[k];
     var v = dn_atrous(k, 16, 1u);
-    if (g.kind == 2u) { v *= dn_demod(g.albedo); }
+    if (g.kind == 2u) { v = v * dn_dalb(g) + dn_spec_out(k); }
     image[k] = vec4<f32>(v, f32(g.kind));
 }
 
@@ -217,6 +331,6 @@ fn dn_atrous3(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (k >= fr.w * fr.h) { return; }
     let g = gbuf[k];
     var v = dn_atrous(k, 4, 1u);
-    if (g.kind == 2u) { v *= dn_demod(g.albedo); }
+    if (g.kind == 2u) { v = v * dn_dalb(g) + dn_spec_out(k); }
     image[k] = vec4<f32>(v, f32(g.kind));
 }

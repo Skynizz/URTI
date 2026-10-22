@@ -3,17 +3,42 @@ use crate::gpu::Gpu;
 use crate::math::{v3, V3};
 use crate::scene::{Aabb, Light};
 
-/// Maillage indexé, un albédo par maillage.
+/// Matériau : couleur (× texture `tex` si ≥ 0), rugosité GGX, métal, masque alpha.
+/// `rough >= 1` et `metal == 0` : lambertien pur (les scènes d'avant la vitrine).
+#[derive(Clone, Copy, Debug)]
+pub struct Mat {
+    pub tex: i32,
+    pub rough: f32,
+    pub metal: f32,
+    pub mask: bool,
+}
+
+impl Mat {
+    pub const DIFFUSE: Mat = Mat { tex: -1, rough: 1.0, metal: 0.0, mask: false };
+}
+
+/// Maillage indexé, un matériau par maillage.
 #[derive(Clone)]
 pub struct Mesh {
     pub pos: Vec<[f32; 3]>,
     pub idx: Vec<u32>,
     pub albedo: [f32; 3],
+    /// coordonnées de texture (une par sommet)
+    pub uv: Vec<[f32; 2]>,
+    pub mat: Mat,
+}
+
+/// Textures de couleur, toutes ramenées à `size`², avec leurs mipmaps : `mips[l]` contient les
+/// couches à la suite (RGBA8 sRGB).
+pub struct TexArray {
+    pub size: u32,
+    pub layers: u32,
+    pub mips: Vec<Vec<u8>>,
 }
 
 impl Mesh {
     fn new(albedo: [f32; 3]) -> Mesh {
-        Mesh { pos: Vec::new(), idx: Vec::new(), albedo }
+        Mesh { pos: Vec::new(), idx: Vec::new(), albedo, uv: Vec::new(), mat: Mat::DIFFUSE }
     }
     /// Quadrilatère a, b, c, d (dans l'ordre du contour).
     fn quad(&mut self, a: V3, b: V3, c: V3, d: V3) {
@@ -21,7 +46,30 @@ impl Mesh {
         for p in [a, b, c, d] {
             self.pos.push([p.x as f32, p.y as f32, p.z as f32]);
         }
+        self.uv.extend_from_slice(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
         self.idx.extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+    }
+    /// Sphère UV de rayon r, centrée à l'origine.
+    pub fn sphere(albedo: [f32; 3], r: f64, mat: Mat) -> Mesh {
+        let mut m = Mesh::new(albedo);
+        m.mat = mat;
+        let (nu, nv) = (48u32, 24u32);
+        for j in 0..=nv {
+            let th = std::f64::consts::PI * j as f64 / nv as f64;
+            for i in 0..=nu {
+                let ph = 2.0 * std::f64::consts::PI * i as f64 / nu as f64;
+                m.pos.push([(r * th.sin() * ph.cos()) as f32, (r * th.cos()) as f32, (r * th.sin() * ph.sin()) as f32]);
+                m.uv.push([i as f32 / nu as f32, j as f32 / nv as f32]);
+            }
+        }
+        for j in 0..nv {
+            for i in 0..nu {
+                let a = j * (nu + 1) + i;
+                let b = a + nu + 1;
+                m.idx.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+            }
+        }
+        m
     }
     /// Boîte alignée (6 faces).
     pub fn cuboid(albedo: [f32; 3], b: &Aabb) -> Mesh {
@@ -50,6 +98,8 @@ pub struct TriScene {
     pub instances: Vec<Instance>,
     pub lights: Vec<Light>,
     pub bounds: Aabb,
+    /// textures de couleur (vitrine) ; None : pas de texture
+    pub tex: Option<&'static TexArray>,
 }
 
 impl TriScene {
@@ -95,7 +145,7 @@ pub fn cornell(step: u32, light_on: bool, lamp2_on: bool) -> TriScene {
         Light { center: v3(2.75, s - 0.01, 2.75), hx: 0.65, hz: 0.55, emission: V3::splat(15.0), on: light_on },
         Light { center: v3(1.0, s - 0.01, 4.4), hx: 0.35, hz: 0.35, emission: v3(40.0, 30.0, 18.0), on: lamp2_on },
     ];
-    TriScene { meshes, instances, lights, bounds: Aabb { min: V3::splat(-0.1), max: V3::splat(s + 0.1) } }
+    TriScene { meshes, instances, lights, bounds: Aabb { min: V3::splat(-0.1), max: V3::splat(s + 0.1) }, tex: None }
 }
 
 /// Structures d'accélération GPU d'une scène : une BLAS par maillage, une TLAS d'instances.
@@ -106,8 +156,12 @@ pub struct Accel {
     /// sommets (vec4 alignés) et indices de tous les maillages, pour les normales dans le shader
     pub verts: wgpu::Buffer,
     pub idx: wgpu::Buffer,
-    /// par maillage : décalage des sommets, des indices, albédo
+    /// par maillage : décalage des sommets, des indices, matériau
     pub mesh_table: wgpu::Buffer,
+    /// coordonnées de texture de tous les sommets
+    pub uvs: wgpu::Buffer,
+    /// tableau de textures de couleur (1×1 blanc si la scène n'en a pas)
+    pub tex_view: wgpu::TextureView,
     vbufs: Vec<wgpu::Buffer>,
     ibufs: Vec<wgpu::Buffer>,
     sizes: Vec<wgpu::BlasTriangleGeometrySizeDescriptor>,
@@ -118,9 +172,39 @@ pub struct Accel {
 pub struct GMesh {
     pub first_vertex: u32,
     pub first_index: u32,
-    pub pad: [u32; 2],
+    pub tex: i32,
+    /// bit 0 : masque alpha
+    pub flags: u32,
     pub albedo: [f32; 3],
-    pub pad2: f32,
+    pub rough: f32,
+    pub metal: f32,
+    pub pad: [f32; 3],
+}
+
+/// Vue d'un tableau de textures sur GPU (mipmaps comprises) ; 1×1 blanc si `tex` est None.
+pub fn tex_view(gpu: &Gpu, tex: Option<&TexArray>) -> wgpu::TextureView {
+    let white = TexArray { size: 1, layers: 1, mips: vec![vec![255; 4]] };
+    let t = tex.unwrap_or(&white);
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("textures"),
+        size: wgpu::Extent3d { width: t.size, height: t.size, depth_or_array_layers: t.layers },
+        mip_level_count: t.mips.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (l, data) in t.mips.iter().enumerate() {
+        let s = (t.size >> l).max(1);
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: l as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * s), rows_per_image: Some(s) },
+            wgpu::Extent3d { width: s, height: s, depth_or_array_layers: t.layers },
+        );
+    }
+    texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 fn transform(o: V3) -> [f32; 12] {
@@ -136,15 +220,21 @@ impl Accel {
         let mut sizes = Vec::new();
         let mut blas = Vec::new();
         let (mut all_v, mut all_i, mut table) = (Vec::<[f32; 4]>::new(), Vec::<u32>::new(), Vec::new());
+        let mut all_uv: Vec<[f32; 2]> = Vec::new();
         for m in &scene.meshes {
             table.push(GMesh {
                 first_vertex: all_v.len() as u32,
                 first_index: all_i.len() as u32,
-                pad: [0; 2],
+                tex: m.mat.tex,
+                flags: m.mat.mask as u32,
                 albedo: m.albedo,
-                pad2: 0.0,
+                rough: m.mat.rough,
+                metal: m.mat.metal,
+                pad: [0.0; 3],
             });
             all_v.extend(m.pos.iter().map(|p| [p[0], p[1], p[2], 0.0]));
+            assert!(m.uv.is_empty() || m.uv.len() == m.pos.len());
+            all_uv.extend((0..m.pos.len()).map(|k| m.uv.get(k).copied().unwrap_or([0.0; 2])));
             all_i.extend_from_slice(&m.idx);
             vbufs.push(dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("blas v"),
@@ -199,6 +289,12 @@ impl Accel {
                 contents: bytemuck::cast_slice(&table),
                 usage: st,
             }),
+            uvs: dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("uvs"),
+                contents: bytemuck::cast_slice(&all_uv),
+                usage: st,
+            }),
+            tex_view: tex_view(gpu, scene.tex),
             blas,
             vbufs,
             ibufs,
@@ -255,7 +351,7 @@ pub fn smoke(gpu: &Gpu) {
         label: Some("rtsmoke"),
         source: wgpu::ShaderSource::Wgsl(
             r#"
-struct GMesh { first_vertex: u32, first_index: u32, p0: u32, p1: u32, albedo: vec3<f32>, p2: f32 };
+struct GMesh { first_vertex: u32, first_index: u32, tex: i32, flags: u32, albedo: vec3<f32>, rough: f32, metal: f32, p0: f32, p1: f32, p2: f32 };
 @group(0) @binding(0) var acc: acceleration_structure;
 @group(0) @binding(1) var<storage, read> verts: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> idx: array<u32>;
@@ -347,12 +443,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Bloc de géométrie du shader pour les triangles : ray query matériel sur la TLAS courante
 /// (binding 1) ou précédente (binding 3) ; normale du triangle, albédo du maillage.
 pub const TRI_GEOMETRY: &str = r#"// <geometrie> triangles : ray query matériel
-struct GMesh { first_vertex: u32, first_index: u32, p0: u32, p1: u32, albedo: vec3<f32>, p2: f32 };
+struct GMesh { first_vertex: u32, first_index: u32, tex: i32, flags: u32, albedo: vec3<f32>, rough: f32, metal: f32, p0: f32, p1: f32, p2: f32 };
 @group(0) @binding(1) var acc_cur: acceleration_structure;
 @group(0) @binding(3) var acc_prev: acceleration_structure;
 @group(0) @binding(18) var<storage, read> verts: array<vec4<f32>>;
 @group(0) @binding(19) var<storage, read> tidx: array<u32>;
 @group(0) @binding(20) var<storage, read> meshes: array<GMesh>;
+@group(0) @binding(32) var tex_arr: texture_2d_array<f32>;
+@group(0) @binding(33) var tex_samp: sampler;
+@group(0) @binding(34) var<storage, read> uvs: array<vec2<f32>>;
+
+// couleur de base (et alpha) au point d'impact : texture × facteur ; niveau de mip d'après la
+// distance parcourue par le rayon
+fn surface_color(r: RayIntersection) -> vec4<f32> {
+    let m = meshes[r.instance_custom_index];
+    if (m.tex < 0) { return vec4<f32>(m.albedo, 1.0); }
+    let ti = m.first_index + 3u * r.primitive_index;
+    let b = r.barycentrics;
+    let uv = uvs[m.first_vertex + tidx[ti]] * (1.0 - b.x - b.y) + uvs[m.first_vertex + tidx[ti + 1u]] * b.x
+        + uvs[m.first_vertex + tidx[ti + 2u]] * b.y;
+    let lod = clamp(log2(max(r.t * fr.px_angle * 256.0, 1.0)), 0.0, 9.0);
+    let c = textureSampleLevel(tex_arr, tex_samp, uv, m.tex, lod);
+    return vec4<f32>(c.rgb * m.albedo, c.a);
+}
+
+// impact le plus proche, en traversant les texels transparents des maillages à masque alpha
+fn rq_closest(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> RayIntersection {
+    var t0 = 0.0;
+    var r = rq_trace(o, d, tmax, 0u);
+    for (var k = 0; k < 8; k++) {
+        if (r.kind == RAY_QUERY_INTERSECTION_NONE) { break; }
+        let m = meshes[r.instance_custom_index];
+        if ((m.flags & 1u) == 0u || surface_color(r).a >= 0.5) { break; }
+        t0 += r.t + 1e-4;
+        if (t0 >= tmax) {
+            r.kind = RAY_QUERY_INTERSECTION_NONE;
+            break;
+        }
+        r = rq_trace(o + d * t0, d, tmax - t0, 0u);
+    }
+    r.t += t0;
+    return r;
+}
 
 fn rq_trace(o: vec3<f32>, d: vec3<f32>, tmax: f32, flags: u32) -> RayIntersection {
     var q: ray_query;
@@ -367,7 +499,9 @@ fn scene_hit(o: vec3<f32>, d: vec3<f32>) -> Hit {
     h.found = false;
     h.t = 1e30;
     h.light = -1;
-    let r = rq_trace(o, d, 1e30, 0u);
+    h.rough = 1.0;
+    h.metal = 0.0;
+    let r = rq_closest(o, d, 1e30);
     if (r.kind != RAY_QUERY_INTERSECTION_NONE) {
         let m = meshes[r.instance_custom_index];
         let ti = m.first_index + 3u * r.primitive_index;
@@ -379,16 +513,27 @@ fn scene_hit(o: vec3<f32>, d: vec3<f32>) -> Hit {
         h.found = true;
         h.t = r.t;
         h.n = n;
-        h.albedo = m.albedo;
+        h.albedo = surface_color(r).rgb;
+        h.rough = m.rough;
+        h.metal = m.metal;
     }
     return h;
 }
 
 fn occluder(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Occ {
     var r: Occ;
+    // premier impact quelconque (rapide) ; s'il tombe sur un maillage à masque alpha, on refait
+    // une recherche du plus proche qui traverse les texels transparents
     let i = rq_trace(o, d, tmax, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-    r.found = i.kind != RAY_QUERY_INTERSECTION_NONE;
-    r.t = select(tmax, i.t, r.found);
+    var found = i.kind != RAY_QUERY_INTERSECTION_NONE;
+    var t = i.t;
+    if (found && (meshes[i.instance_custom_index].flags & 1u) != 0u) {
+        let c = rq_closest(o, d, tmax);
+        found = c.kind != RAY_QUERY_INTERSECTION_NONE;
+        t = c.t;
+    }
+    r.found = found;
+    r.t = select(tmax, t, r.found);
     return r;
 }
 "#;
@@ -802,7 +947,11 @@ fn sponza_meshes() -> &'static (Vec<Mesh>, Aabb) {
                     let q = v3(p[0] as f64, p[1] as f64, p[2] as f64);
                     b = Aabb { min: b.min.min(q), max: b.max.max(q) };
                 }
-                meshes.push(Mesh { pos, idx, albedo });
+                let uv: Vec<[f32; 2]> = match reader.read_tex_coords(0) {
+                    Some(t) => t.into_f32().collect(),
+                    None => vec![[0.0; 2]; pos.len()],
+                };
+                meshes.push(Mesh { pos, idx, albedo, uv, mat: Mat::DIFFUSE });
             }
         }
         (meshes, b.expand(0.1))
@@ -825,7 +974,7 @@ pub fn sponza(step: u32, l0_on: bool, l2_on: bool) -> TriScene {
         lamp(-8.5, true),
         lamp(8.5, true),
     ];
-    TriScene { meshes, instances, lights, bounds: *bounds }
+    TriScene { meshes, instances, lights, bounds: *bounds, tex: None }
 }
 
 pub fn sponza_at(frame: u32) -> TriScene {
@@ -1376,4 +1525,92 @@ pub fn game_eval(gpu: &Gpu, setup: &TriSetup, cfgs: &[(DuelCfg, bool)]) {
     let path = format!("{out_dir}/resultats.txt");
     let prev = std::fs::read_to_string(&path).unwrap_or_default();
     std::fs::write(path, prev + &out).unwrap();
+}
+
+/// Sponza de la vitrine : vraies textures de couleur (512², mipmaps), matériaux PBR choisis à la
+/// main (le glTF n'a pas de noms) : sol de pierre polie presque miroir, pierre satinée, tissus
+/// mats, métal (chaîne, suspensions), poteaux chromés ; feuillages en masque alpha.
+pub fn sponza_pbr() -> &'static (Vec<Mesh>, Aabb, TexArray) {
+    static CELL: std::sync::OnceLock<(Vec<Mesh>, Aabb, TexArray)> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let dir = "assets/sponza";
+        let gltf = gltf::Gltf::open(format!("{dir}/Sponza.gltf")).expect("assets/sponza : lancer tools/fetch_sponza.sh");
+        let bin = std::fs::read(format!("{dir}/Sponza.bin")).expect("Sponza.bin");
+        let scale = 0.008f32;
+        const SIZE: u32 = 512;
+        // une couche de texture par matériau (texture de couleur)
+        let mut layers: Vec<image::RgbaImage> = Vec::new();
+        let mut layer_of = vec![-1i32; gltf.materials().len()];
+        for mat in gltf.materials() {
+            let Some(i) = mat.index() else { continue };
+            if let Some(info) = mat.pbr_metallic_roughness().base_color_texture() {
+                let gltf::image::Source::Uri { uri, .. } = info.texture().source().source() else { continue };
+                let img = image::open(format!("{dir}/{uri}")).expect("texture Sponza").to_rgba8();
+                layers.push(image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle));
+                layer_of[i] = layers.len() as i32 - 1;
+            }
+        }
+        let mut mips = Vec::new();
+        let mut cur = layers;
+        loop {
+            let s = cur[0].width();
+            mips.push(cur.iter().flat_map(|l| l.as_raw().iter().copied()).collect::<Vec<u8>>());
+            if s == 1 {
+                break;
+            }
+            cur = cur.iter().map(|l| image::imageops::resize(l, s / 2, s / 2, image::imageops::FilterType::Triangle)).collect();
+        }
+        let tex = TexArray { size: SIZE, layers: layer_of.iter().filter(|&&l| l >= 0).count() as u32, mips };
+        let mut meshes = Vec::new();
+        let mut b = Aabb { min: V3::splat(f64::INFINITY), max: V3::splat(f64::NEG_INFINITY) };
+        for mesh in gltf.meshes() {
+            for prim in mesh.primitives() {
+                let reader = prim.reader(|_| Some(&bin[..]));
+                let pos: Vec<[f32; 3]> =
+                    reader.read_positions().unwrap().map(|p| [p[0] * scale, p[1] * scale, p[2] * scale]).collect();
+                let idx: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
+                let uv: Vec<[f32; 2]> = match reader.read_tex_coords(0) {
+                    Some(t) => t.into_f32().collect(),
+                    None => vec![[0.0; 2]; pos.len()],
+                };
+                let mat = prim.material();
+                let mi = mat.index().unwrap_or(0);
+                let c = mat.pbr_metallic_roughness().base_color_factor();
+                // sol : faces tournées vers le haut au niveau du sol
+                let (mut up, mut area) = (0.0f32, 0.0f32);
+                for t in idx.chunks(3) {
+                    let (p0, p1, p2) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+                    let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                    let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                    let cr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                    let a = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+                    area += a;
+                    if cr[1].abs() > 0.9 * a && p0[1] < 0.3 {
+                        up += a;
+                    }
+                }
+                let floor = area > 0.0 && up > 0.6 * area;
+                let (rough, metal) = match mi {
+                    _ if floor => (0.06, 0.0),
+                    14..=19 | 0 | 3 | 24 => (1.0, 0.0), // tissus, feuillages, tuiles : mats
+                    20 | 21 => (0.3, 1.0),              // chaîne, suspensions : métal
+                    2 => (0.15, 1.0),                   // poteaux : chrome
+                    _ => (0.4, 0.0),                    // pierre satinée
+                };
+                let alpha_mask = matches!(mat.alpha_mode(), gltf::material::AlphaMode::Mask);
+                for p in &pos {
+                    let q = v3(p[0] as f64, p[1] as f64, p[2] as f64);
+                    b = Aabb { min: b.min.min(q), max: b.max.max(q) };
+                }
+                meshes.push(Mesh {
+                    pos,
+                    idx,
+                    albedo: [c[0], c[1], c[2]],
+                    uv,
+                    mat: Mat { tex: layer_of[mi], rough, metal, mask: alpha_mask },
+                });
+            }
+        }
+        (meshes, b.expand(0.1), tex)
+    })
 }
