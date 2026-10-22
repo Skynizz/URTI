@@ -117,7 +117,8 @@ struct FrameU {
     dn_gamma: f32,
     sh_spp: u32,
     krc_spp: u32,
-    pad12: [u32; 2],
+    dbg: u32,
+    pad12: u32,
 }
 
 /// Méthode du pipeline.
@@ -280,6 +281,8 @@ pub struct GpuKrc<'a> {
     pub dn_wide: bool,
     /// mode jeu : estimations par pixel de l'éclairage direct et du reflet (KRC)
     pub krc_spp: u32,
+    /// diagnostic de l'image finale KRC : 1 indirect des cellules seul, 2 direct + reflet seuls
+    pub dbg: u32,
     /// chemins corrélés arrêtés sur le cache (événements moins chers)
     pub delta_resample: bool,
     /// chemins corrélés par cellule pour un événement de lampe (0 : 8)
@@ -578,6 +581,7 @@ impl<'a> GpuKrc<'a> {
             indirect_only: false,
             dn_wide: false,
             krc_spp: 1,
+            dbg: 0,
             delta_resample: false,
             m_light: 0,
             debt_rate: -1.0,
@@ -653,7 +657,8 @@ impl<'a> GpuKrc<'a> {
             dn_gamma: self.dn_gamma,
             sh_spp: self.sh.render_spp,
             krc_spp: self.krc_spp,
-            pad12: [0; 2],
+            dbg: self.dbg,
+            pad12: 0,
         }
     }
 

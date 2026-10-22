@@ -63,7 +63,7 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (h.found && h.light < 0) {
                     let c1 = cell_at(h.p, h.n, length(h.p - fr.eye));
                     if (c1 != 0xffffffffu && cells[c1].n >= 4.0) {
-                        let nh = nee_split(h.p, h.n, -bs.wi, h.albedo, h.rough, h.metal);
+                        let nh = nee_split(h.p, h.n, -bs.wi, h.albedo, reg_rough(h.rough), h.metal);
                         let ld = select(cells[c1].mean - cells[c1].dmean, cells[c1].mean, (fr.flags & F_DSPLIT) == 0u);
                         // diffus : direct calculé ici (net), indirect de la cellule
                         let lind = max(ld, vec3<f32>(0.0)) * demod(diff_albedo(h.albedo, h.metal));
@@ -73,7 +73,7 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 if (!cached && h.found && h.light < 0) {
                     pm_wo = -bs.wi;
-                    pm_rough = h.rough;
+                    pm_rough = reg_rough(h.rough);
                     pm_metal = h.metal;
                     pm_diffuse_only = false;
                     resample = (fr.flags & F_RESAMPLE) != 0u;
@@ -86,20 +86,49 @@ fn krc_final(@builtin(global_invocation_id) gid: vec3<u32>) {
         v /= f32(nspp);
         sp /= f32(nspp);
         spec_img[k] = vec4<f32>(sp, 0.0);
-        var ind = vec3<f32>(0.0);
-        var w = 0.0;
+        // indirect des K cellules du pixel : moyenne tronquée (sans la plus claire ni la plus
+        // sombre) dès qu'il y en a 4 ; une cellule aberrante isolée (luciole capturée) n'est
+        // alors jamais affichée, une vraie variation partagée par les voisines passe
+        var vals: array<vec3<f32>, 4>;
+        var nv = 0u;
         for (var s = 0u; s < K; s++) {
             let c = pix_cells[k * K + s];
-            if (c != 0xffffffffu && cells[c].n > 0.0) {
+            if (c != 0xffffffffu && cells[c].n > 0.0 && nv < 4u) {
                 if ((fr.flags & F_DSPLIT) != 0u) {
-                    ind += max(cells[c].mean - cells[c].dmean, vec3<f32>(0.0));
+                    vals[nv] = max(cells[c].mean - cells[c].dmean, vec3<f32>(0.0));
                 } else {
-                    ind += cells[c].mean;
+                    vals[nv] = cells[c].mean;
                 }
+                nv++;
+            }
+        }
+        var ind = vec3<f32>(0.0);
+        var w = 0.0;
+        if (nv == 4u) {
+            var imin = 0u;
+            var imax = 0u;
+            for (var s = 1u; s < 4u; s++) {
+                if (lum(vals[s]) < lum(vals[imin])) { imin = s; }
+                if (lum(vals[s]) >= lum(vals[imax])) { imax = s; }
+            }
+            if (imin == imax) { imax = (imin + 1u) % 4u; }
+            for (var s = 0u; s < 4u; s++) {
+                if (s != imin && s != imax) {
+                    ind += vals[s];
+                    w += 1.0;
+                }
+            }
+        } else {
+            for (var s = 0u; s < nv; s++) {
+                ind += vals[s];
                 w += 1.0;
             }
         }
-        if (w > 0.0) { v += ind / w * demod(diff_albedo(g.albedo, metal)); }
+        if (fr.dbg == 1u) {
+            v = vec3<f32>(0.0);
+            spec_img[k] = vec4<f32>(0.0);
+        }
+        if (fr.dbg != 2u && w > 0.0) { v += ind / w * demod(diff_albedo(g.albedo, metal)); }
     } else {
         spec_img[k] = vec4<f32>(0.0);
     }

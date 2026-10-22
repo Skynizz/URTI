@@ -133,7 +133,8 @@ const F_GAME: u32 = 32768u;   // pipeline de jeu (parties diffuse / spéculaire 
 // paire lisent la même valeur, qui s'annule dans la différence ; il manque seulement l'effet de
 // l'événement au-delà du point d'arrêt (second ordre, corrigé aux frames suivantes)
 const F_DRS: u32 = 65536u;
-const FIREFLY_K: f32 = 1.0e9;
+const FIREFLY_K: f32 = 100.0;
+const FIREFLY_K_YOUNG: f32 = 20.0;
 const MULTI_N: f32 = 32.0;
 
 fn slot_dist(dist: f32, slot: u32) -> f32 {
@@ -169,7 +170,7 @@ struct Frame {
     prev_fwd: vec3<f32>, debt_rate: f32,   // part du budget qui rembourse les chemins d'événement (< 0 : DEBT_RATE)
     prev_right: vec3<f32>, reset_ratio: f32, // changement relatif au-delà duquel on repart de zéro (0 : jamais)
     prev_up: vec3<f32>, dn_gamma: f32,     // bornage de l'historique du débruiteur (0 : DN_GAMMA)
-    sh_spp: u32, krc_spp: u32, pad13: u32, pad14: u32, // SHaRC : chemins par pixel de la passe Render ; KRC : estimations du direct par pixel (mode jeu)
+    sh_spp: u32, krc_spp: u32, dbg: u32, pad14: u32, // SHaRC : chemins par pixel de la passe Render ; KRC : estimations du direct par pixel (mode jeu)
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -465,6 +466,14 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
 fn g_rough(g: Gpx) -> f32 { return select(1.0, unpack2x16unorm(g.p0).x, g.kind == 2u); }
 fn g_metal(g: Gpx) -> f32 { return select(0.0, unpack2x16unorm(g.p0).y, g.kind == 2u); }
 fn is_diffuse(rough: f32, metal: f32) -> bool { return rough >= 0.999 && metal <= 0.0; }
+// régularisation des chemins (mode jeu, les deux méthodes ; la référence reste exacte) : au-delà
+// du premier sommet, une surface brillante est traitée comme rugueuse d'au moins PATH_REG ; les
+// caustiques (diffus → miroir → petite lampe), quasi impossibles à échantillonner, disparaissent
+const PATH_REG: f32 = 0.3;
+fn reg_rough(r: f32) -> f32 {
+    if ((fr.flags & F_GAME) == 0u) { return r; }
+    return max(r, PATH_REG);
+}
 fn diff_albedo(base: vec3<f32>, metal: f32) -> vec3<f32> { return base * (1.0 - metal); }
 fn f0_of(base: vec3<f32>, metal: f32) -> vec3<f32> { return mix(vec3<f32>(0.04), base, metal); }
 fn fresnel(f0: vec3<f32>, vh: f32) -> vec3<f32> { return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - clamp(vh, 0.0, 1.0), 5.0); }
@@ -772,7 +781,7 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
         p = h.p;
         n = h.n;
         albedo = h.albedo;
-        rough = h.rough;
+        rough = reg_rough(h.rough);
         metal = h.metal;
         wo = -d;
         // réutilisation : la cellule visible du 1er rebond (assez loin pour ne pas être la sienne)
@@ -1746,7 +1755,9 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     // il fait une tache de la taille de la cellule, que le débruiteur étale
     var vscale = 1.0;
     if ((fr.flags & F_GAME) != 0u && cells[c].n >= 8.0) {
-        let cap = FIREFLY_K * max(cells[c].lmean, 1e-4);
+        // jeune cellule (après un événement, une valeur rare pèse lourd) : borne plus stricte
+        let kf = select(FIREFLY_K, FIREFLY_K_YOUNG, cells[c].n < 64.0);
+        let cap = kf * max(cells[c].lmean, 1e-4);
         let lv = lum(v);
         if (lv > cap) { vscale = cap / lv; }
     }

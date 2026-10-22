@@ -309,3 +309,19 @@ Tests courts (`krc duel`, `krc statique` : 480×270 ou 256², 3 graines) pour d�
   (pic de 19,7 → 12,6 ms à l'allumage).
 - Faux problème écarté : la sphère miroir « mal placée » dans la référence (sa moitié basse
   reflète le sol et s'y fond).
+
+## v16 — les points blancs de KRC dans la vitrine
+
+- Diagnostic par composante (`krc vitrinedbg f` : indirect des cellules seul, direct + reflet
+  seuls, image complète, avec et sans débruiteur) : les taches blanches venaient des
+  **cellules** (une cellule qui tire une valeur rare énorme devient une tache de sa taille, que
+  le débruiteur étale), pas de l'éclairage direct.
+- Erreur de ma part trouvée en route : après le test des seuils, l'écrêtage des lucioles des
+  cellules était resté désactivé (1e9) dans la vidéo précédente.
+- Correctifs : moyenne tronquée des 4 cellules d'un pixel (sans la plus claire ni la plus
+  sombre : une cellule aberrante isolée n'est jamais affichée) ; écrêtage à 100× la moyenne
+  pour une cellule mûre, 20× pour une jeune (< 64 échantillons, juste après un événement) ;
+  régularisation des chemins en mode jeu pour les deux méthodes (au-delà du premier sommet,
+  rugosité ≥ 0,3 : les caustiques diffus → miroir → petite lampe, à l'origine des taches
+  cyan sur le rideau bleu, disparaissent ; la référence reste exacte).
+- Cellules de 12 ou 16 px : pas mieux.

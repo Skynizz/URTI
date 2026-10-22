@@ -575,11 +575,15 @@ la frame 80, caméra qui marche. Même pipeline de jeu pour les deux méthodes, 
 
 | relMSE* contre la référence (2 048 chemins/px) | KRC | SHaRC NVIDIA |
 |---|---|---|
-| Statique, ciel (f39) | 9,0e-3 | **6,5e-3** |
+| Statique, ciel (f39) | 8,8e-3 | **6,4e-3** |
 | La sphère roule (f60) | 1,8e-2 | **1,3e-2** |
-| Juste après le coucher du ciel (f101) | **2,5e-3** | 5,0e-3 |
-| 10 et 19 frames après (f110, f119) | **6,4e-4**, **4,0e-4** | 1,5e-3, 9,1e-4 |
-| Séquence | 1,04e-2 | **7,96e-3** |
+| Juste après le coucher du ciel (f101) | **2,4e-3** | 4,9e-3 |
+| 10 frames après (f110) | **6,6e-4** (lum 0,98) | 1,5e-3 (lum 1,56) |
+| Séquence | 9,9e-3 | **8,0e-3** |
+
+Après les correctifs des points blancs (JOURNAL v16 : moyenne tronquée des cellules,
+écrêtage des jeunes cellules, régularisation des chemins pour les deux méthodes), les deux
+images sont très proches à l'œil dans les phases claires.
 
 Lecture :
 

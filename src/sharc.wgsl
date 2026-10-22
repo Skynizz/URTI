@@ -415,7 +415,7 @@ fn sharc_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         p = h.p;
         n = h.n;
         albedo = h.albedo;
-        rough = h.rough;
+        rough = reg_rough(h.rough);
         metal = h.metal;
         wo = -d;
     }
@@ -507,7 +507,7 @@ fn sharc_render(@builtin(global_invocation_id) gid: vec3<u32>) {
             p = h.p;
             n = h.n;
             albedo = h.albedo;
-            rough = h.rough;
+            rough = reg_rough(h.rough);
             metal = h.metal;
             wo = -d;
             if (depth >= 2u) {

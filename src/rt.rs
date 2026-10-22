@@ -1837,6 +1837,11 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
         k.ppp = ppp;
         k.sh = sh;
         k.krc_spp = sh.render_spp;
+        if method == Method::Krc {
+            if let Some(c) = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()) {
+                k.cell_px = c;
+            }
+        }
         k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
         k.readback = false;
         let mut prev = at(0);
@@ -1856,6 +1861,11 @@ pub fn vitrine_video(gpu: &Gpu, w: usize) {
         k.ppp = ppp;
         k.sh = sh;
         k.krc_spp = sh.render_spp;
+        if method == Method::Krc {
+            if let Some(c) = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()) {
+                k.cell_px = c;
+            }
+        }
         k.m_light = std::env::var("KRC_ML").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
         let mut prev = at(0);
         let mut err = 0.0;
@@ -1937,4 +1947,44 @@ pub fn vitrine_ref(gpu: &Gpu, f: u32, spp: u32) {
         img2 = k.frame_tri(&sc, &sc, f).image;
     }
     crate::image::write_png(&format!("results/vitrine/test_krc_cold_f{f:03}.png"), 960, 540, &tonemap(&img2, 9.3)).unwrap();
+}
+
+/// `krc vitrinedbg f` : composantes de l'image finale KRC à la frame f (séquence jouée depuis 0) :
+/// indirect des cellules seul, direct + reflet seuls, image complète ; avec et sans débruiteur.
+pub fn vitrine_dbg(gpu: &Gpu, f: u32) {
+    use crate::gpu_krc::{GpuKrc, Method, ShParams};
+    use crate::grid::Grid;
+    let setup = vitrine_setup(960, 540);
+    let at = setup.at;
+    let scene0 = at(0);
+    let grid = Grid::fit(&scene0.bounds);
+    for (dbg, name) in [(1u32, "indirect"), (2, "direct"), (0, "complet")] {
+        for denoise in [false, true] {
+            let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&scene0), Method::Krc, 1);
+            k.game = true;
+            k.ppp = 0.25;
+            k.krc_spp = 2;
+            k.m_light = 16;
+            k.sh = ShParams::default();
+            k.dbg = dbg;
+            if let Some(c) = std::env::var("KRC_CELL").ok().and_then(|c| c.parse().ok()) {
+                k.cell_px = c;
+            }
+            k.denoise = denoise;
+            let mut prev = at(0);
+            let mut img = Vec::new();
+            for t in 0..=f {
+                let scene = at(t);
+                k.set_view(setup.view_at(t));
+                k.readback = t == f;
+                let fr = k.frame_tri(&scene, &prev, t);
+                prev = scene;
+                if t == f {
+                    img = fr.image;
+                }
+            }
+            let tag = if denoise { "debruite" } else { "brut" };
+            crate::image::write_png(&format!("results/vitrine/dbg_f{f:03}_{name}_{tag}.png"), 960, 540, &tonemap(&img, 9.3)).unwrap();
+        }
+    }
 }
