@@ -104,7 +104,8 @@ struct FrameU {
     sh_accum: u32,
     sh_stale: u32,
     sh_down: u32,
-    pad5: [u32; 3],
+    cell_px: f32,
+    pad5: [u32; 2],
 }
 
 /// Méthode du pipeline.
@@ -149,6 +150,10 @@ const F_PENDING: u32 = 8;
 const F_AMORTIZE: u32 = 16;
 const F_S2HIST: u32 = 32;
 const F_ZCAP: u32 = 64;
+const F_RESAMPLE: u32 = 128;
+const F_REUSE: u32 = 256;
+const F_DEMOD: u32 = 512;
+const F_SEED: u32 = 1024;
 
 /// Résultat d'une frame.
 pub struct GpuFrame {
@@ -223,8 +228,19 @@ pub struct GpuKrc<'a> {
     pub s2_hist: bool,
     /// événement de lampe : historique plafonné aussi pour les cellules sans différence mesurée
     pub zero_cap: bool,
+    /// rééchantillonnage du cache : chemins ordinaires arrêtés au 1er ou 2e rebond sur une cellule
+    pub resample: bool,
+    /// largeur d'une cellule, en pixels (à la distance de la surface)
+    pub cell_px: f32,
+    /// réutilisation des sommets : le 1er rebond nourrit aussi la cellule visible qu'il touche
+    pub reuse: bool,
+    /// démodulation matériau (radiance / albédo dans les cellules)
+    pub demod: bool,
+    /// cellule neuve initialisée depuis le niveau voisin
+    pub seed_levels: bool,
     pending: Option<GpuEvent>,
     _free_buf: wgpu::Buffer,
+    _vis_buf: wgpu::Buffer,
     _sh_bufs: [wgpu::Buffer; 4],
     /// compteur de frames monotone (éviction des cellules invisibles)
     clock: u32,
@@ -237,7 +253,8 @@ pub struct GpuKrc<'a> {
     sh_cam_prev: V3,
 }
 
-const ENTRIES: [&str; 35] = [
+const ENTRIES: [&str; 36] = [
+    "evict_sweep",
     "sharc_update",
     "sharc_resolve",
     "sharc_query",
@@ -304,7 +321,7 @@ impl<'a> GpuKrc<'a> {
             min_binding_size: None,
         };
         let mut entries = Vec::new();
-        for b in 0..27u32 {
+        for b in 0..28u32 {
             let ty = match b {
                 0 => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -364,7 +381,7 @@ impl<'a> GpuKrc<'a> {
             (len * 16, st),
             (162 * 4, st),
             (32, st),
-            (48, st | wgpu::BufferUsages::INDIRECT),
+            (64, st | wgpu::BufferUsages::INDIRECT),
             (cell_cap as usize * 16, st),
         ];
         let bufs: Vec<wgpu::Buffer> = sizes
@@ -385,6 +402,7 @@ impl<'a> GpuKrc<'a> {
         let read = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST;
         let probe_buf = mk((PROBES * 32) as u64, st);
         let free_buf = mk(cell_cap as u64 * 4, st);
+        let vis_buf = mk(cell_cap as u64 * 4, st);
         // SHaRC : clés 64 bits, verrous, accumulation (uint4), résolu (half4 + 2 u32)
         let sh_bufs = [8u64, 4, 16, 16].map(|b| mk(sh_cap as u64 * b, st));
         let accel = tri.map(|t| Accel::new(gpu, t));
@@ -407,6 +425,7 @@ impl<'a> GpuKrc<'a> {
                 }
                 e.push(wgpu::BindGroupEntry { binding: 21, resource: probe_buf.as_entire_binding() });
                 e.push(wgpu::BindGroupEntry { binding: 22, resource: free_buf.as_entire_binding() });
+                e.push(wgpu::BindGroupEntry { binding: 27, resource: vis_buf.as_entire_binding() });
                 for (i, b) in sh_bufs.iter().enumerate() {
                     e.push(wgpu::BindGroupEntry { binding: 23 + i as u32, resource: b.as_entire_binding() });
                 }
@@ -426,11 +445,12 @@ impl<'a> GpuKrc<'a> {
             bind_idx: 0,
             read_img: mk((len * 16) as u64, read),
             read_ctr: mk((CTR * 4) as u64, read),
-            ts: dev.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: MAX_PASSES * 2 }),
-            ts_resolve: mk(
-                MAX_PASSES as u64 * 16,
-                wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            ),
+            ts: dev.create_query_set(&wgpu::QuerySetDescriptor {
+                label: None,
+                ty: wgpu::QueryType::Timestamp,
+                count: MAX_PASSES * 2,
+            }),
+            ts_resolve: mk(MAX_PASSES as u64 * 16, wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
             ts_read: mk(MAX_PASSES as u64 * 16, read),
             period_ns: gpu.queue.get_timestamp_period(),
             bufs,
@@ -445,10 +465,16 @@ impl<'a> GpuKrc<'a> {
             n_post: 16.0,
             s2_hist: true,
             zero_cap: true,
+            resample: false,
+            cell_px: 4.0,
+            reuse: false,
+            demod: false,
+            seed_levels: false,
             pending: None,
             clock: 0,
             rebuild: false,
             _free_buf: free_buf,
+            _vis_buf: vis_buf,
             _sh_bufs: sh_bufs,
             method,
             sh: ShParams::default(),
@@ -497,7 +523,8 @@ impl<'a> GpuKrc<'a> {
             sh_accum: self.sh.accum_frames,
             sh_stale: self.sh.stale_frames,
             sh_down: self.sh.downscale,
-            pad5: [0; 3],
+            cell_px: self.cell_px,
+            pad5: [0; 2],
         }
     }
 
@@ -510,7 +537,8 @@ impl<'a> GpuKrc<'a> {
             light_w: e.light_w.clone(),
             probe_rays: e.probe_rays,
         });
-        let w_ev: Vec<f64> = ev.map(|e| e.light_w.clone()).or(self.pending.as_ref().map(|e| e.light_w.clone())).unwrap_or_default();
+        let w_ev: Vec<f64> =
+            ev.map(|e| e.light_w.clone()).or(self.pending.as_ref().map(|e| e.light_w.clone())).unwrap_or_default();
         let (b, l) = scene_to_gpu(scene, &w_ev);
         let (bp, lp) = scene_to_gpu(prev, &w_ev);
         let q = &self.gpu.queue;
@@ -713,6 +741,18 @@ impl<'a> GpuKrc<'a> {
         if self.zero_cap {
             flags |= F_ZCAP;
         }
+        if self.resample {
+            flags |= F_RESAMPLE;
+        }
+        if self.reuse {
+            flags |= F_REUSE;
+        }
+        if self.demod {
+            flags |= F_DEMOD;
+        }
+        if self.seed_levels {
+            flags |= F_SEED;
+        }
         if let Some(e) = ev {
             if !self.sharc {
                 flags |= F_EVENT;
@@ -751,42 +791,44 @@ impl<'a> GpuKrc<'a> {
             plan.push(("sharc_resolve", Dispatch::Direct(self.sh_cap.div_ceil(256))));
             plan.push((if self.sh.render { "sharc_render" } else { "sharc_query" }, px));
         } else {
-        plan.push(("insert", slots));
-        plan.push(("lookup", slots));
-        plan.push(("prep_cells", Dispatch::Direct(1)));
-        if flags & F_EVENT != 0 {
-            plan.push(("event_mark", cells));
-            plan.push(("prep_d1", Dispatch::Direct(1)));
-            plan.push(("delta_trace1", Dispatch::Indirect(0)));
-            if flags & F_GEOMETRY != 0 {
-                plan.push(("delta_more", cells));
-                plan.push(("prep_d2", Dispatch::Direct(1)));
-                plan.push(("delta_trace2", Dispatch::Indirect(12)));
+            plan.push(("insert", slots));
+            plan.push(("lookup", slots));
+            plan.push(("prep_cells", Dispatch::Direct(1)));
+            if flags & F_EVENT != 0 {
+                plan.push(("event_mark", cells));
+                plan.push(("prep_d1", Dispatch::Direct(1)));
+                plan.push(("delta_trace1", Dispatch::Indirect(0)));
+                if flags & F_GEOMETRY != 0 {
+                    plan.push(("delta_more", cells));
+                    plan.push(("prep_d2", Dispatch::Direct(1)));
+                    plan.push(("delta_trace2", Dispatch::Indirect(12)));
+                }
+                plan.push(("delta_apply", cells));
+            } else if flags & F_PENDING != 0 {
+                plan.push(("pending_mark", cells));
+                plan.push(("prep_d1", Dispatch::Direct(1)));
+                plan.push(("delta_trace1", Dispatch::Indirect(0)));
+                plan.push(("delta_apply", cells));
             }
-            plan.push(("delta_apply", cells));
-        } else if flags & F_PENDING != 0 {
-            plan.push(("pending_mark", cells));
-            plan.push(("prep_d1", Dispatch::Direct(1)));
-            plan.push(("delta_trace1", Dispatch::Indirect(0)));
-            plan.push(("delta_apply", cells));
-        }
-        if self.sharc {
-            plan.push(("sharc_emit", px));
-        } else {
-            plan.push(("alloc_hist", cells));
-            plan.push(("alloc_prep", Dispatch::Direct(1)));
-            plan.push(("alloc_scan1", cells));
-            plan.push(("alloc_pick1", Dispatch::Direct(1)));
-            plan.push(("alloc_scan2", cells));
-            plan.push(("alloc_pick2", Dispatch::Direct(1)));
-            plan.push(("alloc_scan3", cells));
-            plan.push(("alloc_pick3", Dispatch::Direct(1)));
-            plan.push(("alloc_emit", cells));
-        }
-        plan.push(("prep_reg", Dispatch::Direct(1)));
-        plan.push(("trace", Dispatch::Indirect(24)));
-        plan.push(("resolve", cells));
-        plan.push(("display", px));
+            let vis = Dispatch::Indirect(48);
+            if self.sharc {
+                plan.push(("sharc_emit", px));
+            } else {
+                plan.push(("alloc_hist", vis));
+                plan.push(("alloc_prep", Dispatch::Direct(1)));
+                plan.push(("alloc_scan1", vis));
+                plan.push(("alloc_pick1", Dispatch::Direct(1)));
+                plan.push(("alloc_scan2", vis));
+                plan.push(("alloc_pick2", Dispatch::Direct(1)));
+                plan.push(("alloc_scan3", vis));
+                plan.push(("alloc_pick3", Dispatch::Direct(1)));
+                plan.push(("alloc_emit", vis));
+            }
+            plan.push(("prep_reg", Dispatch::Direct(1)));
+            plan.push(("trace", Dispatch::Indirect(24)));
+            plan.push(("evict_sweep", Dispatch::Direct(self.cell_cap.div_ceil(8 * 64))));
+            plan.push(("resolve", vis));
+            plan.push(("display", px));
         }
 
         let dev = &self.gpu.device;
@@ -819,11 +861,8 @@ impl<'a> GpuKrc<'a> {
             b.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("lecture GPU"));
         }
         dev.poll(wgpu::Maintain::Wait);
-        let img: Vec<f32> = if self.readback {
-            bytemuck::cast_slice(&self.read_img.slice(..).get_mapped_range()).to_vec()
-        } else {
-            Vec::new()
-        };
+        let img: Vec<f32> =
+            if self.readback { bytemuck::cast_slice(&self.read_img.slice(..).get_mapped_range()).to_vec() } else { Vec::new() };
         let ctr: Vec<u32> = bytemuck::cast_slice(&self.read_ctr.slice(..).get_mapped_range()).to_vec();
         let ts: Vec<u64> = bytemuck::cast_slice(&self.ts_read.slice(..).get_mapped_range()).to_vec();
         for b in &reads {
@@ -869,8 +908,10 @@ impl<'a> GpuKrc<'a> {
 pub fn bench(gpu: &Gpu) {
     use crate::methods::event;
     use crate::scene::{build, state_at, FRAMES};
-    let mut csv = String::from("scale,width,height,method,phase,mean_ms,max_ms,paths_per_frame
-");
+    let mut csv = String::from(
+        "scale,width,height,method,phase,mean_ms,max_ms,paths_per_frame
+",
+    );
     for s in [1usize, 2, 5, 10] {
         let world = World::scaled(2, s);
         for sharc in [false, true] {
@@ -907,7 +948,9 @@ pub fn bench(gpu: &Gpu) {
                 }
             }
             let mut line = format!("{}×{} {name:<9}", world.w, world.h);
-            for (phase, a, b) in [("statique", 20u32, 40u32), ("boite", 40, 64), ("lampe_on", 80, 81), ("lampe_off", 100, 101), ("tout", 0, 120)] {
+            for (phase, a, b) in
+                [("statique", 20u32, 40u32), ("boite", 40, 64), ("lampe_on", 80, 81), ("lampe_off", 100, 101), ("tout", 0, 120)]
+            {
                 let sel: Vec<&(u32, f64, u32)> = per_frame.iter().filter(|p| p.0 >= a && p.0 < b).collect();
                 // médiane : robuste aux fluctuations de fréquence du GPU
                 let mut v: Vec<f64> = sel.iter().map(|p| p.1).collect();
@@ -915,8 +958,11 @@ pub fn bench(gpu: &Gpu) {
                 let mean = v[v.len() / 2];
                 let max = sel.iter().map(|p| p.1).fold(0.0, f64::max);
                 let paths = sel.iter().map(|p| p.2 as f64).sum::<f64>() / sel.len() as f64;
-                csv += &format!("{s},{},{},{name},{phase},{mean:.4},{max:.4},{paths:.0}
-", world.w, world.h);
+                csv += &format!(
+                    "{s},{},{},{name},{phase},{mean:.4},{max:.4},{paths:.0}
+",
+                    world.w, world.h
+                );
                 line += &format!(" | {phase} {mean:6.3} ms");
             }
             println!("{line}");
@@ -939,8 +985,10 @@ pub fn drift(gpu: &Gpu, cycles: u32, refs: &std::collections::HashMap<String, Ve
     use crate::scene::{build, state_at, FRAMES};
     let world = World::new(2);
     let probe_frames = [39u32, 63, 79, 81, 99, 101, 119];
-    let mut csv = String::from("method,cycle,frame,relmse,cells,max_n,debt,overflow
-");
+    let mut csv = String::from(
+        "method,cycle,frame,relmse,cells,max_n,debt,overflow
+",
+    );
     for sharc in [false, true] {
         let name = if sharc { "gpu_sharc" } else { "gpu_krc" };
         let mut krc = GpuKrc::new(gpu, world, sharc, 7);
@@ -965,8 +1013,11 @@ pub fn drift(gpu: &Gpu, cycles: u32, refs: &std::collections::HashMap<String, Ve
                         }
                     }
                     let (_, rel) = errors(&img, &refs[&state.id()], &gb);
-                    csv += &format!("{name},{cycle},{t},{rel:.6e},{},{},{},{}
-", f.cells, f.max_n, f.debt, f.overflow);
+                    csv += &format!(
+                        "{name},{cycle},{t},{rel:.6e},{},{},{},{}
+",
+                        f.cells, f.max_n, f.debt, f.overflow
+                    );
                     row.push(rel);
                     if t == 119 && (cycle % 10 == 9 || cycle == 0) {
                         println!(
@@ -990,7 +1041,11 @@ pub fn drift(gpu: &Gpu, cycles: u32, refs: &std::collections::HashMap<String, Ve
             }
         }
         let m = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
-        println!("{name} : relMSE moyen aux instants sondés, 10 premiers cycles {:.3e} -> 10 derniers {:.3e}", m(&first), m(&last));
+        println!(
+            "{name} : relMSE moyen aux instants sondés, 10 premiers cycles {:.3e} -> 10 derniers {:.3e}",
+            m(&first),
+            m(&last)
+        );
     }
     std::fs::create_dir_all("results/gpu").unwrap();
     std::fs::write("results/gpu/drift.csv", csv).unwrap();

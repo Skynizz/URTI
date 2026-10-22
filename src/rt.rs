@@ -216,7 +216,8 @@ impl Accel {
 
     fn build(&mut self, gpu: &Gpu, scene: &TriScene, k: usize, with_blas: bool) {
         for (i, inst) in scene.instances.iter().enumerate() {
-            self.tlas[k][i] = Some(wgpu::TlasInstance::new(&self.blas[inst.mesh], transform(inst.offset), inst.mesh as u32, 0xff));
+            self.tlas[k][i] =
+                Some(wgpu::TlasInstance::new(&self.blas[inst.mesh], transform(inst.offset), inst.mesh as u32, 0xff));
         }
         let entries: Vec<wgpu::BlasBuildEntry> = if with_blas {
             (0..self.blas.len())
@@ -319,7 +320,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             wgpu::BindGroupEntry { binding: 4, resource: img.as_entire_binding() },
         ],
     });
-    let _ = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &[0u8; 4], usage: wgpu::BufferUsages::STORAGE });
+    let _ = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: &[0u8; 4],
+        usage: wgpu::BufferUsages::STORAGE,
+    });
     let mut enc = dev.create_command_encoder(&Default::default());
     {
         let mut pass = enc.begin_compute_pass(&Default::default());
@@ -332,7 +337,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     read.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
     dev.poll(wgpu::Maintain::Wait);
     let data: Vec<f32> = bytemuck::cast_slice(&read.slice(..).get_mapped_range()).to_vec();
-    let px: Vec<V3> = (0..(w * h) as usize).map(|k| v3(data[4 * k] as f64, data[4 * k + 1] as f64, data[4 * k + 2] as f64)).collect();
+    let px: Vec<V3> =
+        (0..(w * h) as usize).map(|k| v3(data[4 * k] as f64, data[4 * k + 1] as f64, data[4 * k + 2] as f64)).collect();
     std::fs::create_dir_all("results/rt").unwrap();
     crate::image::save("results/rt/smoke_cornell.png", w as usize, h as usize, &px);
     println!("ray query OK : {} triangles, image results/rt/smoke_cornell.png", scene.triangles());
@@ -523,8 +529,14 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
         });
         refs.insert(id, img);
     }
-    let phases: [(&str, u32, u32); 6] =
-        [("tout", 0, 120), ("statique", 30, 40), ("boite", 40, 64), ("apres_boite", 64, 80), ("lampe_on", 80, 100), ("lampe_off", 100, 120)];
+    let phases: [(&str, u32, u32); 6] = [
+        ("tout", 0, 120),
+        ("statique", 30, 40),
+        ("boite", 40, 64),
+        ("apres_boite", 64, 80),
+        ("lampe_on", 80, 100),
+        ("lampe_off", 100, 120),
+    ];
     let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame,trim_mean,trim_std,lum_ratio\n");
     use crate::gpu_krc::Method;
     // tri_sharc : cache SHaRC-like maison ; tri_sharc_nv : portage du SHaRC officiel de NVIDIA,
@@ -548,7 +560,9 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
             k.sh.render = render;
             let mut prev = at(0);
             let mut rows = Vec::new();
-            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio,cells_live,evicted,overflow\n");
+            let mut csv = String::from(
+                "frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim,lum_ratio,cells_live,evicted,overflow\n",
+            );
             for t in 0..FRAMES {
                 let scene = at(t);
                 k.set_view(setup.view_at(t));
@@ -590,8 +604,9 @@ pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
                 stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.3).sum::<f64>() / (b - a) as f64).collect());
             let (lr, _) =
                 stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.4).sum::<f64>() / (b - a) as f64).collect());
-            let ms: f64 = runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.1).sum::<f64>() / (b - a) as f64).sum::<f64>()
-                / runs.len() as f64;
+            let ms: f64 =
+                runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.1).sum::<f64>() / (b - a) as f64).sum::<f64>()
+                    / runs.len() as f64;
             let paths: f64 = runs
                 .iter()
                 .map(|r| r[a as usize..b as usize].iter().map(|x| x.2 as f64).sum::<f64>() / (b - a) as f64)
@@ -624,11 +639,13 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
     let refs: std::collections::HashMap<String, Vec<V3>> = (0..FRAMES)
         .map(|f| setup.ref_key(f))
         .map(|id| {
-            let img = load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes : lancer d'abord la séquence");
+            let img =
+                load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes : lancer d'abord la séquence");
             (id, img)
         })
         .collect();
-    let mut csv = String::from("method,ppp,relmse,relmse_static,relmse_dynamic,ms_median,ms_mean,ms_p95,trim,trim_static,trim_dynamic\n");
+    let mut csv =
+        String::from("method,ppp,relmse,relmse_static,relmse_dynamic,ms_median,ms_mean,ms_p95,trim,trim_static,trim_dynamic\n");
     use crate::gpu_krc::{Method, ShParams};
     // (méthode, budget « chemins par pixel », paramètres SHaRC). Pour le SHaRC officiel, le budget
     // est sa densité de mise à jour : 1 pixel par bloc d×d, soit 1/d² chemin par pixel.
@@ -643,7 +660,12 @@ pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
     for scale in [50.0f32, 100.0] {
         for down in [5u32, 3, 2, 1] {
             let name = format!("tri_sharc_nv_s{scale}");
-            variants.push((name, Method::Sharc, 1.0 / (down * down) as f32, ShParams { scene_scale: scale, downscale: down, ..d }));
+            variants.push((
+                name,
+                Method::Sharc,
+                1.0 / (down * down) as f32,
+                ShParams { scene_scale: scale, downscale: down, ..d },
+            ));
         }
     }
     let only = std::env::var("KRC_METHODS").ok();
@@ -761,7 +783,8 @@ fn sponza_meshes() -> &'static (Vec<Mesh>, Aabb) {
     static CELL: std::sync::OnceLock<(Vec<Mesh>, Aabb)> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
         let dir = "assets/sponza";
-        let gltf = gltf::Gltf::open(format!("{dir}/Sponza.gltf")).expect("assets/sponza/Sponza.gltf : lancer tools/fetch_sponza.sh");
+        let gltf =
+            gltf::Gltf::open(format!("{dir}/Sponza.gltf")).expect("assets/sponza/Sponza.gltf : lancer tools/fetch_sponza.sh");
         let bin = std::fs::read(format!("{dir}/Sponza.bin")).expect("Sponza.bin");
         let scale = 0.008f32;
         let mut meshes = Vec::new();
@@ -769,7 +792,8 @@ fn sponza_meshes() -> &'static (Vec<Mesh>, Aabb) {
         for mesh in gltf.meshes() {
             for prim in mesh.primitives() {
                 let reader = prim.reader(|_| Some(&bin[..]));
-                let pos: Vec<[f32; 3]> = reader.read_positions().unwrap().map(|p| [p[0] * scale, p[1] * scale, p[2] * scale]).collect();
+                let pos: Vec<[f32; 3]> =
+                    reader.read_positions().unwrap().map(|p| [p[0] * scale, p[1] * scale, p[2] * scale]).collect();
                 let idx: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
                 let mat = prim.material();
                 let c = mat.pbr_metallic_roughness().base_color_factor();
@@ -873,18 +897,34 @@ pub fn sponza_debug(gpu: &Gpu) {
     }
     for ex in [-11.5, -10.5, -9.5, -8.0] {
         let eye = v3(ex, 1.8, -0.3);
-        let dirs = [v3(1.0, 0.1, 0.0), v3(1.0, 0.4, 0.4), v3(1.0, 0.4, -0.4), v3(1.0, -0.2, 0.4), v3(1.0, -0.2, -0.4), v3(0.0, 1.0, 0.0)];
+        let dirs = [
+            v3(1.0, 0.1, 0.0),
+            v3(1.0, 0.4, 0.4),
+            v3(1.0, 0.4, -0.4),
+            v3(1.0, -0.2, 0.4),
+            v3(1.0, -0.2, -0.4),
+            v3(0.0, 1.0, 0.0),
+        ];
         let rays: Vec<(V3, V3)> = dirs.iter().map(|d| (eye, d.norm())).collect();
         let h = k.trace_rays(&rays, 0);
         let dist: Vec<String> = h.iter().map(|x| x.map_or("∞".to_string(), |(p, _)| format!("{:.1}", (p - eye).len()))).collect();
-        println!("œil x = {ex} : distances libres (avant, haut-gauche, haut-droite, bas-gauche, bas-droite, zénith) = {:?}", dist);
+        println!(
+            "œil x = {ex} : distances libres (avant, haut-gauche, haut-droite, bas-gauche, bas-droite, zénith) = {:?}",
+            dist
+        );
     }
     for (j, l) in scene.lights.iter().enumerate() {
         let hits = k.probes(l, 0, 7);
         let d: Vec<f64> = hits.iter().map(|(p, _)| (*p - l.center).len()).collect();
         let mean = d.iter().sum::<f64>() / d.len().max(1) as f64;
         let near = d.iter().filter(|&&x| x < 0.5).count();
-        println!("lampe {j} en {:?} : {} sondes touchent, distance moyenne {:.2} m, {} à moins de 0,5 m", l.center, hits.len(), mean, near);
+        println!(
+            "lampe {j} en {:?} : {} sondes touchent, distance moyenne {:.2} m, {} à moins de 0,5 m",
+            l.center,
+            hits.len(),
+            mean,
+            near
+        );
     }
 }
 
@@ -977,7 +1017,8 @@ pub fn sharc_check(gpu: &Gpu, setup: &TriSetup) {
     let (view, at) = (setup.view, setup.at);
     let scene = at(39);
     let grid = Grid::fit(&scene.bounds);
-    let r = load_raw(&format!("results/ref_{}/{}.bin", setup.name, setup.ref_key(39)), view.len()).expect("références manquantes");
+    let r =
+        load_raw(&format!("results/ref_{}/{}.bin", setup.name, setup.ref_key(39)), view.len()).expect("références manquantes");
     let d = ShParams::default();
     let variants = [
         ("défaut NVIDIA", d),
@@ -1022,6 +1063,13 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
         let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&at(0)), method, 3);
         k.ppp = ppp;
         k.readback = false;
+        // réglages KRC optionnels : KRC_RS=1 (rééchantillonnage), KRC_CELL=8, KRC_SEED=1
+        let env = |v: &str| std::env::var(v).ok();
+        k.resample = env("KRC_RS").is_some();
+        k.seed_levels = env("KRC_SEED").is_some();
+        if let Some(c) = env("KRC_CELL").and_then(|c| c.parse().ok()) {
+            k.cell_px = c;
+        }
         let mut sum: Vec<(&'static str, f64)> = Vec::new();
         let (mut live, mut total) = (0u32, 0.0);
         let mut prev = at(0);
@@ -1045,4 +1093,88 @@ pub fn passes(gpu: &Gpu, setup: &TriSetup, ppp: f32) {
             println!("    {name:<16} {ms:.3} ms");
         }
     }
+}
+
+/// Une configuration du duel KRC / SHaRC.
+#[derive(Clone, Copy)]
+pub struct DuelCfg {
+    pub name: &'static str,
+    pub method: crate::gpu_krc::Method,
+    pub ppp: f32,
+    pub resample: bool,
+    pub cell_px: f32,
+    pub reuse: bool,
+    pub demod: bool,
+    pub seed: bool,
+    pub sh: crate::gpu_krc::ShParams,
+}
+
+/// `krc duel [sponzacam|sponza|cornellcam|cornell]` : test court, 1 graine, 120 frames.
+/// Passage 1 : erreur (relue) ; passage 2 : temps GPU sans relecture. Une ligne par configuration.
+pub fn duel(gpu: &Gpu, setup: &TriSetup, cfgs: &[DuelCfg]) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    use crate::render::load_raw;
+    use crate::scene::FRAMES;
+    let at = setup.at;
+    let grid = Grid::fit(&at(0).bounds);
+    let dir = format!("results/ref_{}", setup.name);
+    let refs: Vec<Vec<V3>> = (0..FRAMES)
+        .map(|f| load_raw(&format!("{dir}/{}.bin", setup.ref_key(f)), setup.view.len()).expect("références manquantes"))
+        .collect();
+    let mut out = String::new();
+    let seeds: u32 = std::env::var("KRC_DUEL_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    for c in cfgs {
+        let (mut all, mut stat, mut dynm, mut lum_min, mut ms) = (0.0, 0.0, 0.0, 9.0f64, Vec::new());
+        for seed in 0..seeds {
+            let mut k = GpuKrc::with_method(gpu, setup.view, grid, Some(&at(0)), c.method, 3 + seed);
+            k.ppp = c.ppp;
+            k.resample = c.resample;
+            k.cell_px = c.cell_px;
+            k.reuse = c.reuse;
+            k.demod = c.demod;
+            k.seed_levels = c.seed;
+            k.sh = c.sh;
+            for pass in 0..2 {
+                k.readback = pass == 0;
+                let mut prev = at(0);
+                for t in 0..FRAMES {
+                    let scene = at(t);
+                    k.set_view(setup.view_at(t));
+                    let f = k.frame_tri(&scene, &prev, t);
+                    prev = scene;
+                    if pass == 0 {
+                        let (_, e, lr) = frame_err(&f.image, &f.kinds, &refs[t as usize]);
+                        let w = 1.0 / seeds as f64;
+                        all += w * e / FRAMES as f64;
+                        if (30..40).contains(&t) {
+                            stat += w * e / 10.0;
+                        }
+                        if t >= 40 {
+                            dynm += w * e / 80.0;
+                        }
+                        if t >= 20 {
+                            lum_min = lum_min.min(lr);
+                        }
+                    } else {
+                        ms.push(f.gpu_ms());
+                    }
+                }
+            }
+        }
+        ms.sort_by(|a, b| a.total_cmp(b));
+        let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+        let line = format!(
+            "{:<28} relMSE* {all:.3e} (statique {stat:.2e}, dynamique {dynm:.2e}) lum min {lum_min:.2} | GPU moy {mean:.2} ms, p95 {:.2} ms",
+            c.name,
+            ms[ms.len() * 95 / 100]
+        );
+        println!("{line}");
+        out += &line;
+        out += "\n";
+    }
+    std::fs::create_dir_all("results/duel").unwrap();
+    let path = format!("results/duel/{}.txt", setup.name);
+    let prev = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(path, prev + &out).unwrap();
 }

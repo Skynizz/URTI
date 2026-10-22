@@ -1,5 +1,9 @@
+mod bench;
 mod cache;
 mod deps;
+mod gpu;
+mod gpu_krc;
+mod grid;
 mod image;
 mod math;
 mod methods;
@@ -7,10 +11,6 @@ mod par;
 mod pt;
 mod render;
 mod rt;
-mod bench;
-mod gpu;
-mod gpu_krc;
-mod grid;
 mod scene;
 mod tracer;
 
@@ -131,10 +131,10 @@ fn scale(tracer: &tracer::Tracer) {
         "krc_energy_l2",
         "krc_energy_l2_target",
     ]
-        .iter()
-        .map(|s| s.to_string())
-        .filter(|s| only.as_ref().map_or(true, |o| o.contains(s)))
-        .collect();
+    .iter()
+    .map(|s| s.to_string())
+    .filter(|s| only.as_ref().map_or(true, |o| o.contains(s)))
+    .collect();
     let mut all = String::from("rooms,method,phase,relmse_mean,relmse_std,rmse_mean,paths_per_frame\n");
     let rooms_list: Vec<usize> = std::env::var("KRC_ROOMS")
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
@@ -253,12 +253,83 @@ fn main() {
             },
             None => eprintln!("pas de GPU"),
         },
+        Some("duel") => match gpu::Gpu::new() {
+            Some(g) => {
+                use gpu_krc::{Method, ShParams};
+                let setup = match args.get(1).map(String::as_str) {
+                    Some("sponza") => rt::sponza_setup(480, 270),
+                    Some("cornellcam") => rt::cornell_cam_setup(256),
+                    Some("cornell") => rt::cornell_setup(256),
+                    _ => rt::sponza_cam_setup(480, 270),
+                };
+                let d = ShParams::default();
+                let krcs = |name, ppp, resample, cell_px, reuse, demod, seed| rt::DuelCfg {
+                    name,
+                    method: Method::Krc,
+                    ppp,
+                    resample,
+                    cell_px,
+                    reuse,
+                    demod,
+                    seed,
+                    sh: d,
+                };
+                let krcd = |name, ppp, resample, cell_px, reuse, demod| krcs(name, ppp, resample, cell_px, reuse, demod, false);
+                let krcr = |name, ppp, resample, cell_px, reuse| krcd(name, ppp, resample, cell_px, reuse, false);
+                let krcc = |name, ppp, resample, cell_px| krcr(name, ppp, resample, cell_px, false);
+                let krc = |name, ppp, resample| krcc(name, ppp, resample, 4.0);
+                let nv = |name, down| rt::DuelCfg {
+                    name,
+                    method: Method::Sharc,
+                    ppp: 1.0,
+                    resample: false,
+                    cell_px: 4.0,
+                    reuse: false,
+                    demod: false,
+                    seed: false,
+                    sh: ShParams { downscale: down, ..d },
+                };
+                let all = [
+                    krc("krc 1", 1.0, false),
+                    krc("krc 0.25", 0.25, false),
+                    krc("krc+resample 1", 1.0, true),
+                    krc("krc+resample 0.25", 0.25, true),
+                    krcc("krc+rs cell8 1", 1.0, true, 8.0),
+                    krcc("krc+rs cell8 0.25", 0.25, true, 8.0),
+                    krcc("krc+rs cell16 1", 1.0, true, 16.0),
+                    krcc("krc+rs cell16 0.25", 0.25, true, 16.0),
+                    krcr("krc+rs+ru cell8 1", 1.0, true, 8.0, true),
+                    krcr("krc+rs+ru cell8 0.25", 0.25, true, 8.0, true),
+                    krcr("krc+rs+ru cell16 0.25", 0.25, true, 16.0, true),
+                    krcd("krc+rs+dm cell8 1", 1.0, true, 8.0, false, true),
+                    krcd("krc+rs+dm cell8 0.25", 0.25, true, 8.0, false, true),
+                    krcd("krc+rs+dm cell16 1", 1.0, true, 16.0, false, true),
+                    krcd("krc+rs+dm cell16 0.25", 0.25, true, 16.0, false, true),
+                    krcs("krc+rs+sd cell8 1", 1.0, true, 8.0, false, false, true),
+                    krcs("krc+rs+sd cell8 0.25", 0.25, true, 8.0, false, false, true),
+                    krcs("krc+rs+sd cell16 0.25", 0.25, true, 16.0, false, false, true),
+                    krcs("krc+rs+sd+dm cell8 1", 1.0, true, 8.0, false, true, true),
+                    krcs("krc+rs+sd+dm cell8 0.25", 0.25, true, 8.0, false, true, true),
+                    krcs("krc+rs+sd+dm cell16 0.25", 0.25, true, 16.0, false, true, true),
+                    nv("sharc_nv 1px/5x5", 5),
+                    nv("sharc_nv 1px/1x1", 1),
+                ];
+                let only = std::env::var("KRC_DUEL").ok();
+                let cfgs: Vec<rt::DuelCfg> = all
+                    .into_iter()
+                    .filter(|c| only.as_ref().is_none_or(|o| o.split(',').any(|x| c.name.starts_with(x))))
+                    .collect();
+                rt::duel(&g, &setup, &cfgs);
+            }
+            None => eprintln!("pas de GPU"),
+        },
         Some("passes") => match gpu::Gpu::new() {
             Some(g) => {
                 let ppp = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
                 let setup = match args.get(1).map(String::as_str) {
                     Some("sponza") => rt::sponza_setup(1280, 720),
                     Some("cornellcam") => rt::cornell_cam_setup(1024),
+                    Some("sponzacam480") => rt::sponza_cam_setup(480, 270),
                     _ => rt::sponza_cam_setup(1280, 720),
                 };
                 rt::passes(&g, &setup, ppp);

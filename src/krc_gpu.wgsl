@@ -28,7 +28,6 @@ const PRIOR_FLOOR: f32 = 0.1;
 const REL_EPS: f32 = 0.01;
 const DEP_WINDOW: u32 = 64u;
 const DEBT_RATE: f32 = 0.5;
-const CELL_PX: f32 = 4.0;
 const EMA_MIN: f32 = 0.015625;
 const MAX_PER_CELL: u32 = 64u;
 const N_MAX: f32 = 1024.0; // historique maximal d'une cellule (test de dérive)
@@ -58,6 +57,8 @@ const C_DUSED: u32 = 19u;    // chemins corrélés réservés dans la frame (pla
 const C_FREE: u32 = 20u;     // cellules libres dans free_list (persistant)
 const C_TOMB: u32 = 21u;     // pierres tombales dans la table de hachage (persistant)
 const C_EVICT: u32 = 22u;    // cellules évincées dans la frame
+const C_POP: u32 = 23u;      // cellules prises dans la liste libre pendant l'insertion
+const C_NVIS: u32 = 24u;     // cellules visibles dans la frame (vis_list)
 const TOMB: u32 = 0xffffffffu;
 // Caméra mobile : une cellule invisible depuis STALE_FRAMES frames est évincée (même règle que
 // le staleFrameNumMax de l'exemple SHaRC de NVIDIA, 60).
@@ -95,7 +96,26 @@ const F_SHARC: u32 = 4u;
 const F_PENDING: u32 = 8u;   // frame sans nouvel événement, mais avec des cellules en attente
 const F_AMORTIZE: u32 = 16u;
 const F_S2HIST: u32 = 32u;
-const F_ZCAP: u32 = 64u;     // lampe : cellule sans différence mesurée → historique plafonné   // variance par échantillon après correction : au moins celle de l'historique // chemins corrélés plafonnés à DELTA_CAP chemin/pixel par frame
+const F_ZCAP: u32 = 64u;
+// rééchantillonnage du cache (comme SHaRC) : un chemin ordinaire s'arrête au 1er ou 2e rebond
+// sur une cellule existante et prend sa moyenne
+const F_RESAMPLE: u32 = 128u;
+const RESAMPLE_N_MIN: f32 = 2.0;
+// réutilisation des sommets (comme SHaRC) : la radiance du reste du chemin au 1er rebond est
+// aussi un échantillon de la cellule visible qui s'y trouve
+const F_REUSE: u32 = 256u;
+// démodulation matériau (comme SHARC_MATERIAL_DEMODULATION) : les cellules stockent la radiance
+// divisée par l'albédo du point de départ, l'affichage la remultiplie par l'albédo du pixel
+const F_DEMOD: u32 = 512u;
+// cellule neuve initialisée depuis la cellule du niveau voisin au même endroit (la caméra qui
+// avance fait changer les surfaces de niveau ; comme SHARC_BLEND_ADJACENT_LEVELS)
+const F_SEED: u32 = 1024u;
+const SEED_N: f32 = 8.0;
+
+fn demod(a: vec3<f32>) -> vec3<f32> {
+    if ((fr.flags & F_DEMOD) == 0u) { return vec3<f32>(1.0); }
+    return max(a, vec3<f32>(0.05));
+}     // lampe : cellule sans différence mesurée → historique plafonné   // variance par échantillon après correction : au moins celle de l'historique // chemins corrélés plafonnés à DELTA_CAP chemin/pixel par frame
 const DELTA_CAP: f32 = 1.0;
 
 struct Frame {
@@ -113,7 +133,7 @@ struct Frame {
     // SHaRC officiel (sharc.wgsl)
     sh_cam_prev: vec3<f32>, sh_scene_scale: f32,
     sh_rscale: f32, sh_cap: u32, sh_accum: u32, sh_stale: u32,
-    sh_down: u32, pad5: u32, pad6: u32, pad7: u32,
+    sh_down: u32, cell_px: f32, pad6: u32, pad7: u32, // cell_px : largeur d'une cellule en pixels
 };
 struct Box { mn: vec3<f32>, p0: f32, mx: vec3<f32>, p1: f32, albedo: vec3<f32>, p2: f32 };
 struct Light { center: vec3<f32>, hx: f32, hz: f32, on: f32, power: f32, toggle_w: f32, emission: vec3<f32>, p0: f32 };
@@ -146,6 +166,9 @@ struct Cell {
 // résumé compact par cellule pour l'allocation : (empreinte, n, variance relative, tirage)
 @group(0) @binding(17) var<storage, read_write> qbuf: array<vec4<f32>>;
 @group(0) @binding(22) var<storage, read_write> free_list: array<u32>;
+// cellules visibles de la frame : l'allocation et la résolution ne parcourent qu'elles (en
+// caméra mobile, l'essentiel des cellules vivantes est hors champ)
+@group(0) @binding(27) var<storage, read_write> vis_list: array<u32>;
 
 // ---------------------------------------------------------------- outils
 var<private> rng: u32;
@@ -157,6 +180,12 @@ var<private> m_trav: vec2<u32>;
 var<private> m_vsup: vec2<u32>;
 var<private> m_lights: u32;
 var<private> m_aff: bool;     // le chemin touche-t-il une région de l'événement ?
+var<private> resample: bool;  // chemins ordinaires seulement (jamais les chemins corrélés)
+var<private> rs_depth: u32;
+var<private> reuse: bool;
+var<private> ru_cell: u32;       // cellule du 1er rebond (0xffffffff : aucune)
+var<private> ru_prefix: vec3<f32>;
+var<private> ru_beta: vec3<f32>;
 
 fn pcg(v: u32) -> u32 {
     let s = v * 747796405u + 2891336453u;
@@ -387,6 +416,41 @@ fn toggle_w(j: u32) -> f32 {
 
 struct LL { l: vec3<f32>, dl: vec3<f32> };
 
+struct CacheHit { found: bool, mean: vec3<f32>, deps: vec2<u32> };
+
+// indice de la cellule existante au point (p, n) (jitter tiré au hasard), ou 0xffffffff
+fn cell_at(p: vec3<f32>, n: vec3<f32>, dist: f32) -> u32 {
+    let key = key_at(p, n, dist, vec2<f32>(rnd() - 0.5, rnd() - 0.5));
+    var h = key & fr.table_mask;
+    for (var probe = 0u; probe < 64u; probe++) {
+        let kk = atomicLoad(&keys[h]);
+        if (kk == key) { return atomicLoad(&vals[h]) - 1u; }
+        if (kk == 0u) { break; }
+        h = (h + 1u) & fr.table_mask;
+    }
+    return 0xffffffffu;
+}
+
+// cellule existante au point (p, n), avec assez d'échantillons
+fn cache_at(p: vec3<f32>, n: vec3<f32>, dist: f32, albedo: vec3<f32>) -> CacheHit {
+    var r: CacheHit;
+    r.found = false;
+    let c1 = cell_at(p, n, dist);
+    {
+        {
+            let c = c1 + 1u;
+            if (c == 0u) { return r; }
+            let cell = cells[c - 1u];
+            if (cell.n < RESAMPLE_N_MIN) { return r; }
+            r.found = true;
+            r.mean = cell.mean * demod(albedo);
+            let b = (c - 1u) * ACC;
+            r.deps = cell.deps_prev | vec2<u32>(atomicLoad(&acc[b + A_DEPS]), atomicLoad(&acc[b + A_DEPS + 1u]));
+            return r;
+        }
+    }
+}
+
 fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
     var p = p0;
     var n = n0;
@@ -454,6 +518,35 @@ fn radiance(p0: vec3<f32>, n0: vec3<f32>, a0: vec3<f32>) -> LL {
         p = h.p;
         n = h.n;
         albedo = h.albedo;
+        // réutilisation : la cellule visible du 1er rebond (assez loin pour ne pas être la sienne)
+        if (reuse && depth == 0u) {
+            let dist = length(p - fr.eye);
+            if (h.t > cell_size(dist) * 1.7320508) {
+                let c1 = cell_at(p, n, dist);
+                if (c1 != 0xffffffffu && atomicLoad(&acc[c1 * ACC + A_FOOT]) > 0u) {
+                    ru_cell = c1;
+                    ru_prefix = res.l;
+                    ru_beta = beta;
+                }
+            }
+        }
+        // rééchantillonnage : au sommet rs_depth (1 ou 2), si une cellule existe assez loin (le
+        // segment dépasse la cellule, pour ne pas se relire soi-même), on prend sa moyenne ; la
+        // cellule lue transmet ses dépendances (la détection d'événements reste conservatrice)
+        if (resample && depth + 1u >= rs_depth) {
+            let dist = length(p - fr.eye);
+            if (h.t > cell_size(dist) * 1.7320508) {
+                let ch = cache_at(p, n, dist, albedo);
+                if (ch.found) {
+                    res.l += beta * ch.mean;
+                    if (rec_on) {
+                        m_trav = m_trav | ch.deps;
+                        m_vsup = m_vsup | ch.deps;
+                    }
+                    break;
+                }
+            }
+        }
         if (depth >= 2u) {
             let q = clamp(max(beta.x, max(beta.y, beta.z)), 0.05, 0.95);
             if (rnd() > q) { break; }
@@ -532,18 +625,60 @@ fn gbuffer(@builtin(global_invocation_id) gid: vec3<u32>) {
     gbuf[k] = g;
 }
 
+fn jitter(k: u32, slot: u32) -> vec2<f32> {
+    let h = pcg(k * 8u + slot + 0x5bd1e995u);
+    return vec2<f32>(f32(h & 0xffffu) / 65536.0 - 0.5, f32((h >> 16u) & 0xffffu) / 65536.0 - 0.5);
+}
+
 fn cell_key(k: u32, slot: u32) -> u32 {
     let g = gbuf[k];
-    let level = floor(log2(CELL_PX * g.dist * fr.px_angle));
+    return key_at(g.p, g.n, g.dist, jitter(k, slot));
+}
+
+fn find_cell(key: u32) -> u32 {
+    var h = key & fr.table_mask;
+    for (var probe = 0u; probe < 64u; probe++) {
+        let kk = atomicLoad(&keys[h]);
+        if (kk == key) { return atomicLoad(&vals[h]) - 1u; }
+        if (kk == 0u) { break; }
+        h = (h + 1u) & fr.table_mask;
+    }
+    return 0xffffffffu;
+}
+
+// a priori d'une cellule neuve : la cellule du niveau plus grossier, sinon plus fin, au même
+// point (poids SEED_N au plus), avec ses dépendances
+fn seed_cell(c: u32, p: vec3<f32>, n: vec3<f32>, dist: f32, j: vec2<f32>) {
+    for (var s = 0u; s < 2u; s++) {
+        let pc = find_cell(key_at(p, n, select(dist * 2.0, dist * 0.5, s == 1u), j));
+        if (pc == 0xffffffffu || pc == c) { continue; }
+        let par = cells[pc];
+        if (par.n < 1.0) { continue; }
+        let ns = min(par.n, SEED_N);
+        cells[c].mean = par.mean;
+        cells[c].lmean = par.lmean;
+        cells[c].n = ns;
+        cells[c].m2 = select(0.0, par.m2 / (par.n - 1.0) * (ns - 1.0), par.n > 1.0);
+        let pb = pc * ACC;
+        cells[c].deps_prev = par.deps_prev | vec2<u32>(atomicLoad(&acc[pb + A_DEPS]), atomicLoad(&acc[pb + A_DEPS + 1u]));
+        cells[c].ns_prev = par.ns_prev;
+        for (var w = 0u; w < 18u; w++) { cells[c].freq_prev[w] = par.freq_prev[w]; }
+        return;
+    }
+}
+
+fn cell_size(dist: f32) -> f32 { return exp2(floor(log2(fr.cell_px * dist * fr.px_angle))); }
+
+// clé de la cellule d'un point quelconque (taille selon la distance à la caméra, jitter j)
+fn key_at(p: vec3<f32>, n: vec3<f32>, dist: f32, j: vec2<f32>) -> u32 {
+    let level = floor(log2(fr.cell_px * dist * fr.px_angle));
     let s = exp2(level);
-    let h = pcg(k * 8u + slot + 0x5bd1e995u);
-    let j = vec2<f32>(f32(h & 0xffffu) / 65536.0 - 0.5, f32((h >> 16u) & 0xffffu) / 65536.0 - 0.5);
     var axis = 2u;
-    if (abs(g.n.x) > 0.5) { axis = 0u; } else if (abs(g.n.y) > 0.5) { axis = 1u; }
+    if (abs(n.x) > 0.5) { axis = 0u; } else if (abs(n.y) > 0.5) { axis = 1u; }
     var q: vec3<i32>;
     var ji = 0u;
     for (var a = 0u; a < 3u; a++) {
-        let c = g.p[a] / s;
+        let c = p[a] / s;
         if (a == axis) {
             q[a] = i32(round(c));
         } else {
@@ -551,7 +686,7 @@ fn cell_key(k: u32, slot: u32) -> u32 {
             ji++;
         }
     }
-    let naxis = axis * 2u + select(0u, 1u, g.n[axis] > 0.0);
+    let naxis = axis * 2u + select(0u, 1u, n[axis] > 0.0);
     var key = pcg(bitcast<u32>(i32(level)) ^ (naxis << 24u));
     key = pcg(key ^ bitcast<u32>(q.x));
     key = pcg(key ^ bitcast<u32>(q.y));
@@ -562,13 +697,11 @@ fn cell_key(k: u32, slot: u32) -> u32 {
 // cellule neuve : d'abord la liste libre (remplie par l'éviction, dans une autre passe), sinon
 // au bout du tableau
 fn alloc_cell() -> u32 {
-    var n = atomicLoad(&ctr[C_FREE]);
-    loop {
-        if (n == 0u) { break; }
-        let r = atomicCompareExchangeWeak(&ctr[C_FREE], n, n - 1u);
-        if (r.exchanged) { return free_list[n - 1u]; }
-        n = r.old_value;
-    }
+    // C_FREE ne change pas pendant l'insertion (il n'est modifié que par l'éviction et par
+    // prep_cells) : un simple curseur suffit, sans boucle de CAS sur un compteur partagé
+    let n = atomicLoad(&ctr[C_FREE]);
+    let i = atomicAdd(&ctr[C_POP], 1u);
+    if (i < n) { return free_list[n - 1u - i]; }
     let c = atomicAdd(&ctr[C_CELLS], 1u);
     if (c >= fr.cell_cap) { return 0xffffffffu; }
     return c;
@@ -632,6 +765,14 @@ fn insert(@builtin(global_invocation_id) gid: vec3<u32>) {
     let key = cell_key(k, slot);
     var h = key & fr.table_mask;
     for (var probe = 0u; probe < 64u; probe++) {
+        // lecture d'abord : la clé existe presque toujours, et un CAS sur chaque case sondée
+        // sérialise les milliers de fils qui partagent une cellule
+        let kk = atomicLoad(&keys[h]);
+        if (kk == key) { return; }
+        if (kk != 0u) {
+            h = (h + 1u) & fr.table_mask;
+            continue;
+        }
         let r = atomicCompareExchangeWeak(&keys[h], 0u, key);
         if (r.exchanged) {
             let c = alloc_cell();
@@ -642,6 +783,10 @@ fn insert(@builtin(global_invocation_id) gid: vec3<u32>) {
             cells[c].key = key;
             cells[c].slot = h + 1u;
             cells[c].seen = fr.clock;
+            if ((fr.flags & F_SEED) != 0u) {
+                let g = gbuf[k];
+                seed_cell(c, g.p, g.n, g.dist, jitter(k, slot));
+            }
             atomicStore(&vals[h], c + 1u);
             return;
         }
@@ -674,7 +819,9 @@ fn lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
     pix_cells[gid.x] = c;
     if (c == 0xffffffffu) { return; }
     let b = c * ACC;
-    atomicAdd(&acc[b + A_FOOT], 1u);
+    if (atomicAdd(&acc[b + A_FOOT], 1u) == 0u) {
+        vis_list[atomicAdd(&ctr[C_NVIS], 1u)] = c;
+    }
     let r = pcg(gid.x ^ pcg(fr.frame + fr.seed)) >> 21u;
     atomicMax(&acc[b + A_REF], (r << 21u) | k);
 }
@@ -831,6 +978,11 @@ fn prep_indirect(round: u32) {
 // passes « par cellule » : autant de groupes que de cellules réelles, pas que de capacité
 @compute @workgroup_size(1)
 fn prep_cells() {
+    ind[12] = (atomicLoad(&ctr[C_NVIS]) + 63u) / 64u;
+    ind[13] = 1u;
+    ind[14] = 1u;
+    let nf = atomicLoad(&ctr[C_FREE]);
+    atomicStore(&ctr[C_FREE], nf - min(atomicLoad(&ctr[C_POP]), nf));
     let n = min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap);
     ind[9] = (n + 63u) / 64u;
     ind[10] = 1u;
@@ -897,6 +1049,8 @@ fn delta_trace(g: u32, round: u32) {
         }
     }
     commit_deps(c);
+    x = x / demod(gx.albedo);
+    y = y / demod(gx.albedo);
     let b = c * ACC;
     atomicAdd(&acc[b + A_PM], 1u);
     if (any(x != y)) { atomicStore(&acc[b + A_PDIFF], 1u); }
@@ -1001,8 +1155,8 @@ fn rel_var(c: u32) -> f32 {
 
 @compute @workgroup_size(64)
 fn alloc_hist(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
-    if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
+    if (gid.x >= atomicLoad(&ctr[C_NVIS])) { return; }
+    let c = vis_list[gid.x];
     // une cellule en attente ne reçoit pas d'échantillons ordinaires (historique périmé)
     let foot = select(atomicLoad(&acc[c * ACC + A_FOOT]), 0u, atomicLoad(&acc[c * ACC + A_SUSP]) == 2u);
     let u = f32(pcg(c ^ pcg(fr.frame * 7u + fr.seed)) >> 8u) * (1.0 / 16777216.0);
@@ -1100,8 +1254,8 @@ fn alloc_scan3(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_inv
 fn alloc_scan(gid: vec3<u32>, lid: vec3<u32>, base: u32) {
     if (lid.x < NCAND) { atomicStore(&wsum[lid.x], 0u); }
     workgroupBarrier();
-    let c = gid.x;
-    if (c < min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) {
+    if (gid.x < atomicLoad(&ctr[C_NVIS])) {
+        let c = vis_list[gid.x];
         let prior = scal[1];
         for (var i = 0u; i < NCAND; i++) {
             let q = quota(c, cand(i), prior);
@@ -1139,8 +1293,8 @@ fn alloc_pick(base: u32) {
 
 @compute @workgroup_size(64)
 fn alloc_emit(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
-    if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
+    if (gid.x >= atomicLoad(&ctr[C_NVIS])) { return; }
+    let c = vis_list[gid.x];
     let k = quota(c, scal[0], scal[1]) + explore(c);
     if (k > 0u) { push_tasks(c, k, 0u); }
 }
@@ -1180,9 +1334,26 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     split = false;
     sel = 0u;
     seed_rng(t.z, i, fr.frame);
-    let v = radiance(gx.p, gx.n, gx.albedo).l;
+    resample = (fr.flags & F_RESAMPLE) != 0u;
+    rs_depth = select(1u, 2u, rnd() < 0.5);
+    reuse = (fr.flags & F_REUSE) != 0u;
+    ru_cell = 0xffffffffu;
+    let v_raw = radiance(gx.p, gx.n, gx.albedo).l;
+    let v = v_raw / demod(gx.albedo);
     let b = c * ACC;
     if (rec_on) { commit_deps(c); }
+    if (ru_cell != 0xffffffffu && all(ru_beta > vec3<f32>(0.0))) {
+        // radiance sortante au 1er rebond : la suite du chemin, divisée par le débit à l'arrivée
+        let u = (v_raw - ru_prefix) / ru_beta;
+        let b1 = ru_cell * ACC;
+        atomicAdd(&acc[b1 + A_FN], 1u);
+        add_f32(b1 + A_FR, u.x);
+        add_f32(b1 + A_FR + 1u, u.y);
+        add_f32(b1 + A_FR + 2u, u.z);
+        let l1 = lum(u);
+        add_f32(b1 + A_FL, l1);
+        add_f32(b1 + A_FL2, l1 * l1);
+    }
     atomicAdd(&acc[b + A_FN], 1u);
     add_f32(b + A_FR, v.x);
     add_f32(b + A_FR + 1u, v.y);
@@ -1195,8 +1366,8 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
 // fusion des échantillons de la frame, filet de sécurité, vieillissement, remise à zéro
 @compute @workgroup_size(64)
 fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
-    if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
+    if (gid.x >= atomicLoad(&ctr[C_NVIS])) { return; }
+    let c = vis_list[gid.x];
     let b = c * ACC;
     var cell = cells[c];
     let fn_ = f32(atomicLoad(&acc[b + A_FN]));
@@ -1274,7 +1445,18 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var w = A_FR; w <= A_FL2; w++) { atomicStore(&acc[b + w], 0u); }
     for (var w = A_PM; w < A_SUSP; w++) { atomicStore(&acc[b + w], 0u); }
     if (susp == 1u) { atomicStore(&acc[b + A_SUSP], 0u); } // 2 (en attente) persiste
-    if (cell.slot != 0u && foot == 0u && susp != 2u && fr.clock - cell.seen > STALE_FRAMES) { evict(c); }
+}
+
+// éviction : un huitième des cellules par frame (avant la résolution, qui remet l'empreinte à 0)
+@compute @workgroup_size(64)
+fn evict_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x * 8u + (fr.clock & 7u);
+    if (c >= min(atomicLoad(&ctr[C_CELLS]), fr.cell_cap)) { return; }
+    let b = c * ACC;
+    if (cells[c].slot != 0u && atomicLoad(&acc[b + A_FOOT]) == 0u && atomicLoad(&acc[b + A_SUSP]) != 2u
+        && fr.clock - cells[c].seen > STALE_FRAMES) {
+        evict(c);
+    }
 }
 
 @compute @workgroup_size(64)
@@ -1294,7 +1476,7 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
                 w += 1.0;
             }
         }
-        if (w > 0.0) { v /= w; }
+        if (w > 0.0) { v = v / w * demod(g.albedo); }
     }
     image[k] = vec4<f32>(v, f32(g.kind));
 }
