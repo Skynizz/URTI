@@ -1,3 +1,5 @@
 target/
 results/ref/*.bin
 target-dev/
+assets/
+results/ref_*/*.bin

@@ -458,14 +458,24 @@ impl<'a> GpuKrc<'a> {
 
     /// Rayons-sondes depuis une lampe, tracés sur GPU (`sel` 0 : scène courante, 1 : précédente).
     /// Renvoie (point d'impact, luminance de l'albédo) des sondes qui touchent la géométrie.
-    fn probes(&mut self, l: &crate::scene::Light, sel: u32, seed: u64) -> Vec<(V3, f64)> {
+    pub fn probes(&mut self, l: &crate::scene::Light, sel: u32, seed: u64) -> Vec<(V3, f64)> {
         let mut rng = Rng::new(seed);
-        let mut rays = Vec::with_capacity(PROBES * 2);
-        for _ in 0..PROBES {
-            let o = l.center + v3((2.0 * rng.f64() - 1.0) * l.hx, -1e-3, (2.0 * rng.f64() - 1.0) * l.hz);
-            let d = cosine_dir(v3(0.0, -1.0, 0.0), &mut rng);
-            rays.push([o.x as f32, o.y as f32, o.z as f32, 0.0]);
-            rays.push([d.x as f32, d.y as f32, d.z as f32, 0.0]);
+        let rays: Vec<(V3, V3)> = (0..PROBES)
+            .map(|_| {
+                let o = l.center + v3((2.0 * rng.f64() - 1.0) * l.hx, -1e-3, (2.0 * rng.f64() - 1.0) * l.hz);
+                (o, cosine_dir(v3(0.0, -1.0, 0.0), &mut rng))
+            })
+            .collect();
+        self.trace_rays(&rays, sel).into_iter().filter_map(|h| h.map(|(p, a)| (p, a.lum()))).collect()
+    }
+
+    /// Premier impact (point, albédo) de rayons quelconques (au plus PROBES), sur GPU.
+    pub fn trace_rays(&mut self, rays_in: &[(V3, V3)], sel: u32) -> Vec<Option<(V3, V3)>> {
+        assert!(rays_in.len() <= PROBES);
+        let mut rays = vec![[0.0f32, -1e6, 0.0, 0.0]; PROBES * 2];
+        for (i, (o, d)) in rays_in.iter().enumerate() {
+            rays[2 * i] = [o.x as f32, o.y as f32, o.z as f32, 0.0];
+            rays[2 * i + 1] = [d.x as f32, d.y as f32, d.z as f32, 0.0];
         }
         let q = &self.gpu.queue;
         q.write_buffer(&self.probe_buf, 0, bytemuck::cast_slice(&rays));
@@ -485,11 +495,12 @@ impl<'a> GpuKrc<'a> {
         dev.poll(wgpu::Maintain::Wait);
         let v: Vec<[f32; 4]> = bytemuck::cast_slice(&self.probe_read.slice(..).get_mapped_range()).to_vec();
         self.probe_read.unmap();
-        (0..PROBES)
-            .filter(|&i| v[2 * i][3] > 0.5)
+        (0..rays_in.len())
             .map(|i| {
                 let a = v[2 * i + 1];
-                (v3(v[2 * i][0] as f64, v[2 * i][1] as f64, v[2 * i][2] as f64), v3(a[0] as f64, a[1] as f64, a[2] as f64).lum())
+                (v[2 * i][3] > 0.5).then(|| {
+                    (v3(v[2 * i][0] as f64, v[2 * i][1] as f64, v[2 * i][2] as f64), v3(a[0] as f64, a[1] as f64, a[2] as f64))
+                })
             })
             .collect()
     }

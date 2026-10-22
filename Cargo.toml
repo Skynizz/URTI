@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
+gltf = { version = "1", default-features = false, features = ["utils"] }
 pollster = "0.4"
 wgpu = "24"
 

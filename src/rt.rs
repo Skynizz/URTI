@@ -406,16 +406,54 @@ pub fn cornell_at(frame: u32) -> TriScene {
     cornell(s.box_step, s.l0_on, s.l2_on)
 }
 
-/// `krc cornell` : la séquence de 120 frames (boîte qui bouge, lampe allumée, plafonnier éteint)
-/// sur la Cornell box en triangles, ray tracing matériel, pipeline entièrement GPU.
-pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
+/// Une scène en triangles pour les bancs : nom, vue, scène à chaque frame de la séquence.
+pub struct TriSetup {
+    pub name: String,
+    pub view: crate::gpu_krc::View,
+    pub at: fn(u32) -> TriScene,
+    pub ref_spp: u32,
+}
+
+pub fn cornell_setup(size: usize) -> TriSetup {
+    TriSetup { name: format!("cornell_{size}"), view: cornell_view(size), at: cornell_at, ref_spp: 4096 }
+}
+
+/// relMSE d'une frame sur les pixels de surface : brute, et sans le 0,1 % de pixels les plus
+/// fautifs (pratique courante du path guiding : une luciole isolée ne doit pas décider seule).
+pub fn frame_err(img: &[V3], kinds: &[u8], r: &[V3]) -> (f64, f64) {
+    let mut px: Vec<f64> = Vec::with_capacity(img.len());
+    for i in 0..img.len() {
+        if kinds[i] != 2 {
+            continue;
+        }
+        let mut e = 0.0;
+        for c in 0..3 {
+            let (x, y) = (img[i].get(c), r[i].get(c));
+            e += (x - y) * (x - y) / (y * y + 0.01);
+        }
+        px.push(e / 3.0);
+    }
+    let n = px.len().max(1) as f64;
+    let raw = px.iter().sum::<f64>() / n;
+    let keep = px.len() - px.len() / 1000;
+    if keep < px.len() {
+        px.select_nth_unstable_by(keep, |a, b| a.total_cmp(b));
+    }
+    let trim = px[..keep].iter().sum::<f64>() / keep.max(1) as f64;
+    (raw, trim)
+}
+
+/// `krc cornell|sponza` : la séquence de 120 frames (objet qui bouge, lampe allumée, lampe
+/// éteinte) sur une scène en triangles, ray tracing matériel, pipeline entièrement GPU.
+pub fn run_tri(gpu: &Gpu, seeds: u64, setup: &TriSetup) {
     use crate::gpu_krc::GpuKrc;
     use crate::grid::Grid;
     use crate::render::{load_raw, save_raw};
     use crate::scene::{state_at, FRAMES};
     use std::collections::HashMap;
-    let view = cornell_view(size);
-    let base = cornell_at(0);
+    let view = setup.view;
+    let at = setup.at;
+    let base = at(0);
     let grid = Grid::fit(&base.bounds);
     eprintln!(
         "grille : régions {:.3} m, {:?} ({} régions), super-régions {:?}",
@@ -424,7 +462,7 @@ pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
         grid.dims.iter().product::<i64>(),
         grid.sdims()
     );
-    let dir = format!("results/ref_cornell_{size}");
+    let dir = format!("results/ref_{}", setup.name);
     std::fs::create_dir_all(&dir).unwrap();
     let mut refs: HashMap<String, Vec<V3>> = HashMap::new();
     let mut rk = GpuKrc::with(gpu, view, grid, Some(&base), false, 0);
@@ -436,7 +474,7 @@ pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
         let path = format!("{dir}/{id}.bin");
         let img = load_raw(&path, view.len()).unwrap_or_else(|| {
             let t = std::time::Instant::now();
-            let (img, _) = rk.reference_tri(&cornell_at(f), 4096);
+            let (img, _) = rk.reference_tri(&at(f), setup.ref_spp);
             save_raw(&path, &img);
             crate::image::save(&format!("{dir}/{id}.png"), view.w, view.h, &img);
             eprintln!("référence {id} : {:.1} s", t.elapsed().as_secs_f64());
@@ -446,39 +484,27 @@ pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
     }
     let phases: [(&str, u32, u32); 6] =
         [("tout", 0, 120), ("statique", 30, 40), ("boite", 40, 64), ("apres_boite", 64, 80), ("lampe_on", 80, 100), ("lampe_off", 100, 120)];
-    let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame\n");
+    let mut summary = String::from("method,phase,relmse_mean,relmse_std,gpu_ms,paths_per_frame,trim_mean,trim_std\n");
     for (name, sharc) in [("tri_krc", false), ("tri_sharc", true)] {
-        let out = format!("results/cornell_{size}/{name}");
+        let out = format!("results/{}/{name}", setup.name);
         std::fs::create_dir_all(&out).unwrap();
-        let mut runs: Vec<Vec<(f64, f64, u32)>> = Vec::new();
+        let mut runs: Vec<Vec<(f64, f64, u32, f64)>> = Vec::new();
         for seed in 0..seeds {
             let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 1 + seed as u32);
-            let mut prev = cornell_at(0);
+            let mut prev = at(0);
             let mut rows = Vec::new();
-            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths\n");
+            let mut csv = String::from("frame,relmse,gpu_ms,paths,suspects,delta_paths,relmse_trim\n");
             for t in 0..FRAMES {
-                let scene = cornell_at(t);
+                let scene = at(t);
                 let f = k.frame_tri(&scene, &prev, t);
                 assert_eq!(f.overflow, 0);
-                let r = &refs[&state_at(t).id()];
-                let (mut rel, mut n) = (0.0, 0.0);
-                for i in 0..view.len() {
-                    if f.kinds[i] != 2 {
-                        continue;
-                    }
-                    for c in 0..3 {
-                        let (x, y) = (f.image[i].get(c), r[i].get(c));
-                        rel += (x - y) * (x - y) / (y * y + 0.01);
-                    }
-                    n += 3.0;
-                }
-                let rel = rel / n;
+                let (rel, trim) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
                 let paths = f.regular_paths + f.delta_paths + f.probe_rays as u32;
-                csv += &format!("{t},{rel:.6e},{:.4},{paths},{},{}\n", f.gpu_ms(), f.suspects, f.delta_paths);
+                csv += &format!("{t},{rel:.6e},{:.4},{paths},{},{},{trim:.6e}\n", f.gpu_ms(), f.suspects, f.delta_paths);
                 if seed == 0 && crate::methods::SAVE_FRAMES.contains(&t) {
                     crate::image::save(&format!("{out}/f{t:03}.png"), view.w, view.h, &f.image);
                 }
-                rows.push((rel, f.gpu_ms(), paths));
+                rows.push((rel, f.gpu_ms(), paths, trim));
                 prev = scene;
             }
             let file = if seed == 0 { "metrics.csv".to_string() } else { format!("metrics_s{seed}.csv") };
@@ -486,11 +512,16 @@ pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
             runs.push(rows);
         }
         let mut line = format!("{name:<10}");
+        let mut line_t = format!("{:<10}", format!("{name}*"));
+        let stat = |v: Vec<f64>| {
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            (m, (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (v.len().max(2) - 1) as f64).sqrt())
+        };
         for (phase, a, b) in phases {
-            let per: Vec<f64> =
-                runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.0).sum::<f64>() / (b - a) as f64).collect();
-            let m = per.iter().sum::<f64>() / per.len() as f64;
-            let sd = (per.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (per.len().max(2) - 1) as f64).sqrt();
+            let (m, sd) =
+                stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.0).sum::<f64>() / (b - a) as f64).collect());
+            let (mt, sdt) =
+                stat(runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.3).sum::<f64>() / (b - a) as f64).collect());
             let ms: f64 = runs.iter().map(|r| r[a as usize..b as usize].iter().map(|x| x.1).sum::<f64>() / (b - a) as f64).sum::<f64>()
                 / runs.len() as f64;
             let paths: f64 = runs
@@ -498,34 +529,37 @@ pub fn run_cornell(gpu: &Gpu, seeds: u64, size: usize) {
                 .map(|r| r[a as usize..b as usize].iter().map(|x| x.2 as f64).sum::<f64>() / (b - a) as f64)
                 .sum::<f64>()
                 / runs.len() as f64;
-            summary += &format!("{name},{phase},{m:.6e},{sd:.6e},{ms:.4},{paths:.0}\n");
+            summary += &format!("{name},{phase},{m:.6e},{sd:.6e},{ms:.4},{paths:.0},{mt:.6e},{sdt:.6e}\n");
             line += &format!(" | {phase} {m:.2e}±{sd:.0e} {ms:.2}ms");
+            line_t += &format!(" | {phase} {mt:.2e}±{sdt:.0e}");
         }
         println!("{line}");
+        println!("{line_t}");
     }
-    std::fs::write(format!("results/cornell_{size}/summary.csv"), summary).unwrap();
+    std::fs::write(format!("results/{}/summary.csv", setup.name), summary).unwrap();
 }
 
 /// `krc pareto [taille]` : erreur contre temps GPU, KRC et SHaRC, pour plusieurs budgets
 /// (chemins par pixel et par frame). Erreur : un passage avec relecture d'image ; temps : deux
 /// passages sans relecture (chauffe, puis mesure ; médiane par frame).
-pub fn pareto(gpu: &Gpu, size: usize) {
+pub fn pareto(gpu: &Gpu, setup: &TriSetup) {
     use crate::gpu_krc::GpuKrc;
     use crate::grid::Grid;
     use crate::render::load_raw;
     use crate::scene::{state_at, FRAMES};
-    let view = cornell_view(size);
-    let base = cornell_at(0);
+    let view = setup.view;
+    let at = setup.at;
+    let base = at(0);
     let grid = Grid::fit(&base.bounds);
-    let dir = format!("results/ref_cornell_{size}");
+    let dir = format!("results/ref_{}", setup.name);
     let refs: std::collections::HashMap<String, Vec<V3>> = (0..FRAMES)
         .map(|f| state_at(f).id())
         .map(|id| {
-            let img = load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes : lancer `krc cornell <taille>`");
+            let img = load_raw(&format!("{dir}/{id}.bin"), view.len()).expect("références manquantes : lancer d'abord la séquence");
             (id, img)
         })
         .collect();
-    let mut csv = String::from("method,ppp,relmse,relmse_static,relmse_dynamic,ms_median,ms_mean,ms_p95\n");
+    let mut csv = String::from("method,ppp,relmse,relmse_static,relmse_dynamic,ms_median,ms_mean,ms_p95,trim,trim_static,trim_dynamic\n");
     let variants = [
         ("tri_krc", false, false, vec![0.25f32, 0.5, 1.0, 2.0, 4.0]),
         ("tri_krc_amort", false, true, vec![0.25f32, 0.5, 1.0, 2.0, 4.0]),
@@ -536,33 +570,27 @@ pub fn pareto(gpu: &Gpu, size: usize) {
             let mut k = GpuKrc::with(gpu, view, grid, Some(&base), sharc, 3);
             k.ppp = ppp;
             k.amortize = amortize;
-            let mut prev = cornell_at(0);
+            let mut prev = at(0);
             let (mut rel, mut rel_s, mut rel_d) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut tr, mut tr_s, mut tr_d) = (Vec::new(), Vec::new(), Vec::new());
             let mut ms = Vec::new();
             for pass in 0..3 {
                 k.readback = pass == 0;
                 for t in 0..FRAMES {
-                    let scene = cornell_at(t);
+                    let scene = at(t);
                     let f = k.frame_tri(&scene, &prev, t);
                     prev = scene;
                     if pass == 0 {
-                        let r = &refs[&state_at(t).id()];
-                        let (mut e, mut n) = (0.0, 0.0);
-                        for i in 0..view.len() {
-                            if f.kinds[i] == 2 {
-                                for c in 0..3 {
-                                    let (x, y) = (f.image[i].get(c), r[i].get(c));
-                                    e += (x - y) * (x - y) / (y * y + 0.01);
-                                }
-                                n += 3.0;
-                            }
-                        }
-                        rel.push(e / n);
+                        let (e, et) = frame_err(&f.image, &f.kinds, &refs[&state_at(t).id()]);
+                        rel.push(e);
+                        tr.push(et);
                         if (30..40).contains(&t) {
-                            rel_s.push(e / n);
+                            rel_s.push(e);
+                            tr_s.push(et);
                         }
                         if t >= 40 {
-                            rel_d.push(e / n);
+                            rel_d.push(e);
+                            tr_d.push(et);
                         }
                     }
                     if pass == 2 {
@@ -580,27 +608,44 @@ pub fn pareto(gpu: &Gpu, size: usize) {
                 mean(&rel_d),
                 mean(&ms)
             );
-            csv += &format!("{name},{ppp},{:.6e},{:.6e},{:.6e},{med:.4},{:.4},{p95:.4}\n", mean(&rel), mean(&rel_s), mean(&rel_d), mean(&ms));
+            println!(
+                "{:<14} {ppp:>5} chemin/px : relMSE sans 0,1 % {:.3e} (statique {:.2e}, dynamique {:.2e})",
+                format!("{name}*"),
+                mean(&tr),
+                mean(&tr_s),
+                mean(&tr_d)
+            );
+            csv += &format!(
+                "{name},{ppp},{:.6e},{:.6e},{:.6e},{med:.4},{:.4},{p95:.4},{:.6e},{:.6e},{:.6e}\n",
+                mean(&rel),
+                mean(&rel_s),
+                mean(&rel_d),
+                mean(&ms),
+                mean(&tr),
+                mean(&tr_s),
+                mean(&tr_d)
+            );
         }
     }
-    std::fs::create_dir_all(format!("results/cornell_{size}")).unwrap();
-    std::fs::write(format!("results/cornell_{size}/pareto.csv"), csv).unwrap();
+    std::fs::create_dir_all(format!("results/{}", setup.name)).unwrap();
+    std::fs::write(format!("results/{}/pareto.csv", setup.name), csv).unwrap();
 }
 
 /// `krc spikes [taille]` : composition du temps GPU des frames d'événement (KRC, 1 chemin/px).
-pub fn spikes(gpu: &Gpu, size: usize) {
+pub fn spikes(gpu: &Gpu, setup: &TriSetup) {
     use crate::gpu_krc::GpuKrc;
     use crate::grid::Grid;
     use crate::scene::FRAMES;
-    let view = cornell_view(size);
-    let base = cornell_at(0);
+    let view = setup.view;
+    let at = setup.at;
+    let base = at(0);
     let mut k = GpuKrc::with(gpu, view, Grid::fit(&base.bounds), Some(&base), false, 3);
     k.readback = false;
     k.amortize = std::env::var("KRC_AMORT").is_ok();
-    let mut prev = cornell_at(0);
+    let mut prev = at(0);
     for pass in 0..2 {
         for t in 0..FRAMES {
-            let scene = cornell_at(t);
+            let scene = at(t);
             let f = k.frame_tri(&scene, &prev, t);
             prev = scene;
             if pass == 1 && [38u32, 40, 41, 80, 81, 82, 83, 100, 101, 102].contains(&t) {
@@ -618,5 +663,125 @@ pub fn spikes(gpu: &Gpu, size: usize) {
                 );
             }
         }
+    }
+}
+
+/// Géométrie de Sponza (Khronos glTF-Sample-Assets, CC-BY : Crytek / Frank Meinl), chargée une
+/// fois : une primitive = un maillage ; albédo = couleur de base (les textures sont ignorées),
+/// légèrement teintée par matériau pour distinguer les surfaces.
+fn sponza_meshes() -> &'static (Vec<Mesh>, Aabb) {
+    static CELL: std::sync::OnceLock<(Vec<Mesh>, Aabb)> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let dir = "assets/sponza";
+        let gltf = gltf::Gltf::open(format!("{dir}/Sponza.gltf")).expect("assets/sponza/Sponza.gltf : lancer tools/fetch_sponza.sh");
+        let bin = std::fs::read(format!("{dir}/Sponza.bin")).expect("Sponza.bin");
+        let scale = 0.008f32;
+        let mut meshes = Vec::new();
+        let mut b = Aabb { min: V3::splat(f64::INFINITY), max: V3::splat(f64::NEG_INFINITY) };
+        for mesh in gltf.meshes() {
+            for prim in mesh.primitives() {
+                let reader = prim.reader(|_| Some(&bin[..]));
+                let pos: Vec<[f32; 3]> = reader.read_positions().unwrap().map(|p| [p[0] * scale, p[1] * scale, p[2] * scale]).collect();
+                let idx: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
+                let mat = prim.material();
+                let c = mat.pbr_metallic_roughness().base_color_factor();
+                let m = mat.index().unwrap_or(0) as u64;
+                let h = crate::math::mix64(m ^ 0x5b0);
+                let tint = |k: u32| 0.85 + 0.3 * ((h >> (8 * k)) & 0xff) as f32 / 255.0;
+                let albedo = [(c[0] * tint(0)).min(0.9), (c[1] * tint(1)).min(0.9), (c[2] * tint(2)).min(0.9)];
+                for p in &pos {
+                    let q = v3(p[0] as f64, p[1] as f64, p[2] as f64);
+                    b = Aabb { min: b.min.min(q), max: b.max.max(q) };
+                }
+                meshes.push(Mesh { pos, idx, albedo });
+            }
+        }
+        (meshes, b.expand(0.1))
+    })
+}
+
+/// Sponza éclairée par trois lampes suspendues dans l'atrium (lampe 0 : centrale, s'éteint) et une
+/// lampe d'appoint chaude dans la galerie basse (lampe 1, s'allume) ; une boîte se déplace au sol.
+pub fn sponza(step: u32, l0_on: bool, l2_on: bool) -> TriScene {
+    let (meshes0, bounds) = sponza_meshes();
+    let mut meshes = meshes0.clone();
+    let mut instances: Vec<Instance> = (0..meshes.len()).map(|m| Instance { mesh: m, offset: V3::default() }).collect();
+    meshes.push(Mesh::cuboid([0.25, 0.35, 0.8], &Aabb { min: v3(0.0, 0.0, 0.0), max: v3(1.4, 1.4, 1.4) }));
+    let floor = 0.0;
+    instances.insert(1, Instance { mesh: meshes.len() - 1, offset: v3(3.0 - step as f64 * 0.5, floor, -0.7) });
+    let lamp = |x: f64, on: bool| Light { center: v3(x, 9.0, -0.3), hx: 0.8, hz: 0.8, emission: V3::splat(30.0), on };
+    let lights = vec![
+        lamp(0.0, l0_on),
+        Light { center: v3(-6.0, 2.5, 4.0), hx: 0.4, hz: 0.4, emission: v3(60.0, 45.0, 27.0), on: l2_on },
+        lamp(-8.5, true),
+        lamp(8.5, true),
+    ];
+    TriScene { meshes, instances, lights, bounds: *bounds }
+}
+
+pub fn sponza_at(frame: u32) -> TriScene {
+    let s = crate::scene::state_at(frame);
+    sponza(s.box_step, s.l0_on, s.l2_on)
+}
+
+pub fn sponza_setup(w: usize, h: usize) -> TriSetup {
+    // dans l'atrium (ouvert vers le ciel pour |z| < ~1,9 m), devant le mur du fond (x ≈ −12)
+    let eye = v3(-10.0, 1.6, -0.3);
+    let fwd = (v3(10.0, 4.0, -0.3) - eye).norm();
+    let right = fwd.cross(v3(0.0, 1.0, 0.0)).norm();
+    let tv = 0.5;
+    TriSetup {
+        name: format!("sponza_{w}x{h}"),
+        view: crate::gpu_krc::View { w, h, eye, fwd, right, up: right.cross(fwd), th: tv * w as f64 / h as f64, tv },
+        at: sponza_at,
+        // petites lampes brillantes près des murs : lucioles à 4096 spp
+        ref_spp: 16384,
+    }
+}
+
+/// `krc sponzadebug` : ce que voit la caméra et où tombent les sondes de chaque lampe.
+pub fn sponza_debug(gpu: &Gpu) {
+    use crate::gpu_krc::GpuKrc;
+    use crate::grid::Grid;
+    let setup = sponza_setup(480, 270);
+    let scene = sponza_at(0);
+    println!("emprise {:?} -> {:?}, {} triangles", scene.bounds.min, scene.bounds.max, scene.triangles());
+    let mut k = GpuKrc::with(gpu, setup.view, Grid::fit(&scene.bounds), Some(&scene), false, 1);
+    let f = k.frame_tri(&scene, &scene, 0);
+    let n = f.kinds.len() as f64;
+    let count = |v: u8| f.kinds.iter().filter(|&&x| x == v).count() as f64 / n;
+    println!("pixels : vides {:.2}, lampes {:.2}, surfaces {:.2}", count(0), count(1), count(2));
+    let v = setup.view;
+    let mut rays = Vec::new();
+    for (sx, sy) in [(0.0, 0.0), (-0.9, 0.9), (0.9, 0.9), (-0.9, -0.9), (0.9, -0.9), (0.0, -0.9), (0.0, 0.9)] {
+        rays.push((v.eye, (v.fwd + v.right * (sx * v.th) + v.up * (sy * v.tv)).norm()));
+    }
+    for ((_, d), h) in rays.iter().zip(k.trace_rays(&rays, 0)) {
+        match h {
+            Some((p, a)) => println!("rayon caméra {:?} : impact à {:.2} m en {:?}, albédo {:?}", d, (p - v.eye).len(), p, a),
+            None => println!("rayon caméra {:?} : rien", d),
+        }
+    }
+    for z in [-8.0, -6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0] {
+        let eye = v3(-5.0, 1.8, z);
+        let rays = vec![(eye, v3(0.0, 1.0, 0.0)), (eye, v3(0.0, -1.0, 0.0))];
+        let h = k.trace_rays(&rays, 0);
+        let d: Vec<String> = h.iter().map(|x| x.map_or("∞".to_string(), |(p, _)| format!("{:.2}", (p - eye).len()))).collect();
+        println!("x=-5, z={z:>5} : au-dessus {}, au-dessous {}", d[0], d[1]);
+    }
+    for ex in [-11.5, -10.5, -9.5, -8.0] {
+        let eye = v3(ex, 1.8, -0.3);
+        let dirs = [v3(1.0, 0.1, 0.0), v3(1.0, 0.4, 0.4), v3(1.0, 0.4, -0.4), v3(1.0, -0.2, 0.4), v3(1.0, -0.2, -0.4), v3(0.0, 1.0, 0.0)];
+        let rays: Vec<(V3, V3)> = dirs.iter().map(|d| (eye, d.norm())).collect();
+        let h = k.trace_rays(&rays, 0);
+        let dist: Vec<String> = h.iter().map(|x| x.map_or("∞".to_string(), |(p, _)| format!("{:.1}", (p - eye).len()))).collect();
+        println!("œil x = {ex} : distances libres (avant, haut-gauche, haut-droite, bas-gauche, bas-droite, zénith) = {:?}", dist);
+    }
+    for (j, l) in scene.lights.iter().enumerate() {
+        let hits = k.probes(l, 0, 7);
+        let d: Vec<f64> = hits.iter().map(|(p, _)| (*p - l.center).len()).collect();
+        let mean = d.iter().sum::<f64>() / d.len().max(1) as f64;
+        let near = d.iter().filter(|&&x| x < 0.5).count();
+        println!("lampe {j} en {:?} : {} sondes touchent, distance moyenne {:.2} m, {} à moins de 0,5 m", l.center, hits.len(), mean, near);
     }
 }

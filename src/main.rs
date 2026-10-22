@@ -195,16 +195,36 @@ fn main() {
         Some("cornell") => match gpu::Gpu::new() {
             Some(g) => {
                 let size = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(256);
-                rt::run_cornell(&g, seeds(), size);
+                rt::run_tri(&g, seeds(), &rt::cornell_setup(size));
+            }
+            None => eprintln!("pas de GPU"),
+        },
+        Some("sponza") => match gpu::Gpu::new() {
+            Some(g) => {
+                let w: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(480);
+                rt::run_tri(&g, seeds(), &rt::sponza_setup(w, w * 9 / 16));
             }
             None => eprintln!("pas de GPU"),
         },
         Some("pareto") => match gpu::Gpu::new() {
-            Some(g) => rt::pareto(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024)),
+            Some(g) => match args.get(1).map(String::as_str) {
+                Some("sponza") => {
+                    let w: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1280);
+                    rt::pareto(&g, &rt::sponza_setup(w, w * 9 / 16))
+                }
+                _ => rt::pareto(&g, &rt::cornell_setup(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024))),
+            },
             None => eprintln!("pas de GPU"),
         },
         Some("spikes") => match gpu::Gpu::new() {
-            Some(g) => rt::spikes(&g, args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024)),
+            Some(g) => match args.get(1).map(String::as_str) {
+                Some("sponza") => rt::spikes(&g, &rt::sponza_setup(1280, 720)),
+                _ => rt::spikes(&g, &rt::cornell_setup(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1024))),
+            },
+            None => eprintln!("pas de GPU"),
+        },
+        Some("sponzadebug") => match gpu::Gpu::new() {
+            Some(g) => rt::sponza_debug(&g),
             None => eprintln!("pas de GPU"),
         },
         Some("rtsmoke") => match gpu::Gpu::new() {
