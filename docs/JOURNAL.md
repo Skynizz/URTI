@@ -379,3 +379,25 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   fin de démo, corrigé) ; le compilateur MSVC en français casse le suivi des en-têtes par
   Ninja (UBO incohérent entre fichiers C, image noire) ; l'exposition automatique se mêlait à
   la mesure du retard (figée pendant le test).
+
+## v19 — reflets, débruiteur piloté par KRC, options NVIDIA
+
+- Lieux à reflets : `krc_view x y z pitch yaw` (commande ajoutée au code du jeu) ; repérage des
+  surfaces d'eau et de verre dans les cartes (`tools/q2rtx/find_reflective.py`) ; deux vues de
+  `demo1` : salle rouge au sol d'eau, bassin extérieur. Mesure au même instant pour toutes les
+  méthodes (jeu en pause, exposition figée) : sinon l'eau qui ondule faisait varier le PSNR de
+  3 dB d'une session à l'autre (un premier « KRC gagne » n'était que ce bruit).
+- Référence honnête : `pt_cache 3`, chemins complets à 8 rebonds sans cache, accumulés ; sans
+  profondeur de champ, avec du vrai spéculaire partout. La référence du jeu ne trace qu'un rebond.
+- Trois erreurs de KRC trouvées en comparant : (1) l'indirect fourni avec la normale pour
+  direction (faux reflets du débruiteur trop forts) ; (2) puis direction mesurée par cellule
+  (idée de l'option SH de SHaRC) ; (3) premier rebond tiré comme le jeu (loi « uniformish »),
+  la convention que sa reconstruction en harmoniques sphériques attend. Historique des cellules
+  4096 (les chemins corrélés le gardent à jour).
+- KRC ↔ débruiteur : confiance (erreur relative σ/√n de la cellule) qui décide où filtrer
+  l'indirect ; rapport « après / avant » de la lumière directe (chemins corrélés) qui rééclaire
+  l'historique du débruiteur. Essayé et retiré : jeter l'historique là où la lumière change
+  (bruit), garder l'historique rééclairé contre les gradients du débruiteur (le rapport mesuré
+  est bruité avec des lampes qui clignotent).
+- Options NVIDIA de SHaRC : pas de préréglages nommés dans le SDK ; FADE_ACCELERATION activé
+  (sans effet mesurable sur la coupure) ; accumulation 5 frames : plus réactif, même plateau.

@@ -1,0 +1,3 @@
+Jeu sans cache : PSNR 32.349557 dB (accumulé : 41.496878 dB)
+SHaRC NVIDIA : PSNR 32.119565 dB (accumulé : 40.999160 dB)
+KRC : PSNR 30.380124 dB (accumulé : 42.886529 dB)

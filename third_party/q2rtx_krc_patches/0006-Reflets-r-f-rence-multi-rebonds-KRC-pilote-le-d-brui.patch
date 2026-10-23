@@ -1,0 +1,822 @@
+From 35ba307b738492fbc9c3d184d2007b358c897d5a Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 02:21:08 +0200
+Subject: [PATCH 6/6] =?UTF-8?q?Reflets,=20r=C3=A9f=C3=A9rence=20multi-rebo?=
+ =?UTF-8?q?nds,=20KRC=20pilote=20le=20d=C3=A9bruiteur?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- krc_view : caméra placée dans une carte ; pt_cache 3 : référence à 8 rebonds.
+- KRC : direction de la lumière par cellule, premier rebond tiré comme le jeu,
+  orientations plus fines, historique 4096.
+- KRC -> débruiteur : confiance qui décide où filtrer l'indirect, rapport
+  après/avant qui rééclaire l'historique du direct et des reflets.
+- SHaRC : option FADE_ACCELERATION du SDK.
+
+---
+ src/game/g_cmds.c                             | 44 +++++++++
+ src/refresh/vkpt/asvgf.c                      |  6 +-
+ src/refresh/vkpt/path_tracer.c                |  6 ++
+ src/refresh/vkpt/radiance_cache.c             | 18 ++--
+ src/refresh/vkpt/shader/asvgf_atrous.comp     |  4 +
+ src/refresh/vkpt/shader/asvgf_lf.comp         | 19 ++++
+ src/refresh/vkpt/shader/asvgf_temporal.comp   | 44 +++++++++
+ src/refresh/vkpt/shader/global_ubo.h          | 18 +++-
+ .../vkpt/shader/indirect_lighting.rgen        | 39 +++++++-
+ src/refresh/vkpt/shader/radiance_cache.h      | 50 ++++++++--
+ src/refresh/vkpt/shader/radiance_cache.rgen   | 91 +++++++++++++++++--
+ 11 files changed, 309 insertions(+), 30 deletions(-)
+
+diff --git a/src/game/g_cmds.c b/src/game/g_cmds.c
+index 4c0e1a37..bb26ecb5 100644
+--- a/src/game/g_cmds.c
++++ b/src/game/g_cmds.c
+@@ -324,6 +324,48 @@ Cmd_Noclip_f
+ argv(0) noclip
+ ==================
+ */
++/*
++==================
++Cmd_KrcView_f
++
++krc_view x y z pitch yaw : place l'œil du joueur (comparaisons des caches de radiance,
++vues fixes choisies dans les cartes). Mêmes règles que les autres triches.
++==================
++*/
++void Cmd_KrcView_f(edict_t *ent)
++{
++    vec3_t angles;
++    int i;
++
++    if (deathmatch->value && !sv_cheats->value) {
++        gi.cprintf(ent, PRINT_HIGH, "You must run the server with '+set cheats 1' to enable this command.\n");
++        return;
++    }
++    if (gi.argc() < 6) {
++        gi.cprintf(ent, PRINT_HIGH, "usage: krc_view x y z pitch yaw\n");
++        return;
++    }
++
++    gi.unlinkentity(ent);
++    for (i = 0; i < 3; i++)
++        ent->s.origin[i] = atof(gi.argv(1 + i));
++    ent->s.origin[2] -= ent->viewheight;
++    VectorCopy(ent->s.origin, ent->s.old_origin);
++    VectorClear(ent->velocity);
++    ent->client->ps.pmove.pm_time = 160 >> 3;
++    ent->client->ps.pmove.pm_flags |= PMF_TIME_TELEPORT;
++
++    angles[0] = atof(gi.argv(4));
++    angles[1] = atof(gi.argv(5));
++    angles[2] = 0;
++    for (i = 0; i < 3; i++)
++        ent->client->ps.pmove.delta_angles[i] = ANGLE2SHORT(angles[i] - ent->client->resp.cmd_angles[i]);
++    VectorCopy(angles, ent->s.angles);
++    VectorCopy(angles, ent->client->ps.viewangles);
++    VectorCopy(angles, ent->client->v_angle);
++    gi.linkentity(ent);
++}
++
+ void Cmd_Noclip_f(edict_t *ent)
+ {
+     if ((deathmatch->value || coop->value) && !sv_cheats->value) {
+@@ -899,6 +941,8 @@ void ClientCommand(edict_t *ent)
+         Cmd_Notarget_f(ent);
+     else if (Q_stricmp(cmd, "noclip") == 0)
+         Cmd_Noclip_f(ent);
++    else if (Q_stricmp(cmd, "krc_view") == 0)
++        Cmd_KrcView_f(ent);
+     else if (Q_stricmp(cmd, "inven") == 0)
+         Cmd_Inven_f(ent);
+     else if (Q_stricmp(cmd, "invnext") == 0)
+diff --git a/src/refresh/vkpt/asvgf.c b/src/refresh/vkpt/asvgf.c
+index 15ddb9c8..81891cf7 100644
+--- a/src/refresh/vkpt/asvgf.c
++++ b/src/refresh/vkpt/asvgf.c
+@@ -231,12 +231,14 @@ vkpt_asvgf_gradient_reproject(VkCommandBuffer cmd_buf)
+ 
+ extern cvar_t *cvar_pt_cache;
+ extern cvar_t *cvar_pt_krc_denoise;
++extern cvar_t *cvar_pt_krc_dn_talk;
+ 
+ VkResult
+ vkpt_asvgf_filter(VkCommandBuffer cmd_buf, bool enable_lf)
+ {
+-	// KRC avec débruiteur intégré : l'indirect (LF) n'est pas filtré ici
+-	if ((int)cvar_pt_cache->value == 2 && cvar_pt_krc_denoise->value != 0)
++	// KRC avec débruiteur intégré : l'indirect (LF) n'est pas filtré ici, sauf si KRC pilote le
++	// filtre (pt_krc_dn_talk : il ne lisse que là où son erreur est trop grande)
++	if ((int)cvar_pt_cache->value == 2 && cvar_pt_krc_denoise->value != 0 && cvar_pt_krc_dn_talk->value == 0)
+ 		enable_lf = false;
+ 
+ 	VkDescriptorSet desc_sets[] = {
+diff --git a/src/refresh/vkpt/path_tracer.c b/src/refresh/vkpt/path_tracer.c
+index 1d93c3f5..57bced28 100644
+--- a/src/refresh/vkpt/path_tracer.c
++++ b/src/refresh/vkpt/path_tracer.c
+@@ -1160,6 +1160,12 @@ trace_radiance_cache(VkCommandBuffer cmd_buf)
+ 		dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 1, push, 4096, n / 4096, 1);
+ 		cache_barrier(cmd_buf);
+ 	}
++	else if (mode == 3)
++	{
++		// référence : un chemin complet par pixel
++		dispatch_rays(cmd_buf, PIPELINE_CACHE_FIRST + 3, push, qvk.extent_render.width, qvk.extent_render.height, 1);
++		cache_barrier(cmd_buf);
++	}
+ 	else if (mode == 2)
+ 	{
+ 		// KRC : compteurs, cellules des pixels et chemins (Neyman), liste libre, éviction, résolution
+diff --git a/src/refresh/vkpt/radiance_cache.c b/src/refresh/vkpt/radiance_cache.c
+index fc69d82c..f90e5818 100644
+--- a/src/refresh/vkpt/radiance_cache.c
++++ b/src/refresh/vkpt/radiance_cache.c
+@@ -27,8 +27,8 @@ GNU General Public License for more details.
+ 
+ #define KRC_TABLE      (1u << 22)   // cases de la table de hachage
+ #define KRC_CELLS      (1u << 20)   // cellules
+-#define KRC_CELL_SIZE  48           // octets, struct KrcCell
+-#define KRC_ACC        10           // accumulateurs 64 bits par cellule
++#define KRC_CELL_SIZE  64           // octets, struct KrcCell
++#define KRC_ACC        15           // accumulateurs 64 bits par cellule
+ #define KRC_CTR        64           // compteurs 64 bits
+ #define KRC_K          4            // cellules par pixel
+ #define KRC_MAX_PIXELS (2560u * 1600u)
+@@ -38,7 +38,7 @@ static BufferResource_t buf_sharc_accum;    // accumulation de la frame, 16 octe
+ static BufferResource_t buf_sharc_resolved; // données résolues, 16 octets
+ 
+ static BufferResource_t buf_krc_keys, buf_krc_vals, buf_krc_cells, buf_krc_acc, buf_krc_ctr,
+-	buf_krc_vis, buf_krc_free, buf_krc_pix, buf_krc_tasks;
++	buf_krc_vis, buf_krc_free, buf_krc_pix, buf_krc_tasks, buf_krc_signal, buf_ref;
+ static bool rc_needs_clear = true;
+ static float cam_pos_prev[3];
+ static int last_cache_mode = -1;
+@@ -71,6 +71,8 @@ vkpt_rc_init(void)
+ 	_VK(create_cache_buffer(&buf_krc_free, (size_t)KRC_CELLS * 4, "krc free list"));
+ 	_VK(create_cache_buffer(&buf_krc_pix, (size_t)KRC_MAX_PIXELS * KRC_K * 4, "krc pixel cells"));
+ 	_VK(create_cache_buffer(&buf_krc_tasks, (size_t)KRC_MAX_PIXELS * 8, "krc tasks"));
++	_VK(create_cache_buffer(&buf_krc_signal, (size_t)KRC_MAX_PIXELS * 8, "krc denoiser signal"));
++	_VK(create_cache_buffer(&buf_ref, (size_t)KRC_MAX_PIXELS * 32, "reference indirect"));
+ 	rc_needs_clear = true;
+ 	return VK_SUCCESS;
+ }
+@@ -90,6 +92,8 @@ vkpt_rc_destroy(void)
+ 	buffer_destroy(&buf_krc_free);
+ 	buffer_destroy(&buf_krc_pix);
+ 	buffer_destroy(&buf_krc_tasks);
++	buffer_destroy(&buf_krc_signal);
++	buffer_destroy(&buf_ref);
+ 	return VK_SUCCESS;
+ }
+ 
+@@ -114,7 +118,7 @@ vkpt_rc_prepare_ubo(QVKUniformBuffer_t *ubo, uint64_t frame_counter)
+ 	split_address(buf_sharc_accum.address, &ubo->rc_addr_a[2], &ubo->rc_addr_a[3]);
+ 	split_address(buf_sharc_resolved.address, &ubo->rc_addr_b[0], &ubo->rc_addr_b[1]);
+ 	ubo->rc_addr_b[2] = SHARC_CAPACITY;
+-	ubo->rc_addr_b[3] = (uint32_t)frame_counter;
++	ubo->rc_frame = (uint32_t)frame_counter;
+ 	ubo->rc_cam_pos_prev[0] = cam_pos_prev[0];
+ 	ubo->rc_cam_pos_prev[1] = cam_pos_prev[1];
+ 	ubo->rc_cam_pos_prev[2] = cam_pos_prev[2];
+@@ -130,10 +134,9 @@ vkpt_rc_prepare_ubo(QVKUniformBuffer_t *ubo, uint64_t frame_counter)
+ 	ubo->rc_krc[0] = KRC_TABLE - 1;
+ 	ubo->rc_krc[1] = KRC_CELLS;
+ 	ubo->rc_krc[2] = KRC_MAX_PIXELS;
+-	ubo->rc_krc[3] = 0;
++	split_address(buf_ref.address, &ubo->rc_krc[3], &ubo->rc_addr_b[3]);
+ 	split_address(buf_krc_tasks.address, &ubo->rc_addr_g[0], &ubo->rc_addr_g[1]);
+-	ubo->rc_addr_g[2] = 0;
+-	ubo->rc_addr_g[3] = 0;
++	split_address(buf_krc_signal.address, &ubo->rc_addr_g[2], &ubo->rc_addr_g[3]);
+ 	memcpy(cam_pos_prev, ubo->cam_pos, sizeof(cam_pos_prev));
+ 
+ 	// changer de méthode : on repart d'un cache vide, pour une comparaison juste
+@@ -161,6 +164,7 @@ vkpt_rc_clear_if_needed(VkCommandBuffer cmd_buf)
+ 	vkCmdFillBuffer(cmd_buf, buf_krc_cells.buffer, 0, VK_WHOLE_SIZE, 0);
+ 	vkCmdFillBuffer(cmd_buf, buf_krc_acc.buffer, 0, VK_WHOLE_SIZE, 0);
+ 	vkCmdFillBuffer(cmd_buf, buf_krc_ctr.buffer, 0, VK_WHOLE_SIZE, 0);
++	vkCmdFillBuffer(cmd_buf, buf_krc_signal.buffer, 0, VK_WHOLE_SIZE, 0);
+ 
+ 	VkMemoryBarrier barrier = {
+ 		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+diff --git a/src/refresh/vkpt/shader/asvgf_atrous.comp b/src/refresh/vkpt/shader/asvgf_atrous.comp
+index 430b9867..4a6cc9b7 100644
+--- a/src/refresh/vkpt/shader/asvgf_atrous.comp
++++ b/src/refresh/vkpt/shader/asvgf_atrous.comp
+@@ -370,6 +370,10 @@ main()
+ 				fake_specular = demodulate_specular(base_reflectivity, fake_specular);
+ 
+ 				filtered_spec += fake_specular;
++
++				// pt_cache_debug 2 : directionnalité de l'indirect (rouge) et poids du faux spéculaire (vert)
++				if (global_ubo.pt_cache_debug == 2)
++					filtered_spec = vec3(directionality, fake_specular_weight, 0) * 0.02;
+ 			}
+ 		}
+ #endif
+diff --git a/src/refresh/vkpt/shader/asvgf_lf.comp b/src/refresh/vkpt/shader/asvgf_lf.comp
+index 7e604522..5a6b9677 100644
+--- a/src/refresh/vkpt/shader/asvgf_lf.comp
++++ b/src/refresh/vkpt/shader/asvgf_lf.comp
+@@ -29,6 +29,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ #version 460
+ #extension GL_GOOGLE_include_directive    : enable
+ #extension GL_EXT_nonuniform_qualifier    : enable
++#extension GL_EXT_buffer_reference         : require
++#extension GL_EXT_buffer_reference_uvec2   : require
+ 
+ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+ 
+@@ -46,6 +48,19 @@ layout(push_constant, std140) uniform IterationInfo {
+ #include "asvgf.glsl"
+ #include "brdf.glsl"
+ 
++// confiance de KRC dans son indirect (pt_cache 2, radiance_cache.h) : là où elle est haute, le
++// filtre ne touche pas ; là où l'erreur de la cellule est trop grande, il lisse
++layout(buffer_reference, std430, buffer_reference_align = 8) buffer KrcSignalL { vec2 v[]; };
++
++float krc_confidence(ivec2 ipos)
++{
++	if (global_ubo.pt_cache != 2 || global_ubo.pt_krc_denoise == 0 || global_ubo.pt_krc_dn_talk == 0
++		|| uint(global_ubo.width) * uint(global_ubo.height) > global_ubo.rc_krc.z)
++		return 0.0;
++	ipos = clamp(ipos, ivec2(0), ivec2(global_ubo.width - 1, global_ubo.height - 1));
++	return clamp(KrcSignalL(global_ubo.rc_addr_g.zw).v[uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x)].y, 0.0, 1.0);
++}
++
+ // Filter kernel.
+ // The filter operates on a 1/3 resolution signal, where each 3x3 pixel part of the screen
+ // is represented by a single low-res pixel, whose depth and normal correspond to the 
+@@ -134,6 +149,10 @@ filter_image(
+ 
+ 	filtered_lf.shY = sum_color_lf.shY / sum_w_lf;
+ 	filtered_lf.CoCg = sum_color_lf.CoCg / sum_w_lf;
++
++	float conf = krc_confidence(ipos_hires);
++	filtered_lf.shY = mix(filtered_lf.shY, color_center_lf.shY, conf);
++	filtered_lf.CoCg = mix(filtered_lf.CoCg, color_center_lf.CoCg, conf);
+ }
+ 
+ void deflicker_image(
+diff --git a/src/refresh/vkpt/shader/asvgf_temporal.comp b/src/refresh/vkpt/shader/asvgf_temporal.comp
+index 4afd90f0..c9c3e13e 100644
+--- a/src/refresh/vkpt/shader/asvgf_temporal.comp
++++ b/src/refresh/vkpt/shader/asvgf_temporal.comp
+@@ -29,6 +29,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ #version 460
+ #extension GL_GOOGLE_include_directive    : enable
+ #extension GL_EXT_nonuniform_qualifier    : enable
++#extension GL_EXT_buffer_reference         : require
++#extension GL_EXT_buffer_reference_uvec2   : require
+ 
+ #define GROUP_SIZE 15
+ // spatially compute variance in a 3x3 (radius = 1) or a 5x5 (radius = 2) window 
+@@ -44,6 +46,32 @@ layout(local_size_x = GROUP_SIZE, local_size_y = GROUP_SIZE, local_size_z = 1) i
+ #define GLOBAL_TEXTURES_DESC_SET_IDX 1
+ #include "global_textures.h"
+ 
++// signaux de KRC (pt_cache 2, radiance_cache.h) : x = la lumière a changé, y = confiance
++layout(buffer_reference, std430, buffer_reference_align = 8) buffer KrcSignalT { vec2 v[]; };
++
++vec2 krc_signal_at(ivec2 ipos)
++{
++	if (global_ubo.pt_cache != 2 || global_ubo.pt_krc_dn_talk == 0
++		|| uint(global_ubo.width) * uint(global_ubo.height) > global_ubo.rc_krc.z)
++		return vec2(-1);
++	return KrcSignalT(global_ubo.rc_addr_g.zw).v[uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x)];
++}
++
++// facteur anti-retard du débruiteur, corrigé par KRC : là où KRC est sûr et que la lumière n'a
++// pas changé, les fausses alertes (gradients mesurés sur des pixels bruités) sont réduites
++// (pt_krc_dn_trust < 1)
++float krc_antilag(float antilag, vec2 s)
++{
++	if (s.x < 0)
++		return antilag;
++	// (essayé : garder l'historique rééclairé contre les gradients du débruiteur ; avec des lampes
++	// qui clignotent sans cesse, le rapport mesuré par cellule est bruité et l'historique,
++	// multiplié par ce bruit à chaque frame, dérivait : pire)
++	if (abs(s.x - 1.0) < 0.01 && s.y > 0.5)
++		antilag *= global_ubo.pt_krc_dn_trust;
++	return antilag;
++}
++
+ // Store some color data in shared memory for efficient access and for downsampling
+ shared uvec2 s_normal_lum[SHARED_SIZE][SHARED_SIZE];
+ shared float s_depth[SHARED_SIZE][SHARED_SIZE];
+@@ -246,6 +274,15 @@ main()
+ 			temporal_color_lf.CoCg        *= inv_w_diff;
+ 			temporal_color_hf             *= inv_w_diff;
+ 			temporal_moments_histlen_hf   *= inv_w_diff;
++			{
++				vec2 krc_r = krc_signal_at(ipos);
++				if (krc_r.x >= 0)
++				{
++					temporal_color_hf *= krc_r.x;
++					temporal_moments_histlen_hf.r *= krc_r.x;
++					temporal_moments_histlen_hf.g *= krc_r.x * krc_r.x;
++				}
++			}
+ 			temporal_sample_valid_diff    = true;
+ 		}
+ 
+@@ -253,6 +290,11 @@ main()
+ 		{
+ 			float inv_w_spec = 1.0 / temporal_sum_w_spec;
+ 			temporal_color_histlen_spec   *= inv_w_spec;
++			// KRC rééclaire l'historique : la lumière directe a été multipliée par ce rapport
++			// (mesuré par ses chemins corrélés) ; l'historique reste propre et devient juste
++			vec2 krc_s = krc_signal_at(ipos);
++			if (krc_s.x >= 0)
++				temporal_color_histlen_spec.rgb *= krc_s.x;
+ 			temporal_sample_valid_spec    = true;
+ 		}
+ 	}
+@@ -309,6 +351,7 @@ main()
+ 		// Compute the antilag factors based on the gradients
+ 		float antilag_alpha_lf = clamp(mix(1.0, global_ubo.flt_antilag_lf * grad_lf, global_ubo.flt_temporal_lf), 0, 1);
+ 		float antilag_alpha_hf = clamp(mix(1.0, global_ubo.flt_antilag_hf * grad_hf_spec.x, global_ubo.flt_temporal_hf), 0, 1);
++		antilag_alpha_hf = krc_antilag(antilag_alpha_hf, krc_signal_at(ipos));
+ 
+ 		// Adjust the history length, taking the antilag factors into account
+ 		float hist_len_hf = min(temporal_moments_histlen_hf.b * pow(1.0 - antilag_alpha_hf, 10) + 1.0, 256.0);
+@@ -351,6 +394,7 @@ main()
+ 		// Same sequence as above, only for the specular channel
+ 		float antilag = grad_hf_spec.y * global_ubo.flt_antilag_spec + motion_length * global_ubo.flt_antilag_spec_motion;
+ 		float antilag_alpha_spec = clamp(mix(1.0, antilag, global_ubo.flt_temporal_spec), 0, 1);
++		antilag_alpha_spec = krc_antilag(antilag_alpha_spec, krc_signal_at(ipos));
+ 		float hist_len_spec = min(temporal_color_histlen_spec.a * pow(1.0 - antilag_alpha_spec, 10) + 1.0, 256.0);
+ 		float alpha_color_spec = max(global_ubo.flt_min_alpha_color_spec, 1.0 / hist_len_spec);
+ 		alpha_color_spec = mix(alpha_color_spec, 1.0, antilag_alpha_spec);
+diff --git a/src/refresh/vkpt/shader/global_ubo.h b/src/refresh/vkpt/shader/global_ubo.h
+index f06463f1..e219e17f 100644
+--- a/src/refresh/vkpt/shader/global_ubo.h
++++ b/src/refresh/vkpt/shader/global_ubo.h
+@@ -35,7 +35,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ // Variables that have "_lf", "_hf" or "_spec" suffix apply to the low-frequency, high-frequency or specular lighting channels, respectively.
+ 
+ #define UBO_CVAR_LIST \
+-	UBO_CVAR_DO(pt_cache, 0) /* cache de radiance de l'indirect : 0 jeu d'origine, 1 SHaRC (SDK NVIDIA), 2 KRC */ \
++	UBO_CVAR_DO(pt_cache, 0) /* cache de radiance de l'indirect : 0 jeu d'origine, 1 SHaRC (SDK NVIDIA), 2 KRC, 3 référence (chemins complets, sans cache) */ \
++	UBO_CVAR_DO(pt_ref_bounces, 8) /* référence (pt_cache 3) : rebonds des chemins */ \
+ 	UBO_CVAR_DO(pt_cache_debug, 0) /* 1 : affiche la grille du cache (SHaRC) */ \
+ 	UBO_CVAR_DO(pt_sharc_scene_scale, 50) /* SHaRC : voxel ≈ distance à la caméra / échelle, quelle que soit l'unité (50 : exemple du SDK) */ \
+ 	UBO_CVAR_DO(pt_sharc_accum_frames, 20) /* SHaRC : fenêtre d'accumulation (réglage de l'exemple NVIDIA) */ \
+@@ -45,10 +46,13 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 	UBO_CVAR_DO(pt_cache_bounces, 4) /* rebonds des chemins de mise à jour du cache */ \
+ 	UBO_CVAR_DO(pt_krc_ppp, 0.1) /* KRC : chemins par pixel et par frame (moyenne, allocation de Neyman) ; 0,1 : même coût que SHaRC */ \
+ 	UBO_CVAR_DO(pt_krc_cell_px, 16) /* KRC : taille d'une cellule à l'écran, en pixels */ \
+-	UBO_CVAR_DO(pt_krc_hist, 256) /* KRC : historique maximal d'une cellule (échantillons) */ \
++	UBO_CVAR_DO(pt_krc_hist, 4096) /* KRC : historique maximal d'une cellule (échantillons) ; long, car les chemins corrélés et la détection le gardent à jour */ \
+ 	UBO_CVAR_DO(pt_krc_delta, 1) /* KRC : chemins corrélés (lumière d'avant / d'après des lampes animées) */ \
+ 	UBO_CVAR_DO(pt_krc_detect, 1) /* KRC : détection de changement non expliqué (porte, objet) */ \
+ 	UBO_CVAR_DO(pt_krc_denoise, 1) /* KRC : débruiteur intégré (l'indirect est reconstruit par KRC, sans historique ni filtre du débruiteur) */ \
++	UBO_CVAR_DO(pt_krc_dn_talk, 1) /* KRC dit au débruiteur où la lumière a changé (historique jeté) et où son estimation est sûre */ \
++	UBO_CVAR_DO(pt_krc_dn_trust, 1) /* KRC : là où ses cellules sont sûres et stables, fausses alertes du débruiteur réduites (× ce facteur) */ \
++	UBO_CVAR_DO(pt_krc_dn_err, 0.03) /* KRC : erreur relative jugée correcte (le filtre spatial de l'indirect ne touche pas en dessous) */ \
+ 	UBO_CVAR_DO(pt_test_light_scale, 1) /* test des caches : intensité de toutes les lampes (coupure de courant) */ \
+ 	UBO_CVAR_DO(pt_krc_passes, 31) /* KRC, débogage : passes actives (bits : compteurs, pixels, liste libre, éviction, résolution) */ \
+ 	UBO_CVAR_DO(flt_antilag_hf, 1) /* A-SVGF anti-lag filter strength, [0..inf) */ \
+@@ -238,14 +242,18 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            world_half_size_inv) \
+ 	\
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_a) /* cache de radiance : SHaRC clés (xy), accumulation (zw) */ \
+-	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_b) /* SHaRC résolu (xy), capacité (z), frame (w) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_b) /* SHaRC résolu (xy), capacité (z), référence (w : moitié haute de l'adresse) */ \
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            rc_cam_pos_prev) \
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_c) /* KRC : clés (xy), valeurs (zw) de la table */ \
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_d) /* KRC : cellules (xy), accumulateurs (zw) */ \
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_e) /* KRC : compteurs (xy), cellules visibles (zw) */ \
+ 	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_f) /* KRC : liste libre (xy), cellules des pixels (zw) */ \
+-	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_krc) /* KRC : masque de la table, capacité, pixels max, - */ \
+-	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_g) /* KRC : tâches (xy) : (pixel, cellule) des chemins de la frame */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_krc) /* KRC : masque de la table, capacité, pixels max, référence (w : moitié basse de l'adresse) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uvec4,           rc_addr_g) /* KRC : tâches (xy), signaux pour le débruiteur (zw) */ \
++	GLOBAL_UBO_VAR_LIST_DO(uint,            rc_frame) /* numéro de frame des caches */ \
++	GLOBAL_UBO_VAR_LIST_DO(uint,            rc_pad0) \
++	GLOBAL_UBO_VAR_LIST_DO(uint,            rc_pad1) \
++	GLOBAL_UBO_VAR_LIST_DO(uint,            rc_pad2) \
+ 	\
+ 	GLOBAL_UBO_VAR_LIST_DO(DynLightData,    dyn_light_data[MAX_LIGHT_SOURCES]) \
+ 	GLOBAL_UBO_VAR_LIST_DO(vec4,            cam_pos) \
+diff --git a/src/refresh/vkpt/shader/indirect_lighting.rgen b/src/refresh/vkpt/shader/indirect_lighting.rgen
+index 6c0d462f..5be4edc8 100644
+--- a/src/refresh/vkpt/shader/indirect_lighting.rgen
++++ b/src/refresh/vkpt/shader/indirect_lighting.rgen
+@@ -40,6 +40,7 @@ layout(constant_id = 0) const uint spec_bounce_index = 0;
+ // KRC (pt_cache 2) : indirect diffus du pixel lu dans ses cellules, ajouté au canal LF
+ vec3 krc_lf = vec3(0);
+ vec3 krc_lf_direction = vec3(0, 0, 1);
++vec3 krc_lf_normal = vec3(0, 0, 1);
+ bool krc_used = false;
+ 
+ void
+@@ -220,17 +221,44 @@ indirect_lighting(
+ 	// du jeu, 1 - F compris, avec tous les rebonds) ; le rayon diffus n'est plus tracé, ni le
+ 	// second rebond qui le suivrait. Le reflet spéculaire reste celui du jeu. Tant que les
+ 	// cellules du pixel n'ont pas d'échantillon, le jeu trace son rayon diffus comme avant.
++	if (spec_bounce_index == 0 && cache_mode() == CACHE_REF
++		&& uint(global_ubo.width) * uint(global_ubo.height) <= global_ubo.rc_krc.z)
++	{
++		uint ridx = uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x);
++		krc_lf = throughput.rgb * ref_indirect().v[2u * ridx].rgb;
++		krc_lf_direction = ref_indirect().v[2u * ridx + 1u].xyz; // direction du chemin, comme le jeu
++		krc_lf_normal = normal;
++		krc_used = true;
++		if (!is_specular_ray)
++		{
++			bounce_direction = normal;
++			bounce_contrib = vec3(0);
++			if(spec_bounce_index < global_ubo.pt_num_bounce_rays - 1)
++				imageStore(IMG_PT_SHADING_POSITION, ipos, vec4(0));
++			return;
++		}
++	}
++
+ 	if (spec_bounce_index == 0 && cache_mode() == CACHE_KRC)
+ 	{
+ 		vec3 cell_value;
++		vec2 cell_signal = vec2(1.0, 0.0);
++		vec3 cell_dir = vec3(0);
+ 		vec3 cell_normal = dot(geo_normal, view_direction.xyz) > 0 ? -geo_normal : geo_normal;
+ 		bool cell_found = (global_ubo.pt_krc_denoise != 0)
+-			? krc_smooth_indirect(position, cell_normal, cell_value)
++			? krc_smooth_indirect(position, cell_normal, cell_value, cell_signal, cell_dir)
+ 			: krc_pixel_indirect(ipos, cell_value);
++		// KRC parle au débruiteur : où la lumière a changé, où son estimation est sûre
++		krc_signal().v[uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x)] = cell_signal;
+ 		if (cell_found)
+ 		{
+ 			krc_lf = throughput.rgb * cell_value;
+-			krc_lf_direction = normal;
++			// harmoniques sphériques du débruiteur : direction moyenne de la lumière arrivante,
++			// pondérée par son intensité, mesurée par la cellule (comme l'option SH de SHaRC) ; à
++			// défaut, celle d'une lumière uniforme en cosinus (2/3 de la normale). Avec la normale
++			// entière, la lumière paraissait venir d'en face : faux reflets trop forts.
++			krc_lf_direction = (length(cell_dir) > 0.05) ? cell_dir : normal * (2.0 / 3.0);
++			krc_lf_normal = normal;
+ 			krc_used = true;
+ 			if (!is_specular_ray)
+ 			{
+@@ -553,6 +581,11 @@ main()
+ 	vec3 bounce_contrib;
+ 	bool is_specular_ray;
+ 
++	// signaux KRC pour le débruiteur : rien à dire par défaut (pixels sans surface, sans cellule)
++	if (spec_bounce_index == 0 && cache_mode() == CACHE_KRC
++		&& uint(global_ubo.width) * uint(global_ubo.height) <= global_ubo.rc_krc.z)
++		krc_signal().v[uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x)] = vec2(1.0, 0.0);
++
+ 	indirect_lighting(ipos, half_res, bounce_direction, bounce_contrib, is_specular_ray);
+ 
+ 	if (global_ubo.pt_cache_debug == 1 && spec_bounce_index == 0 && cache_mode() == CACHE_KRC)
+@@ -569,6 +602,8 @@ main()
+ 		if(global_ubo.flt_enable == 0)
+ 			low_freq.shY.xyz += lf;
+ 		else
++			// valeur et direction moyennes des cellules, obtenues avec le tirage du jeu : en
++			// espérance, ce sont exactement les harmoniques que le jeu accumulerait
+ 			accumulate_SH(low_freq, irradiance_to_SH(lf, krc_lf_direction), 1.0);
+ 	#else
+ 		low_freq.shY.xyz += lf;
+diff --git a/src/refresh/vkpt/shader/radiance_cache.h b/src/refresh/vkpt/shader/radiance_cache.h
+index 78459e7b..de57e290 100644
+--- a/src/refresh/vkpt/shader/radiance_cache.h
++++ b/src/refresh/vkpt/shader/radiance_cache.h
+@@ -17,6 +17,7 @@ Licence GPL v2 ou ultérieure (voir license.txt).
+ 
+ #define SHARC_ENABLE_GLSL 1
+ #define SHARC_MATERIAL_DEMODULATION 1   // comme l'exemple Pathtracer du SDK
++#define SHARC_ENABLE_FADE_ACCELERATION 1 // option du SDK : convergence accélérée quand la lumière baisse
+ #ifndef SHARC_UPDATE
+ #define SHARC_UPDATE 0
+ #endif
+@@ -30,6 +31,7 @@ Licence GPL v2 ou ultérieure (voir license.txt).
+ #define CACHE_NONE  0
+ #define CACHE_SHARC 1
+ #define CACHE_KRC   2
++#define CACHE_REF   3
+ 
+ int cache_mode()
+ {
+@@ -41,6 +43,11 @@ uint64_t rc_address(uvec2 a)
+ 	return packUint2x32(a);
+ }
+ 
++// référence (pt_cache 3) : indirect diffus de la frame par pixel (chemin complet, sans cache)
++layout(buffer_reference, std430, buffer_reference_align = 16) buffer RefIndirect { vec4 v[]; };
++RefIndirect ref_indirect() { return RefIndirect(rc_address(uvec2(global_ubo.rc_krc.w, global_ubo.rc_addr_b.w))); }
++// par pixel : v[2 i] = indirect (rgb), v[2 i + 1] = direction du premier rebond (xyz)
++
+ SharcParameters sharc_parameters()
+ {
+ 	SharcParameters p;
+@@ -86,7 +93,9 @@ struct KrcCell
+ 	uint slot;      // case de la table + 1 (0 : libre)
+ 	float sigma;    // écart-type par échantillon (allocation de Neyman)
+ 	uint born;
+-	uint pad;
++	float change;   // la lumière vient de changer ici (0 à 1, décroît de moitié par frame)
++	vec3 dir;       // direction moyenne de la lumière arrivante, pondérée par son intensité (|dir| <= 1)
++	float relight;  // rapport « après / avant » de la lumière directe dans la frame (chemins corrélés)
+ };
+ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells { KrcCell c[]; };
+ 
+@@ -95,13 +104,16 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells {
+ #define KRC_TOMB     0xffffffffu
+ #define KRC_FX       65536.0
+ // accumulateurs par cellule (64 bits, virgule fixe KRC_FX)
+-#define KRC_ACC      10
++#define KRC_ACC      15
+ #define KRC_A_FOOT   0   // pixels qui lisent la cellule dans la frame
+ #define KRC_A_FN     1   // échantillons de la frame
+ #define KRC_A_SUM    2   // 2..4 : somme rgb
+ #define KRC_A_LUM    5
+ #define KRC_A_LUM2   6
+ #define KRC_A_DELTA  7   // 7..9 : somme rgb des différences « après - avant » (signée)
++#define KRC_A_DIR    10  // 10..12 : somme de luminance × direction du premier rebond (signée)
++#define KRC_A_D0NEW  13  // luminance de la lumière directe au point de départ, lumière de la frame
++#define KRC_A_D0OLD  14  // ... la même avec la lumière de la frame précédente (même tirage)
+ // compteurs (64 bits)
+ #define KRC_C_CELLS     0
+ #define KRC_C_NVIS      1
+@@ -125,6 +137,11 @@ KrcU32 krc_free()  { return KrcU32(rc_address(global_ubo.rc_addr_f.xy)); }
+ KrcU32 krc_pix()   { return KrcU32(rc_address(global_ubo.rc_addr_f.zw)); }
+ KrcU32 krc_tasks() { return KrcU32(rc_address(global_ubo.rc_addr_g.xy)); }
+ 
++// signaux pour le débruiteur, par pixel : x = rapport « après / avant » de la lumière directe
++// (1 : rien n'a changé), y = confiance de l'estimation de KRC (0 à 1)
++layout(buffer_reference, std430, buffer_reference_align = 8) buffer KrcSignal { vec2 v[]; };
++KrcSignal krc_signal() { return KrcSignal(rc_address(global_ubo.rc_addr_g.zw)); }
++
+ uint krc_mix(uint h, uint v)
+ {
+ 	h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2);
+@@ -155,10 +172,19 @@ uint krc_axis(vec3 n)
+ 	return (an.x >= an.y && an.x >= an.z) ? 0u : ((an.y >= an.z) ? 1u : 2u);
+ }
+ 
++// orientation de la cellule : axe dominant et signe (6 faces), puis l'inclinaison dans chacun
++// des deux autres axes en 3 classes (9) : une rampe ne partage plus ses cellules avec le sol ou
++// le mur de même axe dominant (la lumière de l'un fuyait sur l'autre)
+ uint krc_face(vec3 n, uint axis)
+ {
+-	float sgn = (axis == 0u) ? n.x : ((axis == 1u) ? n.y : n.z);
+-	return axis * 2u + (sgn < 0.0 ? 1u : 0u);
++	float na = (axis == 0u) ? n.x : ((axis == 1u) ? n.y : n.z);
++	uint a1 = (axis + 1u) % 3u;
++	uint a2 = (axis + 2u) % 3u;
++	float t1 = n[a1] / max(abs(na), 1e-3);
++	float t2 = n[a2] / max(abs(na), 1e-3);
++	uint b1 = t1 < -0.4 ? 0u : (t1 > 0.4 ? 2u : 1u);
++	uint b2 = t2 < -0.4 ? 0u : (t2 > 0.4 ? 2u : 1u);
++	return (axis * 2u + (na < 0.0 ? 1u : 0u)) * 9u + b1 * 3u + b2;
+ }
+ 
+ uint krc_key_q(ivec3 q, int level, uint face)
+@@ -166,7 +192,7 @@ uint krc_key_q(ivec3 q, int level, uint face)
+ 	uint h = krc_mix(0x12345u, uint(q.x));
+ 	h = krc_mix(h, uint(q.y));
+ 	h = krc_mix(h, uint(q.z));
+-	h = krc_mix(h, uint(level + 128) * 8u + face);
++	h = krc_mix(h, uint(level + 128) * 64u + face);
+ 	if (h == 0u || h == KRC_TOMB)
+ 		h = 1u;
+ 	return h;
+@@ -210,9 +236,11 @@ uint krc_find(uint key)
+ // confiance (échantillons accumulés). Déterministe : pas de bruit d'un pixel ou d'une frame à
+ // l'autre, donc rien à accumuler ni à filtrer ensuite ; la mise à jour dans le temps est celle
+ // des cellules (chemins corrélés), sans retard ajouté.
+-bool krc_smooth_indirect(vec3 p, vec3 n, out vec3 value)
++bool krc_smooth_indirect(vec3 p, vec3 n, out vec3 value, out vec2 signal, out vec3 dir)
+ {
+ 	value = vec3(0);
++	signal = vec2(0);
++	dir = vec3(0);
+ 	float dist = length(p - global_ubo.cam_pos.xyz);
+ 	float size;
+ 	int level = krc_level(dist, size);
+@@ -226,6 +254,7 @@ bool krc_smooth_indirect(vec3 p, vec3 n, out vec3 value)
+ 	uint a2 = (axis + 2u) % 3u;
+ 	KrcCells cells = krc_cells();
+ 	float wsum = 0.0;
++	float wbil = 0.0;
+ 	for (int j = 0; j < 2; j++)
+ 	{
+ 		for (int i = 0; i < 2; i++)
+@@ -240,14 +269,23 @@ bool krc_smooth_indirect(vec3 p, vec3 n, out vec3 value)
+ 			if (cn <= 0.0)
+ 				continue;
+ 			float w = (i == 1 ? t[a1] : 1.0 - t[a1]) * (j == 1 ? t[a2] : 1.0 - t[a2]);
++			wbil += w;
++			// confiance : erreur relative de la moyenne de la cellule (sigma / racine(n) / moyenne)
++			float rse = cells.c[c].sigma / sqrt(cn) / max(cells.c[c].lmean, 1e-3);
++			float conf = 1.0 / (1.0 + square(rse / max(global_ubo.pt_krc_dn_err, 1e-4)));
++			signal.x += w * cells.c[c].relight;
++			signal.y += w * conf;
+ 			w = max(w, 1e-3) * min(cn / 16.0, 1.0);
+ 			value += w * cells.c[c].mean;
++			dir += w * cells.c[c].dir;
+ 			wsum += w;
+ 		}
+ 	}
+ 	if (wsum <= 0.0)
+ 		return false;
++	signal = (wbil > 0.0) ? signal / wbil : vec2(1.0, 0.0);
+ 	value /= wsum;
++	dir /= wsum;
+ 	return true;
+ }
+ 
+diff --git a/src/refresh/vkpt/shader/radiance_cache.rgen b/src/refresh/vkpt/shader/radiance_cache.rgen
+index 2f8ae548..0b9d4d66 100644
+--- a/src/refresh/vkpt/shader/radiance_cache.rgen
++++ b/src/refresh/vkpt/shader/radiance_cache.rgen
+@@ -202,7 +202,7 @@ bool rc_bounce(RcSurface s, vec3 view_dir, out vec3 dir)
+ void sharc_update(uvec2 block)
+ {
+ 	uint ds = uint(max(1.0, global_ubo.pt_sharc_downscale));
+-	rc_state = rc_hash(block.x * 9781u + block.y * 6271u + rc_hash(global_ubo.rc_addr_b.w));
++	rc_state = rc_hash(block.x * 9781u + block.y * 6271u + rc_hash(global_ubo.rc_frame));
+ 	ivec2 ipos = ivec2(block * ds) + ivec2(min(uvec2(rc_rand() * ds, rc_rand() * ds), uvec2(ds - 1)));
+ 	if (ipos.x >= global_ubo.width || ipos.y >= global_ubo.height)
+ 		return;
+@@ -256,7 +256,7 @@ void sharc_resolve(uint index)
+ 	rp.accumulationFrameNum = uint(global_ubo.pt_sharc_accum_frames);
+ 	rp.responsiveFrameNum = 1;
+ 	rp.staleFrameNumMax = uint(global_ubo.pt_sharc_stale_frames);
+-	rp.frameIndex = global_ubo.rc_addr_b.w;
++	rp.frameIndex = global_ubo.rc_frame;
+ 	SharcResolveEntry(index, sharc_parameters(), rp);
+ }
+ 
+@@ -438,7 +438,9 @@ uint krc_insert(uint key)
+ 			cell.slot = h + 1u;
+ 			cell.sigma = 0.0;
+ 			cell.born = cell.seen;
+-			cell.pad = 0u;
++			cell.change = 1.0;
++			cell.dir = vec3(0);
++			cell.relight = 1.0;
+ 			krc_cells().c[c] = cell;
+ 			atomicExchange(vals.v[h], c + 1u);
+ 			return c;
+@@ -467,6 +469,8 @@ float krc_sigma(uint c, float sigma_mean)
+ // (cosinus autour de la normale d'ombrage, poids 1 - F), puis jusqu'à pt_cache_bounces rebonds
+ // diffus, avec arrêt sur une cellule mûre au 1er ou 2e sommet (rééchantillonnage du cache).
+ // value : estimation avec la lumière de la frame ; old : la même avec celle d'avant.
++vec3 krc_first_dir; // direction du premier rebond du dernier chemin tracé
++
+ void krc_path(ivec2 ipos, RcSurface s, vec3 view_dir, out vec3 value, out vec3 old)
+ {
+ 	value = vec3(0);
+@@ -480,8 +484,18 @@ void krc_path(ivec2 ipos, RcSurface s, vec3 view_dir, out vec3 value, out vec3 o
+ 	vec3 albedo, base_reflectivity;
+ 	get_reflectivity(base_color.rgb, metallic, albedo, base_reflectivity);
+ 
++	// premier rebond tiré exactement comme le jeu : avec le débruiteur à harmoniques sphériques,
++	// le jeu tire autour de la normale géométrique avec une loi « uniformish » (et sans
++	// correction de densité) ; c'est cette convention que sa reconstruction attend
+ 	vec2 u = vec2(rc_rand(), rc_rand());
+-	vec3 dir = normalize(construct_ONB_frisvad(normal) * sample_cos_hemisphere(u));
++	vec3 dir;
++#if ENABLE_SH
++	if (global_ubo.flt_enable != 0)
++		dir = normalize(construct_ONB_frisvad(s.normal) * sample_cos_hemisphere_multi(0, 1, u, HEMISPHERE_UNIFORMISH));
++	else
++#endif
++		dir = normalize(construct_ONB_frisvad(normal) * sample_cos_hemisphere(u));
++	krc_first_dir = dir;
+ 	vec3 H = normalize(dir - view_dir);
+ 	vec3 F = schlick_fresnel(base_reflectivity, max(0.0, dot(-view_dir, H)), base_color.a);
+ 	vec3 beta = vec3(1.0) - F;
+@@ -495,8 +509,8 @@ void krc_path(ivec2 ipos, RcSurface s, vec3 view_dir, out vec3 value, out vec3 o
+ 	if (!found_intersection(ray_payload_geometry))
+ 		return;
+ 
+-	int bounces = max(int(global_ubo.pt_cache_bounces), 1);
+-	uint rs_depth = rc_rand() < 0.5 ? 1u : 2u;
++	int bounces = max(int(cache_mode() == CACHE_REF ? global_ubo.pt_ref_bounces : global_ubo.pt_cache_bounces), 1);
++	uint rs_depth = (cache_mode() == CACHE_REF) ? 0u : (rc_rand() < 0.5 ? 1u : 2u);
+ 	bool from_primary = true;
+ 	for (int b = 1; ; b++)
+ 	{
+@@ -603,7 +617,7 @@ void krc_pixel(ivec2 ipos)
+ 		return;
+ 	}
+ 
+-	rc_state = rc_hash(idx * 0x9e3779b9u + rc_hash(global_ubo.rc_addr_b.w));
++	rc_state = rc_hash(idx * 0x9e3779b9u + rc_hash(global_ubo.rc_frame));
+ 	float dist = length(s.position - global_ubo.cam_pos.xyz);
+ 	KrcU64 acc = krc_acc();
+ 	KrcU64 ctr = krc_ctr();
+@@ -679,7 +693,7 @@ void krc_trace(uint id)
+ 	vec3 view_dir;
+ 	if (!rc_primary_surface(ipos, s, view_dir))
+ 		return;
+-	rc_state = rc_hash(id * 0x9e3779b9u + rc_hash(global_ubo.rc_addr_b.w ^ 0x68e31da4u));
++	rc_state = rc_hash(id * 0x9e3779b9u + rc_hash(global_ubo.rc_frame ^ 0x68e31da4u));
+ 	KrcU64 acc = krc_acc();
+ 	KrcCell cell = krc_cells().c[c];
+ 	{
+@@ -707,6 +721,19 @@ void krc_trace(uint id)
+ 		krc_add(b + KRC_A_DELTA + 0u, d.x);
+ 		krc_add(b + KRC_A_DELTA + 1u, d.y);
+ 		krc_add(b + KRC_A_DELTA + 2u, d.z);
++		krc_add(b + KRC_A_DIR + 0u, l * krc_first_dir.x);
++		krc_add(b + KRC_A_DIR + 1u, l * krc_first_dir.y);
++		krc_add(b + KRC_A_DIR + 2u, l * krc_first_dir.z);
++		// lumière directe au point de départ, avant et après (même lampe, même point, même
++		// rayon d'ombre) : le rapport permet au débruiteur de rééclairer son historique
++		if (global_ubo.pt_krc_dn_talk != 0)
++		{
++			vec3 dn, dold;
++			rng_seed = rc_hash(rc_state ^ 0x7f4a7c15u);
++			krc_direct(s, view_dir, 0, dn, dold);
++			krc_add(b + KRC_A_D0NEW, luminance(dn));
++			krc_add(b + KRC_A_D0OLD, luminance(dold));
++		}
+ 	}
+ }
+ 
+@@ -773,6 +800,11 @@ void krc_resolve(uint id)
+ 		vec3 fd = vec3(krc_load(b + KRC_A_DELTA), krc_load(b + KRC_A_DELTA + 1u), krc_load(b + KRC_A_DELTA + 2u)) / fn;
+ 		float var_s = max(fl2 - fl * fl, 0.0);
+ 
++		// signal pour le débruiteur : écart relatif « après - avant » mesuré par les chemins
++		// corrélés (une lampe a changé), ou changement détecté
++		float rel = abs(luminance(fd)) / max(cell.lmean, 1e-3);
++		float change = (cell.n > 0.0) ? smoothstep(0.03, 0.2, rel) : 1.0;
++
+ 		if (cell.n > 0.0 && global_ubo.pt_krc_delta != 0)
+ 		{
+ 			cell.mean = max(cell.mean + fd, vec3(0));
+@@ -782,7 +814,10 @@ void krc_resolve(uint id)
+ 		{
+ 			float se = sqrt((var_s + cell.var) / fn);
+ 			if (abs(fl - cell.lmean) > 4.0 * se + 0.05 * cell.lmean)
++			{
+ 				cell.n = min(cell.n, 4.0);
++				change = 1.0;
++			}
+ 		}
+ 		float a = max(fn / (cell.n + fn), fn / max(global_ubo.pt_krc_hist, 1.0));
+ 		a = min(a, 1.0);
+@@ -791,6 +826,23 @@ void krc_resolve(uint id)
+ 		cell.var = (cell.n > 0.0) ? mix(cell.var, var_s + square(fl - cell.lmean), a) : var_s;
+ 		cell.n = min(cell.n + fn, global_ubo.pt_krc_hist);
+ 		cell.sigma = sqrt(cell.var);
++		cell.change = max(change, cell.change * 0.5);
++		float d0n = krc_load(b + KRC_A_D0NEW);
++		float d0o = krc_load(b + KRC_A_D0OLD);
++		cell.relight = (d0o > 1e-5) ? clamp(d0n / d0o, 0.02, 50.0) : 1.0;
++		// direction moyenne de la lumière (pour les harmoniques sphériques du débruiteur)
++		vec3 fdir = vec3(krc_load(b + KRC_A_DIR), krc_load(b + KRC_A_DIR + 1u), krc_load(b + KRC_A_DIR + 2u)) / fn;
++		if (fl > 1e-6)
++		{
++			vec3 m = fdir / fl;
++			if (length(m) > 1.0) m = normalize(m);
++			cell.dir = (length(cell.dir) > 0.0) ? mix(cell.dir, m, a) : m;
++		}
++	}
++	else
++	{
++		cell.change *= 0.5;
++		cell.relight = 1.0;
+ 	}
+ 	cell.seen = uint(ctr.v[KRC_C_CLOCK]);
+ 	cells.c[c] = cell;
+@@ -808,6 +860,29 @@ void main()
+ 		else if (spec_pass == 1)
+ 			sharc_resolve(id.y * 4096u + id.x);
+ 	}
++	else if (cache_mode() == CACHE_REF)
++	{
++		// référence : un chemin complet par pixel et par frame, sans cache ; le mode
++		// d'accumulation du jeu (en pause) en fait la moyenne
++		ivec2 ipos = ivec2(id);
++		if (spec_pass == 3 && ipos.x < global_ubo.width && ipos.y < global_ubo.height
++			&& uint(global_ubo.width) * uint(global_ubo.height) <= global_ubo.rc_krc.z)
++		{
++			uint idx = uint(ipos.y) * uint(global_ubo.width) + uint(ipos.x);
++			RcSurface s;
++			vec3 view_dir;
++			vec3 v = vec3(0), o;
++			krc_first_dir = vec3(0, 0, 1);
++			if (rc_primary_surface(ipos, s, view_dir))
++			{
++				rc_state = rc_hash(idx * 0x9e3779b9u + rc_hash(global_ubo.rc_frame ^ 0x3c6ef372u));
++				krc_path(ipos, s, view_dir, v, o);
++				v = clamp_output(v);
++			}
++			ref_indirect().v[2u * idx] = vec4(v, 1.0);
++			ref_indirect().v[2u * idx + 1u] = vec4(krc_first_dir, 0.0);
++		}
++	}
+ 	else if (cache_mode() == CACHE_KRC)
+ 	{
+ 		if (spec_pass == 2)
+-- 
+2.55.0.windows.3
+

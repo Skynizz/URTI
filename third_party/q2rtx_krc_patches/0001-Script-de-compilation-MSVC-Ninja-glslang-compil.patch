@@ -1,7 +1,7 @@
 From b5a73bc805780d3eeb21a73f51ef77d423e2b83a Mon Sep 17 00:00:00 2001
 From: Skynizz <182822215+Skynizz@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 23:24:13 +0200
-Subject: [PATCH 1/5] =?UTF-8?q?Script=20de=20compilation=20(MSVC=20+=20Nin?=
+Subject: [PATCH 1/6] =?UTF-8?q?Script=20de=20compilation=20(MSVC=20+=20Nin?=
  =?UTF-8?q?ja,=20glslang=20compil=C3=A9)?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

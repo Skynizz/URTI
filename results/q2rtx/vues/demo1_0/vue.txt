@@ -1,0 +1,2 @@
+map demo1
+krc_view 420 480 -180 15 90

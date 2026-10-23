@@ -47,8 +47,8 @@ def method(mode, frame, scale, extra, spp):
     for a in AFTER:
         lines += [f'wait {a - prev}', f'screenshotpng rt_m{mode}_p{a:02d}']
         prev = a
-    # référence d'après, même caméra : rendu de référence du jeu (accumulation en pause)
-    lines += ['set pt_cache 0', f'set pt_accumulation_rendering_framenum {spp}', 'set pt_accumulation_rendering 1',
+    # référence d'après, même caméra : chemins complets à 8 rebonds sans cache (pt_cache 3), accumulés en pause
+    lines += ['set pt_cache 3', 'set pt_dof 0', 'set pt_fake_roughness_threshold 1', f'set pt_accumulation_rendering_framenum {spp}', 'set pt_accumulation_rendering 1',
               f'wait {spp + 30}', f'screenshotpng rt_m{mode}_ref', 'set pt_test_light_scale 1', 'wait 5', 'quit']
     run(f'rt{mode}.cfg', lines)
     dst = os.path.join(OUT, f'm{mode}')
@@ -56,7 +56,7 @@ def method(mode, frame, scale, extra, spp):
     for tag in ['avant', 'ref'] + [f'p{a:02d}' for a in AFTER]:
         src = os.path.join(shots_dir(), f'rt_m{mode}_{tag}.png')
         if os.path.exists(src):
-            shutil.move(src, os.path.join(dst, f'{tag}.png'))
+            os.replace(src, os.path.join(dst, f'{tag}.png'))
 
 
 def psnr(a, b):

@@ -1,3 +1,3 @@
-Jeu sans cache (pt_cache 0) : 631 frames en 2.48 s, 254.6 i/s
-SHaRC NVIDIA (pt_cache 1) : 631 frames en 2.77 s, 227.7 i/s
-KRC (pt_cache 2) : 631 frames en 2.79 s, 226.3 i/s
+Jeu sans cache (pt_cache 0) : 631 frames en 2.27 s, 278.6 i/s
+SHaRC NVIDIA (pt_cache 1) : 631 frames en 2.79 s, 226.6 i/s
+KRC (pt_cache 2) : 631 frames en 3.00 s, 210.1 i/s

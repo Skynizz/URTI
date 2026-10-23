@@ -682,3 +682,36 @@ Lecture :
   des rebonds que la référence n'a pas.
 - **Coût** : à temps égal avec SHaRC. Le débruiteur intégré enlève le retard ajouté à
   l'indirect, mais fait gagner peu de temps ici.
+
+## 19. Reflets et débruiteur piloté par KRC (Quake II RTX)
+
+Deux vues fixes de `demo1` riches en reflets (eau qui reflète), même instant pour toutes les
+méthodes, référence : chemins complets à 8 rebonds, accumulés (`python tools/q2rtx/views.py`).
+
+| PSNR (dB) contre la référence | Salle rouge, sol d'eau | Bassin extérieur |
+|---|---|---|
+| Jeu sans cache | 36,2 | **32,3** |
+| SHaRC NVIDIA | **36,5** | 32,1 |
+| KRC | **36,5** | 30,4 |
+| *Accumulé, biais seul : jeu / SHaRC / KRC* | *44,8 / 45,3 / **45,8*** | *41,5 / 41,0 / **42,9*** |
+| *Vrai spéculaire partout (`pt_fake_roughness_threshold 1`)* | *37,1 / 37,2 / 36,8* | *32,0 / 31,9 / **32,1*** |
+
+Coupure de courant (démo figée, lampes à 15 %) :
+
+| PSNR (dB) | +1 frame | +2 | +4 | +64 |
+|---|---|---|---|---|
+| Jeu sans cache | 28,5 | **29,6** | **30,2** | **30,7** |
+| SHaRC NVIDIA | 27,9 | 28,3 | 28,7 | 30,1 |
+| KRC | **28,7** | 29,4 | 30,1 | **30,7** |
+
+Images par seconde sur la démo complète (1280×720) : jeu 279, SHaRC 227, KRC 210.
+
+Lecture :
+
+- **Le cache de KRC est le plus juste** (biais seul : +0,5 à +1,9 dB sur SHaRC).
+- **Image finale** : les trois méthodes se tiennent à 0,5 dB, sauf dehors avec le faux
+  spéculaire du jeu (KRC −2 dB) : ce raccourci du débruiteur, réglé sur l'indirect à un rebond du
+  jeu, exagère avec un indirect à plusieurs rebonds. Avec du vrai spéculaire, KRC repasse devant.
+- **Réaction** : KRC meilleur à la première frame, SHaRC nettement en retard ; le jeu sans cache
+  (un seul rebond, recalculé à chaque frame) rattrape dès +2.
+- **Coût** : KRC est 7 % plus lent que SHaRC depuis l'ajout du rayon d'ombre du rééclairage.
