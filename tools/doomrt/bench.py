@@ -73,7 +73,14 @@ def run_session(mapnum, out, script, captures, env_extra, timeout):
     env.update(env_extra)
     args = [os.path.join(GAME, 'prboom-plus.exe'), '-iwad', 'doom1.wad', '-warp', '1', str(mapnum), '-skill', '3',
             '-nomonsters', '-nomouse', '-nosound', '-nomusic', '-width', '1280', '-height', '720', '-window']
-    p = subprocess.Popen(args, cwd=GAME, env=env)
+    # KRC_HIDDEN=1 (essai) : lancé réduit sans prendre le focus, puis la DLL place la fenêtre hors
+    # de l'écran. Ne marche pas encore : le jeu ne rend plus dans cet état.
+    si = None
+    if env.get('KRC_HIDDEN', '0') != '0':
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+    p = subprocess.Popen(args, cwd=GAME, env=env, startupinfo=si)
     try:
         p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
