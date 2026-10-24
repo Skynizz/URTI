@@ -1,0 +1,39 @@
+{
+ "reglages": {
+  "scene": "bistro.scene.json",
+  "name": "bistro",
+  "methods": [
+   "sharc50",
+   "krca50"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 512,
+  "cam": "",
+  "eval_only": false
+ },
+ "resultats": {
+  "sharc50": {
+   "biais_psnr": 35.7691335893532,
+   "biais_relmse": 0.004677779028488233,
+   "biais_flip": 0.046175457537174225,
+   "nrd_psnr": 26.013841877017825,
+   "nrd_relmse": 0.02881033990508241,
+   "nrd_flip": 0.07657384872436523,
+   "nrd_flip_hdr": 0.1596142202615738,
+   "lum": 1.0079234051152912,
+   "gpu_ms": 7.2842
+  },
+  "krca50": {
+   "biais_psnr": 35.98721446101141,
+   "biais_relmse": 0.004404197295448316,
+   "biais_flip": 0.04403131827712059,
+   "nrd_psnr": 26.02253522452181,
+   "nrd_relmse": 0.028661195597786182,
+   "nrd_flip": 0.07743227481842041,
+   "nrd_flip_hdr": 0.16022053360939026,
+   "lum": 1.0047690847480102,
+   "gpu_ms": 8.0861
+  }
+ }
+}

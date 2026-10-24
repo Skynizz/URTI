@@ -26,6 +26,7 @@ METHODS = {
     'sharc50': ['tech=sharc', 'scale=50'],
     'sharc100': ['tech=sharc', 'scale=100'],
     'krca100': ['tech=krc', 'scale=100'],
+    'krca50': ['tech=krc', 'scale=50'],   # cellules fines de la taille SHaRC, mères deux fois plus grandes
 }
 
 
@@ -55,13 +56,17 @@ def main():
     ap.add_argument('--warm', type=int, default=250)
     ap.add_argument('--acc', type=int, default=512)
     ap.add_argument('--cam', default='', help='px,py,pz,tx,ty,tz')
+    ap.add_argument('--eval-only', action='store_true', help='réévaluer les captures existantes')
     a = ap.parse_args()
 
     out = f'F:/rtxgi/out/{a.name}'
     script = plan(a.methods, a.ref, a.warm, a.acc)
     if a.cam:
         script = f'15:cam={a.cam};' + script
-    print(run.run(out, script, ['-scene', a.scene]))
+    if not a.eval_only:
+        if os.path.exists(f'{out}/fps.txt'):
+            os.remove(f'{out}/fps.txt')   # un temps GPU par méthode, de cette série seulement
+        print(run.run(out, script, ['-scene', a.scene]))
 
     ref = img.read_pfm(f'{out}/ref.pfm')
     dst = os.path.join(ROOT, 'results', 'rtxgi', a.name)
@@ -76,16 +81,21 @@ def main():
     for name in a.methods:
         acc = img.read_pfm(f'{out}/{name}_acc.pfm')
         nrd = img.read_pfm(f'{out}/{name}_nrd.pfm')
+        flip_nrd, flip_map = img.flip(nrd, ref)
         res[name] = {
             'biais_psnr': img.psnr(acc, ref), 'biais_relmse': img.rel_mse(acc, ref),
+            'biais_flip': img.flip(acc, ref)[0],
             'nrd_psnr': img.psnr(nrd, ref), 'nrd_relmse': img.rel_mse(nrd, ref),
+            'nrd_flip': flip_nrd, 'nrd_flip_hdr': img.flip(nrd, ref, hdr=True)[0],
             'lum': float(acc.mean() / ref.mean()), 'gpu_ms': gpu.get(name, 0.0),
         }
         img.write_png(os.path.join(dst, f'{name}_nrd.png'), img.tonemap(nrd))
         img.write_png(os.path.join(dst, f'{name}_erreur.png'), img.error_map(acc, ref))
+        img.write_png(os.path.join(dst, f'{name}_flip.png'), flip_map)
         r = res[name]
-        print(f'{name:9s} biais PSNR {r["biais_psnr"]:.2f} relMSE {r["biais_relmse"]:.4f} lum {r["lum"]:.3f} | '
-              f'frame NRD PSNR {r["nrd_psnr"]:.2f} relMSE {r["nrd_relmse"]:.4f} | GPU {r["gpu_ms"]:.2f} ms')
+        print(f'{name:9s} biais PSNR {r["biais_psnr"]:.2f} relMSE {r["biais_relmse"]:.4f} FLIP {r["biais_flip"]:.4f} '
+              f'lum {r["lum"]:.3f} | frame NRD PSNR {r["nrd_psnr"]:.2f} FLIP {r["nrd_flip"]:.4f} '
+              f'(HDR {r["nrd_flip_hdr"]:.4f}) | GPU {r["gpu_ms"]:.2f} ms')
     with open(os.path.join(dst, 'mesures.json'), 'w') as f:
         json.dump({'reglages': vars(a), 'resultats': res}, f, indent=1)
 

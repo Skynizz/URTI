@@ -47,3 +47,17 @@ def write_png(path, ldr):
 def error_map(a, b, gain=8.0):
     """Écart signé des images affichées, gris = 0."""
     return np.clip((tonemap(a) - tonemap(b)) * gain + 0.5, 0, 1)
+
+
+def flip(test, ref, hdr=False):
+    """ꟻLIP de NVIDIA (NVlabs/flip) : erreur perçue en alternant les deux images, 0 à 1 (plus bas =
+    mieux). LDR : sur les images affichées (courbe de tons de l'exemple) ; HDR : sur les images
+    linéaires, ꟻLIP balaie lui-même les expositions. Renvoie (erreur moyenne, carte en magma)."""
+    import flip_evaluator
+    if hdr:
+        a, b = np.maximum(ref, 0).astype(np.float32), np.maximum(test, 0).astype(np.float32)
+        emap, mean, _ = flip_evaluator.evaluate(a, b, 'HDR', inputsRGB=False)
+    else:
+        a, b = tonemap(ref).astype(np.float32), tonemap(test).astype(np.float32)
+        emap, mean, _ = flip_evaluator.evaluate(a, b, 'LDR')
+    return float(mean), emap
