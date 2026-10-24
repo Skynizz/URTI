@@ -31,16 +31,19 @@ def main():
     ap.add_argument('--variant', action='append', default=[], help='nom=NOM1=v1,NOM2=v2')
     ap.add_argument('--map', type=int, default=1)
     ap.add_argument('--acc', type=int, default=512)
+    ap.add_argument('--kacc', type=int, default=64, help='frames moyennées pour KRC')
     a = ap.parse_args()
 
-    script = ['100:pause', '101:expo', '102:show=32', '110:mode=2', '700:mode=3']
-    captures = ['600+64', f'1000+{a.acc}']
+    k_end = 600 + a.kacc
+    script = ['100:pause', '101:expo', '102:show=32', '110:mode=2', f'{k_end + 10}:mode=3']
+    captures = [f'600+{a.kacc}', f'{k_end + 310}+{a.acc}']
     for v in a.variant:
         name, _, settings = v.partition('=')
         env = dict(s.split('=', 1) for s in settings.split(',') if s)
         out = os.path.join(bench.GAME, 'cap', 'biais', name)
         bench.run_session(a.map, out, script, captures, env, 1200)
-        k, r = ppm.read(os.path.join(out, 'f00600.ppm')), ppm.read(os.path.join(out, 'f01000.ppm'))
+        k = ppm.read(os.path.join(out, 'f00600.ppm'))
+        r = ppm.read(os.path.join(out, f'f{k_end + 310:05d}.ppm'))
         h, w, _ = r.shape
         mask = np.ones((h, w), bool)
         mask[int(h * 0.62):, int(w * 0.36):int(w * 0.66)] = False  # l'arme
