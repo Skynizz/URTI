@@ -20,8 +20,11 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 ## Vers de vrais jeux (après la vitrine, RESULTATS §17)
 
 **Fait (RESULTATS §18)** : KRC et le SDK officiel de SHaRC tournent dans Quake II RTX, à temps
-égal, sur une vraie partie enregistrée. Suite : intégrer davantage le débruiteur (le direct et
-les reflets, là où il coûte), puis Portal / RTX Remix.
+égal, sur une vraie partie enregistrée. **Fait (RESULTATS §20)** : Doom RT (RTGL1), à coût égal
+de SHaRC ; rééclairage exact par groupes de lampes et historique du débruiteur rééclairé : KRC
+nettement devant après un changement de lumière. À faire : la fin de convergence après un
+changement (la part inexpliquée traîne), les scènes éclairées par des surfaces émissives (les
+échantillonner directement, guidé par les cellules), puis Portal / RTX Remix.
 
 KRC ne peut pas être « injecté » dans un jeu fermé comme Cyberpunk 2077 : son moteur
 (REDengine, DX12) calcule lui-même son éclairage et n'offre aucun point d'entrée pour le

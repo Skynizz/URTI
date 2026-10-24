@@ -715,3 +715,46 @@ Lecture :
 - **Réaction** : KRC meilleur à la première frame, SHaRC nettement en retard ; le jeu sans cache
   (un seul rebond, recalculé à chaque frame) rattrape dès +2.
 - **Coût** : KRC est 7 % plus lent que SHaRC depuis l'ajout du rayon d'ombre du rééclairage.
+
+## 20. Doom en path tracing (PrBoom+ RT, RTGL1)
+
+KRC et le SDK officiel de SHaRC branchés dans RTGL1 v1.1.1, le moteur de PrBoom+ RT (branche
+`krc` de `F:\RayTracedGL1`), Doom shareware. Mesure dans une session figée par la touche Pause
+(`python tools/doomrt/bench.py --maps 1 2 3 --env KRC_PPP=0.05 KRC_EMIT_PHYS=1`) : les
+méthodes passent l'une après l'autre sur la même image, exposition figée ; référence : chemins
+complets à 8 rebonds, **accumulés en harmoniques sphériques dans le moteur** ; PSNR hors de
+l'arme du joueur ; coupure de toutes les lampes à 10 % (`light=0.1`) ; 1280×720.
+
+| PSNR (dB) | Image fixe | +1 frame | +32 | +250 | GPU |
+|---|---|---|---|---|---|
+| **E1M1** jeu / SHaRC / KRC | 47,1 / **50,7** / 50,1 | 33,1 / 33,3 / **36,0** | 38,5 / 39,1 / **42,6** | 44,6 / **50,1** / 46,1 | 3,98 / 3,48 / 3,54 ms |
+| **E1M2** | 46,7 / 44,0 / **47,5** | 33,4 / 32,6 / **37,9** | 35,5 / 35,8 / **39,8** | 42,8 / **43,0** / 42,3 | 4,41 / 3,99 / 4,03 ms |
+| **E1M3** (salle éclairée par des panneaux émissifs) | 49,5 / **50,5** / 46,3 | — | — | — | 3,65 / 3,12 / 3,23 ms |
+
+![E1M1, 4 frames après la coupure : référence, jeu / SHaRC, KRC](../results/doomrt/coupure/comparaison_E1M1_plus4.png)
+
+Lecture :
+
+- **Réaction** : KRC est nettement devant après un changement de lumière (+2,7 à +5,3 dB la
+  frame suivante, +3,5 à +4 dB à +32), grâce au rééclairage exact par groupes de lampes et au
+  dialogue avec le débruiteur. SHaRC et le jeu mettent 128 à 250 frames à revenir.
+- **Fin de la convergence** : SHaRC repasse devant à +128/+250 sur E1M1 (−4 dB pour KRC) : la
+  part du changement que les groupes n'expliquent pas reste quelques centaines de frames dans la
+  moyenne des cellules.
+- **Image fixe** : partagée (KRC devant sur E1M2, SHaRC sur E1M1 de 0,6 dB, nettement sur E1M3 où
+  la lumière vient de panneaux émissifs que les chemins de KRC doivent trouver par hasard).
+- **Coût** : à égalité avec SHaRC (+0,05 ms), 0,4 ms de moins que le jeu sans cache.
+
+Bug de RTGL1 trouvé et corrigé (pour toutes les méthodes) : l'échantillon de gradient de son
+débruiteur relisait l'ancienne couleur des lampes ; un changement d'intensité ne réinitialisait
+jamais l'historique. Jeu d'origine sur E1M1 après la coupure : 21,4 dB à +1, 35,9 dB à +250 ;
+corrigé : 33,2 et 39,9 (`results/doomrt/correctif_gradient`, `KRC_FIX_GRADIENT=0` pour l'ancien).
+
+Deux pièges de mesure, corrigés avant ces chiffres :
+
+- **Convention d'émission** : RTGL1 ajoute l'émission vue au premier rebond diffus sans le poids
+  du rebond (elle compte cos² au lieu de cos) ; KRC et la référence la pondèrent. Sans
+  `KRC_EMIT_PHYS=1`, qui donne la même convention au jeu et à SHaRC, KRC gagnait 7 à 11 dB sur
+  E1M2/E1M3 pour une raison qui n'était pas la qualité de son cache.
+- **Référence moyennée après écrêtage** : moyenner des images finales d'une référence bruitée
+  perd l'énergie écrêtée dans les zones claires (KRC y paraissait +56 % trop clair).

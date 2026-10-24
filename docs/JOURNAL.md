@@ -401,3 +401,35 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   est bruité avec des lampes qui clignotent).
 - Options NVIDIA de SHaRC : pas de préréglages nommés dans le SDK ; FADE_ACCELERATION activé
   (sans effet mesurable sur la coupure) ; accumulation 5 frames : plus réactif, même plateau.
+
+## v20 — Doom RT (PrBoom+ RT / RTGL1)
+
+- Avant de s'y lancer (demande de Skynizz) : l'indirect de RTGL1 v1.1.1 est un chemin à deux
+  rebonds par pixel, rangé en harmoniques sphériques, débruité par A-SVGF ; pas de cache. Les
+  lampes de secteur de Doom sont des lampes sphériques dont la couleur suit le niveau de lumière
+  du secteur, avec un identifiant stable : idéal pour le rééclairage exact.
+- Intégration (branche `krc` de RTGL1) : SHaRC officiel, KRC (passes RtCache0..8), mode de
+  référence ; outils pilotés par variables d'environnement : scénario de session (pause, mode,
+  coupure de lampes, exposition, affichage de débogage), captures moyennées, temps GPU par étape
+  (`tools/doomrt/bench.py`, `indirect_bias.py`).
+- **Bug de RTGL1** : son échantillon de gradient relisait l'ancienne couleur des lampes ; le
+  débruiteur ne voyait jamais un changement d'intensité (environ 100 frames de traînée dans le
+  jeu d'origine). Corrigé pour toutes les méthodes.
+- **Rééclairage exact par groupes de lampes** (idée de Skynizz) : groupe = lampes d'un secteur et
+  de même forme ; le moteur calcule le rapport « après / avant » de chaque groupe, ou le déclare
+  inconnu si ses lampes ne changent pas toutes pareil. Les cellules suivent leurs deux groupes
+  principaux ; l'historique du débruiteur est rééclairé du même rapport (direct, indirect,
+  spéculaire au point touché par le reflet), et le gradient en tient compte.
+- Défauts de KRC trouvés et corrigés : rapport indirect mesuré sur la moyenne (bruité, faisait
+  dériver l'historique du débruiteur jusqu'au blanc) ; **allocation de Neyman seule biaisée**
+  (une cellule qui n'a pas trouvé de source rare ne reçoit plus de chemins : zones sombres à
+  65 % de la référence ; 30 % uniforme + 70 % Neyman → 87 %) ; écrêtage des lucioles avec
+  réserve ; direction de la lumière par canal (les couleurs n'arrivent pas du même côté).
+- Coût ramené à celui de SHaRC : lumière directe en cache aux points des reflets (règle du cône
+  de SHaRC), vue compacte des cellules, lecture au pixel sortie du shader des rayons (passe 8 :
+  −0,3 ms, le code de KRC y prenait des registres), passe des pixels sur un pixel par bloc 2×2.
+- Pièges de mesure : convention d'émission de RTGL1 (KRC_EMIT_PHYS) ; référence moyennée après
+  l'écrêtage de l'image (remplacée par une accumulation dans le moteur) ; état de la pause qui
+  varie d'une session à l'autre (comparer seulement dans une même session).
+- Essayé sans gain : historique raccourci par le changement inexpliqué ; une seule cellule au
+  point du reflet ; historique de 32 768 échantillons.
