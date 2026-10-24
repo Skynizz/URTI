@@ -7,6 +7,7 @@ chemins complets sans cache) est accumulée sur des centaines de frames, avant e
 
   python -I tools/doomrt/bench.py --maps 1 2 3 --group half --scale 0.1
 Sorties : results/doomrt/<nom>/E1M<n>/ (images PNG choisies) et results/doomrt/<nom>/mesures.json
+Les PSNR sont mesurés hors de l'arme du joueur (identique pour toutes les méthodes).
 """
 
 import argparse
@@ -15,6 +16,8 @@ import os
 import shutil
 import subprocess
 import sys
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ppm  # noqa: E402
@@ -90,14 +93,23 @@ def fps_lines(out, methods):
     return res
 
 
+def weapon_mask(shape):
+    """Pixels hors de l'arme du joueur (bas de l'écran, au centre), commune à toutes les méthodes."""
+    h, w = shape[:2]
+    mask = np.ones((h, w), bool)
+    mask[int(h * 0.62):, int(w * 0.36):int(w * 0.66)] = False
+    return mask
+
+
 def analyse(out, roles, methods):
     img = lambda f: ppm.read(os.path.join(out, f'f{f:05d}.ppm'))
     ref = {k: img(f) for f, (m, k) in roles.items() if m == 3}
+    mask = weapon_mask(ref['avant'].shape)
     res = {}
     for m in methods:
         frames = {k: f for f, (mm, k) in roles.items() if mm == m}
-        r = {'avant': ppm.psnr(img(frames['avant']), ref['avant'])}
-        r['apres'] = {k: ppm.psnr(img(frames[k]), ref['apres']) for k in AFTER}
+        r = {'avant': ppm.psnr(img(frames['avant']), ref['avant'], mask)}
+        r['apres'] = {k: ppm.psnr(img(frames[k]), ref['apres'], mask) for k in AFTER}
         res[NAMES[m]] = r
     return res
 
