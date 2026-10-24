@@ -1,0 +1,112 @@
+From 72e512b1c69cf34eafd8325dbe88e90ff6256b72 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 03:43:55 +0200
+Subject: [PATCH 6/7] =?UTF-8?q?Mesure=20:=20convention=20d'=C3=A9mission?=
+ =?UTF-8?q?=20commune=20(KRC=5FEMIT=5FPHYS)=20;=20KRC=20:=20historique=20r?=
+ =?UTF-8?q?accourci=20par=20le=20changement=20inexpliqu=C3=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RTGL1 ajoute l'émission vue au premier rebond diffus sans le poids du rebond ; la référence et
+KRC la pondèrent. KRC_EMIT_PHYS=1 donne la même convention au jeu et à SHaRC.
+
+---
+ Source/RadianceCache.cpp             |  3 ++-
+ Source/RadianceCache.h               |  1 +
+ Source/Shaders/RtCache.inl           |  6 ++++++
+ Source/Shaders/RtRaygenIndirect.rgen | 14 ++++++++++++--
+ 4 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/Source/RadianceCache.cpp b/Source/RadianceCache.cpp
+index 91634e3..63600d8 100644
+--- a/Source/RadianceCache.cpp
++++ b/Source/RadianceCache.cpp
+@@ -44,6 +44,7 @@ RadianceCache::RadianceCache(VkDevice _device, const std::shared_ptr<MemoryAlloc
+ {
+     mode = (int)EnvFloat("KRC_MODE", 0);
+     fireflyFactor = EnvFloat("KRC_FIREFLY", 50);
++    emitPhys = EnvFloat("KRC_EMIT_PHYS", 0) != 0;
+ 
+     // méthode, débogage, échelle SHaRC (50 : exemple du SDK ; voxel ≈ distance / échelle), accumulation
+     float p[5][4] = {
+@@ -142,7 +143,7 @@ void RadianceCache::FillUniform(ShGlobalUniform *gu, uint32_t frameIndex, uint32
+     gu->rcKrc[0] = KRC_TABLE - 1;
+     gu->rcKrc[1] = KRC_CELLS;
+     gu->rcKrc[2] = KRC_MAX_PIXELS;
+-    gu->rcKrc[3] = 0;
++    gu->rcKrc[3] = emitPhys ? 1 : 0;   // émission au premier rebond pondérée (KRC_EMIT_PHYS)
+ 
+     for (int i = 0; i < 3; i++)
+     {
+diff --git a/Source/RadianceCache.h b/Source/RadianceCache.h
+index 7427d1d..6609dcf 100644
+--- a/Source/RadianceCache.h
++++ b/Source/RadianceCache.h
+@@ -51,6 +51,7 @@ private:
+     bool needsClear = true;
+     float camPosPrev[3] = {};
+     float fireflyFactor = 50;
++    bool emitPhys = false;
+     float params[5][4] = {};
+ 
+     Buffer sharcHash, sharcAccum, sharcResolved;
+diff --git a/Source/Shaders/RtCache.inl b/Source/Shaders/RtCache.inl
+index 4d92e33..9740706 100644
+--- a/Source/Shaders/RtCache.inl
++++ b/Source/Shaders/RtCache.inl
+@@ -908,6 +908,12 @@ void krc_resolve(uint id)
+         if (cell.n > 0.0 && RC_KRC_DELTA)
+         {
+             fd -= explained;
++            // la part du changement que les groupes n'expliquent pas n'est mesurée que sur cette
++            // frame (bruitée) : l'historique est raccourci d'autant, pour qu'elle se moyenne vite
++            // au lieu de rester ~300 frames dans la moyenne
++            const float relU = abs(rc_lum(fd)) / max(cell.lmean, 1e-4);
++            if (relU > 0.02)
++                cell.n = min(cell.n, clamp(8.0 / (relU * relU), 32.0, RC_KRC_HIST));
+             cell.mean = max(cell.mean + fd, vec3(0));
+             cell.lmean = max(cell.lmean + rc_lum(fd), 0.0);
+         }
+diff --git a/Source/Shaders/RtRaygenIndirect.rgen b/Source/Shaders/RtRaygenIndirect.rgen
+index af03932..c461dd6 100644
+--- a/Source/Shaders/RtRaygenIndirect.rgen
++++ b/Source/Shaders/RtRaygenIndirect.rgen
+@@ -43,6 +43,16 @@ layout (constant_id = 0) const uint maxAlbedoLayerCount = 0;
+ #define SHARC_SEPARATE_EMISSIVE 1
+ #include "RadianceCache.h"
+ bool rcSpecularBounce = false; // le rebond en cours est le reflet spéculaire
++
++// Émission vue au premier rebond diffus. RTGL1 l'ajoute sans le poids du rebond (1 / cos, que
++// la reconstruction en harmoniques sphériques compense pour le reste) : elle est ainsi pondérée
++// par cos² au lieu de cos. KRC et la référence la pondèrent comme le reste ; KRC_EMIT_PHYS=1
++// donne la même convention au jeu et à SHaRC, pour comparer les caches et non les conventions.
++// weight : poids du rebond, déjà multiplié par l'albédo du point touché.
++vec3 rc_first_emission(float emission, vec3 albedo, vec3 weight)
++{
++    return (globalUniform.rcKrc.w != 0 && !rcSpecularBounce) ? emission * weight : emission * albedo;
++}
+ vec3 rcSpecOld = vec3(-1.0);   // KRC : le reflet avec l'éclairage de la frame précédente (-1 : inconnu)
+ vec3 rcSpecNew = vec3(0), rcSpecOldTotal = vec3(0), rcSpecDirect = vec3(0); // spéculaire du pixel
+ 
+@@ -173,7 +183,7 @@ vec3 processBounce(
+             if (usable && SharcGetCachedRadiance(sharcParams, sharcHit, cachedRadiance, false))
+             {
+                 rayHitDistance = segment;
+-                return h.emission * h.albedo + cachedRadiance * throughput_First;
++                return rc_first_emission(h.emission, h.albedo, throughput_First * h.albedo) + cachedRadiance * throughput_First;
+             }
+         }
+ 
+@@ -250,7 +260,7 @@ vec3 processBounce(
+             throughput_Second);
+ 
+ 
+-        return h.emission * h.albedo + (diffuse + contrib_Second) * throughput_First;
++        return rc_first_emission(h.emission, h.albedo, throughput_First) + (diffuse + contrib_Second) * throughput_First;
+     }
+     else
+     {
+-- 
+2.55.0.windows.3
+

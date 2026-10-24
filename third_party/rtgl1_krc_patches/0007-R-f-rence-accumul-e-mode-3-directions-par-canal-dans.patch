@@ -1,0 +1,549 @@
+From 98c81f0239bebfbb98eea57b694d244abd2f4b78 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:50:57 +0200
+Subject: [PATCH 7/7] =?UTF-8?q?R=C3=A9f=C3=A9rence=20accumul=C3=A9e=20(mod?=
+ =?UTF-8?q?e=203),=20directions=20par=20canal=20dans=20KRC,=20nettoyage=20?=
+ =?UTF-8?q?des=20d=C3=A9bogages?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Mode 3 : somme des harmoniques sphériques de chaque frame par pixel, affichée en moyenne,
+  remise à zéro à chaque changement de lampes. L'ancienne référence moyennait des images déjà
+  écrêtées : bruitée, elle perdait de l'énergie dans les zones claires (KRC y paraissait +56 %).
+- KRC : moments directionnels par canal (moyenne de couleur x direction), linéaires, rééclairés
+  avec la moyenne ; une direction courte est une mesure, plus de repli sur la normale.
+- Barrière avant les passes du cache.
+
+---
+ Source/KrcTools.cpp                  |  2 +
+ Source/KrcTools.h                    |  3 +
+ Source/RadianceCache.cpp             | 30 +++++++--
+ Source/RadianceCache.h               |  1 +
+ Source/Shaders/RadianceCache.h       | 91 ++++++++++++++++++++--------
+ Source/Shaders/RtCache.inl           | 71 ++++++++++++++--------
+ Source/Shaders/RtRaygenIndirect.rgen | 12 ++--
+ 7 files changed, 152 insertions(+), 58 deletions(-)
+
+diff --git a/Source/KrcTools.cpp b/Source/KrcTools.cpp
+index ade0f6f..759a813 100644
+--- a/Source/KrcTools.cpp
++++ b/Source/KrcTools.cpp
+@@ -283,6 +283,7 @@ void KrcScript::Frame(uint32_t frameId)
+         else if (c.key == "light")
+         {
+             lightScale = (float)std::atof(c.value.c_str());
++            lightEpoch++;
+         }
+         else if (c.key == "show")
+         {
+@@ -291,6 +292,7 @@ void KrcScript::Frame(uint32_t frameId)
+         else if (c.key == "group")
+         {
+             halfGroup = c.value == "half";
++            lightEpoch++;
+         }
+         else if (c.key == "fps")
+         {
+diff --git a/Source/KrcTools.h b/Source/KrcTools.h
+index fb56897..fa9a7f4 100644
+--- a/Source/KrcTools.h
++++ b/Source/KrcTools.h
+@@ -131,6 +131,8 @@ public:
+     int Mode(int current) const { return mode >= 0 ? mode : current; }
+     bool ExposureFrozen() const { return exposureFrozen; }
+     uint32_t ShowFlags() const { return showFlags; }
++    // change à chaque commande light ou group : la référence accumulée doit repartir de zéro
++    uint32_t LightEpoch() const { return lightEpoch; }
+     float LightScale(uint64_t uniqueID) const;
+     // temps GPU d'une frame, en ms par étape (KrcGpuTimer::Mark)
+     void GpuSample(const double ms[KrcGpuTimer::MARK_COUNT]);
+@@ -148,6 +150,7 @@ private:
+     int mode = -1;
+     bool exposureFrozen = false;
+     uint32_t showFlags = 0;
++    uint32_t lightEpoch = 0;
+     float lightScale = 1.0f;
+     bool halfGroup = false;
+ 
+diff --git a/Source/RadianceCache.cpp b/Source/RadianceCache.cpp
+index 63600d8..0d00f3d 100644
+--- a/Source/RadianceCache.cpp
++++ b/Source/RadianceCache.cpp
+@@ -16,8 +16,8 @@ namespace
+ constexpr uint32_t SHARC_CAPACITY = 1u << 22;
+ constexpr uint32_t KRC_TABLE = 1u << 22;
+ constexpr uint32_t KRC_CELLS = 1u << 20;
+-constexpr uint32_t KRC_CELL_SIZE = 128;  // octets, struct KrcCell (Shaders/RadianceCache.h)
+-constexpr uint32_t KRC_ACC = 27;         // accumulateurs 64 bits par cellule
++constexpr uint32_t KRC_CELL_SIZE = 160;  // octets, struct KrcCell (Shaders/RadianceCache.h)
++constexpr uint32_t KRC_ACC = 33;         // accumulateurs 64 bits par cellule
+ constexpr uint32_t KRC_CTR = 64;
+ constexpr uint32_t KRC_K = 4;
+ constexpr uint32_t KRC_MAX_PIXELS = 2560u * 1600u;
+@@ -67,7 +67,7 @@ RadianceCache::RadianceCache(VkDevice _device, const std::shared_ptr<MemoryAlloc
+     make(krcKeys, (VkDeviceSize)KRC_TABLE * 4, "KRC keys");
+     make(krcVals, (VkDeviceSize)KRC_TABLE * 4, "KRC values");
+     make(krcCells, (VkDeviceSize)KRC_CELLS * KRC_CELL_SIZE, "KRC cells");
+-    make(krcViews, (VkDeviceSize)KRC_CELLS * 32, "KRC cell views");
++    make(krcViews, (VkDeviceSize)KRC_CELLS * 48, "KRC cell views");
+     make(krcAcc, (VkDeviceSize)KRC_CELLS * KRC_ACC * 8, "KRC accumulators");
+     make(krcCtr, (VkDeviceSize)KRC_CTR * 8, "KRC counters");
+     make(krcVis, (VkDeviceSize)KRC_CELLS * 4, "KRC visible cells");
+@@ -75,7 +75,7 @@ RadianceCache::RadianceCache(VkDevice _device, const std::shared_ptr<MemoryAlloc
+     make(krcPix, (VkDeviceSize)KRC_MAX_PIXELS * KRC_K * 4, "KRC pixel cells");
+     make(krcTasks, (VkDeviceSize)KRC_MAX_PIXELS * 8, "KRC tasks");
+     make(krcSignal, (VkDeviceSize)KRC_MAX_PIXELS * 16, "KRC denoiser signal");
+-    make(refIndirect, (VkDeviceSize)KRC_MAX_PIXELS * 32, "Reference indirect");
++    make(refIndirect, (VkDeviceSize)KRC_MAX_PIXELS * 64, "Reference indirect (accumulated SH)");
+ 
+     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+     {
+@@ -184,7 +184,7 @@ void RadianceCache::FillUniform(ShGlobalUniform *gu, uint32_t frameIndex, uint32
+ void RadianceCache::Clear(VkCommandBuffer cmd)
+ {
+     for (Buffer *b : { &sharcHash, &sharcAccum, &sharcResolved, &krcKeys, &krcVals, &krcCells, &krcViews, &krcAcc,
+-                       &krcCtr, &krcSignal })
++                       &krcCtr, &krcSignal, &refIndirect })
+     {
+         vkCmdFillBuffer(cmd, b->GetBuffer(), 0, VK_WHOLE_SIZE, 0);
+     }
+@@ -227,9 +227,29 @@ void RadianceCache::Trace(VkCommandBuffer cmd, uint32_t frameIndex, const std::s
+         Clear(cmd);
+         needsClear = false;
+     }
++    else if (mode == 3 && refEpoch != KrcScript::Get().LightEpoch())
++    {
++        // les lampes ont changé : la référence accumulée repart de zéro
++        vkCmdFillBuffer(cmd, refIndirect.GetBuffer(), 0, VK_WHOLE_SIZE, 0);
++        VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
++                             nullptr, 0, nullptr);
++    }
++    refEpoch = KrcScript::Get().LightEpoch();
+ 
+     CmdLabel label(cmd, "Radiance cache");
+ 
++    // la lumière directe de RTGL1 vient d'écrire ses images (direction de vue…) : les attendre
++    {
++        VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
++                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
++    }
++
+     if (mode == 1)
+     {
+         // SHaRC : Update (un pixel par bloc NxN), Resolve (toutes les entrées)
+diff --git a/Source/RadianceCache.h b/Source/RadianceCache.h
+index 6609dcf..11b047a 100644
+--- a/Source/RadianceCache.h
++++ b/Source/RadianceCache.h
+@@ -52,6 +52,7 @@ private:
+     float camPosPrev[3] = {};
+     float fireflyFactor = 50;
+     bool emitPhys = false;
++    uint32_t refEpoch = 0;
+     float params[5][4] = {};
+ 
+     Buffer sharcHash, sharcAccum, sharcResolved;
+diff --git a/Source/Shaders/RadianceCache.h b/Source/Shaders/RadianceCache.h
+index cdabf5c..e41e8af 100644
+--- a/Source/Shaders/RadianceCache.h
++++ b/Source/Shaders/RadianceCache.h
+@@ -66,7 +66,8 @@ float rc_lum(vec3 c)
+     return getLuminance(c);
+ }
+ 
+-// référence (mode 3) : par pixel, v[2 i] = indirect (rgb), v[2 i + 1] = direction du premier rebond
++// référence (mode 3) : par pixel, somme des harmoniques sphériques de l'indirect de chaque frame
++// (v[4 i] rouge, v[4 i + 1] vert, v[4 i + 2] bleu) et nombre de frames (v[4 i + 3].x)
+ layout(buffer_reference, std430, buffer_reference_align = 16) buffer RefIndirect { vec4 v[]; };
+ RefIndirect ref_indirect() { return RefIndirect(rc_address(globalUniform.rcAddrH.xy)); }
+ 
+@@ -122,7 +123,9 @@ struct KrcCell
+     float sigma;    // écart-type par échantillon (allocation de Neyman)
+     uint born;
+     float change;   // la lumière vient de changer ici (0 à 1)
+-    vec3 dir;       // direction moyenne de la lumière arrivante, pondérée par son intensité
++    vec3 momR;      // moyenne de (rouge × direction du premier rebond) : la direction de la
++                    // lumière rouge arrivante ; une par canal, car les lumières de couleurs
++                    // différentes n'arrivent pas du même côté (momG, momB plus bas)
+     float relight;  // rapport « après / avant » de la lumière directe dans la frame
+     uvec2 lights;   // rééclairage exact : les deux lampes principales (type << 30 | indice de la frame)
+     vec2 share;     // ... leur part de l'indirect de la cellule
+@@ -133,6 +136,10 @@ struct KrcCell
+     float pad2;
+     vec3 direct;      // lumière directe moyenne au point (sans l'albédo), rééclairée comme le reste
+     float pad3;
++    vec3 momG;
++    float pad4;
++    vec3 momB;
++    float pad5;
+ };
+ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells { KrcCell c[]; };
+ 
+@@ -141,14 +148,14 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells {
+ #define KRC_TOMB     0xffffffffu
+ #define KRC_FX       65536.0
+ // accumulateurs par cellule (64 bits, virgule fixe KRC_FX)
+-#define KRC_ACC      27
++#define KRC_ACC      33
+ #define KRC_A_FOOT   0   // la cellule est lue dans la frame
+ #define KRC_A_FN     1   // échantillons de la frame
+ #define KRC_A_SUM    2   // 2..4 : somme rgb
+ #define KRC_A_LUM    5
+ #define KRC_A_LUM2   6
+ #define KRC_A_DELTA  7   // 7..9 : somme rgb des différences « après - avant » (signée)
+-#define KRC_A_DIR    10  // 10..12 : somme de luminance × direction du premier rebond (signée)
++#define KRC_A_DIR    10  // 10..12 : somme de rouge × direction du premier rebond (signée)
+ #define KRC_A_D0NEW  13  // luminance de la lumière directe au point de départ (frame)
+ #define KRC_A_D0OLD  14  // ... la même avec la lumière de la frame précédente
+ #define KRC_A_LID    15  // 15..16 : lampes suivies (type << 30 | indice), 0 : libre
+@@ -156,6 +163,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells {
+ #define KRC_A_LDIR   19  // 19..20 : part de la lumière directe au départ due à ces lampes
+ #define KRC_A_EXC    21  // 21..23 : énergie écrêtée dans la frame (rgb)
+ #define KRC_A_D0RGB  24  // 24..26 : lumière directe au point de départ (rgb)
++#define KRC_A_DIRG   27  // 27..29 : vert × direction du premier rebond
++#define KRC_A_DIRB   30  // 30..32 : bleu × direction du premier rebond
+ // compteurs (64 bits)
+ #define KRC_C_CELLS     0
+ #define KRC_C_NVIS      1
+@@ -278,10 +287,11 @@ uint krc_find(uint key)
+     return KRC_NONE;
+ }
+ 
+-// Vue compacte d'une cellule (32 octets), écrite à sa résolution, seule lue par l'affichage :
++// Vue compacte d'une cellule (48 octets), écrite à sa résolution, seule lue par l'affichage :
+ //  a : moyenne r g ; moyenne b, poids (n / 16 plafonné à 1, 0 : inutilisable) ; rapports direct,
+ //      indirect ; confiance
+-//  b : lumière directe r g ; b ; direction moyenne (snorm 8 bits) ; frame de la résolution
++//  b : lumière directe r g ; b ; frame de la résolution ; -
++//  c : direction moyenne de la lumière rouge, verte, bleue (snorm 8 bits) ; -
+ // Les rapports ne valent que dans la frame de leur résolution (sinon 1 : rien à rééclairer).
+ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcViews { uvec4 v[]; };
+ KrcViews krc_views() { return KrcViews(rc_address(globalUniform.rcAddrJ.xy)); }
+@@ -292,44 +302,63 @@ struct KrcView
+     float weight;
+     float relight, relightInd, conf;
+     vec3 direct;
+-    vec3 dir;
++    vec3 dirR, dirG, dirB;
+ };
+ 
+-KrcView krc_view_unpack(uvec4 a, uvec4 b, uint clock)
++#define KRC_VIEW_WORDS 3u
++
++KrcView krc_view_unpack(uvec4 a, uvec4 b, uvec4 d, uint clock)
+ {
+     KrcView v;
+     const vec2 rg = unpackHalf2x16(a.x), bw = unpackHalf2x16(a.y), r = unpackHalf2x16(a.z);
+     v.mean = vec3(rg, bw.x);
+     v.weight = bw.y;
+-    const bool fresh = b.w == clock;
++    const bool fresh = b.z == clock;
+     v.relight = fresh ? r.x : 1.0;
+     v.relightInd = fresh ? r.y : 1.0;
+     v.conf = unpackHalf2x16(a.w).x;
+     const vec2 drg = unpackHalf2x16(b.x);
+     v.direct = vec3(drg, unpackHalf2x16(b.y).x);
+-    v.dir = unpackSnorm4x8(b.z).xyz;
++    v.dirR = unpackSnorm4x8(d.x).xyz;
++    v.dirG = unpackSnorm4x8(d.y).xyz;
++    v.dirB = unpackSnorm4x8(d.z).xyz;
+     return v;
+ }
+ 
+-void krc_view_pack(KrcCell cell, uint clock, out uvec4 a, out uvec4 b)
++// direction d'un canal : moment / valeur, au plus de longueur 1
++vec3 krc_channel_dir(vec3 mom, float value)
++{
++    if (value <= 1e-8)
++        return vec3(0);
++    vec3 d = mom / value;
++    const float l = length(d);
++    return l > 1.0 ? d / l : d;
++}
++
++void krc_view_pack(KrcCell cell, uint clock, out uvec4 a, out uvec4 b, out uvec4 d)
+ {
+     const vec3 m = min(cell.mean, vec3(60000.0));
+-    const vec3 d = min(cell.direct, vec3(60000.0));
++    const vec3 dl = min(cell.direct, vec3(60000.0));
+     const float rse = cell.sigma / sqrt(max(cell.n, 1.0)) / max(cell.lmean, 1e-4);
+     const float conf = (cell.n > 0.0) ? 1.0 / (1.0 + square(rse / max(RC_KRC_DN_ERR, 1e-4))) : 0.0;
+     a = uvec4(packHalf2x16(m.xy), packHalf2x16(vec2(m.z, clamp(cell.n / 16.0, 0.0, 1.0))),
+               packHalf2x16(vec2(min(cell.relight, 60000.0), min(cell.relightInd, 60000.0))), packHalf2x16(vec2(conf, 0.0)));
+-    b = uvec4(packHalf2x16(d.xy), packHalf2x16(vec2(d.z, 0.0)), packSnorm4x8(vec4(clamp(cell.dir, -1.0, 1.0), 0.0)), clock);
++    b = uvec4(packHalf2x16(dl.xy), packHalf2x16(vec2(dl.z, 0.0)), clock, 0u);
++    d = uvec4(packSnorm4x8(vec4(krc_channel_dir(cell.momR, cell.mean.r), 0.0)),
++              packSnorm4x8(vec4(krc_channel_dir(cell.momG, cell.mean.g), 0.0)),
++              packSnorm4x8(vec4(krc_channel_dir(cell.momB, cell.mean.b), 0.0)), 0u);
+ }
+ 
+ // Débruiteur intégré : indirect d'un point reconstruit à partir des 4 cellules voisines dans le
+ // plan de sa face (interpolation bilinéaire), pondérées par leur confiance. Déterministe : rien à
+ // accumuler ni à filtrer ensuite.
+-bool krc_smooth_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3 dir, out vec3 direct)
++bool krc_smooth_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3 dirR, out vec3 dirG,
++                       out vec3 dirB, out vec3 direct)
+ {
+     value = vec3(0);
+     signal = vec4(0);
+-    dir = vec3(0);
++    vec3 momR = vec3(0), momG = vec3(0), momB = vec3(0);
++    dirR = dirG = dirB = vec3(0);
+     direct = vec3(0);
+     float dist = length(p - RC_CAM_POS);
+     float size;
+@@ -356,7 +385,8 @@ bool krc_smooth_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3
+             uint c = krc_find(krc_key_q(q, level, face));
+             if (c == KRC_NONE)
+                 continue;
+-            const KrcView cv = krc_view_unpack(views.v[2u * c], views.v[2u * c + 1u], clock);
++            const KrcView cv = krc_view_unpack(views.v[KRC_VIEW_WORDS * c], views.v[KRC_VIEW_WORDS * c + 1u],
++                                               views.v[KRC_VIEW_WORDS * c + 2u], clock);
+             if (cv.weight <= 0.0)
+                 continue;
+             float w = (i == 1 ? t[a1] : 1.0 - t[a1]) * (j == 1 ? t[a2] : 1.0 - t[a2]);
+@@ -366,7 +396,9 @@ bool krc_smooth_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3
+             signal.z += w * cv.relightInd;
+             w = max(w, 1e-3) * cv.weight;
+             value += w * cv.mean;
+-            dir += w * cv.dir;
++            momR += w * cv.mean.r * cv.dirR;
++            momG += w * cv.mean.g * cv.dirG;
++            momB += w * cv.mean.b * cv.dirB;
+             direct += w * cv.direct;
+             wsum += w;
+         }
+@@ -375,11 +407,26 @@ bool krc_smooth_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3
+         return false;
+     signal = (wbil > 0.0) ? signal / wbil : vec4(1.0, 0.0, 1.0, 0.0);
+     value /= wsum;
+-    dir /= wsum;
++    dirR = krc_channel_dir(momR / wsum, value.r);
++    dirG = krc_channel_dir(momG / wsum, value.g);
++    dirB = krc_channel_dir(momB / wsum, value.b);
+     direct /= wsum;
+     return true;
+ }
+ 
++// harmoniques sphériques d'ordre 1 avec une direction par canal (irradianceToSH, canal par canal).
++// Une direction courte est une mesure (lumière rasante ou venue de côtés opposés : composante
++// directionnelle presque nulle), pas une absence de mesure : la remplacer par 2/3 de la normale
++// doublait l'éclairage des surfaces éclairées de biais.
++SH krc_sh(vec3 value, vec3 dirR, vec3 dirG, vec3 dirB, vec3 n)
++{
++    SH sh;
++    sh.r = vec4(0.282095, 0.488603 * dirR.y, 0.488603 * dirR.z, 0.488603 * dirR.x) * value.r;
++    sh.g = vec4(0.282095, 0.488603 * dirG.y, 0.488603 * dirG.z, 0.488603 * dirG.x) * value.g;
++    sh.b = vec4(0.282095, 0.488603 * dirB.y, 0.488603 * dirB.z, 0.488603 * dirB.x) * value.b;
++    return sh;
++}
++
+ // Une seule cellule, celle qui contient le point (pour un reflet : le lobe et le débruiteur du
+ // spéculaire lissent déjà ; quatre fois moins de recherches que krc_smooth_lookup)
+ bool krc_point_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3 direct, out float size)
+@@ -393,7 +440,8 @@ bool krc_point_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3
+     const uint c = krc_find(krc_key_q(q, level, krc_face(n, axis)));
+     if (c == KRC_NONE)
+         return false;
+-    const KrcView cv = krc_view_unpack(krc_views().v[2u * c], krc_views().v[2u * c + 1u], uint(krc_ctr().v[KRC_C_CLOCK]));
++    const KrcView cv = krc_view_unpack(krc_views().v[KRC_VIEW_WORDS * c], krc_views().v[KRC_VIEW_WORDS * c + 1u],
++                                       krc_views().v[KRC_VIEW_WORDS * c + 2u], uint(krc_ctr().v[KRC_C_CLOCK]));
+     if (cv.weight <= 0.0)
+         return false;
+     value = cv.mean;
+@@ -402,10 +450,5 @@ bool krc_point_lookup(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3
+     return true;
+ }
+ 
+-bool krc_smooth_indirect(vec3 p, vec3 n, out vec3 value, out vec4 signal, out vec3 dir)
+-{
+-    vec3 direct;
+-    return krc_smooth_lookup(p, n, value, signal, dir, direct);
+-}
+ 
+ #endif // RADIANCE_CACHE_H_
+diff --git a/Source/Shaders/RtCache.inl b/Source/Shaders/RtCache.inl
+index 9740706..5fcd8d0 100644
+--- a/Source/Shaders/RtCache.inl
++++ b/Source/Shaders/RtCache.inl
+@@ -489,7 +489,8 @@ uint krc_insert(uint key)
+             cell.sigma = 0.0;
+             cell.born = cell.seen;
+             cell.change = 1.0;
+-            cell.dir = vec3(0);
++            cell.momR = cell.momG = cell.momB = vec3(0);
++            cell.pad4 = cell.pad5 = 0.0;
+             cell.relight = 1.0;
+             cell.lights = uvec2(0);
+             cell.share = vec2(0);
+@@ -501,7 +502,7 @@ uint krc_insert(uint key)
+             cell.direct = vec3(0);
+             cell.pad3 = 0.0;
+             krc_cells().c[c] = cell;
+-            krc_views().v[2u * c] = uvec4(0);   // poids nul : pas encore affichable
++            krc_views().v[KRC_VIEW_WORDS * c] = uvec4(0);   // poids nul : pas encore affichable
+             atomicExchange(vals.v[h], c + 1u);
+             return c;
+         }
+@@ -766,9 +767,12 @@ void krc_trace(uint id)
+     krc_add(b + KRC_A_DELTA + 0u, d.x);
+     krc_add(b + KRC_A_DELTA + 1u, d.y);
+     krc_add(b + KRC_A_DELTA + 2u, d.z);
+-    krc_add(b + KRC_A_DIR + 0u, l * krc_first_dir.x);
+-    krc_add(b + KRC_A_DIR + 1u, l * krc_first_dir.y);
+-    krc_add(b + KRC_A_DIR + 2u, l * krc_first_dir.z);
++    for (uint k = 0u; k < 3u; k++)
++    {
++        krc_add(b + KRC_A_DIR + k, v.r * krc_first_dir[k]);
++        krc_add(b + KRC_A_DIRG + k, v.g * krc_first_dir[k]);
++        krc_add(b + KRC_A_DIRB + k, v.b * krc_first_dir[k]);
++    }
+     const uint pathLight = krc_path_light;
+     const float pathLightLum = krc_path_light_lum * clampK;
+ 
+@@ -883,6 +887,9 @@ void krc_resolve(uint id)
+         cell.mean *= scaleInd;
+         cell.lmean *= scaleInd;
+         cell.excess *= scaleInd;
++        cell.momR *= scaleInd;
++        cell.momG *= scaleInd;
++        cell.momB *= scaleInd;
+         const float sInd = max(scaleInd, 1e-6);
+         cell.share /= sInd;
+         cell.dshare /= max(relightD0, 1e-6);
+@@ -908,12 +915,9 @@ void krc_resolve(uint id)
+         if (cell.n > 0.0 && RC_KRC_DELTA)
+         {
+             fd -= explained;
+-            // la part du changement que les groupes n'expliquent pas n'est mesurée que sur cette
+-            // frame (bruitée) : l'historique est raccourci d'autant, pour qu'elle se moyenne vite
+-            // au lieu de rester ~300 frames dans la moyenne
+-            const float relU = abs(rc_lum(fd)) / max(cell.lmean, 1e-4);
+-            if (relU > 0.02)
+-                cell.n = min(cell.n, clamp(8.0 / (relU * relU), 32.0, RC_KRC_HIST));
++            cell.momR += fd.r * krc_channel_dir(cell.momR, cell.mean.r);
++            cell.momG += fd.g * krc_channel_dir(cell.momG, cell.mean.g);
++            cell.momB += fd.b * krc_channel_dir(cell.momB, cell.mean.b);
+             cell.mean = max(cell.mean + fd, vec3(0));
+             cell.lmean = max(cell.lmean + rc_lum(fd), 0.0);
+         }
+@@ -940,12 +944,22 @@ void krc_resolve(uint id)
+         cell.sigma = sqrt(cell.var);
+         cell.change = max(change, cell.change * 0.5);
+ 
+-        const vec3 fdir = vec3(krc_load(b + KRC_A_DIR), krc_load(b + KRC_A_DIR + 1u), krc_load(b + KRC_A_DIR + 2u)) / fn;
+-        if (fl > 1e-6)
++        // moments directionnels par canal (linéaires : sans le biais d'un rapport par frame) ; la
++        // réserve des lucioles rendue prend la direction actuelle du canal
+         {
+-            vec3 m = fdir / fl;
+-            if (length(m) > 1.0) m = normalize(m);
+-            cell.dir = (length(cell.dir) > 0.0) ? mix(cell.dir, m, a) : m;
++            vec3 fr = vec3(0), fg = vec3(0), fb = vec3(0);
++            for (uint k = 0u; k < 3u; k++)
++            {
++                fr[k] = krc_load(b + KRC_A_DIR + k);
++                fg[k] = krc_load(b + KRC_A_DIRG + k);
++                fb[k] = krc_load(b + KRC_A_DIRB + k);
++            }
++            fr = (fr + release.r * krc_channel_dir(cell.momR, cell.mean.r)) / fn;
++            fg = (fg + release.g * krc_channel_dir(cell.momG, cell.mean.g)) / fn;
++            fb = (fb + release.b * krc_channel_dir(cell.momB, cell.mean.b)) / fn;
++            cell.momR = mix(cell.momR, fr, a);
++            cell.momG = mix(cell.momG, fg, a);
++            cell.momB = mix(cell.momB, fb, a);
+         }
+         const float d0n = krc_load(b + KRC_A_D0NEW);
+         const float d0o = krc_load(b + KRC_A_D0OLD);
+@@ -1004,10 +1018,11 @@ void krc_resolve(uint id)
+ 
+     cell.seen = uint(ctr.v[KRC_C_CLOCK]);
+     cells.c[c] = cell;
+-    uvec4 va, vb;
+-    krc_view_pack(cell, cell.seen, va, vb);
+-    krc_views().v[2u * c] = va;
+-    krc_views().v[2u * c + 1u] = vb;
++    uvec4 va, vb, vd;
++    krc_view_pack(cell, cell.seen, va, vb, vd);
++    krc_views().v[KRC_VIEW_WORDS * c] = va;
++    krc_views().v[KRC_VIEW_WORDS * c + 1u] = vb;
++    krc_views().v[KRC_VIEW_WORDS * c + 2u] = vd;
+     for (uint i = 0u; i < KRC_ACC; i++)
+         acc.v[b + i] = 0;
+ }
+@@ -1028,12 +1043,12 @@ void krc_display(ivec2 pix)
+     // luminances du spéculaire écrites par l'indirect : direct, reflet avec l'éclairage d'avant, total
+     const vec4 spec = krc_signal().v[i];
+ 
+-    vec3 value, dir;
++    vec3 value, dirR, dirG, dirB, cellDirect;
+     vec4 sig;
+     SH sh = newSH();
+-    if (krc_smooth_indirect(s.position, s.normalGeom, value, sig, dir))
++    if (krc_smooth_lookup(s.position, s.normalGeom, value, sig, dirR, dirG, dirB, cellDirect))
+     {
+-        sh = irradianceToSH(value, (length(dir) > 0.05) ? dir : s.normalGeom * (2.0 / 3.0));
++        sh = krc_sh(value, dirR, dirG, dirB, s.normalGeom);
+         // débogage : rapports pour le débruiteur, rouge = direct > 1,05, bleu = direct < 0,95,
+         // vert = indirect hors de [0,95 ; 1,05]
+         if (RC_DEBUG == 8)
+@@ -1070,8 +1085,14 @@ void ref_pixel(ivec2 pix)
+         krc_path(s, toViewer, true, v, o);
+         v = clamp(v, vec3(0), vec3(1e4));
+     }
+-    ref_indirect().v[2u * idx] = vec4(v, 1.0);
+-    ref_indirect().v[2u * idx + 1u] = vec4(krc_first_dir, 0.0);
++    // accumulée tant que la scène et les lampes ne changent pas (remise à zéro par RadianceCache) :
++    // l'indirect affiché est la moyenne, convergée, et non un échantillon bruité que l'écrêtage
++    // de l'image finale fausserait dans les zones claires
++    const SH sh = irradianceToSH(v, krc_first_dir);
++    ref_indirect().v[4u * idx + 0u] += sh.r;
++    ref_indirect().v[4u * idx + 1u] += sh.g;
++    ref_indirect().v[4u * idx + 2u] += sh.b;
++    ref_indirect().v[4u * idx + 3u].x += 1.0;
+ }
+ 
+ void main()
+diff --git a/Source/Shaders/RtRaygenIndirect.rgen b/Source/Shaders/RtRaygenIndirect.rgen
+index c461dd6..b1090b6 100644
+--- a/Source/Shaders/RtRaygenIndirect.rgen
++++ b/Source/Shaders/RtRaygenIndirect.rgen
+@@ -300,11 +300,16 @@ SH processIndirectDiffuse(
+ 
+     // KRC : l'indirect diffus du pixel est lu dans les cellules par la passe 8 (RtCache.inl),
+     // après ce shader : cette fonction n'est pas appelée dans ce mode
+-    // référence : le chemin complet du pixel (à accumuler)
++    // référence : la moyenne des chemins complets du pixel depuis la dernière remise à zéro
+     if (cache_mode() == CACHE_REF && rc_fits())
+     {
+         const uint i = rc_pixel_index(ivec2(gl_LaunchIDEXT.xy));
+-        return irradianceToSH(ref_indirect().v[2u * i].rgb, ref_indirect().v[2u * i + 1u].xyz);
++        const float n = max(ref_indirect().v[4u * i + 3u].x, 1.0);
++        SH sh;
++        sh.r = ref_indirect().v[4u * i + 0u] / n;
++        sh.g = ref_indirect().v[4u * i + 1u] / n;
++        sh.b = ref_indirect().v[4u * i + 2u] / n;
++        return sh;
+     }
+ 
+     vec3 bounceDirection;
+@@ -335,8 +340,7 @@ void processIndirectIllumination(
+     rcSpecDirect = rcSpecNew = texelFetchUnfilteredSpecular(pix);
+     rcSpecOldTotal = vec3(0);
+ 
+-    // mesure du coût (débogage 21) : sans reflet tracé
+-    if (surfRoughness <= FAKE_ROUGH_SPECULAR_THRESHOLD + FAKE_ROUGH_SPECULAR_LENGTH && RC_DEBUG != 21)
++    if (surfRoughness <= FAKE_ROUGH_SPECULAR_THRESHOLD + FAKE_ROUGH_SPECULAR_LENGTH)
+     {
+         const vec3 directSpecular = texelFetchUnfilteredSpecular(pix);
+         float rayHitDistance = 0;
+-- 
+2.55.0.windows.3
+

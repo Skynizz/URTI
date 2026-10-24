@@ -1,0 +1,232 @@
+From 9427836d7814929d917c48ad7612a4be2bd706a7 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 02:50:54 +0200
+Subject: [PATCH 4/7] =?UTF-8?q?KRC=20:=20allocation=20d=C3=A9fensive=20des?=
+ =?UTF-8?q?=20chemins,=20r=C3=A9serve=20des=20lucioles,=20vues=20de=20d?=
+ =?UTF-8?q?=C3=A9bogage=20par=20composante?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Allocation 30 % uniforme + 70 % Neyman : selon Neyman seul, une cellule sans source rare
+  trouvée ne recevait plus de chemins (biais : zones sombres à 65 % de la référence -> 87 %).
+- Écrêtage des lucioles réglable (KRC_FIREFLY), excès mis en réserve et rendu à la moyenne.
+- KRC_RESAMPLE ; affichage de débogage show=N (direct, spéculaire, indirect non filtrés).
+
+---
+ Source/RadianceCache.cpp          |  9 +++++----
+ Source/RadianceCache.h            |  1 +
+ Source/Shaders/CmComposition.comp | 10 ++++++----
+ Source/Shaders/RadianceCache.h    |  5 ++++-
+ Source/Shaders/RtCache.inl        | 33 +++++++++++++++++++++++--------
+ 5 files changed, 41 insertions(+), 17 deletions(-)
+
+diff --git a/Source/RadianceCache.cpp b/Source/RadianceCache.cpp
+index 890515a..da5df03 100644
+--- a/Source/RadianceCache.cpp
++++ b/Source/RadianceCache.cpp
+@@ -16,8 +16,8 @@ namespace
+ constexpr uint32_t SHARC_CAPACITY = 1u << 22;
+ constexpr uint32_t KRC_TABLE = 1u << 22;
+ constexpr uint32_t KRC_CELLS = 1u << 20;
+-constexpr uint32_t KRC_CELL_SIZE = 96;   // octets, struct KrcCell (Shaders/RadianceCache.h)
+-constexpr uint32_t KRC_ACC = 21;         // accumulateurs 64 bits par cellule
++constexpr uint32_t KRC_CELL_SIZE = 112;  // octets, struct KrcCell (Shaders/RadianceCache.h)
++constexpr uint32_t KRC_ACC = 24;         // accumulateurs 64 bits par cellule
+ constexpr uint32_t KRC_CTR = 64;
+ constexpr uint32_t KRC_K = 4;
+ constexpr uint32_t KRC_MAX_PIXELS = 2560u * 1600u;
+@@ -43,6 +43,7 @@ namespace RTGL1
+ RadianceCache::RadianceCache(VkDevice _device, const std::shared_ptr<MemoryAllocator> &allocator) : device(_device)
+ {
+     mode = (int)EnvFloat("KRC_MODE", 0);
++    fireflyFactor = EnvFloat("KRC_FIREFLY", 50);
+ 
+     // méthode, débogage, échelle SHaRC (50 : exemple du SDK ; voxel ≈ distance / échelle), accumulation
+     float p[5][4] = {
+@@ -50,7 +51,7 @@ RadianceCache::RadianceCache(VkDevice _device, const std::shared_ptr<MemoryAlloc
+         { EnvFloat("SHARC_STALE", 64), EnvFloat("SHARC_DOWNSCALE", 5), EnvFloat("SHARC_RADIANCE_SCALE", 1000), EnvFloat("KRC_BOUNCES", 4) },
+         { EnvFloat("KRC_PPP", 0.1f), EnvFloat("KRC_CELL_PX", 16), EnvFloat("KRC_HIST", 4096), EnvFloat("KRC_DELTA", 1) },
+         { EnvFloat("KRC_DETECT", 1), EnvFloat("KRC_DENOISE", 1), EnvFloat("KRC_DN_TALK", 1), EnvFloat("KRC_DN_ERR", 0.03f) },
+-        { EnvFloat("KRC_REF_BOUNCES", 8), EnvFloat("KRC_RELIGHT", 1), EnvFloat("KRC_FIX_GRADIENT", 1), 0 },
++        { EnvFloat("KRC_REF_BOUNCES", 8), EnvFloat("KRC_RELIGHT", 1), EnvFloat("KRC_FIX_GRADIENT", 1), EnvFloat("KRC_RESAMPLE", 1) },
+     };
+     std::memcpy(params, p, sizeof(params));
+ 
+@@ -144,7 +145,7 @@ void RadianceCache::FillUniform(ShGlobalUniform *gu, uint32_t frameIndex, uint32
+         gu->rcCamPosPrev[i] = camPosPrev[i];
+         camPosPrev[i] = gu->cameraPosition[i];
+     }
+-    gu->rcCamPosPrev[3] = 0;
++    gu->rcCamPosPrev[3] = fireflyFactor; // écrêtage des lucioles de KRC (KRC_FIREFLY × la moyenne)
+     std::memcpy(gu->rcParams0, params[0], sizeof(params[0]));
+     std::memcpy(gu->rcParams1, params[1], sizeof(params[1]));
+     std::memcpy(gu->rcParams2, params[2], sizeof(params[2]));
+diff --git a/Source/RadianceCache.h b/Source/RadianceCache.h
+index b93c3a5..144d46c 100644
+--- a/Source/RadianceCache.h
++++ b/Source/RadianceCache.h
+@@ -47,6 +47,7 @@ private:
+     int mode = 0;
+     bool needsClear = true;
+     float camPosPrev[3] = {};
++    float fireflyFactor = 50;
+     float params[5][4] = {};
+ 
+     Buffer sharcHash, sharcAccum, sharcResolved;
+diff --git a/Source/Shaders/CmComposition.comp b/Source/Shaders/CmComposition.comp
+index 4fb4ad0..0542b14 100644
+--- a/Source/Shaders/CmComposition.comp
++++ b/Source/Shaders/CmComposition.comp
+@@ -133,19 +133,21 @@ void main()
+             color = vec3(1,0,0);
+         }
+     }
+-#if 0
++    // (branche krc) composantes non filtrées, avec l'exposition, sans courbe de tons : pour
++    // mesurer le biais de chaque méthode composante par composante
+     else if ((globalUniform.debugShowFlags & DEBUG_SHOW_FLAG_UNFILTERED_DIFF) != 0)
+     {
+-        color = texelFetchUnfilteredDirect(getCheckerboardPix(pix));
++        color = texelFetchUnfilteredDirect(getCheckerboardPix(pix)) * albedo4.rgb * getExposure();
+     }
+     else if ((globalUniform.debugShowFlags & DEBUG_SHOW_FLAG_UNFILTERED_SPEC) != 0)
+     {
+-        color = texelFetchUnfilteredSpecular(getCheckerboardPix(pix));
++        color = texelFetchUnfilteredSpecular(getCheckerboardPix(pix)) * getExposure();
+     }
+     else if ((globalUniform.debugShowFlags & DEBUG_SHOW_FLAG_UNFILTERED_INDIR) != 0)
+     {
++        const ivec2 cp = getCheckerboardPix(pix);
++        color = SHToIrradiance(texelFetchUnfilteredIndirectSH(cp), texelFetchNormal(cp)) * albedo4.rgb * getExposure();
+     }
+-#endif
+ #if GRADIENT_ESTIMATION_ENABLED
+     else if ((globalUniform.debugShowFlags & DEBUG_SHOW_FLAG_GRADIENTS) != 0)
+     {
+diff --git a/Source/Shaders/RadianceCache.h b/Source/Shaders/RadianceCache.h
+index d7c2090..0f40c3f 100644
+--- a/Source/Shaders/RadianceCache.h
++++ b/Source/Shaders/RadianceCache.h
+@@ -129,6 +129,8 @@ struct KrcCell
+     vec2 dshare;    // ... leur part de la lumière directe au point de départ
+     float relightInd; // rapport « après / avant » de l'indirect de la cellule dans la frame
+     float pad;
++    vec3 excess;      // énergie écrêtée des lucioles, rendue peu à peu à la moyenne
++    float pad2;
+ };
+ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells { KrcCell c[]; };
+ 
+@@ -137,7 +139,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells {
+ #define KRC_TOMB     0xffffffffu
+ #define KRC_FX       65536.0
+ // accumulateurs par cellule (64 bits, virgule fixe KRC_FX)
+-#define KRC_ACC      21
++#define KRC_ACC      24
+ #define KRC_A_FOOT   0   // la cellule est lue dans la frame
+ #define KRC_A_FN     1   // échantillons de la frame
+ #define KRC_A_SUM    2   // 2..4 : somme rgb
+@@ -150,6 +152,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer KrcCells {
+ #define KRC_A_LID    15  // 15..16 : lampes suivies (type << 30 | indice), 0 : libre
+ #define KRC_A_LIND   17  // 17..18 : part de l'indirect due à ces lampes (luminance)
+ #define KRC_A_LDIR   19  // 19..20 : part de la lumière directe au départ due à ces lampes
++#define KRC_A_EXC    21  // 21..23 : énergie écrêtée dans la frame (rgb)
+ // compteurs (64 bits)
+ #define KRC_C_CELLS     0
+ #define KRC_C_NVIS      1
+diff --git a/Source/Shaders/RtCache.inl b/Source/Shaders/RtCache.inl
+index 73c6d17..66326ae 100644
+--- a/Source/Shaders/RtCache.inl
++++ b/Source/Shaders/RtCache.inl
+@@ -496,6 +496,8 @@ uint krc_insert(uint key)
+             cell.dshare = vec2(0);
+             cell.relightInd = 1.0;
+             cell.pad = 0.0;
++            cell.excess = vec3(0);
++            cell.pad2 = 0.0;
+             krc_cells().c[c] = cell;
+             atomicExchange(vals.v[h], c + 1u);
+             return c;
+@@ -552,7 +554,7 @@ void krc_path(RcSurface s, vec3 toViewer, bool reference, out vec3 value, out ve
+     vec3 beta = vec3(evalBRDFLambertian(1.0) * oneOverPdf);
+ 
+     const int bounces = max(reference ? RC_REF_BOUNCES : RC_BOUNCES, 1);
+-    const uint rsDepth = reference ? 0u : (rc_rand() < 0.5 ? 1u : 2u);
++    const uint rsDepth = (reference || globalUniform.rcParams4.w == 0) ? 0u : (rc_rand() < 0.5 ? 1u : 2u);
+     RcSurface from = s;
+     for (int b = 1; ; b++)
+     {
+@@ -669,7 +671,10 @@ void krc_pixel(ivec2 pix)
+         atomicAdd(ctr.v[KRC_C_SIG], uint64_t(sigSum) * uint64_t(KRC_FX / 1024.0));
+         atomicAdd(ctr.v[KRC_C_PIX], uint64_t(pixSum));
+     }
+-    const float p = RC_KRC_PPP * (sigmaMean > 0 ? sigma / sigmaMean : 1.0);
++    // allocation défensive : 30 % uniforme, 70 % selon Neyman. Selon Neyman seul, une cellule
++    // dont les chemins n'ont pas encore trouvé de source rare (sigma presque nul) n'en reçoit
++    // presque plus et reste trop sombre : l'allocation dépend de sa propre estimation (biais)
++    const float p = RC_KRC_PPP * (sigmaMean > 0 ? 0.3 + 0.7 * sigma / sigmaMean : 1.0);
+     const uint paths = uint(floor(min(p, 4.0) + rc_rand()));
+ 
+     const uint offset = subgroupExclusiveAdd(paths);
+@@ -732,17 +737,23 @@ void krc_trace(uint id)
+     krc_path(s, toViewer, false, v, o);
+     v = clamp(v, vec3(0), vec3(1e4));
+     o = clamp(o, vec3(0), vec3(1e4));
+-    // écrêtage des lucioles : un échantillon plus de 50× la moyenne d'une cellule mûre
++    // écrêtage des lucioles : un échantillon plus de 50× la moyenne d'une cellule mûre ; l'excès
++    // n'est pas perdu, il est mis en réserve et rendu à la moyenne sur les frames suivantes
+     float l = rc_lum(v);
+     float clampK = 1.0;
+-    if (cell.n >= 8.0 && l > 50.0 * max(cell.lmean, 1e-4))
++    const uint b = c * KRC_ACC;
++    const float fireflyK = globalUniform.rcCamPosPrev.w;
++    if (cell.n >= 8.0 && l > fireflyK * max(cell.lmean, 1e-4))
+     {
+-        clampK = 50.0 * max(cell.lmean, 1e-4) / l;
++        clampK = fireflyK * max(cell.lmean, 1e-4) / l;
++        const vec3 ex = v * (1.0 - clampK);
++        krc_add(b + KRC_A_EXC + 0u, ex.x);
++        krc_add(b + KRC_A_EXC + 1u, ex.y);
++        krc_add(b + KRC_A_EXC + 2u, ex.z);
+         v *= clampK;
+         o *= clampK;
+         l *= clampK;
+     }
+-    const uint b = c * KRC_ACC;
+     atomicAdd(krc_acc().v[b + KRC_A_FN], uint64_t(1));
+     krc_add(b + KRC_A_SUM + 0u, v.x);
+     krc_add(b + KRC_A_SUM + 1u, v.y);
+@@ -866,6 +877,7 @@ void krc_resolve(uint id)
+         explained = cell.mean * (scaleInd - 1.0);
+         cell.mean *= scaleInd;
+         cell.lmean *= scaleInd;
++        cell.excess *= scaleInd;
+         const float sInd = max(scaleInd, 1e-6);
+         cell.share /= sInd;
+         cell.dshare /= max(relightD0, 1e-6);
+@@ -874,8 +886,12 @@ void krc_resolve(uint id)
+ 
+     if (fn > 0.0)
+     {
+-        const vec3 fm = vec3(krc_load(b + KRC_A_SUM), krc_load(b + KRC_A_SUM + 1u), krc_load(b + KRC_A_SUM + 2u)) / fn;
+-        const float fl = krc_load(b + KRC_A_LUM) / fn;
++        // réserve des lucioles : 1/16 rendu par frame, réparti sur les échantillons de la frame
++        cell.excess += vec3(krc_load(b + KRC_A_EXC), krc_load(b + KRC_A_EXC + 1u), krc_load(b + KRC_A_EXC + 2u));
++        const vec3 release = cell.excess * (1.0 / 16.0);
++        cell.excess -= release;
++        const vec3 fm = (vec3(krc_load(b + KRC_A_SUM), krc_load(b + KRC_A_SUM + 1u), krc_load(b + KRC_A_SUM + 2u)) + release) / fn;
++        const float fl = (krc_load(b + KRC_A_LUM) + rc_lum(release)) / fn;
+         const float fl2 = krc_load(b + KRC_A_LUM2) / fn;
+         vec3 fd = vec3(krc_load(b + KRC_A_DELTA), krc_load(b + KRC_A_DELTA + 1u), krc_load(b + KRC_A_DELTA + 2u)) / fn;
+         const float varS = max(fl2 - fl * fl, 0.0);
+@@ -900,6 +916,7 @@ void krc_resolve(uint id)
+             if (abs(fl - cell.lmean) > 4.0 * se + 0.05 * cell.lmean)
+             {
+                 cell.n = min(cell.n, 4.0);
++                cell.excess = vec3(0); // énergie d'un éclairage qui n'existe plus
+                 change = 1.0;
+             }
+         }
+-- 
+2.55.0.windows.3
+

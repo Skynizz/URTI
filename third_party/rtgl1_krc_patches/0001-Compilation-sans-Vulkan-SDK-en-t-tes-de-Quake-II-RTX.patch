@@ -1,0 +1,54 @@
+From daafa622d1cb4c890fb71634ac6cf7c284c37a57 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:01:24 +0200
+Subject: [PATCH 1/7] =?UTF-8?q?Compilation=20sans=20Vulkan=20SDK=20(en-t?=
+ =?UTF-8?q?=C3=AAtes=20de=20Quake=20II=20RTX,=20glslangValidator)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Source/Shaders/ShaderCommonGLSLFunc.h |  3 +++
+ build_krc.bat                         | 12 ++++++++++++
+ 2 files changed, 15 insertions(+)
+ create mode 100644 build_krc.bat
+
+diff --git a/Source/Shaders/ShaderCommonGLSLFunc.h b/Source/Shaders/ShaderCommonGLSLFunc.h
+index 750a30d..2dcdcb6 100644
+--- a/Source/Shaders/ShaderCommonGLSLFunc.h
++++ b/Source/Shaders/ShaderCommonGLSLFunc.h
+@@ -65,10 +65,13 @@ layout(
+     binding = BINDING_TEXTURES)
+     uniform sampler2D globalTextures[];
+ 
++// inutilisée, et refusée par glslangValidator (type de retour sampler2D en SPIR-V)
++#if 0
+ sampler2D getTexture(uint textureIndex)
+ {
+     return globalTextures[nonuniformEXT(textureIndex)];
+ }
++#endif
+ 
+ vec4 getTextureSample(uint textureIndex, const vec2 texCoord)
+ {
+diff --git a/build_krc.bat b/build_krc.bat
+new file mode 100644
+index 0000000..3c93ef8
+--- /dev/null
++++ b/build_krc.bat
+@@ -0,0 +1,12 @@
++@echo off
++rem Compilation de RTGL1 (branche krc) : MSVC x64, CMake + Ninja de Visual Studio, en-tetes et
++rem bibliotheque Vulkan de Quake II RTX (pas de Vulkan SDK sur cette machine).
++call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
++cd /d %~dp0
++if not exist build mkdir build
++cd build
++if not exist build.ninja (
++    cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DRG_WITH_SURFACE_WIN32=ON ^
++        -DVulkan_INCLUDE_DIR=F:/Q2RTX-KRC/extern/Vulkan-Headers/include -DVulkan_LIBRARY=F:/Q2RTX-KRC/vulkan-1.lib .. || exit /b 1
++)
++cmake --build . %* || exit /b 1
+-- 
+2.55.0.windows.3
+

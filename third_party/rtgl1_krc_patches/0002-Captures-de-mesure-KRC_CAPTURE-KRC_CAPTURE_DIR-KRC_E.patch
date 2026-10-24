@@ -1,0 +1,325 @@
+From 07506ddff19110c1b5d64f89f3520538ee91e1ed Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:05:02 +0200
+Subject: [PATCH 2/7] Captures de mesure (KRC_CAPTURE, KRC_CAPTURE_DIR,
+ KRC_EXIT_AFTER)
+
+---
+ CMakeLists.txt          |   2 +
+ Source/KrcTools.cpp     | 170 ++++++++++++++++++++++++++++++++++++++++
+ Source/KrcTools.h       |  44 +++++++++++
+ Source/VulkanDevice.cpp |   8 ++
+ Source/VulkanDevice.h   |   2 +
+ 5 files changed, 226 insertions(+)
+ create mode 100644 Source/KrcTools.cpp
+ create mode 100644 Source/KrcTools.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7af7faf..6dd6639 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,6 +20,7 @@ set(PrivateHeaders
+     "Source/ISwapchainDependency.h"
+     "Source/VertexBufferProperties.h"
+     "Source/VulkanDevice.h"
++    "Source/KrcTools.h"
+     "Source/Buffer.h"
+     "Source/Scene.h"
+     "Source/PhysicalDevice.h"
+@@ -94,6 +95,7 @@ set(Sources
+     "Source/RTGL1.cpp"
+     "Source/RTGL1A.cpp"
+     "Source/VulkanDevice.cpp"
++    "Source/KrcTools.cpp"
+     "Source/Buffer.cpp"
+     "Source/Scene.cpp"
+     "Source/PhysicalDevice.cpp"
+diff --git a/Source/KrcTools.cpp b/Source/KrcTools.cpp
+new file mode 100644
+index 0000000..141e352
+--- /dev/null
++++ b/Source/KrcTools.cpp
+@@ -0,0 +1,170 @@
++// Copyright (c) 2026 Skynizz
++
++#include "KrcTools.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sstream>
++
++#ifdef _WIN32
++#include <direct.h>
++#include <windows.h>
++#endif
++
++namespace
++{
++
++// flottant sans signe à 11 ou 10 bits (mantisse 6 ou 5 bits, exposant 5 bits)
++float UnpackUnsignedFloat(uint32_t v, uint32_t mantissaBits)
++{
++    uint32_t mantissa = v & ((1u << mantissaBits) - 1);
++    uint32_t exponent = (v >> mantissaBits) & 0x1f;
++    if (exponent == 0)
++    {
++        return std::ldexp((float)mantissa / (float)(1u << mantissaBits), -14);
++    }
++    if (exponent == 31)
++    {
++        return 65504.0f;
++    }
++    return std::ldexp(1.0f + (float)mantissa / (float)(1u << mantissaBits), (int)exponent - 15);
++}
++
++uint8_t ToSrgb8(float c)
++{
++    c = c < 0 ? 0 : (c > 1 ? 1 : c);
++    float s = c <= 0.0031308f ? 12.92f * c : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
++    return (uint8_t)(s * 255.0f + 0.5f);
++}
++
++}
++
++namespace RTGL1
++{
++
++void KrcCapture::Init(const std::shared_ptr<MemoryAllocator> &allocator)
++{
++    if (const char *s = std::getenv("KRC_CAPTURE"))
++    {
++        std::stringstream ss(s);
++        std::string item;
++        while (std::getline(ss, item, ','))
++        {
++            if (!item.empty())
++            {
++                frames.push_back((uint32_t)std::strtoul(item.c_str(), nullptr, 10));
++            }
++        }
++    }
++    if (const char *s = std::getenv("KRC_CAPTURE_DIR"))
++    {
++        dir = s;
++    }
++    if (const char *s = std::getenv("KRC_EXIT_AFTER"))
++    {
++        exitAfter = std::atoi(s) != 0;
++    }
++    enabled = !frames.empty();
++    if (enabled)
++    {
++        // assez grand pour du 3840×2160
++        buffer.Init(allocator, (VkDeviceSize)3840 * 2160 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, "KRC capture");
++#ifdef _WIN32
++        _mkdir(dir.c_str());
++#endif
++    }
++}
++
++void KrcCapture::Destroy()
++{
++    if (buffer.IsInitted())
++    {
++        buffer.Destroy();
++    }
++}
++
++void KrcCapture::Record(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height, uint32_t frameId)
++{
++    if (!enabled || width * height > 3840u * 2160u)
++    {
++        return;
++    }
++    bool wanted = false;
++    for (uint32_t f : frames)
++    {
++        wanted |= (f == frameId);
++    }
++    if (!wanted)
++    {
++        return;
++    }
++
++    VkMemoryBarrier before = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++    before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0,
++                         nullptr, 0, nullptr);
++
++    VkBufferImageCopy region = {};
++    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.imageSubresource.layerCount = 1;
++    region.imageExtent = { width, height, 1 };
++    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, buffer.GetBuffer(), 1, &region);
++
++    VkMemoryBarrier after = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0,
++                         nullptr);
++
++    pending = true;
++    pendingWidth = width;
++    pendingHeight = height;
++    pendingFrame = frameId;
++}
++
++void KrcCapture::Finish(VkDevice device, VkFence fence)
++{
++    if (!pending)
++    {
++        return;
++    }
++    pending = false;
++    vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
++
++    const uint32_t *src = (const uint32_t *)buffer.Map();
++    std::vector<uint8_t> rgb((size_t)pendingWidth * pendingHeight * 3);
++    for (size_t i = 0; i < (size_t)pendingWidth * pendingHeight; i++)
++    {
++        uint32_t p = src[i];
++        rgb[3 * i + 0] = ToSrgb8(UnpackUnsignedFloat(p & 0x7ff, 6));
++        rgb[3 * i + 1] = ToSrgb8(UnpackUnsignedFloat((p >> 11) & 0x7ff, 6));
++        rgb[3 * i + 2] = ToSrgb8(UnpackUnsignedFloat((p >> 22) & 0x3ff, 5));
++    }
++    buffer.Unmap();
++
++    char name[64];
++    std::snprintf(name, sizeof(name), "/f%05u.ppm", pendingFrame);
++    std::string path = dir + name;
++    if (FILE *f = std::fopen(path.c_str(), "wb"))
++    {
++        std::fprintf(f, "P6\n%u %u\n255\n", pendingWidth, pendingHeight);
++        std::fwrite(rgb.data(), 1, rgb.size(), f);
++        std::fclose(f);
++    }
++
++    written++;
++    if (exitAfter && written >= frames.size())
++    {
++#ifdef _WIN32
++        TerminateProcess(GetCurrentProcess(), 0);
++#else
++        std::exit(0);
++#endif
++    }
++}
++
++}
+diff --git a/Source/KrcTools.h b/Source/KrcTools.h
+new file mode 100644
+index 0000000..7af99bf
+--- /dev/null
++++ b/Source/KrcTools.h
+@@ -0,0 +1,44 @@
++// Copyright (c) 2026 Skynizz
++//
++// Outils de mesure pour la comparaison des caches de radiance (branche krc), pilotés par
++// variables d'environnement, sans toucher au jeu :
++//   KRC_CAPTURE=120,270,420   numéros de frame (depuis le lancement) à capturer
++//   KRC_CAPTURE_DIR=dossier   dossier des images (défaut : krc_captures)
++//   KRC_EXIT_AFTER=1          quitter après la dernière capture
++// Les images sont l'image finale avant l'interface du jeu, en PPM (sRGB 8 bits).
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "Buffer.h"
++#include "Common.h"
++
++namespace RTGL1
++{
++
++class KrcCapture
++{
++public:
++    void Init(const std::shared_ptr<MemoryAllocator> &allocator);
++    void Destroy();
++
++    // copie l'image (layout GENERAL, format B10G11R11) si la frame est demandée
++    void Record(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t height, uint32_t frameId);
++    // après la soumission de la frame : attend la fin du GPU, écrit l'image
++    void Finish(VkDevice device, VkFence fence);
++
++private:
++    std::vector<uint32_t> frames;
++    std::string dir = "krc_captures";
++    bool exitAfter = false;
++    bool enabled = false;
++
++    Buffer buffer;
++    bool pending = false;
++    uint32_t pendingWidth = 0, pendingHeight = 0, pendingFrame = 0;
++    size_t written = 0;
++};
++
++}
+diff --git a/Source/VulkanDevice.cpp b/Source/VulkanDevice.cpp
+index 9e644b6..c2101c6 100644
+--- a/Source/VulkanDevice.cpp
++++ b/Source/VulkanDevice.cpp
+@@ -86,6 +86,7 @@ VulkanDevice::VulkanDevice(const RgInstanceCreateInfo *info) :
+ 
+ 
+     memAllocator        = std::make_shared<MemoryAllocator>(instance, device, physDevice);
++    krcCapture.Init(memAllocator);
+ 
+     cmdManager          = std::make_shared<CommandBufferManager>(device, queues);
+ 
+@@ -270,6 +271,7 @@ VulkanDevice::VulkanDevice(const RgInstanceCreateInfo *info) :
+ VulkanDevice::~VulkanDevice()
+ {
+     vkDeviceWaitIdle(device);
++    krcCapture.Destroy();
+ 
+     physDevice.reset();
+     queues.reset();
+@@ -938,6 +940,10 @@ void VulkanDevice::Render(VkCommandBuffer cmd, const RgDrawFrameInfo &drawInfo)
+         }
+     }
+ 
++    // capture de mesure : image finale, avant l'interface du jeu
++    krcCapture.Record(cmd, framebuffers->GetImage(currentResultImage, frameIndex),
++                      renderResolution.UpscaledWidth(), renderResolution.UpscaledHeight(), frameId);
++
+     // draw geometry such as HUD directly into the swapchain image
+     if (!drawInfo.disableRasterization)
+     {
+@@ -980,6 +986,8 @@ void VulkanDevice::EndFrame(VkCommandBuffer cmd)
+         renderFinishedSemaphores[frameIndex],
+         frameFences[frameIndex]);
+ 
++    krcCapture.Finish(device, frameFences[frameIndex]);
++
+     // present on a surface when rendering will be finished
+     swapchain->Present(queues, renderFinishedSemaphores[frameIndex]);
+ 
+diff --git a/Source/VulkanDevice.h b/Source/VulkanDevice.h
+index 74670be..9a81d0d 100644
+--- a/Source/VulkanDevice.h
++++ b/Source/VulkanDevice.h
+@@ -27,6 +27,7 @@
+ #include "Common.h"
+ 
+ #include "CommandBufferManager.h"
++#include "KrcTools.h"
+ #include "PhysicalDevice.h"
+ #include "Scene.h"
+ #include "Swapchain.h"
+@@ -241,6 +242,7 @@ private:
+ 
+     // incremented every frame
+     uint32_t            frameId;
++    KrcCapture          krcCapture;     // captures de mesure (KRC_CAPTURE)
+ 
+     VkFence             frameFences[MAX_FRAMES_IN_FLIGHT] = {};
+     VkSemaphore         imageAvailableSemaphores[MAX_FRAMES_IN_FLIGHT] = {};
+-- 
+2.55.0.windows.3
+
