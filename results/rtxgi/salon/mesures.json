@@ -1,0 +1,32 @@
+{
+ "reglages": {
+  "scene": "LivingRoom.scene.json",
+  "name": "salon",
+  "methods": [
+   "sharc50",
+   "krca100"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 512,
+  "cam": ""
+ },
+ "resultats": {
+  "sharc50": {
+   "biais_psnr": 31.961327905479727,
+   "biais_relmse": 0.0162741676978459,
+   "nrd_psnr": 32.11606466632062,
+   "nrd_relmse": 0.011606940975195452,
+   "lum": 1.0210560580053034,
+   "gpu_ms": 4.6438
+  },
+  "krca100": {
+   "biais_psnr": 32.59458606453404,
+   "biais_relmse": 0.013104435170246119,
+   "nrd_psnr": 31.131855916253336,
+   "nrd_relmse": 0.014390687063553734,
+   "lum": 1.0056284232779227,
+   "gpu_ms": 4.792
+  }
+ }
+}

@@ -1,0 +1,32 @@
+{
+ "reglages": {
+  "scene": "Bathroom.scene.json",
+  "name": "salle_de_bain",
+  "methods": [
+   "sharc50",
+   "krca100"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 512,
+  "cam": ""
+ },
+ "resultats": {
+  "sharc50": {
+   "biais_psnr": 35.60821924806128,
+   "biais_relmse": 0.005062593273501618,
+   "nrd_psnr": 32.19728757494161,
+   "nrd_relmse": 0.011534275308788961,
+   "lum": 0.9907215165901042,
+   "gpu_ms": 3.3015
+  },
+  "krca100": {
+   "biais_psnr": 35.62950533808552,
+   "biais_relmse": 0.005152845765464749,
+   "nrd_psnr": 31.922306694121886,
+   "nrd_relmse": 0.012435337923027992,
+   "lum": 0.9883048801630584,
+   "gpu_ms": 3.1526
+  }
+ }
+}
