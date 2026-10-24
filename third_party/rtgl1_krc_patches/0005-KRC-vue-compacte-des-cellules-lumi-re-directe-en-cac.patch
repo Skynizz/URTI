@@ -1,7 +1,7 @@
 From dd83ab10f38f97d1279118eae233c5ccd1fde516 Mon Sep 17 00:00:00 2001
 From: Skynizz <182822215+Skynizz@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 03:22:03 +0200
-Subject: [PATCH 5/7] =?UTF-8?q?KRC=20:=20vue=20compacte=20des=20cellules,?=
+Subject: [PATCH 5/9] =?UTF-8?q?KRC=20:=20vue=20compacte=20des=20cellules,?=
  =?UTF-8?q?=20lumi=C3=A8re=20directe=20en=20cache=20aux=20reflets,=20lectu?=
  =?UTF-8?q?re=20au=20pixel=20en=20passe=208?=
 MIME-Version: 1.0

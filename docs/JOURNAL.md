@@ -433,3 +433,22 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   varie d'une session à l'autre (comparer seulement dans une même session).
 - Essayé sans gain : historique raccourci par le changement inexpliqué ; une seule cellule au
   point du reflet ; historique de 32 768 échantillons.
+
+## v21 — bruit, biais, premier rebond tracé ; banc NVIDIA prêt
+
+- **Mesure du bruit** (`tools/doomrt/noise.py` : 32 frames consécutives par méthode, scène figée) :
+  KRC n'est pas plus bruité que SHaRC (grain E1M1 0,0042 contre 0,0062) ; son retard venait du
+  **biais** (fuite de lumière autour des bords, ex. le panneau d'E1M3).
+- **Premier rebond tracé** (`KRC_HYBRID` : 0 cellules au pixel, 1 tracé là où les cellules
+  voisines se contredisent au-delà de leur incertitude, 2 toujours, comme SHaRC) ; cache de KRC lu
+  au point touché, second rebond tracé si aucune cellule (point hors champ).
+- Trois défauts trouvés en route : hasard blanc au lieu du bruit bleu de RTGL1 (4× plus de bruit
+  après le débruiteur) ; cellule réutilisée en un point par sa valeur brute (pondérée par 1/cos)
+  au lieu de la lumière reçue (évaluation de ses harmoniques avec la normale) ; groupe de lampes
+  non envoyé par le jeu traité comme éteint (noircissement durable, la frame +128 à 25 dB).
+- Résultat, mode 2 (E1M1 / E1M3) : biais 54,9 / 54,0 contre SHaRC 54,8 / 54,0, grain plus faible
+  sur E1M1 ; réaction toujours meilleure (+2 à +4 dB jusqu'à +64). Mais E1M2 recule (41,5 contre
+  47,5 en mode 0), fin de convergence sous SHaRC (47,4 contre 50,0 à +250) et +0,7 ms GPU.
+  Le meilleur mode dépend de la carte : à trancher.
+- Banc de référence : le SDK RTXGI de NVIDIA (path tracer d'exemple, SHaRC et NRC intégrés par
+  NVIDIA, scène Bistro fournie) compile et tourne ici en DirectX 12 (F:\rtxgi\sdk).

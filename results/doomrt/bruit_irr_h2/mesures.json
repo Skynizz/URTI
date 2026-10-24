@@ -1,0 +1,51 @@
+{
+ "reglages": {
+  "maps": [
+   1,
+   3
+  ],
+  "methods": [
+   1,
+   2
+  ],
+  "frames": 32,
+  "warm": 400,
+  "acc": 256,
+  "name": "bruit_irr_h2",
+  "env": [
+   "KRC_EMIT_PHYS=1",
+   "KRC_PPP=0.05",
+   "KRC_HYBRID=2"
+  ]
+ },
+ "cartes": {
+  "E1M1": {
+   "sharc": {
+    "bruit_fin": 0.0061977763906535645,
+    "bruit_taches": 0.0022310505591594822,
+    "biais_psnr": 54.81709417700061,
+    "psnr_frame": 53.289214661639136
+   },
+   "krc": {
+    "bruit_fin": 0.006253609918621769,
+    "bruit_taches": 0.002781394228530824,
+    "biais_psnr": 50.12253503037695,
+    "psnr_frame": 49.572794795140304
+   }
+  },
+  "E1M3": {
+   "sharc": {
+    "bruit_fin": 0.012241583208302327,
+    "bruit_taches": 0.004720703760047783,
+    "biais_psnr": 54.059394424241766,
+    "psnr_frame": 52.62179695265459
+   },
+   "krc": {
+    "bruit_fin": 0.012386176780551776,
+    "bruit_taches": 0.004835184187277498,
+    "biais_psnr": 54.05595942315462,
+    "psnr_frame": 52.614460653864626
+   }
+  }
+ }
+}

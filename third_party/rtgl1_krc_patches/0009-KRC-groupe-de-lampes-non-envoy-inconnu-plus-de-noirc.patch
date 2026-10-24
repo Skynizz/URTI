@@ -1,0 +1,64 @@
+From d87cd5126181eed9b0d84c3ca6251bc9d4d9c403 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 15:47:59 +0200
+Subject: [PATCH 9/9] =?UTF-8?q?KRC=20:=20groupe=20de=20lampes=20non=20envo?=
+ =?UTF-8?q?y=C3=A9=20=3D=20inconnu=20(plus=20de=20noircissement),=20reflet?=
+ =?UTF-8?q?s=20selon=20la=20r=C3=A8gle=20de=20SHaRC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Le jeu écarte des lampes d'une frame à l'autre : un groupe absent avait un rapport 0 qui
+  noircissait cellules et débruiteur sans retour possible ; il est maintenant inconnu.
+- Reflets : cellule lue seulement si le cône la couvre (comme SHaRC), sinon le chemin de RTGL1.
+
+---
+ Source/KrcTools.cpp                  |  5 ++++-
+ Source/Shaders/RtRaygenIndirect.rgen | 14 ++++----------
+ 2 files changed, 8 insertions(+), 11 deletions(-)
+
+diff --git a/Source/KrcTools.cpp b/Source/KrcTools.cpp
+index 759a813..21c1880 100644
+--- a/Source/KrcTools.cpp
++++ b/Source/KrcTools.cpp
+@@ -398,7 +398,10 @@ const std::vector<float> &KrcLightGroups::Ratios() const
+         const uint32_t before = i < countPrev.size() ? countPrev[i] : 0;
+         if (s.count == 0)
+         {
+-            ratios[i] = before > 0 ? 0.0f : 1.0f; // le groupe a disparu : sa lumière est partie
++            // le groupe n'a pas été envoyé : le jeu écarte des lampes d'une frame à l'autre. Un
++            // rapport 0 noircissait cellules et débruiteur sans retour possible (au retour, les
++            // lampes sont « nouvelles ») : inconnu, les chemins corrélés mesurent le changement
++            ratios[i] = before > 0 ? -1.0f : 1.0f;
+         }
+         else if (s.unknown || s.count != before || s.rmax - s.rmin > 0.01f * s.rmax + 1e-6f)
+         {
+diff --git a/Source/Shaders/RtRaygenIndirect.rgen b/Source/Shaders/RtRaygenIndirect.rgen
+index b1090b6..055dacc 100644
+--- a/Source/Shaders/RtRaygenIndirect.rgen
++++ b/Source/Shaders/RtRaygenIndirect.rgen
+@@ -234,17 +234,11 @@ vec3 processBounce(
+         throughput_First *= h.albedo;
+         rayHitDistance = length(h.hitPosition - surfPosition);
+ 
+-        // KRC : au point touché, le second rebond est lu dans les cellules (tous les rebonds, sans
+-        // rayon) ; pour le débruiteur, le même reflet avec l'éclairage d'avant (l'émission ne
+-        // change pas, la lumière des lampes suit les rapports des cellules)
+-        if (krcHit)
++        // KRC : là où la cellule ne convient pas (règle de SHaRC ci-dessus), le chemin de RTGL1, comme
++        // SHaRC ; pour le débruiteur, le reflet avec l'éclairage d'avant suit la lumière directe
++        if (krcHit && rcSpecularBounce)
+         {
+-            const vec3 emitted = h.emission * h.albedo;
+-            if (rcSpecularBounce)
+-            {
+-                rcSpecOld = emitted + (diffuse / max(krcSignal.x, 1e-3) + krcValue / max(krcSignal.z, 1e-3)) * throughput_First;
+-            }
+-            return emitted + (diffuse + krcValue) * throughput_First;
++            rcSpecOld = vec3(-1.0);
+         }
+ 
+         vec3 bounceDir_Second;
+-- 
+2.55.0.windows.3
+

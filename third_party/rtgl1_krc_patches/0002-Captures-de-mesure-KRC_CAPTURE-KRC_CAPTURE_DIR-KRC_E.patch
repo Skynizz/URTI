@@ -1,7 +1,7 @@
 From 07506ddff19110c1b5d64f89f3520538ee91e1ed Mon Sep 17 00:00:00 2001
 From: Skynizz <182822215+Skynizz@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 19:05:02 +0200
-Subject: [PATCH 2/7] Captures de mesure (KRC_CAPTURE, KRC_CAPTURE_DIR,
+Subject: [PATCH 2/9] Captures de mesure (KRC_CAPTURE, KRC_CAPTURE_DIR,
  KRC_EXIT_AFTER)
 
 ---
