@@ -1,0 +1,58 @@
+{
+ "reglages": {
+  "scene": "Bathroom.scene.json",
+  "name": "salle_de_bain",
+  "methods": [
+   "sharc",
+   "sharc_guide",
+   "krca",
+   "krca_guide"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 512,
+  "eval_only": true
+ },
+ "resultats": {
+  "sharc": {
+   "nrd_flip": 0.10381911881268024,
+   "nrd_flip_ecart": 0.00048530595028494844,
+   "nrd_psnr": 32.25683157804908,
+   "bruit_brut": 0.16436902001316508,
+   "biais_flip": 0.046867527067661285,
+   "biais_relmse": 0.005058347133392209,
+   "lum": 0.9906837557908703,
+   "gpu_ms": 3.675
+  },
+  "sharc_guide": {
+   "nrd_flip": 0.10159282572567463,
+   "nrd_flip_ecart": 0.0005459217160082582,
+   "nrd_psnr": 32.248378656574275,
+   "bruit_brut": 0.16404939247435568,
+   "biais_flip": 0.04736241698265076,
+   "biais_relmse": 0.004642269271438446,
+   "lum": 0.9896763810108412,
+   "gpu_ms": 5.0867
+  },
+  "krca": {
+   "nrd_flip": 0.10671435948461294,
+   "nrd_flip_ecart": 0.0006688046409200043,
+   "nrd_psnr": 32.007757022322686,
+   "bruit_brut": 0.1621444966066724,
+   "biais_flip": 0.047347307205200195,
+   "biais_relmse": 0.005127069118097204,
+   "lum": 0.9898905018089209,
+   "gpu_ms": 3.4841
+  },
+  "krca_guide": {
+   "nrd_flip": 0.10364989656955004,
+   "nrd_flip_ecart": 0.0005192556982142623,
+   "nrd_psnr": 32.01863469829868,
+   "bruit_brut": 0.16185466895377523,
+   "biais_flip": 0.047884516417980194,
+   "biais_relmse": 0.004718596429487609,
+   "lum": 0.9881872040863302,
+   "gpu_ms": 6.3077
+  }
+ }
+}

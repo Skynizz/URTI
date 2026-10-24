@@ -90,8 +90,8 @@ def main():
         img.write_png(os.path.join(dst, f'{name}_nrd.png'), img.tonemap(nrd[0]))
         img.write_png(os.path.join(dst, f'{name}_brut.png'), raw[0])
         img.write_png(os.path.join(dst, f'{name}_flip.png'), img.flip(nrd[0], ref)[1])
-        print(f'{name:12s} NRD ꟻLIP {r["nrd_flip"]:.4f} ± {r["nrd_flip_ecart"]:.4f} PSNR {r["nrd_psnr"]:.2f} | '
-              f'bruit brut {r["bruit_brut"]:.4f} | biais ꟻLIP {r["biais_flip"]:.4f} relMSE {r["biais_relmse"]:.4f} '
+        print(f'{name:12s} NRD FLIP {r["nrd_flip"]:.4f} +- {r["nrd_flip_ecart"]:.4f} PSNR {r["nrd_psnr"]:.2f} | '
+              f'bruit brut {r["bruit_brut"]:.4f} | biais FLIP {r["biais_flip"]:.4f} relMSE {r["biais_relmse"]:.4f} '
               f'lum {r["lum"]:.3f} | GPU {r["gpu_ms"]:.2f} ms', flush=True)
     with open(os.path.join(dst, 'comparaison.json'), 'w') as f:
         json.dump({'reglages': vars(a), 'resultats': res}, f, indent=1)

@@ -1,0 +1,58 @@
+{
+ "reglages": {
+  "scene": "bistro.scene.json",
+  "name": "bistro",
+  "methods": [
+   "sharc",
+   "sharc_guide",
+   "krca",
+   "krca_guide"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 512,
+  "eval_only": true
+ },
+ "resultats": {
+  "sharc": {
+   "nrd_flip": 0.07649013493210077,
+   "nrd_flip_ecart": 6.145648681167585e-05,
+   "nrd_psnr": 26.019110309029003,
+   "bruit_brut": 0.13719953643662558,
+   "biais_flip": 0.046219583600759506,
+   "biais_relmse": 0.004685811760302736,
+   "lum": 1.0079638247567173,
+   "gpu_ms": 7.2972
+  },
+  "sharc_guide": {
+   "nrd_flip": 0.07737036794424057,
+   "nrd_flip_ecart": 2.0563214055333442e-05,
+   "nrd_psnr": 25.783202786443017,
+   "bruit_brut": 0.13772413703806327,
+   "biais_flip": 0.04619346559047699,
+   "biais_relmse": 0.003928217620820956,
+   "lum": 1.0086414311992582,
+   "gpu_ms": 9.4729
+  },
+  "krca": {
+   "nrd_flip": 0.0773018253967166,
+   "nrd_flip_ecart": 5.094259512830365e-05,
+   "nrd_psnr": 26.0218208746629,
+   "bruit_brut": 0.13559909693898337,
+   "biais_flip": 0.044074978679418564,
+   "biais_relmse": 0.004407669361102693,
+   "lum": 1.0048228823345196,
+   "gpu_ms": 8.262
+  },
+  "krca_guide": {
+   "nrd_flip": 0.07806735672056675,
+   "nrd_flip_ecart": 3.245015354999797e-05,
+   "nrd_psnr": 25.785780410282527,
+   "bruit_brut": 0.13601007211063593,
+   "biais_flip": 0.0439351424574852,
+   "biais_relmse": 0.0036686190665551582,
+   "lum": 1.005559081653849,
+   "gpu_ms": 11.1285
+  }
+ }
+}

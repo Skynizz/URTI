@@ -452,3 +452,27 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   Le meilleur mode dépend de la carte : à trancher.
 - Banc de référence : le SDK RTXGI de NVIDIA (path tracer d'exemple, SHaRC et NRC intégrés par
   NVIDIA, scène Bistro fournie) compile et tourne ici en DirectX 12 (F:\rtxgi\sdk).
+
+## v22 — banc NVIDIA (RTXGI), ꟻLIP, cellules adaptatives, guidage
+
+- **Banc de référence** : path tracer d'exemple du SDK RTXGI de NVIDIA (branche `krc` de
+  F:\rtxgi\sdk), SHaRC et NRC intégrés par NVIDIA, scènes Bistro, salon, salle de bains. Mode sans
+  fenêtre visible ni prise de focus (Donut patché, `KRC_HIDDEN`), scénario par frame, captures HDR,
+  temps GPU (`tools/rtxgi/`). Piège : la référence accumulée avec jitter contre des frames NRD sans
+  jitter (toutes les arêtes diffèrent) ; tout est maintenant au même échantillonnage.
+- **ꟻLIP** (NVlabs/flip) en LDR et HDR, moyen sur 8 frames débruitées ; plus la variance brute avant
+  NRD et le biais (moyenne de 512 frames).
+- **KRC-A, cellules adaptatives** (idée de Skynizz) sur la table de SHaRC : mère deux fois plus grande
+  par cellule fine, variance d'une frame à l'autre, rétrécissement de James-Stein décidé à la
+  résolution et lissé. Biais du cache réduit (salon : ꟻLIP 0,066 contre 0,074, relMSE −12 %) et
+  bruit brut un peu plus faible ; mais la frame débruitée par NRD est moins bonne (0,082 contre
+  0,072) : NRD converge vers un résultat différent, cause encore inconnue. +0,3 ms.
+- **Guidage du premier rebond** (lobe de von Mises-Fisher appris par cellule, mélange défensif
+  50 %, MIS) : sans effet sur le bruit dans ces scènes (éclairage large, pas de petite source
+  rare), +2 à +3 ms (atomiques 64 bits). Résultat négatif ; à retenter là où la queue lourde existe
+  (Doom, Bistro de nuit) et en moins cher.
+- **État de l'art** (docs/ETAT_DE_L_ART.md) : le guidage en table de hachage existe déjà (Real-Time
+  Markov Chain Path Guiding, I3D 2025) ; le cache comme variable de contrôle avec correction sans
+  biais aussi (Neural Two-Level Monte Carlo, 2025). Restent propres à KRC : chemins corrélés exacts,
+  rééclairage par groupes de lampes et de l'historique du débruiteur, guide figé pendant un
+  événement, taille des cellules par test statistique.
