@@ -339,6 +339,20 @@ int main()
     const D3D12_VERTEX_BUFFER_VIEW ivbv = { instances->GetGPUVirtualAddress(), (UINT)(offsets.size() * sizeof(float)), 12 };
     const D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), (UINT)(idx.size() * sizeof(uint16_t)), DXGI_FORMAT_R16_UINT };
 
+    // dessin indirect (ExecuteIndirect) des cubes instanciés, comme un moteur piloté par le GPU
+    ComPtr<ID3D12CommandSignature> drawSignature;
+    {
+        D3D12_INDIRECT_ARGUMENT_DESC arg = {};
+        arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+        D3D12_COMMAND_SIGNATURE_DESC desc = {};
+        desc.ByteStride = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+        desc.NumArgumentDescs = 1;
+        desc.pArgumentDescs = &arg;
+        CHECK(device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&drawSignature)));
+    }
+    const D3D12_DRAW_INDEXED_ARGUMENTS indirectArgs = { (UINT)idx.size(), 16, 0, 0, 0 };
+    ComPtr<ID3D12Resource> argsBuffer = UploadBuffer(device.Get(), &indirectArgs, sizeof(indirectArgs));
+
     ComPtr<ID3D12CommandAllocator> allocator;
     CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
     ComPtr<ID3D12GraphicsCommandList> cmd;
@@ -415,7 +429,7 @@ int main()
         cmd->IASetVertexBuffers(0, 2, both);
         const Object inst = { Scale(0.8f, 0.8f, 0.8f), { 0, 0.4f, 0.8f, 0.4f } };
         cmd->SetGraphicsRoot32BitConstants(1, 20, &inst, 0);
-        cmd->DrawIndexedInstanced((UINT)idx.size(), 16, 0, 0, 0);
+        cmd->ExecuteIndirect(drawSignature.Get(), 1, argsBuffer.Get(), 0, nullptr, 0);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;

@@ -329,14 +329,14 @@ void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
     if ((stages & pipeline_stage::vertex_shader) == 0 && stages != pipeline_stage::all)
         return;
     std::lock_guard<std::mutex> lock(g_mutex);
-    g.lists[(uint64_t)cmd].pipeline = pipe.handle;
+    g.lists[cmd->get_native()].pipeline = pipe.handle;
 }
 
 void OnBindRenderTargets(command_list* cmd, uint32_t, const resource_view*, resource_view dsv)
 {
     const uint64_t depth = dsv.handle ? cmd->get_device()->get_resource_from_view(dsv).handle : 0;
     std::lock_guard<std::mutex> lock(g_mutex);
-    g.lists[(uint64_t)cmd].depth = depth;
+    g.lists[cmd->get_native()].depth = depth;
 }
 
 void OnBarrier(command_list*, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* newStates)
@@ -348,7 +348,7 @@ void OnBarrier(command_list*, uint32_t count, const resource* resources, const r
 }
 
 // rejoue le dessin avec le pipeline ombre ; renvoie false (le dessin du jeu a lieu ensuite)
-bool CaptureDraw(command_list* cmd, uint64_t verticesOut, const std::function<void(ID3D12GraphicsCommandList*)>& issue)
+bool CaptureDraw(ID3D12GraphicsCommandList* list, uint64_t verticesOut, const std::function<void(ID3D12GraphicsCommandList*)>& issue)
 {
     if (!g.capturing)
         return false;
@@ -358,7 +358,7 @@ bool CaptureDraw(command_list* cmd, uint64_t verticesOut, const std::function<vo
     ID3D12PipelineState* shadow = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        state = g.lists[(uint64_t)cmd];
+        state = g.lists[(uint64_t)list];
         auto it = g_pipelines.find(state.pipeline);
         if (it != g_pipelines.end() && it->second.usable)
         {
@@ -381,7 +381,6 @@ bool CaptureDraw(command_list* cmd, uint64_t verticesOut, const std::function<vo
     }
     g.draws[index] = { offset, bytes, state.pipeline, state.depth };
 
-    ID3D12GraphicsCommandList* list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
     D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + offset, bytes, g.counters->GetGPUVirtualAddress() + index * 8ull };
     list->SetPipelineState(shadow);
     list->SOSetTargets(0, 1, &view);
@@ -392,28 +391,61 @@ bool CaptureDraw(command_list* cmd, uint64_t verticesOut, const std::function<vo
     return false;
 }
 
+ID3D12GraphicsCommandList* Native(command_list* cmd)
+{
+    return reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
+}
+
 bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
-    return CaptureDraw(cmd, 3ull * vertexCount * instanceCount, [&](ID3D12GraphicsCommandList* list) {
+    if (cmd->get_device()->get_api() != device_api::d3d12)
+        return false;
+    return CaptureDraw(Native(cmd), 3ull * vertexCount * instanceCount, [&](ID3D12GraphicsCommandList* list) {
         list->DrawInstanced(vertexCount, instanceCount, firstVertex, firstInstance);
     });
 }
 
 bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
-    return CaptureDraw(cmd, 3ull * indexCount * instanceCount, [&](ID3D12GraphicsCommandList* list) {
+    if (cmd->get_device()->get_api() != device_api::d3d12)
+        return false;
+    return CaptureDraw(Native(cmd), 3ull * indexCount * instanceCount, [&](ID3D12GraphicsCommandList* list) {
         list->DrawIndexedInstanced(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
     });
 }
 
-bool OnDrawIndirect(command_list*, indirect_command type, resource, uint64_t, uint32_t, uint32_t)
+// ExecuteIndirect : l'événement de ReShade ne donne pas la signature de commande ; on rejoue l'appel
+// natif tel quel avec le pipeline ombre (une signature ne change pas de pipeline), dans un budget
+// fixe de sommets, les dessins de l'appel s'ajoutant à la suite dans le flux
+using PFN_ExecuteIndirect = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
+PFN_ExecuteIndirect g_executeIndirect = nullptr;
+constexpr uint64_t kIndirectBudget = 16ull << 20;
+
+void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature, UINT maxCount,
+    ID3D12Resource* args, UINT64 argsOffset, ID3D12Resource* countBuffer, UINT64 countOffset)
 {
-    if (g.capturing && type != indirect_command::dispatch)
-    {
-        g.framesDraws++;
-        g.skippedDraws++; // version 0 : dessins indirects comptés, pas encore capturés
-    }
-    return false;
+    if (g.capturing && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
+        CaptureDraw(self, kIndirectBudget / 16, [&](ID3D12GraphicsCommandList* list) {
+            g_executeIndirect(list, signature, maxCount, args, argsOffset, countBuffer, countOffset);
+        });
+    g_executeIndirect(self, signature, maxCount, args, argsOffset, countBuffer, countOffset);
+}
+
+void OnInitCommandList(command_list* cmd)
+{
+    if (cmd->get_device()->get_api() != device_api::d3d12 || g_executeIndirect)
+        return;
+    ID3D12GraphicsCommandList* list = Native(cmd);
+    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    void** vtable = *reinterpret_cast<void***>(list);
+    constexpr int kExecuteIndirect = 59; // index dans ID3D12GraphicsCommandListVtbl (Windows SDK)
+    DWORD old = 0;
+    VirtualProtect(&vtable[kExecuteIndirect], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+    g_executeIndirect = reinterpret_cast<PFN_ExecuteIndirect>(vtable[kExecuteIndirect]);
+    vtable[kExecuteIndirect] = reinterpret_cast<void*>(&HookExecuteIndirect);
+    VirtualProtect(&vtable[kExecuteIndirect], sizeof(void*), old, &old);
+    Log("URTI : ExecuteIndirect intercepté");
 }
 
 void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -511,6 +543,24 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, u
         }
     }
 
+    // images de contrôle (PFM) : profondeur du jeu et profondeur de la géométrie captée
+    auto writePfm = [&](const char* name, auto value) {
+        const std::string path = g_logPath.substr(0, g_logPath.find_last_of("\\/")) + "\\" + name;
+        if (FILE* f = std::fopen(path.c_str(), "wb"))
+        {
+            std::fprintf(f, "Pf\n%u %u\n-1.0\n", w, h);
+            for (int y = int(h) - 1; y >= 0; y--)
+                for (uint32_t x = 0; x < w; x++)
+                {
+                    const float v = value(x, uint32_t(y));
+                    std::fwrite(&v, 4, 1, f);
+                }
+            std::fclose(f);
+        }
+    };
+    writePfm("urti_profondeur_jeu.pfm", [&](uint32_t x, uint32_t y) { return depth[size_t(y * step + step / 2) * width + x * step + step / 2]; });
+    writePfm("urti_profondeur_captee.pfm", [&](uint32_t x, uint32_t y) { return z[size_t(y) * w + x]; });
+
     uint64_t valid = 0, covered = 0, extra = 0;
     double error = 0;
     for (uint32_t y = 0; y < h; y++)
@@ -545,6 +595,11 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
     if (!g.device || !g.list)
         return;
     ID3D12CommandQueue* q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    if ((GetAsyncKeyState(VK_F9) & 1) && !g.capturing)
+    {
+        g.captureFrame = g.frame + 1; // F9 : capture de la frame suivante, au moment choisi en jeu
+        Log("URTI : F9, capture de la frame %llu", (unsigned long long)g.captureFrame);
+    }
 
     if (g.frame + 1 == g.captureFrame)
     {
@@ -688,7 +743,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-        reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawIndirect);
+        reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
         break;
     }
