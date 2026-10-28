@@ -1,0 +1,48 @@
+{
+ "reglages": {
+  "scene": "LivingRoom.scene.json",
+  "name": "salon_cout",
+  "methods": [
+   "sharc",
+   "krcl_suivi",
+   "krcl",
+   "sharc"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 64,
+  "eval_only": false
+ },
+ "resultats": {
+  "sharc": {
+   "nrd_flip": 0.07303230836987495,
+   "nrd_flip_ecart": 0.001246365166130338,
+   "nrd_psnr": 32.184123481605845,
+   "bruit_brut": 0.1433827689909144,
+   "biais_flip": 0.08955928683280945,
+   "biais_relmse": 0.06136938822320514,
+   "lum": 1.0224207466451636,
+   "gpu_ms": 3.7932
+  },
+  "krcl_suivi": {
+   "nrd_flip": 0.0750200254842639,
+   "nrd_flip_ecart": 0.0012402250165262894,
+   "nrd_psnr": 32.12231261325586,
+   "bruit_brut": 0.14349004579692468,
+   "biais_flip": 0.08817673474550247,
+   "biais_relmse": 0.061184463977966085,
+   "lum": 1.020497234641128,
+   "gpu_ms": 4.9365
+  },
+  "krcl": {
+   "nrd_flip": 0.07321623712778091,
+   "nrd_flip_ecart": 0.0011193420691041724,
+   "nrd_psnr": 32.16918442565415,
+   "bruit_brut": 0.14333116358121106,
+   "biais_flip": 0.08768434822559357,
+   "biais_relmse": 0.06092313450932958,
+   "lum": 1.0200782562386344,
+   "gpu_ms": 5.3914
+  }
+ }
+}

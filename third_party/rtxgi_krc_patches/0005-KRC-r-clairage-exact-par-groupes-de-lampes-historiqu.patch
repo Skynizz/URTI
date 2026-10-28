@@ -1,0 +1,1318 @@
+From 4a93005dbb66ce91d804bce0001221114dd01a54 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:28:12 +0100
+Subject: [PATCH 5/5] =?UTF-8?q?KRC=20:=20r=C3=A9=C3=A9clairage=20exact=20p?=
+ =?UTF-8?q?ar=20groupes=20de=20lampes,=20historique=20de=20NRD=20r=C3=A9?=
+ =?UTF-8?q?=C3=A9clair=C3=A9,=20biblioth=C3=A8que?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Libraries/Krc/include : KrcRelight.h (GPU, en extension de SHaRC) et KrcRelightHost.h (CPU,
+  rapport « après / avant » de chaque groupe de lampes) ; l'exemple les utilise.
+- Parts des groupes suivies le long des chemins de SHaRC, passe krcRelight avant la mise à jour.
+- NRD : confiance d'historique (mode 1) ou entrée normalisée par le produit S lissé (mode 2,
+  historique rééclairé) ; bascule de l'anti-lucioles ; vidage de l'historique à la demande.
+- Banc : lampadd, lamp, lampgroup, lights, relight, nrdconf, nrdaf, nrdreset ; targetLight = -1
+  dès qu'une lampe est ajoutée (l'exemple ne tirait que la lampe 0).
+- Coût : les passes par entrée ne nettoient plus la table qu'à l'éviction (KRC-L +0,05 ms au
+  plus, KRC-A +0,24 ms).
+
+---
+ Libraries/Krc/include/KrcRelight.h           | 211 +++++++++++++++++++
+ Libraries/Krc/include/KrcRelightHost.h       |  98 +++++++++
+ Samples/Pathtracer/CMakeLists.txt            |   4 +-
+ Samples/Pathtracer/KrcBench.cpp              | 122 ++++++++++-
+ Samples/Pathtracer/LightingCb.h              |   7 +
+ Samples/Pathtracer/Nrd/NrdIntegration.cpp    |   8 +-
+ Samples/Pathtracer/Nrd/NrdIntegration.h      |   3 +-
+ Samples/Pathtracer/Pathtracer.cpp            |  65 +++++-
+ Samples/Pathtracer/Pathtracer.h              |  10 +
+ Samples/Pathtracer/Pipelines.cpp             |  24 +++
+ Samples/Pathtracer/Pipelines.h               |   6 +
+ Samples/Pathtracer/RenderTargets.cpp         |   2 +
+ Samples/Pathtracer/RenderTargets.h           |   2 +
+ Samples/Pathtracer/Shaders/Denoiser.hlsl     |  58 ++++-
+ Samples/Pathtracer/Shaders/KrcAdaptive.hlsli |   7 +-
+ Samples/Pathtracer/Shaders/KrcRelight.hlsli  |  33 +++
+ Samples/Pathtracer/Shaders/Pathtracer.hlsl   |  46 +++-
+ Samples/Pathtracer/Shaders/SharcResolve.hlsl |  38 ++++
+ Samples/Pathtracer/UI.h                      |   5 +-
+ Samples/Pathtracer/shaders.cfg               |   4 +-
+ 20 files changed, 732 insertions(+), 21 deletions(-)
+ create mode 100644 Libraries/Krc/include/KrcRelight.h
+ create mode 100644 Libraries/Krc/include/KrcRelightHost.h
+ create mode 100644 Samples/Pathtracer/Shaders/KrcRelight.hlsli
+
+diff --git a/Libraries/Krc/include/KrcRelight.h b/Libraries/Krc/include/KrcRelight.h
+new file mode 100644
+index 0000000..91618dd
+--- /dev/null
++++ b/Libraries/Krc/include/KrcRelight.h
+@@ -0,0 +1,211 @@
++/*
++ * KRC : rééclairage exact par groupes de lampes, en extension de SHaRC (v1.8.x).
++ *
++ * Indépendant du moteur : les tampons et réglages passent par KrcRelightParameters, comme SHaRC
++ * avec SharcParameters. À inclure après SharcCommon.h. Mode d'emploi : docs/INTEGRATION.md.
++ *
++ * Principe. Chaque cellule de SHaRC apprend la part de sa lumière qui vient de chaque groupe de
++ * lampes (3 groupes suivis ; le reste, ciel et émissifs, est fixe). La lumière directe d'un sommet
++ * est rangée dans le groupe de la lampe tirée et remonte vers les cellules précédentes avec les
++ * poids de SHaRC ; un sommet qui relit le cache apporte les parts de sa cellule. Quand le moteur
++ * change l'intensité d'un groupe d'un rapport connu r (« après / avant »), KrcRelightEntry
++ * multiplie la radiance de chaque cellule par k = 1 + Σ f_g (r_g − 1) avant le tracé de la frame :
++ * le cache passe d'un coup au nouvel éclairage, sans bruit ni retard. Exact pour la luminance ; la
++ * couleur est approchée si les groupes n'ont pas la même teinte.
++ *
++ * Le produit S des facteurs k de chaque cellule sert au débruiteur : son entrée est divisée par S
++ * (lissé à l'écran) et sa sortie remultipliée par S, donc son historique ressort rééclairé alors
++ * qu'il n'y a pas accès (NRD, DLSS RR…).
++ *
++ * Tampons, une entrée par entrée de la table de SHaRC, remis à zéro avec elle :
++ *   groupAccumulationBuffer  uint4  sommes de la frame en virgule fixe (xyz groupes, w total)
++ *   groupBuffer              float4 moyennes lissées (même rangement)
++ *   factorBuffer             float2 x : facteur de la frame, y : produit S (0 vaut 1)
++ */
++
++#ifndef KRC_RELIGHT_H
++#define KRC_RELIGHT_H
++
++#ifndef KRC_GROUP_SCALE
++#define KRC_GROUP_SCALE 1e3f // virgule fixe des sommes (comme SHARC_RADIANCE_SCALE)
++#endif
++
++struct KrcRelightParameters
++{
++    RW_STRUCTURED_BUFFER(groupAccumulationBuffer, uint4);
++    RW_STRUCTURED_BUFFER(groupBuffer, float4);
++    RW_STRUCTURED_BUFFER(factorBuffer, float2);
++    uint lightGroups;   // groupe de la lampe i aux bits 2i..2i+1 (0..2 suivis, 3 fixe) ; 16 lampes au plus
++    float3 ratio;       // rapport « après / avant » des groupes 0..2 (1 : inchangé ou inconnu)
++};
++
++uint KrcLightGroup(KrcRelightParameters krcParameters, uint lightIndex)
++{
++    return lightIndex < 16u ? (krcParameters.lightGroups >> (2u * lightIndex)) & 3u : 3u;
++}
++
++// lumière directe d'une lampe, rangée dans son groupe (luminance) ; à sommer sur les lampes du sommet
++float3 KrcGroupSplit(KrcRelightParameters krcParameters, uint lightIndex, float3 lightContribution)
++{
++    const uint g = KrcLightGroup(krcParameters, lightIndex);
++    const float lum = SharcLuma(lightContribution);
++    return float3(g == 0u ? lum : 0.0f, g == 1u ? lum : 0.0f, g == 2u ? lum : 0.0f);
++}
++
++#if SHARC_UPDATE
++void KrcGroupAdd(KrcRelightParameters krcParameters, HashGridIndex cell, float4 value)
++{
++    const uint4 s = uint4(max(value, 0.0f) * KRC_GROUP_SCALE);
++    if (s.x != 0) InterlockedAdd(BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, cell).x, s.x);
++    if (s.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, cell).y, s.y);
++    if (s.z != 0) InterlockedAdd(BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, cell).z, s.z);
++    if (s.w != 0) InterlockedAdd(BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, cell).w, s.w);
++}
++
++// Juste avant SharcUpdateHit, avec le même état, la même lumière directe et le même nombre
++// aléatoire : refait son insertion et sa décision de relecture du cache, et range les parts aux
++// mêmes cellules. directGroups : somme des KrcGroupSplit des lampes du sommet.
++void KrcUpdateHit(in SharcParameters sharcParameters, KrcRelightParameters krcParameters, in SharcState sharcState, SharcHitData sharcHitData,
++    float3 directLighting, float3 directGroups, float random)
++{
++    HashGridKey hashGridKey;
++    HashGridIndex cell;
++    if (!HashGridInsertEntry(sharcParameters.hashGridData, sharcHitData.positionWorld, sharcHitData.normalWorld, sharcParameters.hashGridParameters, hashGridKey, cell))
++        return;
++
++    float3 materialDemodulation = float3(1.0f, 1.0f, 1.0f);
++#if SHARC_MATERIAL_DEMODULATION
++    materialDemodulation = sharcHitData.materialDemodulation;
++#endif
++
++    float3 radiance = directLighting;
++    float4 groups = float4(directGroups, SharcLuma(directLighting));
++    bool resampled = false;
++#if SHARC_ENABLE_CACHE_RESAMPLING
++    const uint resamplingDepth = uint(round(lerp(SHARC_RESAMPLING_DEPTH_MIN, SHARC_PROPAGATION_DEPTH, random)));
++    if (resamplingDepth <= sharcState.pathLength)
++    {
++        const SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, cell);
++        if (voxelData.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
++        {
++            radiance = SharcDecodeRadiance(voxelData.accumulatedRadiance, SharcGetRadianceDirection(sharcHitData)) * materialDemodulation;
++            const float4 f = BUFFER_AT_OFFSET(krcParameters.groupBuffer, cell);
++            const float lum = SharcLuma(radiance);
++            groups = float4(f.w > 0.0f ? saturate(f.xyz / f.w) * lum : float3(0, 0, 0), lum);
++            resampled = true;
++        }
++    }
++#endif // SHARC_ENABLE_CACHE_RESAMPLING
++
++    const float lum = SharcLuma(radiance);
++    if (lum <= 0.0f)
++        return;
++
++    // la cellule du sommet garde sa lumière directe démodulée (comme SHaRC), sauf relecture du cache
++    if (!resampled)
++        KrcGroupAdd(krcParameters, cell, groups * (SharcLuma(radiance / materialDemodulation) / lum));
++
++    for (uint i = 0; i < sharcState.pathLength; ++i)
++    {
++        const HashGridIndex previous = sharcState.cacheIndices[i];
++        if (previous == HASH_GRID_INVALID_CACHE_INDEX)
++            continue;
++        KrcGroupAdd(krcParameters, previous, groups * (SharcLuma(radiance * float3(sharcState.sampleWeights[i])) / lum));
++    }
++}
++
++// juste avant SharcUpdateMiss : le ciel ne compte que dans le total
++void KrcUpdateMiss(KrcRelightParameters krcParameters, in SharcState sharcState, float3 radiance)
++{
++    for (uint i = 0; i < sharcState.pathLength; ++i)
++    {
++        const HashGridIndex previous = sharcState.cacheIndices[i];
++        if (previous == HASH_GRID_INVALID_CACHE_INDEX)
++            continue;
++        KrcGroupAdd(krcParameters, previous, float4(0, 0, 0, SharcLuma(radiance * float3(sharcState.sampleWeights[i]))));
++    }
++}
++#endif // SHARC_UPDATE
++
++// Dans la passe de résolution, juste avant SharcResolveEntry : moyenne des parts avec les poids de
++// SHaRC (accumulationFrameNum : celui de SharcResolveParameters). Renvoie si l'entrée était occupée,
++// à passer à KrcResolveEviction. Les entrées vides (la plupart de la table) ne coûtent qu'une lecture.
++bool KrcResolveEntry(uint entryIndex, SharcParameters sharcParameters, KrcRelightParameters krcParameters, uint accumulationFrameNum)
++{
++    if (entryIndex >= sharcParameters.hashGridData.capacity)
++        return false;
++    if (BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex) == HASH_GRID_INVALID_HASH_KEY)
++        return false;
++
++    const uint4 acc = BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, entryIndex);
++    if (any(acc != 0))
++        BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, entryIndex) = uint4(0, 0, 0, 0);
++
++    const float sampleNum = SharcGetAccumulatedSampleNum(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex));
++    if (sampleNum == 0)
++        return true;
++
++    const SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, entryIndex);
++    float sampleNumPrev = voxelData.accumulatedSampleNum;
++    const uint accumulatedFrameNum = voxelData.accumulatedFrameNum + 1;
++    const uint frameNumMax = clamp(accumulationFrameNum, SHARC_ACCUMULATED_FRAME_NUM_MIN, SHARC_ACCUMULATED_FRAME_NUM_MAX);
++    if (accumulatedFrameNum > frameNumMax)
++        sampleNumPrev *= float(frameNumMax) / float(accumulatedFrameNum);
++
++    const float4 frameMean = float4(acc) / (KRC_GROUP_SCALE * sampleNum);
++    BUFFER_AT_OFFSET(krcParameters.groupBuffer, entryIndex) =
++        (BUFFER_AT_OFFSET(krcParameters.groupBuffer, entryIndex) * sampleNumPrev + frameMean * sampleNum) / (sampleNumPrev + sampleNum);
++    return true;
++}
++
++// Juste après SharcResolveEntry : une cellule que SHaRC vient d'évincer libère ses parts et son
++// produit S, pour que la prochaine cellule rangée là reparte de zéro (et de S = 1).
++void KrcResolveEviction(uint entryIndex, SharcParameters sharcParameters, KrcRelightParameters krcParameters, bool wasValid)
++{
++    if (!wasValid || BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex) != HASH_GRID_INVALID_HASH_KEY)
++        return;
++    BUFFER_AT_OFFSET(krcParameters.groupAccumulationBuffer, entryIndex) = uint4(0, 0, 0, 0);
++    BUFFER_AT_OFFSET(krcParameters.groupBuffer, entryIndex) = float4(0, 0, 0, 0);
++    BUFFER_AT_OFFSET(krcParameters.factorBuffer, entryIndex) = float2(0, 0);
++}
++
++// Passe à part, une entrée par fil, avant la mise à jour de SHaRC d'une frame où un rapport est
++// connu : rééclaire la cellule et note son facteur.
++void KrcRelightEntry(uint entryIndex, SharcParameters sharcParameters, KrcRelightParameters krcParameters)
++{
++    if (entryIndex >= sharcParameters.hashGridData.capacity)
++        return;
++    if (BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex) == HASH_GRID_INVALID_HASH_KEY)
++        return;
++    float2 factor = BUFFER_AT_OFFSET(krcParameters.factorBuffer, entryIndex);
++
++    const float4 groups = BUFFER_AT_OFFSET(krcParameters.groupBuffer, entryIndex);
++    if (groups.w <= 0.0f)
++    {
++        BUFFER_AT_OFFSET(krcParameters.factorBuffer, entryIndex) = float2(1.0f, factor.y);
++        return;
++    }
++
++    const float3 f = saturate(groups.xyz / groups.w);
++    const float k = max(1.0f + dot(f, krcParameters.ratio - 1.0f), 0.0f);
++
++    SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, entryIndex);
++    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(SharcScaleRadianceData(voxelData.accumulatedRadiance, k),
++        voxelData.accumulatedSampleNum, voxelData.accumulatedFrameNum, voxelData.staleFrameNum, voxelData.sampleDataExt);
++    BUFFER_AT_OFFSET(krcParameters.groupBuffer, entryIndex) = float4(groups.xyz * krcParameters.ratio, groups.w * k);
++    BUFFER_AT_OFFSET(krcParameters.factorBuffer, entryIndex) = float2(k, (factor.y == 0.0f ? 1.0f : factor.y) * k);
++}
++
++// Facteurs de la cellule d'un point (x : de la frame, y : produit S) ; (1, 1) sans cellule. Au
++// premier point touché, à écrire dans une texture pour le débruiteur.
++float2 KrcGetRelightFactor(in SharcParameters sharcParameters, KrcRelightParameters krcParameters, float3 position, float3 normal)
++{
++    HashGridKey hashGridKey;
++    const HashGridIndex cell = HashGridFindEntry(sharcParameters.hashGridData, position, normal, sharcParameters.hashGridParameters, hashGridKey);
++    if (cell == HASH_GRID_INVALID_CACHE_INDEX)
++        return float2(1.0f, 1.0f);
++    const float2 factor = BUFFER_AT_OFFSET(krcParameters.factorBuffer, cell);
++    return float2(factor.x, factor.y == 0.0f ? 1.0f : factor.y);
++}
++
++#endif // KRC_RELIGHT_H
+diff --git a/Libraries/Krc/include/KrcRelightHost.h b/Libraries/Krc/include/KrcRelightHost.h
+new file mode 100644
+index 0000000..34348c1
+--- /dev/null
++++ b/Libraries/Krc/include/KrcRelightHost.h
+@@ -0,0 +1,98 @@
++/*
++ * KRC : côté CPU du rééclairage exact (KrcRelight.h). Indépendant du moteur, C++17, sans dépendance.
++ *
++ * À chaque frame, le moteur donne la puissance de chaque lampe (intensité × luminance de la couleur)
++ * et son groupe (0..2 suivis, 3 fixe) ; KrcRelightHost calcule le rapport « après / avant » de chaque
++ * groupe. Un groupe est inconnu (rapport 1, non appliqué) si ses lampes ne changent pas toutes du même
++ * rapport ou si l'une s'allume depuis zéro : sa part dans les cellules ne dit alors rien de la
++ * nouvelle lumière.
++ *
++ *   KrcRelightHost host;
++ *   host.BeginFrame(cacheCleared);
++ *   for (lampe i) host.AddLight(i, group, intensity * luminance(color));
++ *   KrcRelightFrame f = host.EndFrame();
++ *   // f.ratio, f.lightGroups -> KrcRelightParameters ; f.event -> passe KrcRelightEntry avant la
++ *   // mise à jour de SHaRC ; f.active -> S différent de 1 quelque part (débruiteur)
++ */
++
++#ifndef KRC_RELIGHT_HOST_H
++#define KRC_RELIGHT_HOST_H
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++struct KrcRelightFrame
++{
++    float ratio[3] = { 1.0f, 1.0f, 1.0f };
++    uint32_t lightGroups = 0; // groupe de la lampe i aux bits 2i..2i+1
++    bool event = false;       // un rapport connu est à appliquer cette frame
++    bool active = false;      // un rééclairage a eu lieu depuis la remise à zéro du cache
++};
++
++class KrcRelightHost
++{
++public:
++    void BeginFrame(bool cacheCleared)
++    {
++        m_frame = KrcRelightFrame();
++        for (int g = 0; g < 3; g++)
++        {
++            m_seen[g] = false;
++            m_known[g] = true;
++        }
++        if (cacheCleared)
++            m_active = false;
++    }
++
++    // lightIndex : indice stable de la lampe d'une frame à l'autre (16 au plus pour lightGroups)
++    void AddLight(uint32_t lightIndex, int group, float power)
++    {
++        group = std::min(std::max(group, 0), 3);
++        if (lightIndex < 16)
++            m_frame.lightGroups |= uint32_t(group) << (2 * lightIndex);
++        if (m_prevPower.size() <= lightIndex)
++            m_prevPower.resize(lightIndex + 1, -1.0f);
++
++        const float prev = m_prevPower[lightIndex] < 0.0f ? power : m_prevPower[lightIndex];
++        m_prevPower[lightIndex] = power;
++        if (group == 3 || (prev <= 0.0f && power <= 0.0f))
++            return;
++        if (prev <= 0.0f)
++        {
++            m_known[group] = false; // s'allume depuis zéro : rapport inconnu
++            return;
++        }
++        const float r = power / prev;
++        if (!m_seen[group])
++        {
++            m_frame.ratio[group] = r;
++            m_seen[group] = true;
++        }
++        else if (std::abs(r - m_frame.ratio[group]) > 1e-4f * std::max(r, m_frame.ratio[group]))
++            m_known[group] = false;
++    }
++
++    KrcRelightFrame EndFrame()
++    {
++        for (int g = 0; g < 3; g++)
++        {
++            if (!m_known[g])
++                m_frame.ratio[g] = 1.0f;
++            m_frame.event = m_frame.event || m_frame.ratio[g] != 1.0f;
++        }
++        m_active = m_active || m_frame.event;
++        m_frame.active = m_active;
++        return m_frame;
++    }
++
++private:
++    KrcRelightFrame m_frame;
++    std::vector<float> m_prevPower;
++    bool m_seen[3] = {};
++    bool m_known[3] = {};
++    bool m_active = false;
++};
++
++#endif // KRC_RELIGHT_HOST_H
+diff --git a/Samples/Pathtracer/CMakeLists.txt b/Samples/Pathtracer/CMakeLists.txt
+index 4bc107f..6032067 100644
+--- a/Samples/Pathtracer/CMakeLists.txt
++++ b/Samples/Pathtracer/CMakeLists.txt
+@@ -53,9 +53,9 @@ set(SHARC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../Libraries)
+ 
+ # Shader Model 6_6 requires Agility SDK on Windows 10.
+ if(DONUT_WITH_VULKAN)
+-    set (SHADERMAKE_GENERAL_ARGS_SPIRV "--shaderModel 6_6 -I ${NRC_DIR}/include -I ${SHARC_INCLUDE_DIR}/Sharc/include --vulkanMemoryLayout dx")
++    set (SHADERMAKE_GENERAL_ARGS_SPIRV "--shaderModel 6_6 -I ${NRC_DIR}/include -I ${SHARC_INCLUDE_DIR}/Sharc/include -I ${SHARC_INCLUDE_DIR}/Krc/include --vulkanMemoryLayout dx")
+ endif()
+-set (SHADERMAKE_GENERAL_ARGS_DXIL "--shaderModel 6_6 --platform DXIL --WX --PDB -I ${NRC_DIR}/include -I ${SHARC_INCLUDE_DIR}/Sharc/include")
++set (SHADERMAKE_GENERAL_ARGS_DXIL "--shaderModel 6_6 --platform DXIL --WX --PDB -I ${NRC_DIR}/include -I ${SHARC_INCLUDE_DIR}/Sharc/include -I ${SHARC_INCLUDE_DIR}/Krc/include")
+ 
+ donut_compile_shaders(
+         TARGET ${project}_shaders
+diff --git a/Samples/Pathtracer/KrcBench.cpp b/Samples/Pathtracer/KrcBench.cpp
+index af389f4..04600d1 100644
+--- a/Samples/Pathtracer/KrcBench.cpp
++++ b/Samples/Pathtracer/KrcBench.cpp
+@@ -11,6 +11,7 @@
+  *     scale=S                  échelle des cellules (sharcSceneScale, 50 par défaut ; 100 : deux fois
+  *                              plus fines) ; vide le cache
+  *     krctol=T, krcdebug=0|1   tolérance relative du mélange ; affichage de la part de la mère
++ *     nrdaf=0|1                anti-lucioles de REBLUR (actif dans l'exemple)
+  *     guide=0|1                premier rebond diffus guidé par les cellules (KrcGuide.hlsli)
+  *     den=none|acc|nrd         débruiteur (acc : moyenne des frames tant que rien ne bouge)
+  *     spp=N, bounces=N         échantillons par pixel, rebonds
+@@ -20,6 +21,15 @@
+  *     sky=S                    intensité du ciel (8 par défaut)
+  *     capture=nom              image de la frame (HDR) dans KRC_OUT/nom.pfm
+  *     fps=N                    temps GPU moyen sur N frames, ajouté à KRC_OUT/fps.txt
++ *     relight=0|1              rééclairage exact des cellules par groupes de lampes (KrcRelight.hlsli) ;
++ *                              vide le cache
++ *     lampadd=x,y,z,r,g,b,I,R  ajoute une lampe ponctuelle (position, couleur, intensité, rayon)
++ *     lamp=i,S                 intensité de la lampe i (ordre de la scène, soleil compris)
++ *     lampgroup=i,g            groupe de la lampe i : 0..2 suivis par le rééclairage, 3 fixe
++ *     nrdconf=0|1|2            historique de NRD et rééclairage (KrcRelight.hlsli) : 1 confiance de
++ *                              l'historique, 2 normalisation de l'entrée (historique rééclairé)
++ *     nrdreset                 vide l'historique de NRD (ce qu'un moteur peut faire quand ses lampes changent)
++ *     lights                   liste des lampes dans KRC_OUT/lights.txt
+  *     clear                    vide le cache (SHaRC)
+  *     exit                     quitte
+  */
+@@ -33,6 +43,12 @@
+ #include <GLFW/glfw3.h>
+ 
+ using namespace donut;
++using namespace donut::math;
++
++#if ENABLE_NRC
++#include "Nrc/NrcUtils.h"
++#endif // ENABLE_NRC
++#include "LightingCb.h"
+ 
+ namespace
+ {
+@@ -164,8 +180,85 @@ void Pathtracer::KrcBenchBeforeRender()
+             m_ui.krcGuide = std::atoi(c.value.c_str()) != 0;
+             m_ui.sharcEnableClear = true;
+         }
++        else if (c.key == "relight")
++        {
++            m_ui.krcRelight = std::atoi(c.value.c_str()) != 0;
++            m_ui.sharcEnableClear = true;
++        }
++        else if (c.key == "lampadd")
++        {
++            const std::vector<float> v = SplitFloats(c.value);
++            if (v.size() >= 8)
++            {
++                auto light = std::make_shared<engine::PointLight>();
++                light->color = dm::float3(v[3], v[4], v[5]);
++                light->intensity = v[6];
++                light->radius = v[7];
++                light->SetName("KrcLamp");
++                auto node = std::make_shared<engine::SceneGraphNode>();
++                node->SetLeaf(light);
++                node->SetTranslation(dm::double3(v[0], v[1], v[2]));
++                auto graph = m_pathtracerScene->GetScene()->GetSceneGraph();
++                graph->Attach(graph->GetRootNode(), node);
++                m_ui.targetLight = -1; // l'exemple ne tire par défaut que la lampe 0 (le soleil)
++                m_resetAccumulation = true;
++            }
++        }
++        else if (c.key == "lamp" || c.key == "lampgroup")
++        {
++            const std::vector<float> v = SplitFloats(c.value);
++            if (v.size() >= 2)
++            {
++                const int index = (int)v[0];
++                if (c.key == "lampgroup")
++                {
++                    if ((int)m_krcLightGroup.size() <= index)
++                        m_krcLightGroup.resize(index + 1, -1);
++                    m_krcLightGroup[index] = (int)v[1];
++                }
++                else
++                {
++                    int i = 0;
++                    for (auto light : m_pathtracerScene->GetScene()->GetSceneGraph()->GetLights())
++                    {
++                        if (i++ != index)
++                            continue;
++                        if (auto d = std::dynamic_pointer_cast<engine::DirectionalLight>(light))
++                            d->irradiance = v[1];
++                        else if (auto p = std::dynamic_pointer_cast<engine::PointLight>(light))
++                            p->intensity = v[1];
++                        else if (auto s = std::dynamic_pointer_cast<engine::SpotLight>(light))
++                            s->intensity = v[1];
++                    }
++                }
++                m_resetAccumulation = true;
++            }
++        }
++        else if (c.key == "lights")
++        {
++            // liste des lampes de la scène (vérification des indices des commandes lamp et lampgroup)
++            FILE* f = std::fopen((m_krcOut + "/lights.txt").c_str(), "a");
++            if (f)
++            {
++                int i = 0;
++                for (auto light : m_pathtracerScene->GetScene()->GetSceneGraph()->GetLights())
++                {
++                    LightConstants lc = {};
++                    light->FillLightConstants(lc);
++                    std::fprintf(f, "frame %u lampe %d %s type %d intensite %g position %g %g %g\n", m_krcFrame, i++,
++                        light->GetName().c_str(), lc.lightType, lc.intensity, lc.position.x, lc.position.y, lc.position.z);
++                }
++                std::fclose(f);
++            }
++        }
++        else if (c.key == "nrdreset")
++            m_krcNrdReset = true;
++        else if (c.key == "nrdconf")
++            m_ui.krcNrdConfidence = std::atoi(c.value.c_str());
++        else if (c.key == "nrdaf")
++            m_ui.nrdAntiFirefly = std::atoi(c.value.c_str()) != 0;
+         else if (c.key == "krcdebug")
+-            m_ui.krcDebug = std::atoi(c.value.c_str()) != 0;
++            m_ui.krcDebug = std::atoi(c.value.c_str());
+         else if (c.key == "clear")
+             m_ui.sharcEnableClear = true;
+         else if (c.key == "exit")
+@@ -274,3 +367,30 @@ void Pathtracer::KrcCapture(const std::string& path)
+         std::fclose(f);
+     }
+ }
++
++// Rééclairage exact (Libraries/Krc) : groupe de chaque lampe et rapport « après / avant » de chaque
++// groupe, calculé par KrcRelightHost à partir des intensités que le moteur connaît.
++void Pathtracer::KrcFillRelight(LightingConstants& constants)
++{
++    constants.krcRelight = m_ui.krcRelight ? 1 : 0;
++
++    m_krcRelightHost.BeginFrame(m_ui.sharcEnableClear);
++    for (int i = 0; i < constants.lightCount; i++)
++    {
++        const LightConstants& light = constants.lights[i];
++        int group = (i < (int)m_krcLightGroup.size()) ? m_krcLightGroup[i] : -1;
++        if (group < 0)
++            group = (light.lightType == LightType_Directional) ? 0 : 3;
++        const float power = light.intensity * (0.2126f * light.color.x + 0.7152f * light.color.y + 0.0722f * light.color.z);
++        m_krcRelightHost.AddLight((uint32_t)i, group, power);
++    }
++    const KrcRelightFrame frame = m_krcRelightHost.EndFrame();
++
++    if (m_ui.sharcEnableClear)
++        m_krcRelightSinceClear = false;
++    constants.krcLightGroups = (int)frame.lightGroups;
++    constants.krcRelightEvent = (m_ui.krcRelight && frame.event) ? 1 : 0;
++    m_krcRelightSinceClear = m_krcRelightSinceClear || constants.krcRelightEvent != 0;
++    constants.krcRelightRatio = dm::float4(frame.ratio[0], frame.ratio[1], frame.ratio[2], m_krcRelightSinceClear ? 1.0f : 0.0f);
++    m_krcRelightEvents = constants.krcRelightEvent;
++}
+diff --git a/Samples/Pathtracer/LightingCb.h b/Samples/Pathtracer/LightingCb.h
+index e562583..5a21091 100644
+--- a/Samples/Pathtracer/LightingCb.h
++++ b/Samples/Pathtracer/LightingCb.h
+@@ -48,6 +48,13 @@ struct LightingConstants
+     int krcDebug;
+     int krcGuide;     // premier rebond diffus guidé par les cellules (KrcGuide.hlsli)
+ 
++    // branche krc : rééclairage exact par groupes de lampes (KrcRelight.hlsli)
++    int krcRelight;       // les cellules apprennent la part de chaque groupe
++    int krcRelightEvent;  // un rapport connu est à appliquer avant le tracé de cette frame
++    int krcLightGroups;   // groupe de la lampe i aux bits 2i..2i+1 (0 soleil, 1 et 2 lampes, 3 fixe)
++    int krcNrdConfidence; // confiance de l'historique de NRD tirée du rééclairage des cellules
++    float4 krcRelightRatio; // w : 1 si un rééclairage a eu lieu depuis la remise à zéro du cache (sinon S = 1) // rapport « après / avant » des groupes 0..2
++
+     float4 sharcCameraPosition;
+     float4 sharcCameraPositionPrev;
+ 
+diff --git a/Samples/Pathtracer/Nrd/NrdIntegration.cpp b/Samples/Pathtracer/Nrd/NrdIntegration.cpp
+index 86d708c..898b41c 100644
+--- a/Samples/Pathtracer/Nrd/NrdIntegration.cpp
++++ b/Samples/Pathtracer/Nrd/NrdIntegration.cpp
+@@ -343,7 +343,8 @@ void NrdIntegration::RunDenoiserPasses(
+     bool useDisocclusionThresholdAlternateMix,
+     bool enableValidation,
+     const void* methodSettings,
+-    bool reset)
++    bool reset,
++    bool historyConfidence)
+ {
+     if (methodSettings)
+         nrd::SetDenoiserSettings(*m_instance, m_identifier, methodSettings);
+@@ -378,6 +379,7 @@ void NrdIntegration::RunDenoiserPasses(
+     commonSettings.disocclusionThresholdAlternate = disocclusionThresholdAlternate;
+     commonSettings.isDisocclusionThresholdMixAvailable = useDisocclusionThresholdAlternateMix;
+     commonSettings.accumulationMode = reset ? nrd::AccumulationMode::RESTART : nrd::AccumulationMode::CONTINUE;
++    commonSettings.isHistoryConfidenceAvailable = historyConfidence;
+ 
+     nrd::SetCommonSettings(*m_instance, commonSettings);
+ 
+@@ -436,6 +438,10 @@ void NrdIntegration::RunDenoiserPasses(
+                 case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST:
+                     texture = renderTargets.inDiffRadianceHitDist;
+                     break;
++                case nrd::ResourceType::IN_DIFF_CONFIDENCE: // branche krc
++                case nrd::ResourceType::IN_SPEC_CONFIDENCE:
++                    texture = renderTargets.krcConfidence;
++                    break;
+                 case nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST:
+                     texture = renderTargets.outSpecRadianceHitDist;
+                     break;
+diff --git a/Samples/Pathtracer/Nrd/NrdIntegration.h b/Samples/Pathtracer/Nrd/NrdIntegration.h
+index 99a30d7..a6aa50c 100644
+--- a/Samples/Pathtracer/Nrd/NrdIntegration.h
++++ b/Samples/Pathtracer/Nrd/NrdIntegration.h
+@@ -48,7 +48,8 @@ public:
+         bool useDisocclusionThresholdAlternateMix,
+         bool enableValidation,
+         const void* methodSettings,
+-        bool reset);
++        bool reset,
++        bool historyConfidence = false); // branche krc : renderTargets.krcConfidence en entrée
+ 
+     const nrd::Denoiser GetDenoiser() const;
+ 
+diff --git a/Samples/Pathtracer/Pathtracer.cpp b/Samples/Pathtracer/Pathtracer.cpp
+index f39c1e7..32998c4 100644
+--- a/Samples/Pathtracer/Pathtracer.cpp
++++ b/Samples/Pathtracer/Pathtracer.cpp
+@@ -227,6 +227,8 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         nvrhi::BindingLayoutItem::Texture_UAV(5), // Emissive
+         nvrhi::BindingLayoutItem::Texture_UAV(6), // DiffuseAlbedo
+         nvrhi::BindingLayoutItem::Texture_UAV(7), // SpecularAlbedo
++        nvrhi::BindingLayoutItem::Texture_UAV(8), // branche krc : confiance de l'historique de NRD
++        nvrhi::BindingLayoutItem::Texture_UAV(9), // branche krc : S lissé
+     };
+     m_denoiserBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
+ 
+@@ -253,6 +255,9 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(4), // branche krc : moments des cellules
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(5), // branche krc : guide, sommes de la frame
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(6), // branche krc : guide lissé
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(7), // branche krc : parts des groupes de lampes, sommes de la frame
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(8), // branche krc : parts des groupes de lampes, lissées
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(9), // branche krc : facteur de rééclairage de la frame
+     };
+     m_sharcBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
+ #endif // ENABLE_SHARC
+@@ -325,6 +330,21 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         bufferDesc.debugName = "m_krcGuideBuffer";
+         m_krcGuideBuffer = GetDevice()->createBuffer(bufferDesc);
+ 
++        bufferDesc.structStride = 4 * sizeof(uint32_t);
++        bufferDesc.byteSize = m_sharcEntriesNum * bufferDesc.structStride;
++        bufferDesc.debugName = "m_krcGroupAccBuffer";
++        m_krcGroupAccBuffer = GetDevice()->createBuffer(bufferDesc);
++
++        bufferDesc.structStride = 4 * sizeof(float);
++        bufferDesc.byteSize = m_sharcEntriesNum * bufferDesc.structStride;
++        bufferDesc.debugName = "m_krcGroupBuffer";
++        m_krcGroupBuffer = GetDevice()->createBuffer(bufferDesc);
++
++        bufferDesc.structStride = 2 * sizeof(float);
++        bufferDesc.byteSize = m_sharcEntriesNum * bufferDesc.structStride;
++        bufferDesc.debugName = "m_krcRelightFactorBuffer";
++        m_krcRelightFactorBuffer = GetDevice()->createBuffer(bufferDesc);
++
+         nvrhi::BindingSetDesc bindingSetDesc;
+         bindingSetDesc.bindings = {
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer),
+@@ -334,6 +354,9 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(4, m_krcMomentsBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(5, m_krcGuideAccBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(6, m_krcGuideBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(7, m_krcGroupAccBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(8, m_krcGroupBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(9, m_krcRelightFactorBuffer),
+         };
+         m_sharcBindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_sharcBindingLayout);
+     }
+@@ -639,6 +662,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         if (constants.lightCount < MAX_LIGHTS)
+             light->FillLightConstants(constants.lights[constants.lightCount++]);
+     }
++    KrcFillRelight(constants); // branche krc : groupes de lampes, rapport « après / avant »
+ 
+ #if ENABLE_NRC
+     // Update NRC
+@@ -719,8 +743,9 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         constants.sharcEnableAntiFireflyFilter = m_ui.sharcEnableAntiFireflyFilter;
+         constants.krcAdaptive = m_ui.krcAdaptive ? 1 : 0;
+         constants.krcTolerance = m_ui.krcTolerance;
+-        constants.krcDebug = m_ui.krcDebug ? 1 : 0;
++        constants.krcDebug = m_ui.krcDebug;
+         constants.krcGuide = m_ui.krcGuide ? 1 : 0;
++        constants.krcNrdConfidence = m_enableNrd ? m_ui.krcNrdConfidence : 0;
+     }
+ 
+     if (m_ui.sharcUpdateViewCamera || m_ui.techSelection != TechSelection::Sharc)
+@@ -743,6 +768,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+             nvrhi::BindingSetItem::Texture_UAV(5, m_renderTargets->emissive),
+             nvrhi::BindingSetItem::Texture_UAV(6, m_renderTargets->diffuseAlbedo),
+             nvrhi::BindingSetItem::Texture_UAV(7, m_renderTargets->specularAlbedo),
++            nvrhi::BindingSetItem::Texture_UAV(8, m_renderTargets->krcConfidence),
++            nvrhi::BindingSetItem::Texture_UAV(9, m_renderTargets->krcScaleSmooth),
+         };
+ 
+         m_denoiserBindingSet = device->createBindingSet(bindingSetDesc, m_denoiserBindingLayout);
+@@ -756,6 +783,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+             nvrhi::BindingSetItem::Texture_UAV(5, m_renderTargets->emissive),
+             nvrhi::BindingSetItem::Texture_UAV(6, m_renderTargets->diffuseAlbedo),
+             nvrhi::BindingSetItem::Texture_UAV(7, m_renderTargets->specularAlbedo),
++            nvrhi::BindingSetItem::Texture_UAV(8, m_renderTargets->krcConfidence),
++            nvrhi::BindingSetItem::Texture_UAV(9, m_renderTargets->krcScaleSmooth),
+         };
+ 
+         m_denoiserOutBindingSet = device->createBindingSet(bindingSetDesc, m_denoiserBindingLayout);
+@@ -846,6 +875,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+ 
+     if (enableDlss || m_enableNrd)
+         m_commandList->clearTextureFloat(m_renderTargets->depth, nvrhi::AllSubresources, nvrhi::Color(0.0f));
++    if (m_enableNrd && m_ui.krcNrdConfidence != 0)
++        m_commandList->clearTextureFloat(m_renderTargets->krcConfidence, nvrhi::AllSubresources, nvrhi::Color(1.0f));
+ 
+     if (enableDlss)
+         m_commandList->clearTextureFloat(m_renderTargets->motionVectors, nvrhi::AllSubresources, nvrhi::Color(0.0f));
+@@ -925,6 +956,23 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+                 m_commandList->clearBufferUInt(m_krcMomentsBuffer, 0);
+                 m_commandList->clearBufferUInt(m_krcGuideAccBuffer, 0);
+                 m_commandList->clearBufferUInt(m_krcGuideBuffer, 0);
++                m_commandList->clearBufferUInt(m_krcGroupAccBuffer, 0);
++                m_commandList->clearBufferUInt(m_krcGroupBuffer, 0);
++                m_commandList->clearBufferUInt(m_krcRelightFactorBuffer, 0);
++            }
++
++            // branche krc : rééclairage exact des cellules avant le tracé, si des lampes ont changé
++            if (m_ui.krcRelight && m_krcRelightEvents > 0)
++            {
++                nvrhi::ComputeState computeState;
++                if (m_api == nvrhi::GraphicsAPI::D3D12)
++                    computeState.bindings = { m_globalBindingSet, m_sharcBindingSet };
++                else
++                    computeState.bindings = { m_globalBindingSet, m_dummyBindingSets[1], m_dummyBindingSets[2], m_sharcBindingSet };
++                computeState.pipeline = m_pathtracerPipelines->GetKrcRelightPSO();
++                m_commandList->setComputeState(computeState);
++                ScopedMarker scopedMarker(m_commandList, "KrcRelight");
++                m_commandList->dispatch(DivideRoundUp(m_sharcEntriesNum, 256u), 1);
+             }
+ 
+             // SHARC update
+@@ -1001,6 +1049,17 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+ #if ENABLE_NRD
+     if (m_enableNrd)
+     {
++        // branche krc : S lissé, avant la mise en forme de l'entrée de NRD qui l'utilise
++        if (m_ui.krcNrdConfidence == 2 && m_krcRelightSinceClear)
++        {
++            nvrhi::ComputeState computeState;
++            computeState.bindings = { m_globalBindingSet, m_denoiserBindingSet };
++            computeState.pipeline = m_pathtracerPipelines->GetKrcScaleBlurPSO();
++            m_commandList->setComputeState(computeState);
++            ScopedMarker scopedMarker(m_commandList, "KrcScaleBlur");
++            m_commandList->dispatch(DivideRoundUp(renderWidth, 16u), DivideRoundUp(renderHeight, 16u));
++        }
++
+         // Denoiser data packing
+         {
+             nvrhi::ComputeState computeState;
+@@ -1018,7 +1077,9 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         }
+ 
+         nrd::ReblurSettings reblurSettings = NrdConfig::GetDefaultREBLURSettings();
+-        m_nrd->RunDenoiserPasses(m_commandList, *m_renderTargets, 0, m_view, m_viewPrev, GetFrameIndex(), 0.01f, 0.05f, false, false, &reblurSettings, resetDenoiser);
++        reblurSettings.enableAntiFirefly = m_ui.nrdAntiFirefly;
++        m_nrd->RunDenoiserPasses(m_commandList, *m_renderTargets, 0, m_view, m_viewPrev, GetFrameIndex(), 0.01f, 0.05f, false, false, &reblurSettings, resetDenoiser || m_krcNrdReset, m_ui.krcNrdConfidence == 1);
++        m_krcNrdReset = false;
+ 
+         // Denoiser resolve
+         {
+diff --git a/Samples/Pathtracer/Pathtracer.h b/Samples/Pathtracer/Pathtracer.h
+index 2eaf28c..03b910b 100644
+--- a/Samples/Pathtracer/Pathtracer.h
++++ b/Samples/Pathtracer/Pathtracer.h
+@@ -20,6 +20,7 @@
+ #include <donut/render/DLSS.h>
+ 
+ #include "UI.h"
++#include "../../Libraries/Krc/include/KrcRelightHost.h" // branche krc
+ #include "Pipelines.h"
+ #include "AccelStructBuilder.h"
+ #include "SampleScene.h"
+@@ -91,6 +92,7 @@ public:
+     void KrcBenchBeforeRender();
+     void KrcBenchAfterRender();
+     void KrcCapture(const std::string& path);
++    void KrcFillRelight(struct LightingConstants& constants);
+ 
+ private:
+     struct KrcCommand
+@@ -99,6 +101,11 @@ private:
+         std::string key, value;
+     };
+     std::vector<KrcCommand> m_krcCommands;
++    std::vector<int> m_krcLightGroup;    // groupe de chaque lampe (-1 : soleil au groupe 0, lampes fixes)
++    KrcRelightHost m_krcRelightHost;     // rapport « après / avant » des groupes (Libraries/Krc)
++    int m_krcRelightEvents = 0;
++    bool m_krcNrdReset = false;
++    bool m_krcRelightSinceClear = false; // S vaut 1 partout tant qu'aucun rééclairage n'a eu lieu          // historique de NRD vidé à la prochaine frame
+     std::string m_krcOut;
+     std::string m_krcCaptureName;
+     uint32_t m_krcFrame = 0;
+@@ -176,6 +183,9 @@ private:
+     nvrhi::BufferHandle m_krcMomentsBuffer; // branche krc : moments des cellules (KrcAdaptive.hlsli)
+     nvrhi::BufferHandle m_krcGuideAccBuffer; // branche krc : guide du premier rebond (KrcGuide.hlsli)
+     nvrhi::BufferHandle m_krcGuideBuffer;
++    nvrhi::BufferHandle m_krcGroupAccBuffer; // branche krc : parts des groupes de lampes (KrcRelight.hlsli)
++    nvrhi::BufferHandle m_krcGroupBuffer;
++    nvrhi::BufferHandle m_krcRelightFactorBuffer;
+ 
+     nvrhi::BindingLayoutHandle m_sharcBindingLayout;
+     nvrhi::BindingSetHandle m_sharcBindingSet;
+diff --git a/Samples/Pathtracer/Pipelines.cpp b/Samples/Pathtracer/Pipelines.cpp
+index 1197935..4831fad 100644
+--- a/Samples/Pathtracer/Pipelines.cpp
++++ b/Samples/Pathtracer/Pipelines.cpp
+@@ -33,6 +33,11 @@ void Pipelines::CreateCommon(nvrhi::IDevice* device, ShaderFactory& shaderFactor
+         m_krcPropagateCS = shaderFactory.CreateShader("app/Shaders/SharcResolve.hlsl", "krcPropagate", nullptr, nvrhi::ShaderType::Compute);
+         pipelineDesc.CS = m_krcPropagateCS;
+         m_krcPropagatePSO = device->createComputePipeline(pipelineDesc);
++
++        // branche krc : rééclairage exact des cellules
++        m_krcRelightCS = shaderFactory.CreateShader("app/Shaders/SharcResolve.hlsl", "krcRelight", nullptr, nvrhi::ShaderType::Compute);
++        pipelineDesc.CS = m_krcRelightCS;
++        m_krcRelightPSO = device->createComputePipeline(pipelineDesc);
+     }
+ #endif // ENABLE_SHARC
+ 
+@@ -60,6 +65,15 @@ void Pipelines::CreateCommon(nvrhi::IDevice* device, ShaderFactory& shaderFactor
+     }
+ #endif // ENABLE_NRC
+ 
++    {
++        // branche krc : S lissé (rééclairage de l'historique de NRD)
++        m_krcScaleBlurCS = shaderFactory.CreateShader("app/Shaders/Denoiser.hlsl", "krcScaleBlur", &denoiseMacros, nvrhi::ShaderType::Compute);
++        nvrhi::ComputePipelineDesc pipelineDesc;
++        pipelineDesc.bindingLayouts = { layouts.global, layouts.denoiser };
++        pipelineDesc.CS = m_krcScaleBlurCS;
++        m_krcScaleBlurPSO = device->createComputePipeline(pipelineDesc);
++    }
++
+     {
+         m_denoiserResolveCS = shaderFactory.CreateShader("app/Shaders/Denoiser.hlsl", "resolve", &denoiseMacros, nvrhi::ShaderType::Compute);
+         nvrhi::ComputePipelineDesc pipelineDesc;
+@@ -112,6 +126,11 @@ nvrhi::ComputePipelineHandle Pipelines::GetKrcPropagatePSO() const
+     return m_krcPropagatePSO;
+ }
+ 
++nvrhi::ComputePipelineHandle Pipelines::GetKrcRelightPSO() const
++{
++    return m_krcRelightPSO;
++}
++
+ nvrhi::ComputePipelineHandle Pipelines::GetSharcResolvePSO() const
+ {
+     return m_sharcResolvePSO;
+@@ -131,6 +150,11 @@ nvrhi::ComputePipelineHandle Pipelines::GetDenoiserReblurPack_NRC_PSO() const
+ }
+ #endif // ENABLE_NRC
+ 
++nvrhi::ComputePipelineHandle Pipelines::GetKrcScaleBlurPSO() const
++{
++    return m_krcScaleBlurPSO;
++}
++
+ nvrhi::ComputePipelineHandle Pipelines::GetDenoiserResolvePSO() const
+ {
+     return m_denoiserResolvePSO;
+diff --git a/Samples/Pathtracer/Pipelines.h b/Samples/Pathtracer/Pipelines.h
+index 808c107..6a234dd 100644
+--- a/Samples/Pathtracer/Pipelines.h
++++ b/Samples/Pathtracer/Pipelines.h
+@@ -77,6 +77,7 @@ public:
+ #if ENABLE_SHARC
+     nvrhi::ComputePipelineHandle GetSharcResolvePSO() const;
+     nvrhi::ComputePipelineHandle GetKrcPropagatePSO() const;
++    nvrhi::ComputePipelineHandle GetKrcRelightPSO() const;
+ #endif // ENABLE_SHARC
+ 
+ #if ENABLE_NRD
+@@ -87,6 +88,7 @@ public:
+ #endif // ENABLE_NRC
+ 
+     nvrhi::ComputePipelineHandle GetDenoiserResolvePSO() const;
++    nvrhi::ComputePipelineHandle GetKrcScaleBlurPSO() const;
+ #endif // ENABLE_NRD
+ 
+     nvrhi::ShaderHandle GetTonemappingPS() const;
+@@ -102,6 +104,8 @@ private:
+     nvrhi::ComputePipelineHandle m_sharcResolvePSO;
+     nvrhi::ShaderHandle m_krcPropagateCS;
+     nvrhi::ComputePipelineHandle m_krcPropagatePSO;
++    nvrhi::ShaderHandle m_krcRelightCS;
++    nvrhi::ComputePipelineHandle m_krcRelightPSO;
+ #endif // ENABLE_SHARC
+ 
+ #if ENABLE_NRD
+@@ -115,6 +119,8 @@ private:
+ 
+     nvrhi::ShaderHandle m_denoiserResolveCS;
+     nvrhi::ComputePipelineHandle m_denoiserResolvePSO;
++    nvrhi::ShaderHandle m_krcScaleBlurCS;
++    nvrhi::ComputePipelineHandle m_krcScaleBlurPSO;
+ #endif // ENABLE_NRD
+ 
+     nvrhi::ShaderHandle m_tonemappingPS;
+diff --git a/Samples/Pathtracer/RenderTargets.cpp b/Samples/Pathtracer/RenderTargets.cpp
+index 927d153..82c779d 100644
+--- a/Samples/Pathtracer/RenderTargets.cpp
++++ b/Samples/Pathtracer/RenderTargets.cpp
+@@ -40,4 +40,6 @@ RenderTargets::RenderTargets(nvrhi::IDevice* device, uint32_t width, uint32_t he
+     CreateCommonTexture(nvrhi::Format::RGBA16_FLOAT, "outDiffRadianceHitDist", outDiffRadianceHitDist);
+     CreateCommonTexture(nvrhi::Format::RGBA16_FLOAT, "outSpecRadianceHitDist", outSpecRadianceHitDist);
+     CreateCommonTexture(nvrhi::Format::RGBA32_FLOAT, "outPathTracer", outPathTracer);
++    CreateCommonTexture(nvrhi::Format::R16_FLOAT, "krcConfidence", krcConfidence);
++    CreateCommonTexture(nvrhi::Format::R16_FLOAT, "krcScaleSmooth", krcScaleSmooth);
+ }
+\ No newline at end of file
+diff --git a/Samples/Pathtracer/RenderTargets.h b/Samples/Pathtracer/RenderTargets.h
+index 697790b..7ff20cb 100644
+--- a/Samples/Pathtracer/RenderTargets.h
++++ b/Samples/Pathtracer/RenderTargets.h
+@@ -31,4 +31,6 @@ public:
+     nvrhi::TextureHandle outSpecRadianceHitDist;
+ 
+     nvrhi::TextureHandle outPathTracer;
++    nvrhi::TextureHandle krcConfidence; // branche krc : confiance de l'historique de NRD, ou S (KrcRelight.hlsli)
++    nvrhi::TextureHandle krcScaleSmooth; // branche krc : S lissé (Denoiser.hlsl)
+ };
+\ No newline at end of file
+diff --git a/Samples/Pathtracer/Shaders/Denoiser.hlsl b/Samples/Pathtracer/Shaders/Denoiser.hlsl
+index d72b54e..507fab0 100644
+--- a/Samples/Pathtracer/Shaders/Denoiser.hlsl
++++ b/Samples/Pathtracer/Shaders/Denoiser.hlsl
+@@ -28,6 +28,56 @@ RWTexture2D<float4>             u_OutputMotionVectors           : register(u4, s
+ RWTexture2D<float4>             u_OutputEmissive                : register(u5, space1);
+ RWTexture2D<float4>             u_OutputDiffuseAlbedo           : register(u6, space1);
+ RWTexture2D<float4>             u_OutputSpecularAlbedo          : register(u7, space1);
++RWTexture2D<float>              u_KrcScale                      : register(u8, space1); // branche krc : S (KrcRelight.hlsli)
++RWTexture2D<float>              u_KrcScaleSmooth                : register(u9, space1); // branche krc : S lissé
++
++// branche krc : normalisation de l'entrée de NRD par le produit des rééclairages des cellules autour
++// du pixel (mode 2) ; la sortie est remultipliée, d'où un historique rééclairé
++float KrcNrdScale(uint2 pixel)
++{
++    return (g_Lighting.krcNrdConfidence == 2 && g_Lighting.krcRelightRatio.w != 0.0f) ? max(u_KrcScaleSmooth[pixel], 1e-4f) : 1.0f;
++}
++
++// S est constant par cellule : appliqué tel quel, il dessinerait les cellules dans l'image. Lissage
++// épars (9 × 9 prises espacées de 4 pixels), en logarithme, arrêté aux arêtes (normale, profondeur) ;
++// calculé une fois par frame pour que l'entrée et la sortie de NRD utilisent le même S.
++[numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
++void krcScaleBlur(in uint2 did : SV_DispatchThreadID)
++{
++    uint2 size;
++    u_KrcScale.GetDimensions(size.x, size.y);
++    if (any(did >= size))
++        return;
++
++    const float z0 = u_OutputViewSpaceZ[did];
++    if (z0 == 0)
++    {
++        u_KrcScaleSmooth[did] = 1.0f;
++        return;
++    }
++    const float3 n0 = u_OutputNormalRoughness[did].xyz;
++
++    float sumW = 0.0f;
++    float sumLog = 0.0f;
++    for (int y = -4; y <= 4; y++)
++    {
++        for (int x = -4; x <= 4; x++)
++        {
++            const int2 p = int2(did) + 4 * int2(x, y);
++            if (any(p < 0) || any(p >= int2(size)))
++                continue;
++            const float z = u_OutputViewSpaceZ[p];
++            if (z == 0)
++                continue;
++            const float3 n = u_OutputNormalRoughness[p].xyz;
++            const float nd = saturate(dot(n0, n));
++            const float w = exp(-float(x * x + y * y) / 8.0f) * pow(nd, 8.0f) * exp(-abs(z - z0) / (0.03f * abs(z0)));
++            sumW += w;
++            sumLog += w * log(max(u_KrcScale[p], 1e-4f));
++        }
++    }
++    u_KrcScaleSmooth[did] = sumW > 0.0f ? exp(sumLog / sumW) : max(u_KrcScale[did], 1e-4f);
++}
+ 
+ [numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
+ void reblurPackData(in uint2 did : SV_DispatchThreadID)
+@@ -60,7 +110,7 @@ void reblurPackData(in uint2 did : SV_DispatchThreadID)
+             float3 diffuseAlbedo = u_OutputDiffuseAlbedo[did].xyz;
+             diffuseAlbedo += diffuseAlbedo == 0.0f;
+             diffuseData.xyz -= emissive;
+-            diffuseData.xyz /= diffuseAlbedo;
++            diffuseData.xyz /= diffuseAlbedo * KrcNrdScale(did);
+         }
+ 
+         float normalizedHitDistance = REBLUR_FrontEnd_GetNormHitDist(diffuseData.w, viewSpaceZ, g_Global.nrdHitDistanceParams);
+@@ -82,7 +132,7 @@ void reblurPackData(in uint2 did : SV_DispatchThreadID)
+             float3 specularAlbedo = u_OutputSpecularAlbedo[did].xyz;
+             specularAlbedo += specularAlbedo == 0.0f;
+             specularData.xyz -= emissive;
+-            specularData.xyz /= specularAlbedo;
++            specularData.xyz /= specularAlbedo * KrcNrdScale(did);
+         }
+ 
+         float normalizedHitDistance = REBLUR_FrontEnd_GetNormHitDist(specularData.w, viewSpaceZ, g_Global.nrdHitDistanceParams, normalRoughness.w);
+@@ -109,7 +159,7 @@ void resolve(in uint2 did : SV_DispatchThreadID)
+         float3 diffuseAlbedo = u_OutputDiffuseAlbedo[did].xyz;
+         diffuseData = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(diffuseData);
+ 
+-        outputColor.xyz += diffuseData.xyz * diffuseAlbedo;
++        outputColor.xyz += diffuseData.xyz * diffuseAlbedo * KrcNrdScale(did);
+     }
+ 
+ #if ENABLE_SPECULAR_LOBE
+@@ -119,7 +169,7 @@ void resolve(in uint2 did : SV_DispatchThreadID)
+         float3 specularAlbedo = u_OutputSpecularAlbedo[did].xyz;
+         specularData = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(specularData);
+ 
+-        outputColor.xyz += specularData.xyz * specularAlbedo;
++        outputColor.xyz += specularData.xyz * specularAlbedo * KrcNrdScale(did);
+     }
+ #endif // ENABLE_SPECULAR_LOBE
+ 
+diff --git a/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli b/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+index 8851dd8..0d98bb8 100644
+--- a/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
++++ b/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+@@ -83,10 +83,7 @@ void KrcResolveMoments(uint entryIndex, SharcParameters sharcParameters, uint ac
+         return;
+     const HashGridKey key = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex);
+     if (key == HASH_GRID_INVALID_HASH_KEY)
+-    {
+-        moments[entryIndex] = float4(0, 0, 0, 0);
+-        return;
+-    }
++        return; // remis à zéro à l'éviction (sharcResolve), pas à chaque frame
+     const SharcAccumulationData acc = BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex);
+     if (acc.data.w == 0)
+         return;
+@@ -206,6 +203,8 @@ bool KrcGetCachedRadiance(SharcParameters sharcParameters, SharcHitData hitData,
+     float w = 0;
+     if (mother.found)
+         w = saturate(fine.weight);
++    if (g_Lighting.krcDebug == 2)
++        w = 0; // diagnostic : tout KRC-A sauf la lecture de la mère
+     motherWeight = w;
+     radiance = lerp(fine.radiance, mother.radiance, w);
+ #if SHARC_MATERIAL_DEMODULATION
+diff --git a/Samples/Pathtracer/Shaders/KrcRelight.hlsli b/Samples/Pathtracer/Shaders/KrcRelight.hlsli
+new file mode 100644
+index 0000000..c0f9890
+--- /dev/null
++++ b/Samples/Pathtracer/Shaders/KrcRelight.hlsli
+@@ -0,0 +1,33 @@
++/*
++ * Branche krc : adaptation de la bibliothèque KRC (Libraries/Krc/include/KrcRelight.h, rééclairage
++ * exact par groupes de lampes) au path tracer d'exemple : tampons de l'espace de SHaRC (u7..u9) et
++ * réglages de LightingConstants.
++ */
++
++#ifndef KRC_RELIGHT_HLSLI
++#define KRC_RELIGHT_HLSLI
++
++#include "KrcRelight.h"
++
++#define KRC_RELIGHT_PARAMETERS(p)                       \
++    KrcRelightParameters p;                             \
++    p.groupAccumulationBuffer = u_KrcGroupAcc;          \
++    p.groupBuffer = u_KrcGroup;                         \
++    p.factorBuffer = u_KrcRelightFactor;                \
++    p.lightGroups = uint(g_Lighting.krcLightGroups);    \
++    p.ratio = g_Lighting.krcRelightRatio.xyz
++
++#if SHARC_QUERY
++// Confiance de l'historique de NRD (mode 1) : 1 l'historique reste bon, 0 à oublier, d'après le
++// facteur de la frame de la cellule du premier point touché. REBLUR ramène alors son historique à
++// une frame, pas à zéro : le mode 2 (normalisation par S, Denoiser.hlsl) lui est préféré.
++float KrcHistoryConfidence(in SharcParameters sharcParameters, KrcRelightParameters krcParameters, float3 position, float3 normal)
++{
++    if (g_Lighting.krcDebug == 3)
++        return 0.0f; // diagnostic : historique oublié partout
++    const float k = max(KrcGetRelightFactor(sharcParameters, krcParameters, position, normal).x, 1e-4f);
++    return exp(-8.0f * abs(log(k)));
++}
++#endif // SHARC_QUERY
++
++#endif // KRC_RELIGHT_HLSLI
+diff --git a/Samples/Pathtracer/Shaders/Pathtracer.hlsl b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+index b554b53..b2c8fb3 100644
+--- a/Samples/Pathtracer/Shaders/Pathtracer.hlsl
++++ b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+@@ -77,6 +77,7 @@ RWTexture2D<float4>                         u_OutputMotionVectors           : re
+ RWTexture2D<float4>                         u_OutputEmissive                : register(u5, space1);
+ RWTexture2D<float4>                         u_OutputDiffuseAlbedo           : register(u6, space1);
+ RWTexture2D<float4>                         u_OutputSpecularAlbedo          : register(u7, space1);
++RWTexture2D<float>                          u_KrcConfidence                 : register(u8, space1);
+ 
+ RWStructuredBuffer<NrcPackedQueryPathInfo>      queryPathInfo               : register(u0, space2); // Misc path info (vertexCount, queryIndex)
+ RWStructuredBuffer<NrcPackedTrainingPathInfo>   trainingPathInfo            : register(u1, space2); // Misc path info (vertexCount, queryIndex)
+@@ -95,9 +96,13 @@ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer           : re
+ RWStructuredBuffer<float4>                  u_KrcMoments                    : register(u4, space3);
+ RWStructuredBuffer<uint64_t>                u_KrcGuideAcc                   : register(u5, space3);
+ RWStructuredBuffer<float4>                  u_KrcGuide                      : register(u6, space3);
++RWStructuredBuffer<uint4>                   u_KrcGroupAcc                   : register(u7, space3);
++RWStructuredBuffer<float4>                  u_KrcGroup                      : register(u8, space3);
++RWStructuredBuffer<float2>                  u_KrcRelightFactor              : register(u9, space3);
+ 
+ #include "KrcAdaptive.hlsli"
+ #include "KrcGuide.hlsli"
++#include "KrcRelight.hlsli"
+ 
+ RayDesc GeneratePinholeCameraRay(float2 normalizedDeviceCoordinate, float4x4 viewToWorld, float4x4 viewToClip)
+ {
+@@ -144,9 +149,10 @@ float3 CastShadowRay(float3 hitPosition, float3 surfaceNormal, float3 directionT
+ }
+ 
+ // Samples a random light from the pool of all lights using RIS (Resampled Importance Sampling)
+-bool SampleLightRIS(inout uint rngState, float3 hitPosition, float3 surfaceNormal, inout LightConstants selectedSample, out float lightSampleWeight)
++bool SampleLightRIS(inout uint rngState, float3 hitPosition, float3 surfaceNormal, inout LightConstants selectedSample, out float lightSampleWeight, out uint selectedIndex)
+ {
+     lightSampleWeight = 1.0f;
++    selectedIndex = 0;
+     if (g_Lighting.lightCount == 0)
+         return false;
+ 
+@@ -186,6 +192,7 @@ bool SampleLightRIS(inout uint rngState, float3 hitPosition, float3 surfaceNorma
+             if (Rand(rngState) < (candidateRISWeight / totalWeights))
+             {
+                 selectedSample = candidate;
++                selectedIndex = randomLightIndex;
+                 samplePdfG = candidatePdfG;
+             }
+         }
+@@ -474,6 +481,7 @@ void PathTraceRays()
+             sampleRadiance = float3(0.0f, 0.0f, 0.0f);
+             throughput = float3(1.0f, 1.0f, 1.0f);
+ #endif // SHARC_UPDATE
++            float3 krcDirectGroups = float3(0.0f, 0.0f, 0.0f); // branche krc : lumière directe du sommet par groupe
+ 
+             if (enableNrd && bounce == 1)
+                 hitDistance = payload.Hit() ? payload.hitDistance : TRACING_DISTANCE;
+@@ -483,6 +491,13 @@ void PathTraceRays()
+             {
+                 float3 skyValue = g_Lighting.skyColor.rgb;
+ 
++#if SHARC_UPDATE
++                if (g_Lighting.krcRelight != 0)
++                {
++                    KRC_RELIGHT_PARAMETERS(krcParameters);
++                    KrcUpdateMiss(krcParameters, sharcState, skyValue);
++                }
++#endif
+                 SharcUpdateMiss(sharcParameters, sharcState, skyValue);
+ 
+                 NrcUpdateOnMiss(nrcPathState);
+@@ -583,7 +598,7 @@ void PathTraceRays()
+                     else
+                         cached = SharcGetCachedRadiance(sharcParameters, sharcHitData, sharcRadiance, false);
+                 }
+-                if (cached && g_Lighting.krcDebug && bounce == 1)
++                if (cached && g_Lighting.krcDebug == 1 && bounce == 1)
+                 {
+                     // débogage : part de la mère dans la lecture (rouge = mère, vert = fine)
+                     u_Output[DispatchRaysIndex().xy] = float4(krcMotherWeight, 1.0f - krcMotherWeight, 0.0f, 1.0f);
+@@ -617,8 +632,9 @@ void PathTraceRays()
+                 // Evaluate direct light (next event estimation), start by sampling one light 
+                 LightConstants light;
+                 float lightWeight;
++                uint lightIndex;
+ 
+-                if (SampleLightRIS(rngState, hitPosition, geometryNormal, light, lightWeight))
++                if (SampleLightRIS(rngState, hitPosition, geometryNormal, light, lightWeight, lightIndex))
+                 {
+                     // Prepare data needed to evaluate the light
+                     float3 incidentVector;
+@@ -636,6 +652,11 @@ void PathTraceRays()
+                         // This is an entry point for evaluation of all other BRDFs based on selected configuration (for direct light)
+                         float3 lightContribution = evalCombinedBRDF(shadingNormal, vectorToLight, viewVector, material) * light.color * irradiance * lightWeight * lightVisibility;
+                         sampleRadiance += lightContribution * throughput;
++                        if (g_Lighting.krcRelight != 0)
++                        {
++                            KRC_RELIGHT_PARAMETERS(krcParameters);
++                            krcDirectGroups += KrcGroupSplit(krcParameters, lightIndex, lightContribution * throughput);
++                        }
+                     }
+                 }
+             }
+@@ -657,7 +678,15 @@ void PathTraceRays()
+             if (nrcProgressState == NrcProgressState::TerminateAfterDirectLighting)
+                 break;
+ 
+-            if (!SharcUpdateHit(sharcParameters, sharcState, sharcHitData, sampleRadiance, Rand(rngState)))
++            const float sharcRandom = Rand(rngState);
++#if SHARC_UPDATE
++            if (g_Lighting.krcRelight != 0)
++            {
++                KRC_RELIGHT_PARAMETERS(krcParameters);
++                KrcUpdateHit(sharcParameters, krcParameters, sharcState, sharcHitData, sampleRadiance, krcDirectGroups, sharcRandom);
++            }
++#endif
++            if (!SharcUpdateHit(sharcParameters, sharcState, sharcHitData, sampleRadiance, sharcRandom))
+                 break;
+ 
+             // Russian roulette
+@@ -732,6 +761,15 @@ void PathTraceRays()
+                         u_OutputDiffuseAlbedo[launchIndex] = float4(material.diffuseAlbedo * (1.0f - envBRDF), isDiffusePath ? 1.0f : 0.0f);
+                         u_OutputSpecularAlbedo[launchIndex] = float4(envBRDF, 0.0f);
+                     }
++#if SHARC_QUERY
++                    // branche krc : là où la lumière vient de changer, NRD ne garde de son historique
++                    // que ce que le rééclairage de la cellule du pixel laisse valable
++                    KRC_RELIGHT_PARAMETERS(krcParameters);
++                    if (g_Lighting.krcNrdConfidence == 1 && g_Lighting.krcRelightEvent != 0)
++                        u_KrcConfidence[launchIndex] = KrcHistoryConfidence(sharcParameters, krcParameters, hitPosition, geometryNormal);
++                    else if (g_Lighting.krcNrdConfidence == 2 && g_Lighting.krcRelightRatio.w != 0.0f)
++                        u_KrcConfidence[launchIndex] = KrcGetRelightFactor(sharcParameters, krcParameters, hitPosition, geometryNormal).y;
++#endif // SHARC_QUERY
+                 }
+             }
+ #endif // !SHARC_UPDATE && !NRC_UPDATE
+diff --git a/Samples/Pathtracer/Shaders/SharcResolve.hlsl b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+index f5fa021..3d48b03 100644
+--- a/Samples/Pathtracer/Shaders/SharcResolve.hlsl
++++ b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+@@ -24,8 +24,12 @@ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer       : regist
+ RWStructuredBuffer<float4>                  u_KrcMoments                : register(u4, space3);
+ RWStructuredBuffer<uint64_t>                u_KrcGuideAcc               : register(u5, space3);
+ RWStructuredBuffer<float4>                  u_KrcGuide                  : register(u6, space3);
++RWStructuredBuffer<uint4>                   u_KrcGroupAcc               : register(u7, space3);
++RWStructuredBuffer<float4>                  u_KrcGroup                  : register(u8, space3);
++RWStructuredBuffer<float2>                  u_KrcRelightFactor          : register(u9, space3);
+ 
+ #include "KrcAdaptive.hlsli"
++#include "KrcRelight.hlsli"
+ 
+ [numthreads(LINEAR_BLOCK_SIZE, 1, 1)]
+ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+@@ -50,6 +54,8 @@ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+     resolveParameters.cameraPositionPrev = g_Lighting.sharcCameraPositionPrev.xyz;
+     resolveParameters.frameIndex = g_Global.frameIndex;
+ 
++    const bool krcSlotValid = did.x < sharcParameters.hashGridData.capacity &&
++        BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, did.x) != HASH_GRID_INVALID_HASH_KEY;
+     if (g_Lighting.krcAdaptive)
+     {
+         KrcResolveMoments(did.x, sharcParameters, uint(g_Lighting.sharcAccumulationFrameNum), u_KrcMoments);
+@@ -69,7 +75,20 @@ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+         u_KrcGuide[did.x] = valid ? u_KrcGuide[did.x] * 0.95f + acc : float4(0, 0, 0, 0);
+     }
+ 
++    KRC_RELIGHT_PARAMETERS(krcParameters);
++    bool krcWasValid = false;
++    if (g_Lighting.krcRelight != 0)
++        krcWasValid = KrcResolveEntry(did.x, sharcParameters, krcParameters, uint(g_Lighting.sharcAccumulationFrameNum));
++
+     SharcResolveEntry(did.x, sharcParameters, resolveParameters);
++
++    if (g_Lighting.krcRelight != 0)
++        KrcResolveEviction(did.x, sharcParameters, krcParameters, krcWasValid);
++
++    // branche krc : une cellule évincée par SHaRC libère ses moments (KRC-A)
++    if (g_Lighting.krcAdaptive != 0 && krcSlotValid && did.x < sharcParameters.hashGridData.capacity &&
++        BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, did.x) == HASH_GRID_INVALID_HASH_KEY)
++        u_KrcMoments[did.x] = float4(0, 0, 0, 0);
+ }
+ 
+ // branche krc : passe de remontée des cellules fines vers leurs mères, avant sharcResolve
+@@ -89,3 +108,22 @@ void krcPropagate(in uint2 did : SV_DispatchThreadID)
+ 
+     KrcPropagateEntry(did.x, sharcParameters);
+ }
++
++// branche krc : rééclairage exact des cellules, avant le tracé d'une frame où des lampes changent
++[numthreads(LINEAR_BLOCK_SIZE, 1, 1)]
++void krcRelight(in uint2 did : SV_DispatchThreadID)
++{
++    SharcParameters sharcParameters;
++    sharcParameters.hashGridParameters.cameraPosition = g_Lighting.sharcCameraPosition.xyz;
++    sharcParameters.hashGridParameters.sceneScale = g_Lighting.sharcSceneScale;
++    sharcParameters.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
++    sharcParameters.hashGridParameters.levelBias = SHARC_GRID_LEVEL_BIAS;
++    sharcParameters.hashGridData.capacity = g_Lighting.sharcEntriesNum;
++    sharcParameters.hashGridData.hashEntriesBuffer = u_SharcHashEntriesBuffer;
++    sharcParameters.accumulationBuffer = u_SharcAccumulationBuffer;
++    sharcParameters.resolvedBuffer = u_SharcResolvedBuffer;
++    sharcParameters.radianceScale = SHARC_RADIANCE_SCALE;
++
++    KRC_RELIGHT_PARAMETERS(krcParameters);
++    KrcRelightEntry(did.x, sharcParameters, krcParameters);
++}
+diff --git a/Samples/Pathtracer/UI.h b/Samples/Pathtracer/UI.h
+index 6145507..63221f8 100644
+--- a/Samples/Pathtracer/UI.h
++++ b/Samples/Pathtracer/UI.h
+@@ -160,8 +160,11 @@ struct UIData
+     // branche krc : cellules adaptatives (mélange statistique cellule fine / mère)
+     bool krcAdaptive = false;
+     float krcTolerance = 0.03f;
+-    bool krcDebug = false;
++    int krcDebug = 0;        // 1 : part de la mère à l'écran ; 2 : mère jamais lue (diagnostic)
+     bool krcGuide = false;   // premier rebond diffus guidé par les cellules
++    bool krcRelight = false;  // branche krc : rééclairage exact par groupes de lampes
++    int krcNrdConfidence = 0; // branche krc : historique de NRD et rééclairage (1 confiance, 2 normalisation)
++    bool nrdAntiFirefly = true; // branche krc : anti-lucioles de REBLUR (réglage de l'exemple : actif)
+ #endif // ENABLE_SHARC
+ 
+     bool dlssSupported = false;
+diff --git a/Samples/Pathtracer/shaders.cfg b/Samples/Pathtracer/shaders.cfg
+index 9fc954f..f841103 100644
+--- a/Samples/Pathtracer/shaders.cfg
++++ b/Samples/Pathtracer/shaders.cfg
+@@ -8,4 +8,6 @@ Shaders/SharcResolve.hlsl -T cs -E krcPropagate
+ Shaders/Tonemapping.hlsl -T ps -E main_ps
+ Shaders/Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
+ Shaders/Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1 -D ENABLE_NRC=1
+-Shaders/Denoiser.hlsl -T cs -E resolve -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
+\ No newline at end of file
++Shaders/Denoiser.hlsl -T cs -E resolve -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
++Shaders/SharcResolve.hlsl -T cs -E krcRelight
++Shaders/Denoiser.hlsl -T cs -E krcScaleBlur -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
+-- 
+2.55.0.windows.3
+

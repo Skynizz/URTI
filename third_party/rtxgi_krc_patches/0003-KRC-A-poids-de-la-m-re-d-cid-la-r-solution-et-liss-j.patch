@@ -1,0 +1,159 @@
+From d028d8595fee3415043a4c6e28e5c4b697bec4ef Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:00:24 +0200
+Subject: [PATCH 3/5] =?UTF-8?q?KRC-A=20:=20poids=20de=20la=20m=C3=A8re=20d?=
+ =?UTF-8?q?=C3=A9cid=C3=A9=20=C3=A0=20la=20r=C3=A9solution=20et=20liss?=
+ =?UTF-8?q?=C3=A9=20;=20jamais=20la=20m=C3=A8re=20sans=20cellule=20fine?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Samples/Pathtracer/Shaders/KrcAdaptive.hlsli | 78 +++++++++++++++++---
+ Samples/Pathtracer/Shaders/SharcResolve.hlsl |  3 +
+ 2 files changed, 70 insertions(+), 11 deletions(-)
+
+diff --git a/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli b/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+index 310f3b9..8851dd8 100644
+--- a/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
++++ b/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+@@ -12,7 +12,12 @@
+  * l'échelle de la mère (bord, ombre), on lit la fine, sans fuite.
+  *
+  * Requiert SharcCommon.h et u_KrcMoments (float4 par entrée : moyenne glissante de la luminance
+- * moyenne de la frame, de son carré, nombre de frames comptées).
++ * moyenne de la frame, de son carré, nombre de frames comptées ; pour une cellule fine, part de la
++ * mère dans sa lecture, calculée à la résolution et lissée dans le temps).
++ *
++ * Le poids se décide à la résolution, une fois par frame et par cellule, puis se lisse : recalculé à
++ * chaque lecture, il suivait le bruit de la variance estimée et faisait scintiller l'image, ce qui
++ * gênait le débruiteur.
+  */
+ 
+ #ifndef KRC_ADAPTIVE_HLSLI
+@@ -96,12 +101,66 @@ void KrcResolveMoments(uint entryIndex, SharcParameters sharcParameters, uint ac
+     moments[entryIndex] = m;
+ }
+ 
++struct KrcCellStats
++{
++    bool found;
++    float lum;
++    float varMean;
++};
++
++KrcCellStats KrcCellStatsAt(SharcParameters sharcParameters, HashGridKey key, RWStructuredBuffer<float4> moments)
++{
++    KrcCellStats s;
++    s.found = false;
++    s.lum = 0;
++    s.varMean = 0;
++    HashGridIndex index;
++    uint bucketOffset;
++    const uint baseSlot = HashGridGetBaseSlot(key, sharcParameters.hashGridData.capacity);
++    if (!HashGridFind(sharcParameters.hashGridData, key, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, index, bucketOffset))
++        return s;
++    const float4 m = moments[index];
++    if (m.z <= 0)
++        return s;
++    s.found = true;
++    s.lum = m.x;
++    s.varMean = max(m.y - m.x * m.x, 0.0f) / max(m.z, 1.0f);
++    return s;
++}
++
++// à la résolution, pour une cellule fine : part de la mère (rétrécissement), lissée dans le temps
++void KrcResolveWeight(uint entryIndex, SharcParameters sharcParameters, float tolerance, RWStructuredBuffer<float4> moments)
++{
++    if (entryIndex >= sharcParameters.hashGridData.capacity)
++        return;
++    const HashGridKey key = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex);
++    if (key == HASH_GRID_INVALID_HASH_KEY || KrcIsMother(key))
++        return;
++    float4 m = moments[entryIndex];
++    if (m.z <= 0)
++        return;
++    const KrcCellStats mother = KrcCellStatsAt(sharcParameters, KrcMotherKey(key), moments);
++    float target = 0;
++    if (mother.found)
++    {
++        const float fineVar = max(m.y - m.x * m.x, 0.0f) / max(m.z, 1.0f);
++        const float d = m.x - mother.lum;
++        const float tol = tolerance * max(m.x, mother.lum);
++        const float d2 = max(d * d - tol * tol, 0.0f);
++        target = fineVar / max(fineVar + d2 + mother.varMean, 1e-12f);
++    }
++    // nouvelle cellule : part de la mère d'emblée (pas encore de preuve d'une différence)
++    m.w = (m.z <= 1.0f) ? 1.0f : lerp(m.w, target, 0.1f);
++    moments[entryIndex] = m;
++}
++
+ struct KrcCellRead
+ {
+     bool found;
+     float3 radiance;   // démodulée
+     float lum;
+     float varMean;     // variance de la valeur lue (moyenne sur les frames accumulées)
++    float weight;      // cellule fine : part de la mère, décidée à la résolution
+ };
+ 
+ KrcCellRead KrcReadCell(SharcParameters sharcParameters, HashGridKey key, RWStructuredBuffer<float4> moments)
+@@ -111,6 +170,7 @@ KrcCellRead KrcReadCell(SharcParameters sharcParameters, HashGridKey key, RWStru
+     r.radiance = float3(0, 0, 0);
+     r.lum = 0;
+     r.varMean = 0;
++    r.weight = 0;
+     HashGridIndex index;
+     uint bucketOffset;
+     const uint baseSlot = HashGridGetBaseSlot(key, sharcParameters.hashGridData.capacity);
+@@ -124,6 +184,7 @@ KrcCellRead KrcReadCell(SharcParameters sharcParameters, HashGridKey key, RWStru
+     r.lum = SharcLuma(r.radiance);
+     const float4 m = moments[index];
+     r.varMean = max(m.y - m.x * m.x, 0.0f) / max(m.z, 1.0f);
++    r.weight = m.w;
+     return r;
+ }
+ 
+@@ -137,19 +198,14 @@ bool KrcGetCachedRadiance(SharcParameters sharcParameters, SharcHitData hitData,
+     const HashGridKey fineKey = HashGridComputeSpatialHash(hitData.positionWorld, hitData.normalWorld, sharcParameters.hashGridParameters);
+     const KrcCellRead fine = KrcReadCell(sharcParameters, fineKey, moments);
+     const KrcCellRead mother = KrcReadCell(sharcParameters, KrcMotherKey(fineKey), moments);
+-    if (!fine.found && !mother.found)
++    // sans cellule fine, rien : comme SHaRC, le chemin continue. Lire la mère à sa place la faisait
++    // déborder là où aucune cellule fine n'existe (pied des meubles), en points clairs
++    if (!fine.found)
+         return false;
+ 
+     float w = 0;
+-    if (!fine.found)
+-        w = 1;
+-    else if (mother.found)
+-    {
+-        const float d = fine.lum - mother.lum;
+-        const float tol = tolerance * max(fine.lum, mother.lum);
+-        const float d2 = max(d * d - tol * tol, 0.0f);
+-        w = fine.varMean / max(fine.varMean + d2 + mother.varMean, 1e-12f);
+-    }
++    if (mother.found)
++        w = saturate(fine.weight);
+     motherWeight = w;
+     radiance = lerp(fine.radiance, mother.radiance, w);
+ #if SHARC_MATERIAL_DEMODULATION
+diff --git a/Samples/Pathtracer/Shaders/SharcResolve.hlsl b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+index a43dae7..c2837a8 100644
+--- a/Samples/Pathtracer/Shaders/SharcResolve.hlsl
++++ b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+@@ -49,7 +49,10 @@ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+     resolveParameters.frameIndex = g_Global.frameIndex;
+ 
+     if (g_Lighting.krcAdaptive)
++    {
+         KrcResolveMoments(did.x, sharcParameters, uint(g_Lighting.sharcAccumulationFrameNum), u_KrcMoments);
++        KrcResolveWeight(did.x, sharcParameters, g_Lighting.krcTolerance, u_KrcMoments);
++    }
+ 
+     SharcResolveEntry(did.x, sharcParameters, resolveParameters);
+ }
+-- 
+2.55.0.windows.3
+

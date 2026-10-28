@@ -1,0 +1,359 @@
+From fab7c52f028e0c500c79ffc7152e821ee3af9f96 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:49:43 +0200
+Subject: [PATCH 1/5] =?UTF-8?q?Banc=20de=20mesure=20(KrcBench.cpp)=20:=20s?=
+ =?UTF-8?q?c=C3=A9nario,=20captures=20HDR,=20temps=20GPU,=20rendu=20sans?=
+ =?UTF-8?q?=20fen=C3=AAtre=20visible?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ External/Donut                    |   2 +-
+ Samples/Pathtracer/KrcBench.cpp   | 248 ++++++++++++++++++++++++++++++
+ Samples/Pathtracer/Pathtracer.cpp |   9 ++
+ Samples/Pathtracer/Pathtracer.h   |  22 +++
+ 4 files changed, 280 insertions(+), 1 deletion(-)
+ create mode 100644 Samples/Pathtracer/KrcBench.cpp
+
+diff --git a/External/Donut b/External/Donut
+index e50042f..2555add 160000
+--- a/External/Donut
++++ b/External/Donut
+@@ -1 +1 @@
+-Subproject commit e50042f4bbd762971cc90431261e967404855b81
++Subproject commit 2555adddb72c6471793c42376864c21ac5fa9769
+diff --git a/Samples/Pathtracer/KrcBench.cpp b/Samples/Pathtracer/KrcBench.cpp
+new file mode 100644
+index 0000000..0807d3e
+--- /dev/null
++++ b/Samples/Pathtracer/KrcBench.cpp
+@@ -0,0 +1,248 @@
++/*
++ * Branche krc : banc de mesure du path tracer d'exemple, piloté par variables d'environnement,
++ * pour comparer les caches de radiance (référence, SHaRC, NRC, KRC) sur la même image.
++ *
++ *   KRC_HIDDEN=1     fenêtre jamais montrée ni activée ; le rendu continue (mesures pendant que
++ *                    l'écran sert à autre chose)
++ *   KRC_OUT=dossier  sorties : images PFM (HDR linéaire, ce que lit la courbe de tons), fps.txt
++ *   KRC_SCRIPT=10:tech=sharc;10:den=nrd;300:capture=sharc_f300;400:exit
++ *     tech=ref|sharc|nrc|krc   méthode (ref : chemins complets sans cache)
++ *     den=none|acc|nrd         débruiteur (acc : moyenne des frames tant que rien ne bouge)
++ *     spp=N, bounces=N         échantillons par pixel, rebonds
++ *     jitter=0|1               décalage sous-pixel (0 : même échantillonnage que NRD)
++ *     cam=px,py,pz,tx,ty,tz    caméra : position et point visé
++ *     sun=S                    éclairement du soleil (20 par défaut dans la scène)
++ *     sky=S                    intensité du ciel (8 par défaut)
++ *     capture=nom              image de la frame (HDR) dans KRC_OUT/nom.pfm
++ *     fps=N                    temps GPU moyen sur N frames, ajouté à KRC_OUT/fps.txt
++ *     clear                    vide le cache (SHaRC)
++ *     exit                     quitte
++ */
++
++#include "Pathtracer.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <sstream>
++
++#include <GLFW/glfw3.h>
++
++using namespace donut;
++
++namespace
++{
++
++std::vector<float> SplitFloats(const std::string& s)
++{
++    std::vector<float> v;
++    std::stringstream ss(s);
++    std::string item;
++    while (std::getline(ss, item, ','))
++        v.push_back((float)std::atof(item.c_str()));
++    return v;
++}
++
++} // namespace
++
++bool Pathtracer::ShouldRenderUnfocused()
++{
++    return true;
++}
++
++void Pathtracer::KrcBenchInit()
++{
++    if (const char* s = std::getenv("KRC_OUT"))
++        m_krcOut = s;
++    if (const char* s = std::getenv("KRC_SCRIPT"))
++    {
++        std::stringstream ss(s);
++        std::string item;
++        while (std::getline(ss, item, ';'))
++        {
++            const size_t colon = item.find(':');
++            if (colon == std::string::npos)
++                continue;
++            KrcCommand c;
++            c.frame = (uint32_t)std::strtoul(item.substr(0, colon).c_str(), nullptr, 10);
++            const std::string rest = item.substr(colon + 1);
++            const size_t eq = rest.find('=');
++            c.key = rest.substr(0, eq);
++            c.value = eq == std::string::npos ? "" : rest.substr(eq + 1);
++            m_krcCommands.push_back(c);
++        }
++    }
++    m_krcTimer = GetDevice()->createTimerQuery();
++}
++
++void Pathtracer::KrcBenchBeforeRender()
++{
++    m_krcCaptureName.clear();
++    for (const KrcCommand& c : m_krcCommands)
++    {
++        if (c.frame != m_krcFrame)
++            continue;
++        if (c.key == "tech")
++        {
++            if (c.value == "ref")
++                m_ui.techSelection = TechSelection::None;
++            else if (c.value == "sharc")
++                m_ui.techSelection = TechSelection::Sharc;
++#if ENABLE_NRC
++            else if (c.value == "nrc")
++                m_ui.techSelection = TechSelection::Nrc;
++#endif
++            m_resetAccumulation = true;
++        }
++        else if (c.key == "den")
++        {
++            if (c.value == "none")
++                m_ui.denoiserType = DenoiserType::None;
++            else if (c.value == "acc")
++                m_ui.denoiserType = DenoiserType::Accumulation;
++            else if (c.value == "nrd")
++                m_ui.denoiserType = DenoiserType::Nrd;
++            m_resetAccumulation = true;
++        }
++        else if (c.key == "jitter")
++        {
++            // 0 pour comparer une frame débruitée (NRD coupe le jitter) à une référence au même
++            // échantillonnage : sinon toutes les arêtes diffèrent
++            m_ui.enableJitter = std::atoi(c.value.c_str()) != 0;
++            m_resetAccumulation = true;
++        }
++        else if (c.key == "spp")
++            m_ui.samplesPerPixel = std::max(1, std::atoi(c.value.c_str()));
++        else if (c.key == "bounces")
++            m_ui.bouncesMax = std::max(1, std::atoi(c.value.c_str()));
++        else if (c.key == "cam")
++        {
++            const std::vector<float> v = SplitFloats(c.value);
++            if (v.size() >= 6)
++                m_camera.LookAt(dm::float3(v[0], v[1], v[2]), dm::float3(v[3], v[4], v[5]));
++        }
++        else if (c.key == "sun")
++        {
++            m_pathtracerScene->GetSunLight()->irradiance = (float)std::atof(c.value.c_str());
++            m_resetAccumulation = true;
++        }
++        else if (c.key == "sky")
++        {
++            m_ui.skyIntensity = (float)std::atof(c.value.c_str());
++            m_resetAccumulation = true;
++        }
++        else if (c.key == "capture")
++            m_krcCaptureName = c.value;
++        else if (c.key == "fps")
++        {
++            m_krcFpsLeft = m_krcFpsFrames = (uint32_t)std::max(1, std::atoi(c.value.c_str()));
++            m_krcGpuSum = 0.0;
++            m_krcGpuCount = 0;
++        }
++        else if (c.key == "clear")
++            m_ui.sharcEnableClear = true;
++        else if (c.key == "exit")
++            m_krcExit = true;
++    }
++}
++
++void Pathtracer::KrcBenchAfterRender()
++{
++    nvrhi::IDevice* device = GetDevice();
++
++    if (m_ui.sharcEnableClear)
++        m_ui.sharcEnableClear = false;
++
++    // temps GPU de la frame (requête ouverte et fermée dans Render pendant une mesure) : on attend
++    // le GPU pour le lire, ce qui ralentit la cadence mais pas le temps mesuré
++    if (m_krcTiming)
++    {
++        device->waitForIdle();
++        if (device->pollTimerQuery(m_krcTimer))
++        {
++            m_krcGpuSum += device->getTimerQueryTime(m_krcTimer) * 1000.0;
++            m_krcGpuCount++;
++        }
++        device->resetTimerQuery(m_krcTimer);
++        m_krcTiming = false;
++        if (--m_krcFpsLeft == 0 && !m_krcOut.empty())
++        {
++            if (FILE* f = std::fopen((m_krcOut + "/fps.txt").c_str(), "a"))
++            {
++                std::fprintf(f, "frame %u tech %u gpu_ms %.4f frames %u\n", m_krcFrame, (uint32_t)m_ui.techSelection,
++                             m_krcGpuSum / std::max(1u, m_krcGpuCount), m_krcGpuCount);
++                std::fclose(f);
++            }
++        }
++    }
++
++    if (!m_krcCaptureName.empty() && !m_krcOut.empty())
++        KrcCapture(m_krcOut + "/" + m_krcCaptureName + ".pfm");
++
++    m_krcFrame++;
++    if (m_krcExit)
++        glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), 1);
++}
++
++// image HDR que lit la courbe de tons : l'accumulation si elle est active, sinon la sortie du
++// path tracer (débruitée si NRD) ; en PFM (flottants rgb, lignes de bas en haut)
++void Pathtracer::KrcCapture(const std::string& path)
++{
++    nvrhi::IDevice* device = GetDevice();
++    const bool accumulated = m_ui.denoiserType == DenoiserType::Accumulation;
++    nvrhi::ITexture* source = accumulated ? m_accumulationBuffer.Get() : m_renderTargets->outPathTracer.Get();
++    if (!source)
++        return;
++
++    nvrhi::TextureDesc desc = source->getDesc();
++    desc.isUAV = false;
++    desc.isRenderTarget = false;
++    desc.initialState = nvrhi::ResourceStates::CopyDest;
++    desc.keepInitialState = true;
++    desc.debugName = "KrcCaptureStaging";
++    nvrhi::StagingTextureHandle staging = device->createStagingTexture(desc, nvrhi::CpuAccessMode::Read);
++
++    nvrhi::CommandListHandle cmd = device->createCommandList();
++    cmd->open();
++    cmd->copyTexture(staging, nvrhi::TextureSlice(), source, nvrhi::TextureSlice());
++    cmd->close();
++    device->executeCommandList(cmd);
++    device->waitForIdle();
++
++    size_t pitch = 0;
++    const uint8_t* data = (const uint8_t*)device->mapStagingTexture(staging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &pitch);
++    if (!data)
++        return;
++    const uint32_t w = desc.width, h = desc.height;
++    std::vector<float> rgb((size_t)w * h * 3);
++    const bool half = desc.format == nvrhi::Format::RGBA16_FLOAT;
++    for (uint32_t y = 0; y < h; y++)
++    {
++        const uint8_t* row = data + (size_t)(h - 1 - y) * pitch; // PFM : de bas en haut
++        for (uint32_t x = 0; x < w; x++)
++        {
++            for (uint32_t c = 0; c < 3; c++)
++            {
++                float v;
++                if (half)
++                {
++                    const uint16_t hv = ((const uint16_t*)row)[x * 4 + c];
++                    const uint32_t sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1f, man = hv & 0x3ff;
++                    v = exp == 0 ? std::ldexp((float)man, -24) : (exp == 31 ? 65504.0f : std::ldexp((float)(man | 0x400), (int)exp - 25));
++                    if (sign)
++                        v = -v;
++                }
++                else
++                    v = ((const float*)row)[x * 4 + c];
++                rgb[((size_t)y * w + x) * 3 + c] = v;
++            }
++        }
++    }
++    device->unmapStagingTexture(staging);
++
++    if (FILE* f = std::fopen(path.c_str(), "wb"))
++    {
++        std::fprintf(f, "PF\n%u %u\n-1.0\n", w, h);
++        std::fwrite(rgb.data(), sizeof(float), rgb.size(), f);
++        std::fclose(f);
++    }
++}
+diff --git a/Samples/Pathtracer/Pathtracer.cpp b/Samples/Pathtracer/Pathtracer.cpp
+index 7f8f1fd..3ed7b6a 100644
+--- a/Samples/Pathtracer/Pathtracer.cpp
++++ b/Samples/Pathtracer/Pathtracer.cpp
+@@ -343,6 +343,7 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+     }
+ 
+     m_commandList = GetDevice()->createCommandList();
++    KrcBenchInit();
+ 
+     return true;
+ }
+@@ -507,6 +508,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+     const bool useRayReconstruction = useDlss && m_ui.dlssRayReconstructionSupported && m_ui.denoiserType == DenoiserType::Dlssrr;
+     const bool enableDlss = useDlss || useRayReconstruction;
+ 
++    KrcBenchBeforeRender();
++
+     m_pathtracerScene->GetScene()->RefreshSceneGraph(frameIndex);
+ 
+ #if DONUT_WITH_DLSS
+@@ -551,6 +554,9 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+     }
+ 
+     m_commandList->open();
++    m_krcTiming = m_krcFpsLeft > 0;
++    if (m_krcTiming)
++        m_commandList->beginTimerQuery(m_krcTimer);
+ 
+     if (m_accelStructBuilder->NeedsRebuild())
+     {
+@@ -1053,8 +1059,11 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         m_commandList->draw(args);
+     }
+ 
++    if (m_krcTiming)
++        m_commandList->endTimerQuery(m_krcTimer);
+     m_commandList->close();
+     device->executeCommandList(m_commandList);
++    KrcBenchAfterRender();
+ 
+     m_resetAccumulation = false;
+     m_pathtracerScene->ClearReloaded();
+diff --git a/Samples/Pathtracer/Pathtracer.h b/Samples/Pathtracer/Pathtracer.h
+index bd0ca51..3dafed1 100644
+--- a/Samples/Pathtracer/Pathtracer.h
++++ b/Samples/Pathtracer/Pathtracer.h
+@@ -85,7 +85,29 @@ public:
+ 
+     std::string GetResolutionInfo();
+ 
++    // banc de mesure (branche krc, KrcBench.cpp)
++    bool ShouldRenderUnfocused() override;
++    void KrcBenchInit();
++    void KrcBenchBeforeRender();
++    void KrcBenchAfterRender();
++    void KrcCapture(const std::string& path);
++
+ private:
++    struct KrcCommand
++    {
++        uint32_t frame;
++        std::string key, value;
++    };
++    std::vector<KrcCommand> m_krcCommands;
++    std::string m_krcOut;
++    std::string m_krcCaptureName;
++    uint32_t m_krcFrame = 0;
++    bool m_krcExit = false;
++    nvrhi::TimerQueryHandle m_krcTimer;
++    bool m_krcTiming = false;
++    uint32_t m_krcFpsFrames = 0, m_krcFpsLeft = 0, m_krcGpuCount = 0;
++    double m_krcGpuSum = 0.0;
++
+     Pipelines::BindingLayouts BuildBindingLayouts() const;
+ 
+     std::shared_ptr<donut::vfs::RootFileSystem> m_rootFileSystem;
+-- 
+2.55.0.windows.3
+

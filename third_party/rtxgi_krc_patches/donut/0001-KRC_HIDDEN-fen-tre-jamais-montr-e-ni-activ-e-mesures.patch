@@ -1,0 +1,37 @@
+From 2555adddb72c6471793c42376864c21ac5fa9769 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:49:43 +0200
+Subject: [PATCH] =?UTF-8?q?KRC=5FHIDDEN=20:=20fen=C3=AAtre=20jamais=20mont?=
+ =?UTF-8?q?r=C3=A9e=20ni=20activ=C3=A9e=20(mesures=20sans=20=C3=A9cran)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/app/DeviceManager.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/app/DeviceManager.cpp b/src/app/DeviceManager.cpp
+index b40faab..79820bb 100644
+--- a/src/app/DeviceManager.cpp
++++ b/src/app/DeviceManager.cpp
+@@ -465,8 +465,14 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain(const DeviceCreationParameter
+     if (!CreateSwapChain())
+         return false;
+ 
+-    glfwShowWindow(m_Window);
+-    glfwFocusWindow(m_Window);
++    // KRC_HIDDEN=1 (branche krc) : la fenêtre n'est jamais montrée ni activée, pour les mesures
++    // pendant que l'écran sert à autre chose ; le rendu continue (voir ShouldRenderUnfocused)
++    const char* hidden = getenv("KRC_HIDDEN");
++    if (!(hidden && atoi(hidden) != 0))
++    {
++        glfwShowWindow(m_Window);
++        glfwFocusWindow(m_Window);
++    }
+ 
+     if (m_DeviceParams.startMaximized)
+     {
+-- 
+2.55.0.windows.3
+

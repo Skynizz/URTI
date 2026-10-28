@@ -758,3 +758,46 @@ Deux pièges de mesure, corrigés avant ces chiffres :
   E1M2/E1M3 pour une raison qui n'était pas la qualité de son cache.
 - **Référence moyennée après écrêtage** : moyenner des images finales d'une référence bruitée
   perd l'énergie écrêtée dans les zones claires (KRC y paraissait +56 % trop clair).
+
+## 21. Banc de NVIDIA (SDK RTXGI) : NRD, lumière qui change, coût
+
+Path tracer d'exemple du SDK RTXGI de NVIDIA (DirectX 12, SHaRC v1.8.3 et NRD REBLUR intégrés par
+NVIDIA), branche `krc` de `F:\rtxgi\sdk`, rendu sans fenêtre visible. Référence : chemins complets
+accumulés (2 048 frames, jitter coupé comme NRD). ꟻLIP (NVlabs/flip, LDR, plus bas = mieux).
+Outils : `tools/rtxgi/compare.py` (image fixe), `tools/rtxgi/event.py` (changement de lumière).
+
+**Pourquoi KRC-A paraissait pire après NRD.** Test décisif : KRC-A sans lecture de la mère donne
+exactement l'image de SHaRC (salon : 0,0723 contre 0,0723). Mais la lecture de la mère n'abîme
+pas l'image : **le NRD de l'exemple perd 9 à 15 % d'énergie hors ciel**, même en path tracing
+complet sans cache (rapport sortie / entrée 0,913) ; SHaRC, trop clair de 5 % hors ciel, le
+compense en partie ; KRC-A, plus juste, non. À exposition égale (meilleur facteur pour chacun),
+KRC-A égale ou bat SHaRC : salon 0,0636 contre 0,0644. L'anti-lucioles de REBLUR n'y est pour
+rien (couper : −0,003 pour tous). Défaut de l'intégration NRD de l'exemple, à trouver.
+
+**Lumière qui change** (soleil 20 → 5 dans le salon ; luminance hors ciel −19 %). KRC-L = la table
+de SHaRC + rééclairage exact par groupes de lampes (`Libraries/Krc/include/KrcRelight.h`) ;
+« historique rééclairé » = entrée de NRD divisée par le produit S des facteurs (lissé à l'écran),
+sortie remultipliée.
+
+| ꟻLIP après NRD | +0 | +4 | +16 | +32 | +64 | +128 | +512 |
+|---|---|---|---|---|---|---|---|
+| SHaRC | 0,113 | 0,116 | 0,118 | 0,118 | 0,113 | 0,095 | 0,067 |
+| SHaRC, NRD vidé à la bascule | 0,165 | 0,159 | 0,149 | 0,143 | 0,130 | 0,103 | 0,067 |
+| KRC-L | 0,116 | 0,117 | 0,116 | 0,111 | 0,097 | 0,078 | 0,067 |
+| **KRC-L + historique rééclairé** | **0,094** | **0,093** | **0,093** | **0,091** | **0,086** | **0,078** | 0,067 |
+
+Image brute (luminance hors ciel / référence) : SHaRC 1,22 à la bascule, 1,08 à +128 ; KRC-L 1,05
+dès la frame 0, c'est-à-dire son niveau final. La confiance d'historique de NRD (`IN_DIFF_CONFIDENCE`)
+aide peu : REBLUR ne ramène l'historique qu'à une frame, l'ancien éclairage pèse encore 50 %.
+
+![Frame 0 après la coupure : SHaRC, KRC-L + historique rééclairé](../results/rtxgi/salon_soleil2/krcl_norm_nrd_0.png)
+
+**Lampes du Bistro de nuit** (4 lampes ponctuelles ajoutées, groupe A de 100 % à 20 % ; image ×3
+plus sombre) : brut, KRC-L juste dès la frame 0 (0,999 contre 1,108 pour SHaRC, rattrapé à +128).
+Après NRD, gain faible : NRD réagit seul à un changement aussi fort, et l'historique rééclairé
+assombrit 6 % de trop (rapport par cellule, alors que les pixels proches d'une lampe changent plus).
+
+**Image fixe** : KRC-L = SHaRC (salon 0,0742 contre 0,0730, dans l'écart d'une session ; Bistro
+identique). **Coût** après optimisation (salon, 1280×720) : SHaRC 3,85 ms, KRC-L 3,86 à 3,90 ms,
+KRC-A 4,09 ms. Avant, 5,84 ms : les passes par entrée remettaient à zéro les 4 M d'entrées de la
+table chaque frame ; elles ne nettoient plus qu'à l'éviction.

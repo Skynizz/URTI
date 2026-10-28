@@ -40,7 +40,8 @@ KRC. À compléter avant toute revendication de nouveauté.
 ## Ce qui reste propre à KRC (à vérifier dans la littérature avant de le revendiquer)
 
 - Chemins corrélés avant / après un changement de lampes, avec Δ = 0 exact là où rien ne change.
-- Rééclairage exact par groupes de lampes, appliqué aussi à l'historique du débruiteur.
+- Rééclairage exact par groupes de lampes, appliqué aussi à l'historique du débruiteur ; pour un
+  débruiteur fermé (NRD), par normalisation de son entrée par le produit des facteurs de la cellule.
 - Guide figé pendant un événement (même loi de tirage pour l'ancienne et la nouvelle scène), pour
   que les chemins corrélés restent exacts tout en étant guidés.
 - Taille des cellules décidée par un test statistique (cellule fine / mère, rétrécissement).

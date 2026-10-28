@@ -1,0 +1,36 @@
+{
+ "reglages": {
+  "scene": "LivingRoom.scene.json",
+  "name": "salon_path",
+  "methods": [
+   "path",
+   "sharc"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 512,
+  "eval_only": false
+ },
+ "resultats": {
+  "path": {
+   "nrd_flip": 0.09288720227777958,
+   "nrd_flip_ecart": 0.00022302020859222622,
+   "nrd_psnr": 31.386506289853585,
+   "bruit_brut": 0.16921784565511716,
+   "biais_flip": 0.0546715222299099,
+   "biais_relmse": 0.025249309931521965,
+   "lum": 0.9999474766044868,
+   "gpu_ms": 6.062
+  },
+  "sharc": {
+   "nrd_flip": 0.07318556495010853,
+   "nrd_flip_ecart": 0.001379039612035975,
+   "nrd_psnr": 32.18501656807235,
+   "bruit_brut": 0.14310648189108183,
+   "biais_flip": 0.0761939212679863,
+   "biais_relmse": 0.01666167307309675,
+   "lum": 1.0229182082349957,
+   "gpu_ms": 4.0263
+  }
+ }
+}

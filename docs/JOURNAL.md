@@ -476,3 +476,28 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   biais aussi (Neural Two-Level Monte Carlo, 2025). Restent propres à KRC : chemins corrélés exacts,
   rééclairage par groupes de lampes et de l'historique du débruiteur, guide figé pendant un
   événement, taille des cellules par test statistique.
+
+## v23 — banc NVIDIA : NRD compris, rééclairage exact, bibliothèque KRC
+
+- **NRD et KRC-A** : KRC-A sans lecture de la mère redonne l'image de SHaRC ; mais la cause n'est
+  pas la mère : le NRD de l'exemple perd 9 à 15 % d'énergie hors ciel, même en path tracing pur,
+  et SHaRC (+5 % hors ciel) le compense. À exposition égale, KRC-A égale ou bat SHaRC.
+  Anti-lucioles de REBLUR : sans rapport (bascule `nrdaf`).
+- **Rééclairage exact dans le banc NVIDIA** (lampes de la scène en 3 groupes suivis) : parts des
+  groupes par cellule, suivies le long des chemins de SHaRC avec ses poids (y compris quand un
+  sommet relit le cache) ; passe `krcRelight` avant la mise à jour quand le moteur connaît le
+  rapport. Image brute juste dès la frame 0 (salon, Bistro de nuit).
+- **Historique de NRD** : la confiance d'historique de REBLUR ne suffit pas (historique ramené à
+  une frame, pas à zéro). Ce qui marche : diviser l'entrée de NRD par le produit S des facteurs de
+  la cellule du pixel et remultiplier sa sortie ; son historique ressort rééclairé sans y toucher.
+  S lissé à l'écran (sinon les cellules se dessinent). Salon, coupure du soleil : ꟻLIP 0,094 dès
+  la frame 0 contre 0,113 pour SHaRC, qui ne rattrape qu'à +128.
+- **Bistro de nuit** : 4 lampes ajoutées par le banc (`lampadd`). Piège : l'exemple ne tire que
+  la lampe 0 en lumière directe (`targetLight = 0`). Après NRD, gain faible et S assombrit 6 % de
+  trop (rapport par cellule) : prochain correctif, rapport par pixel de la lumière directe.
+- **Coût** : +2 ms au premier essai, ramené à +0,01–0,05 ms : les passes par entrée remettaient à
+  zéro les 4 M d'entrées de la table à chaque frame ; elles ne nettoient plus qu'à l'éviction
+  (même correctif pour KRC-A : +0,24 ms).
+- **Bibliothèque** : `Libraries/Krc/include/KrcRelight.h` (GPU, conventions de SHaRC) et
+  `KrcRelightHost.h` (CPU) ; l'exemple les utilise ; copie dans `krc_sdk/include`, mode d'emploi
+  docs/INTEGRATION.md. Analyse des prochaines étapes : FEUILLE_DE_ROUTE, « Analyse (octobre 2026) ».

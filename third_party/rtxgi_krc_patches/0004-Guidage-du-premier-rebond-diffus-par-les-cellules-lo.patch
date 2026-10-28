@@ -1,0 +1,388 @@
+From dd65f6c808535ddceb3fd1084a4015681938c822 Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:43:33 +0200
+Subject: [PATCH 4/5] =?UTF-8?q?Guidage=20du=20premier=20rebond=20diffus=20?=
+ =?UTF-8?q?par=20les=20cellules=20(lobe=20de=20von=20Mises-Fisher,=20m?=
+ =?UTF-8?q?=C3=A9lange=20d=C3=A9fensif,=20MIS)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Samples/Pathtracer/KrcBench.cpp              |  6 ++
+ Samples/Pathtracer/LightingCb.h              |  2 +-
+ Samples/Pathtracer/Pathtracer.cpp            | 17 ++++
+ Samples/Pathtracer/Pathtracer.h              |  2 +
+ Samples/Pathtracer/Shaders/KrcGuide.hlsli    | 89 ++++++++++++++++++++
+ Samples/Pathtracer/Shaders/Pathtracer.hlsl   | 76 ++++++++++++++++-
+ Samples/Pathtracer/Shaders/SharcResolve.hlsl | 15 ++++
+ Samples/Pathtracer/UI.h                      |  1 +
+ 8 files changed, 206 insertions(+), 2 deletions(-)
+ create mode 100644 Samples/Pathtracer/Shaders/KrcGuide.hlsli
+
+diff --git a/Samples/Pathtracer/KrcBench.cpp b/Samples/Pathtracer/KrcBench.cpp
+index 720aca4..af389f4 100644
+--- a/Samples/Pathtracer/KrcBench.cpp
++++ b/Samples/Pathtracer/KrcBench.cpp
+@@ -11,6 +11,7 @@
+  *     scale=S                  échelle des cellules (sharcSceneScale, 50 par défaut ; 100 : deux fois
+  *                              plus fines) ; vide le cache
+  *     krctol=T, krcdebug=0|1   tolérance relative du mélange ; affichage de la part de la mère
++ *     guide=0|1                premier rebond diffus guidé par les cellules (KrcGuide.hlsli)
+  *     den=none|acc|nrd         débruiteur (acc : moyenne des frames tant que rien ne bouge)
+  *     spp=N, bounces=N         échantillons par pixel, rebonds
+  *     jitter=0|1               décalage sous-pixel (0 : même échantillonnage que NRD)
+@@ -158,6 +159,11 @@ void Pathtracer::KrcBenchBeforeRender()
+         }
+         else if (c.key == "krctol")
+             m_ui.krcTolerance = (float)std::atof(c.value.c_str());
++        else if (c.key == "guide")
++        {
++            m_ui.krcGuide = std::atoi(c.value.c_str()) != 0;
++            m_ui.sharcEnableClear = true;
++        }
+         else if (c.key == "krcdebug")
+             m_ui.krcDebug = std::atoi(c.value.c_str()) != 0;
+         else if (c.key == "clear")
+diff --git a/Samples/Pathtracer/LightingCb.h b/Samples/Pathtracer/LightingCb.h
+index 73e307e..e562583 100644
+--- a/Samples/Pathtracer/LightingCb.h
++++ b/Samples/Pathtracer/LightingCb.h
+@@ -46,7 +46,7 @@ struct LightingConstants
+     int krcAdaptive;
+     float krcTolerance;
+     int krcDebug;
+-    int krcPad;
++    int krcGuide;     // premier rebond diffus guidé par les cellules (KrcGuide.hlsli)
+ 
+     float4 sharcCameraPosition;
+     float4 sharcCameraPositionPrev;
+diff --git a/Samples/Pathtracer/Pathtracer.cpp b/Samples/Pathtracer/Pathtracer.cpp
+index 42a6411..f39c1e7 100644
+--- a/Samples/Pathtracer/Pathtracer.cpp
++++ b/Samples/Pathtracer/Pathtracer.cpp
+@@ -251,6 +251,8 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(2),
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(3),
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(4), // branche krc : moments des cellules
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(5), // branche krc : guide, sommes de la frame
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(6), // branche krc : guide lissé
+     };
+     m_sharcBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
+ #endif // ENABLE_SHARC
+@@ -313,6 +315,16 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         bufferDesc.debugName = "m_krcMomentsBuffer";
+         m_krcMomentsBuffer = GetDevice()->createBuffer(bufferDesc);
+ 
++        bufferDesc.structStride = sizeof(uint64_t);
++        bufferDesc.byteSize = (uint64_t)m_sharcEntriesNum * 4 * bufferDesc.structStride;
++        bufferDesc.debugName = "m_krcGuideAccBuffer";
++        m_krcGuideAccBuffer = GetDevice()->createBuffer(bufferDesc);
++
++        bufferDesc.structStride = 4 * sizeof(float);
++        bufferDesc.byteSize = m_sharcEntriesNum * bufferDesc.structStride;
++        bufferDesc.debugName = "m_krcGuideBuffer";
++        m_krcGuideBuffer = GetDevice()->createBuffer(bufferDesc);
++
+         nvrhi::BindingSetDesc bindingSetDesc;
+         bindingSetDesc.bindings = {
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer),
+@@ -320,6 +332,8 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(2, m_sharcAccumulationBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcResolvedBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(4, m_krcMomentsBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(5, m_krcGuideAccBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(6, m_krcGuideBuffer),
+         };
+         m_sharcBindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_sharcBindingLayout);
+     }
+@@ -706,6 +720,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         constants.krcAdaptive = m_ui.krcAdaptive ? 1 : 0;
+         constants.krcTolerance = m_ui.krcTolerance;
+         constants.krcDebug = m_ui.krcDebug ? 1 : 0;
++        constants.krcGuide = m_ui.krcGuide ? 1 : 0;
+     }
+ 
+     if (m_ui.sharcUpdateViewCamera || m_ui.techSelection != TechSelection::Sharc)
+@@ -908,6 +923,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+                 m_commandList->clearBufferUInt(m_sharcAccumulationBuffer, 0);
+                 m_commandList->clearBufferUInt(m_sharcResolvedBuffer, 0);
+                 m_commandList->clearBufferUInt(m_krcMomentsBuffer, 0);
++                m_commandList->clearBufferUInt(m_krcGuideAccBuffer, 0);
++                m_commandList->clearBufferUInt(m_krcGuideBuffer, 0);
+             }
+ 
+             // SHARC update
+diff --git a/Samples/Pathtracer/Pathtracer.h b/Samples/Pathtracer/Pathtracer.h
+index 9640cb8..2eaf28c 100644
+--- a/Samples/Pathtracer/Pathtracer.h
++++ b/Samples/Pathtracer/Pathtracer.h
+@@ -174,6 +174,8 @@ private:
+     nvrhi::BufferHandle m_sharcAccumulationBuffer;
+     nvrhi::BufferHandle m_sharcResolvedBuffer;
+     nvrhi::BufferHandle m_krcMomentsBuffer; // branche krc : moments des cellules (KrcAdaptive.hlsli)
++    nvrhi::BufferHandle m_krcGuideAccBuffer; // branche krc : guide du premier rebond (KrcGuide.hlsli)
++    nvrhi::BufferHandle m_krcGuideBuffer;
+ 
+     nvrhi::BindingLayoutHandle m_sharcBindingLayout;
+     nvrhi::BindingSetHandle m_sharcBindingSet;
+diff --git a/Samples/Pathtracer/Shaders/KrcGuide.hlsli b/Samples/Pathtracer/Shaders/KrcGuide.hlsli
+new file mode 100644
+index 0000000..69e8bc7
+--- /dev/null
++++ b/Samples/Pathtracer/Shaders/KrcGuide.hlsli
+@@ -0,0 +1,89 @@
++/*
++ * Branche krc : premier rebond diffus guidé par les cellules du cache (KRC_GUIDE).
++ *
++ * Chaque cellule apprend la direction de la lumière qui arrive sur sa surface (moyenne pondérée par
++ * L·cos/p, de chemins déjà tirés), d'où un lobe de von Mises-Fisher : direction moyenne μ, et
++ * concentration κ tirée de la longueur r de la moyenne (approximation de Banerjee,
++ * κ ≈ r(3 − r²)/(1 − r²)). Bien plus pointu qu'une harmonique sphérique d'ordre 1, qui ne dépasse
++ * pas quatre fois la densité uniforme.
++ *
++ * Tirage : mélange défensif, α du tirage du BRDF de l'exemple, 1 − α du lobe ; poids f·cos/p_mélange
++ * (MIS à un échantillon) : sans biais, quel que soit le guide. Une source rare trouvée une fois
++ * devient une direction apprise, visée souvent avec un poids faible au lieu d'un poids énorme.
++ *
++ * Proche de Real-Time Markov Chain Path Guiding (Alber, Hanika, Dachsbacher, I3D 2025), qui garde
++ * des mélanges de vMF dans des tables de hachage ; ici un seul lobe par cellule du cache, appris
++ * par ses propres chemins.
++ */
++
++#ifndef KRC_GUIDE_HLSLI
++#define KRC_GUIDE_HLSLI
++
++#define KRC_GUIDE_BRDF_FRACTION 0.5f    // part du tirage du BRDF (défensive)
++#define KRC_GUIDE_SCALE         1024.0f // virgule fixe des sommes (atomiques entières 64 bits)
++
++struct KrcLobe
++{
++    bool valid;
++    float3 mu;
++    float kappa;
++};
++
++KrcLobe KrcGuideLobe(float4 guide)
++{
++    KrcLobe lobe;
++    lobe.valid = false;
++    lobe.mu = float3(0, 0, 1);
++    lobe.kappa = 0;
++    if (guide.w <= 1e-6f)
++        return lobe;
++    const float3 m = guide.xyz / guide.w;
++    const float r = length(m);
++    if (r < 0.05f)
++        return lobe; // lumière sans direction marquée : le BRDF suffit
++    const float rc = min(r, 0.995f);
++    lobe.valid = true;
++    lobe.mu = m / r;
++    lobe.kappa = min(rc * (3.0f - rc * rc) / (1.0f - rc * rc), 500.0f);
++    return lobe;
++}
++
++float KrcVmfPdf(KrcLobe lobe, float3 w)
++{
++    const float k = lobe.kappa;
++    return k / (2.0f * 3.14159265f * (1.0f - exp(-2.0f * k))) * exp(k * (dot(lobe.mu, w) - 1.0f));
++}
++
++float3 KrcVmfSample(KrcLobe lobe, float2 u)
++{
++    const float k = lobe.kappa;
++    const float c = 1.0f + log(u.x + (1.0f - u.x) * exp(-2.0f * k)) / k; // cos de l'angle à μ
++    const float s = sqrt(max(1.0f - c * c, 0.0f));
++    const float phi = 2.0f * 3.14159265f * u.y;
++    const float3 t = abs(lobe.mu.z) < 0.999f ? normalize(cross(lobe.mu, float3(0, 0, 1))) : float3(1, 0, 0);
++    const float3 b = cross(lobe.mu, t);
++    return normalize(c * lobe.mu + s * (cos(phi) * t + sin(phi) * b));
++}
++
++// le poids diffus de l'exemple (lambertien × (1 − Fresnel), déjà divisé par la densité du tirage en
++// cosinus) évalué dans une direction donnée ; pdfCos : cette densité
++float3 KrcDiffuseWeightAt(float3 direction, float3 shadingNormal, float3 V, MaterialSample material, float2 u, out float pdfCos)
++{
++    pdfCos = 0;
++    float4 qRotationToZ = getRotationToZAxis(shadingNormal);
++    const float3 Vlocal = rotatePoint(qRotationToZ, V);
++    const float3 Llocal = rotatePoint(qRotationToZ, direction);
++    if (Llocal.z <= 0.0f || Vlocal.z <= 0.0f)
++        return float3(0, 0, 0);
++    const BrdfData data = prepareBRDFData(float3(0, 0, 1), Llocal, Vlocal, material);
++    float3 weight = data.diffuseReflectance * diffuseTerm(data);
++#if COMBINE_BRDFS_WITH_FRESNEL
++    const float3 H = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
++    const float VdotH = max(0.00001f, min(1.0f, dot(Vlocal, H)));
++    weight *= (float3(1, 1, 1) - evalFresnel(data.specularF0, shadowedF90(data.specularF0), VdotH));
++#endif
++    pdfCos = diffusePdf(data.NdotL);
++    return weight;
++}
++
++#endif // KRC_GUIDE_HLSLI
+diff --git a/Samples/Pathtracer/Shaders/Pathtracer.hlsl b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+index 064c91f..b554b53 100644
+--- a/Samples/Pathtracer/Shaders/Pathtracer.hlsl
++++ b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+@@ -93,8 +93,11 @@ RWStructuredBuffer<uint>                    u_SharcLockBuffer               : re
+ RWStructuredBuffer<SharcAccumulationData>   u_SharcAccumulationBuffer       : register(u2, space3);
+ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer           : register(u3, space3);
+ RWStructuredBuffer<float4>                  u_KrcMoments                    : register(u4, space3);
++RWStructuredBuffer<uint64_t>                u_KrcGuideAcc                   : register(u5, space3);
++RWStructuredBuffer<float4>                  u_KrcGuide                      : register(u6, space3);
+ 
+ #include "KrcAdaptive.hlsli"
++#include "KrcGuide.hlsli"
+ 
+ RayDesc GeneratePinholeCameraRay(float2 normalizedDeviceCoordinate, float4x4 viewToWorld, float4x4 viewToClip)
+ {
+@@ -451,6 +454,13 @@ void PathTraceRays()
+ 
+         bool internalRay = false;
+ 
++        // branche krc : premier rebond guidé, et ce qu'il faut pour nourrir le guide en fin de chemin
++        uint krcGuideCell = 0xffffffffu;
++        float3 krcRadianceBefore = float3(0, 0, 0);
++        float3 krcThroughput1 = float3(0, 0, 0);
++        float3 krcDirection1 = float3(0, 0, 1);
++        float krcCosOverPdf1 = 0;
++
+         int bounce;
+         for (bounce = 0; true/* break from the middle */; bounce++)
+         {
+@@ -733,7 +743,50 @@ void PathTraceRays()
+ 
+             // Generates a new ray direction
+             float2 rand2 = float2(Rand(rngState), Rand(rngState));
+-            if (!evalIndirectCombinedBRDF(rand2, shadingNormal, geometryNormal, viewVector, material, brdfType, refractiveIndex, ray.Direction, brdfWeight, brdfPdf))
++            bool sampledDirection;
++#if SHARC_QUERY
++            // branche krc : premier rebond diffus guidé par la cellule du point (mélange défensif, MIS)
++            if (g_Lighting.krcGuide != 0 && bounce == 0 && brdfType == DIFFUSE_TYPE)
++            {
++                KrcLobe lobe = KrcGuideLobe(float4(0, 0, 0, 0));
++                {
++                    const HashGridKey key = HashGridComputeSpatialHash(hitPosition, geometryNormal, sharcParameters.hashGridParameters);
++                    const uint baseSlot = HashGridGetBaseSlot(key, sharcParameters.hashGridData.capacity);
++                    HashGridIndex cell;
++                    uint bucketOffset;
++                    if (HashGridFind(sharcParameters.hashGridData, key, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, cell, bucketOffset))
++                    {
++                        krcGuideCell = cell;
++                        lobe = KrcGuideLobe(u_KrcGuide[cell]);
++                    }
++                }
++                const float alpha = lobe.valid ? KRC_GUIDE_BRDF_FRACTION : 1.0f;
++                float pdfCos = 0;
++                if (Rand(rngState) < alpha)
++                {
++                    sampledDirection = evalIndirectCombinedBRDF(rand2, shadingNormal, geometryNormal, viewVector, material, brdfType, refractiveIndex, ray.Direction, brdfWeight, brdfPdf);
++                    pdfCos = brdfPdf;
++                }
++                else
++                {
++                    ray.Direction = KrcVmfSample(lobe, rand2);
++                    brdfWeight = KrcDiffuseWeightAt(ray.Direction, shadingNormal, viewVector, material, float2(Rand(rngState), Rand(rngState)), pdfCos);
++                    sampledDirection = pdfCos > 0 && dot(geometryNormal, ray.Direction) > 0 && luminance(brdfWeight) > 0;
++                }
++                if (sampledDirection && lobe.valid)
++                {
++                    const float pdfMix = alpha * pdfCos + (1.0f - alpha) * KrcVmfPdf(lobe, ray.Direction);
++                    brdfWeight *= pdfCos / max(pdfMix, 1e-8f);
++                    brdfPdf = pdfMix;
++                }
++                krcRadianceBefore = sampleRadiance;
++                krcDirection1 = ray.Direction;
++                krcCosOverPdf1 = max(dot(shadingNormal, ray.Direction), 0.0f) / max(brdfPdf, 1e-8f);
++            }
++            else
++#endif // SHARC_QUERY
++                sampledDirection = evalIndirectCombinedBRDF(rand2, shadingNormal, geometryNormal, viewVector, material, brdfType, refractiveIndex, ray.Direction, brdfWeight, brdfPdf);
++            if (!sampledDirection)
+             {
+                 NrcSetDebugPathTerminationReason(nrcPathState, NrcDebugPathTerminationReason::BRDFAbsorption);
+                 break; // Ray was eaten by the surface :(
+@@ -762,6 +815,8 @@ void PathTraceRays()
+ 
+             // Account for surface properties using the BRDF "weight"
+             throughput *= brdfWeight;
++            if (bounce == 0)
++                krcThroughput1 = throughput;
+ 
+             SharcSetRadianceDirectionWeight(sharcState, (brdfType == SPECULAR_TYPE) ? saturate(1.0f - material.roughness * material.roughness) : 0.0f);
+             SharcSetThroughput(sharcState, throughput);
+@@ -772,6 +827,25 @@ void PathTraceRays()
+ 
+         NrcWriteFinalPathInfo(nrcContext, nrcPathState, throughput, sampleRadiance);
+ 
++#if SHARC_QUERY
++        // branche krc : la lumière arrivée par le premier rebond nourrit le guide de la cellule
++        // (L·cos/p, un pixel sur quatre pour limiter les atomiques)
++        if (g_Lighting.krcGuide != 0 && krcGuideCell != 0xffffffffu &&
++            ((launchIndex.x + 3u * launchIndex.y + g_Global.frameIndex) & 3u) == 0u)
++        {
++            const float3 incoming = max(sampleRadiance - krcRadianceBefore, 0.0f) / max(krcThroughput1, float3(1e-6f, 1e-6f, 1e-6f));
++            const float w = min(luminance(incoming) * krcCosOverPdf1, 1e4f);
++            if (w > 0.0f)
++            {
++                const float4 v = float4(krcDirection1 * w, w) * KRC_GUIDE_SCALE;
++                InterlockedAdd(u_KrcGuideAcc[4u * krcGuideCell + 0u], uint64_t(int64_t(v.x)));
++                InterlockedAdd(u_KrcGuideAcc[4u * krcGuideCell + 1u], uint64_t(int64_t(v.y)));
++                InterlockedAdd(u_KrcGuideAcc[4u * krcGuideCell + 2u], uint64_t(int64_t(v.z)));
++                InterlockedAdd(u_KrcGuideAcc[4u * krcGuideCell + 3u], uint64_t(int64_t(v.w)));
++            }
++        }
++#endif // SHARC_QUERY
++
+ #if !NRC_UPDATE && !SHARC_UPDATE
+         UpdateSampleData(accumulatedSampleData, sampleRadiance, isDiffusePath, hitDistance);
+ 
+diff --git a/Samples/Pathtracer/Shaders/SharcResolve.hlsl b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+index c2837a8..f5fa021 100644
+--- a/Samples/Pathtracer/Shaders/SharcResolve.hlsl
++++ b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+@@ -22,6 +22,8 @@ RWStructuredBuffer<HashGridKey>             u_SharcHashEntriesBuffer    : regist
+ RWStructuredBuffer<SharcAccumulationData>   u_SharcAccumulationBuffer   : register(u2, space3);
+ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer       : register(u3, space3);
+ RWStructuredBuffer<float4>                  u_KrcMoments                : register(u4, space3);
++RWStructuredBuffer<uint64_t>                u_KrcGuideAcc               : register(u5, space3);
++RWStructuredBuffer<float4>                  u_KrcGuide                  : register(u6, space3);
+ 
+ #include "KrcAdaptive.hlsli"
+ 
+@@ -54,6 +56,19 @@ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+         KrcResolveWeight(did.x, sharcParameters, g_Lighting.krcTolerance, u_KrcMoments);
+     }
+ 
++    // branche krc : guide du premier rebond, moyenne glissante des sommes de la frame
++    if (g_Lighting.krcGuide != 0 && did.x < sharcParameters.hashGridData.capacity)
++    {
++        const bool valid = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, did.x) != HASH_GRID_INVALID_HASH_KEY;
++        float4 acc;
++        for (uint k = 0; k < 4; k++)
++        {
++            acc[k] = float(int64_t(u_KrcGuideAcc[4u * did.x + k])) / 1024.0f;
++            u_KrcGuideAcc[4u * did.x + k] = 0;
++        }
++        u_KrcGuide[did.x] = valid ? u_KrcGuide[did.x] * 0.95f + acc : float4(0, 0, 0, 0);
++    }
++
+     SharcResolveEntry(did.x, sharcParameters, resolveParameters);
+ }
+ 
+diff --git a/Samples/Pathtracer/UI.h b/Samples/Pathtracer/UI.h
+index 9de8919..6145507 100644
+--- a/Samples/Pathtracer/UI.h
++++ b/Samples/Pathtracer/UI.h
+@@ -161,6 +161,7 @@ struct UIData
+     bool krcAdaptive = false;
+     float krcTolerance = 0.03f;
+     bool krcDebug = false;
++    bool krcGuide = false;   // premier rebond diffus guidé par les cellules
+ #endif // ENABLE_SHARC
+ 
+     bool dlssSupported = false;
+-- 
+2.55.0.windows.3
+

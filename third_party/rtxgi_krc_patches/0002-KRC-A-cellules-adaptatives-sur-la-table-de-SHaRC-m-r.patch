@@ -1,0 +1,507 @@
+From 18aa4f11841420da25fa72acc2a3f519d448a02f Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:55:45 +0200
+Subject: [PATCH 2/5] =?UTF-8?q?KRC-A=20:=20cellules=20adaptatives=20sur=20?=
+ =?UTF-8?q?la=20table=20de=20SHaRC=20(m=C3=A8re=20par=20cellule=20fine,=20?=
+ =?UTF-8?q?m=C3=A9lange=20statistique)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Passe krcPropagate : les sommes de la frame de chaque cellule fine vont aussi à sa mère, deux fois
+  plus grande (bit 63 de la clé).
+- Moments par entrée (variance d'une frame à l'autre de la moyenne), à la résolution.
+- Lecture : rétrécissement de James-Stein vers la mère, avec une tolérance relative.
+- Banc : tech=krc, scale=, krctol=, krcdebug=.
+
+---
+ Samples/Pathtracer/KrcBench.cpp              |  24 ++-
+ Samples/Pathtracer/LightingCb.h              |   6 +
+ Samples/Pathtracer/Pathtracer.cpp            |  20 +++
+ Samples/Pathtracer/Pathtracer.h              |   1 +
+ Samples/Pathtracer/Pipelines.cpp             |  10 ++
+ Samples/Pathtracer/Pipelines.h               |   3 +
+ Samples/Pathtracer/Shaders/KrcAdaptive.hlsli | 164 +++++++++++++++++++
+ Samples/Pathtracer/Shaders/Pathtracer.hlsl   |  21 ++-
+ Samples/Pathtracer/Shaders/SharcResolve.hlsl |  26 ++-
+ Samples/Pathtracer/UI.h                      |   5 +
+ Samples/Pathtracer/shaders.cfg               |   1 +
+ 11 files changed, 278 insertions(+), 3 deletions(-)
+ create mode 100644 Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+
+diff --git a/Samples/Pathtracer/KrcBench.cpp b/Samples/Pathtracer/KrcBench.cpp
+index 0807d3e..720aca4 100644
+--- a/Samples/Pathtracer/KrcBench.cpp
++++ b/Samples/Pathtracer/KrcBench.cpp
+@@ -6,7 +6,11 @@
+  *                    l'écran sert à autre chose)
+  *   KRC_OUT=dossier  sorties : images PFM (HDR linéaire, ce que lit la courbe de tons), fps.txt
+  *   KRC_SCRIPT=10:tech=sharc;10:den=nrd;300:capture=sharc_f300;400:exit
+- *     tech=ref|sharc|nrc|krc   méthode (ref : chemins complets sans cache)
++ *     tech=ref|sharc|nrc|krc   méthode (ref : chemins complets sans cache ; krc : la table de SHaRC
++ *                              avec les cellules adaptatives de KRC)
++ *     scale=S                  échelle des cellules (sharcSceneScale, 50 par défaut ; 100 : deux fois
++ *                              plus fines) ; vide le cache
++ *     krctol=T, krcdebug=0|1   tolérance relative du mélange ; affichage de la part de la mère
+  *     den=none|acc|nrd         débruiteur (acc : moyenne des frames tant que rien ne bouge)
+  *     spp=N, bounces=N         échantillons par pixel, rebonds
+  *     jitter=0|1               décalage sous-pixel (0 : même échantillonnage que NRD)
+@@ -86,7 +90,16 @@ void Pathtracer::KrcBenchBeforeRender()
+             if (c.value == "ref")
+                 m_ui.techSelection = TechSelection::None;
+             else if (c.value == "sharc")
++            {
++                m_ui.techSelection = TechSelection::Sharc;
++                m_ui.krcAdaptive = false;
++            }
++            else if (c.value == "krc")
++            {
++                // KRC-A : la table de SHaRC avec les cellules adaptatives
+                 m_ui.techSelection = TechSelection::Sharc;
++                m_ui.krcAdaptive = true;
++            }
+ #if ENABLE_NRC
+             else if (c.value == "nrc")
+                 m_ui.techSelection = TechSelection::Nrc;
+@@ -138,6 +151,15 @@ void Pathtracer::KrcBenchBeforeRender()
+             m_krcGpuSum = 0.0;
+             m_krcGpuCount = 0;
+         }
++        else if (c.key == "scale")
++        {
++            m_ui.sharcSceneScale = (float)std::atof(c.value.c_str());
++            m_ui.sharcEnableClear = true;
++        }
++        else if (c.key == "krctol")
++            m_ui.krcTolerance = (float)std::atof(c.value.c_str());
++        else if (c.key == "krcdebug")
++            m_ui.krcDebug = std::atoi(c.value.c_str()) != 0;
+         else if (c.key == "clear")
+             m_ui.sharcEnableClear = true;
+         else if (c.key == "exit")
+diff --git a/Samples/Pathtracer/LightingCb.h b/Samples/Pathtracer/LightingCb.h
+index f361d6e..73e307e 100644
+--- a/Samples/Pathtracer/LightingCb.h
++++ b/Samples/Pathtracer/LightingCb.h
+@@ -42,6 +42,12 @@ struct LightingConstants
+     float sharcSceneScale;
+     float sharcRoughnessThreshold;
+ 
++    // branche krc : cellules adaptatives (KrcAdaptive.hlsli)
++    int krcAdaptive;
++    float krcTolerance;
++    int krcDebug;
++    int krcPad;
++
+     float4 sharcCameraPosition;
+     float4 sharcCameraPositionPrev;
+ 
+diff --git a/Samples/Pathtracer/Pathtracer.cpp b/Samples/Pathtracer/Pathtracer.cpp
+index 3ed7b6a..42a6411 100644
+--- a/Samples/Pathtracer/Pathtracer.cpp
++++ b/Samples/Pathtracer/Pathtracer.cpp
+@@ -250,6 +250,7 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(1),
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(2),
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(3),
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(4), // branche krc : moments des cellules
+     };
+     m_sharcBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
+ #endif // ENABLE_SHARC
+@@ -307,12 +308,18 @@ bool Pathtracer::Initialize(int argc, const char* const* argv)
+         bufferDesc.debugName = "m_sharcResolvedBuffer";
+         m_sharcResolvedBuffer = GetDevice()->createBuffer(bufferDesc);
+ 
++        bufferDesc.structStride = 4 * sizeof(float);
++        bufferDesc.byteSize = m_sharcEntriesNum * bufferDesc.structStride;
++        bufferDesc.debugName = "m_krcMomentsBuffer";
++        m_krcMomentsBuffer = GetDevice()->createBuffer(bufferDesc);
++
+         nvrhi::BindingSetDesc bindingSetDesc;
+         bindingSetDesc.bindings = {
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(1, m_sharcLockBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(2, m_sharcAccumulationBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcResolvedBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(4, m_krcMomentsBuffer),
+         };
+         m_sharcBindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_sharcBindingLayout);
+     }
+@@ -696,6 +703,9 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         constants.sharcAccumulationFrameNum = m_ui.sharcAccumulationFrameNum;
+         constants.sharcStaleFrameNum = m_ui.sharcStaleFrameNum;
+         constants.sharcEnableAntiFireflyFilter = m_ui.sharcEnableAntiFireflyFilter;
++        constants.krcAdaptive = m_ui.krcAdaptive ? 1 : 0;
++        constants.krcTolerance = m_ui.krcTolerance;
++        constants.krcDebug = m_ui.krcDebug ? 1 : 0;
+     }
+ 
+     if (m_ui.sharcUpdateViewCamera || m_ui.techSelection != TechSelection::Sharc)
+@@ -897,6 +907,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+                 m_commandList->clearBufferUInt(m_sharcHashEntriesBuffer, m_sharcInvalidEntry);
+                 m_commandList->clearBufferUInt(m_sharcAccumulationBuffer, 0);
+                 m_commandList->clearBufferUInt(m_sharcResolvedBuffer, 0);
++                m_commandList->clearBufferUInt(m_krcMomentsBuffer, 0);
+             }
+ 
+             // SHARC update
+@@ -921,6 +932,15 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+                 else
+                     computeState.bindings = { m_globalBindingSet, m_dummyBindingSets[1], m_dummyBindingSets[2], m_sharcBindingSet };
+ 
++                // branche krc : remontée des cellules fines vers leurs mères, avant la résolution
++                if (m_ui.krcAdaptive)
++                {
++                    computeState.pipeline = m_pathtracerPipelines->GetKrcPropagatePSO();
++                    m_commandList->setComputeState(computeState);
++                    ScopedMarker scopedMarker(m_commandList, "KrcPropagate");
++                    m_commandList->dispatch(DivideRoundUp(m_sharcEntriesNum, 256u), 1);
++                }
++
+                 // SHARC resolve
+                 {
+                     computeState.pipeline = m_pathtracerPipelines->GetSharcResolvePSO();
+diff --git a/Samples/Pathtracer/Pathtracer.h b/Samples/Pathtracer/Pathtracer.h
+index 3dafed1..9640cb8 100644
+--- a/Samples/Pathtracer/Pathtracer.h
++++ b/Samples/Pathtracer/Pathtracer.h
+@@ -173,6 +173,7 @@ private:
+     nvrhi::BufferHandle m_sharcLockBuffer;
+     nvrhi::BufferHandle m_sharcAccumulationBuffer;
+     nvrhi::BufferHandle m_sharcResolvedBuffer;
++    nvrhi::BufferHandle m_krcMomentsBuffer; // branche krc : moments des cellules (KrcAdaptive.hlsli)
+ 
+     nvrhi::BindingLayoutHandle m_sharcBindingLayout;
+     nvrhi::BindingSetHandle m_sharcBindingSet;
+diff --git a/Samples/Pathtracer/Pipelines.cpp b/Samples/Pathtracer/Pipelines.cpp
+index dfc0e7c..1197935 100644
+--- a/Samples/Pathtracer/Pipelines.cpp
++++ b/Samples/Pathtracer/Pipelines.cpp
+@@ -28,6 +28,11 @@ void Pipelines::CreateCommon(nvrhi::IDevice* device, ShaderFactory& shaderFactor
+         m_sharcResolveCS = shaderFactory.CreateShader("app/Shaders/SharcResolve.hlsl", "sharcResolve", nullptr, nvrhi::ShaderType::Compute);
+         pipelineDesc.CS = m_sharcResolveCS;
+         m_sharcResolvePSO = device->createComputePipeline(pipelineDesc);
++
++        // branche krc : remontée des cellules fines vers leurs mères
++        m_krcPropagateCS = shaderFactory.CreateShader("app/Shaders/SharcResolve.hlsl", "krcPropagate", nullptr, nvrhi::ShaderType::Compute);
++        pipelineDesc.CS = m_krcPropagateCS;
++        m_krcPropagatePSO = device->createComputePipeline(pipelineDesc);
+     }
+ #endif // ENABLE_SHARC
+ 
+@@ -102,6 +107,11 @@ Pipelines::Permutation& Pipelines::GetPermutation(Type t)
+ }
+ 
+ #if ENABLE_SHARC
++nvrhi::ComputePipelineHandle Pipelines::GetKrcPropagatePSO() const
++{
++    return m_krcPropagatePSO;
++}
++
+ nvrhi::ComputePipelineHandle Pipelines::GetSharcResolvePSO() const
+ {
+     return m_sharcResolvePSO;
+diff --git a/Samples/Pathtracer/Pipelines.h b/Samples/Pathtracer/Pipelines.h
+index 4784e8f..808c107 100644
+--- a/Samples/Pathtracer/Pipelines.h
++++ b/Samples/Pathtracer/Pipelines.h
+@@ -76,6 +76,7 @@ public:
+ 
+ #if ENABLE_SHARC
+     nvrhi::ComputePipelineHandle GetSharcResolvePSO() const;
++    nvrhi::ComputePipelineHandle GetKrcPropagatePSO() const;
+ #endif // ENABLE_SHARC
+ 
+ #if ENABLE_NRD
+@@ -99,6 +100,8 @@ private:
+ #if ENABLE_SHARC
+     nvrhi::ShaderHandle m_sharcResolveCS;
+     nvrhi::ComputePipelineHandle m_sharcResolvePSO;
++    nvrhi::ShaderHandle m_krcPropagateCS;
++    nvrhi::ComputePipelineHandle m_krcPropagatePSO;
+ #endif // ENABLE_SHARC
+ 
+ #if ENABLE_NRD
+diff --git a/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli b/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+new file mode 100644
+index 0000000..310f3b9
+--- /dev/null
++++ b/Samples/Pathtracer/Shaders/KrcAdaptive.hlsli
+@@ -0,0 +1,164 @@
++/*
++ * Branche krc : cellules adaptatives de KRC (KRC-A) sur la table de hachage de SHaRC.
++ *
++ * Chaque cellule fine (celles de SHaRC) a une mère deux fois plus grande, dans la même table, marquée
++ * par le bit 63 de la clé (réservé par SHaRC aux données de l'utilisateur ; l'éclairage réactif, qui
++ * l'utilise, est désactivé dans cet exemple). Les sommes de la frame d'une cellule fine sont ajoutées
++ * à sa mère (krcPropagate, avant la résolution de SHaRC), qui se résout comme les autres.
++ *
++ * La lecture mélange fine et mère (rétrécissement de James-Stein) : là où elles ne diffèrent pas plus
++ * que leur incertitude (variance d'une frame à l'autre de leur moyenne, ramenée au nombre de frames
++ * accumulées), on lit la mère, avec bien plus d'échantillons ; là où la lumière change vraiment à
++ * l'échelle de la mère (bord, ombre), on lit la fine, sans fuite.
++ *
++ * Requiert SharcCommon.h et u_KrcMoments (float4 par entrée : moyenne glissante de la luminance
++ * moyenne de la frame, de son carré, nombre de frames comptées).
++ */
++
++#ifndef KRC_ADAPTIVE_HLSLI
++#define KRC_ADAPTIVE_HLSLI
++
++static const HashGridKey KRC_MOTHER_BIT = HashGridKey(1) << 63;
++
++bool KrcIsMother(HashGridKey key)
++{
++    return (key & KRC_MOTHER_BIT) != 0;
++}
++
++// clé de la mère : position divisée par 2, niveau + 1 (cellule deux fois plus grande), même
++// classe de normale
++HashGridKey KrcMotherKey(HashGridKey key)
++{
++    int3 p;
++    p.x = int((key >> (HASH_GRID_POSITION_BIT_NUM * 0)) & HASH_GRID_POSITION_BIT_MASK);
++    p.y = int((key >> (HASH_GRID_POSITION_BIT_NUM * 1)) & HASH_GRID_POSITION_BIT_MASK);
++    p.z = int((key >> (HASH_GRID_POSITION_BIT_NUM * 2)) & HASH_GRID_POSITION_BIT_MASK);
++    p = (p << (32 - HASH_GRID_POSITION_BIT_NUM)) >> (32 - HASH_GRID_POSITION_BIT_NUM);
++    p = p >> 1; // division entière vers -infini
++    uint level = uint((key >> HASH_GRID_LEVEL_BIT_OFFSET) & HASH_GRID_LEVEL_BIT_MASK);
++    level = min(level + 1, HASH_GRID_LEVEL_BIT_MASK);
++    HashGridKey m = ((HashGridKey(p.x) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 0))
++                  | ((HashGridKey(p.y) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 1))
++                  | ((HashGridKey(p.z) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 2))
++                  | ((HashGridKey(level) & HASH_GRID_LEVEL_BIT_MASK) << HASH_GRID_LEVEL_BIT_OFFSET);
++    m |= key & (HashGridKey(HASH_GRID_NORMAL_BIT_MASK) << HASH_GRID_NORMAL_BIT_OFFSET);
++    return m | KRC_MOTHER_BIT;
++}
++
++// passe de remontée (avant la résolution) : les sommes de la frame d'une cellule fine vont aussi
++// à sa mère, créée au besoin
++void KrcPropagateEntry(uint entryIndex, SharcParameters sharcParameters)
++{
++    if (entryIndex >= sharcParameters.hashGridData.capacity)
++        return;
++    const HashGridKey key = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex);
++    if (key == HASH_GRID_INVALID_HASH_KEY || KrcIsMother(key))
++        return;
++    const SharcAccumulationData acc = BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex);
++    if (acc.data.w == 0)
++        return;
++    const HashGridKey motherKey = KrcMotherKey(key);
++    const uint baseSlot = HashGridGetBaseSlot(motherKey, sharcParameters.hashGridData.capacity);
++    HashGridIndex motherIndex;
++    uint bucketOffset;
++    if (!HashGridInsert(sharcParameters.hashGridData, motherKey, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, motherIndex, bucketOffset))
++        return;
++    if (acc.data.x != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, motherIndex).data.x, acc.data.x);
++    if (acc.data.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, motherIndex).data.y, acc.data.y);
++    if (acc.data.z != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, motherIndex).data.z, acc.data.z);
++    InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, motherIndex).data.w, acc.data.w);
++}
++
++// avant SharcResolveEntry (qui efface les sommes de la frame) : moyenne glissante de la luminance
++// moyenne de la frame et de son carré, d'où la variance d'une frame à l'autre
++void KrcResolveMoments(uint entryIndex, SharcParameters sharcParameters, uint accumulationFrameNum,
++                       RWStructuredBuffer<float4> moments)
++{
++    if (entryIndex >= sharcParameters.hashGridData.capacity)
++        return;
++    const HashGridKey key = BUFFER_AT_OFFSET(sharcParameters.hashGridData.hashEntriesBuffer, entryIndex);
++    if (key == HASH_GRID_INVALID_HASH_KEY)
++    {
++        moments[entryIndex] = float4(0, 0, 0, 0);
++        return;
++    }
++    const SharcAccumulationData acc = BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex);
++    if (acc.data.w == 0)
++        return;
++    const float sampleNum = float(acc.data.w);
++    const float frameLum = SharcLuma(float3(acc.data.xyz) / (sharcParameters.radianceScale * sampleNum));
++    float4 m = moments[entryIndex];
++    const float frames = min(m.z + 1.0f, float(max(accumulationFrameNum, 1u)));
++    const float a = 1.0f / frames;
++    m.x = lerp(m.x, frameLum, a);
++    m.y = lerp(m.y, frameLum * frameLum, a);
++    m.z = frames;
++    moments[entryIndex] = m;
++}
++
++struct KrcCellRead
++{
++    bool found;
++    float3 radiance;   // démodulée
++    float lum;
++    float varMean;     // variance de la valeur lue (moyenne sur les frames accumulées)
++};
++
++KrcCellRead KrcReadCell(SharcParameters sharcParameters, HashGridKey key, RWStructuredBuffer<float4> moments)
++{
++    KrcCellRead r;
++    r.found = false;
++    r.radiance = float3(0, 0, 0);
++    r.lum = 0;
++    r.varMean = 0;
++    HashGridIndex index;
++    uint bucketOffset;
++    const uint baseSlot = HashGridGetBaseSlot(key, sharcParameters.hashGridData.capacity);
++    if (!HashGridFind(sharcParameters.hashGridData, key, baseSlot, HASH_GRID_HASH_MAP_BUCKET_SIZE, index, bucketOffset))
++        return r;
++    const SharcVoxelData voxel = SharcGetVoxelData(sharcParameters.resolvedBuffer, index);
++    if (voxel.accumulatedSampleNum <= SHARC_SAMPLE_NUM_THRESHOLD)
++        return r;
++    r.found = true;
++    r.radiance = voxel.accumulatedRadiance.radiance;
++    r.lum = SharcLuma(r.radiance);
++    const float4 m = moments[index];
++    r.varMean = max(m.y - m.x * m.x, 0.0f) / max(m.z, 1.0f);
++    return r;
++}
++
++// lecture KRC-A au point touché : mélange de la cellule fine et de sa mère. tolerance : écart relatif
++// en dessous duquel fine et mère sont tenues pour égales (on lit la mère, moins bruitée)
++bool KrcGetCachedRadiance(SharcParameters sharcParameters, SharcHitData hitData, float tolerance,
++                          RWStructuredBuffer<float4> moments, out float3 radiance, out float motherWeight)
++{
++    radiance = float3(0, 0, 0);
++    motherWeight = 0;
++    const HashGridKey fineKey = HashGridComputeSpatialHash(hitData.positionWorld, hitData.normalWorld, sharcParameters.hashGridParameters);
++    const KrcCellRead fine = KrcReadCell(sharcParameters, fineKey, moments);
++    const KrcCellRead mother = KrcReadCell(sharcParameters, KrcMotherKey(fineKey), moments);
++    if (!fine.found && !mother.found)
++        return false;
++
++    float w = 0;
++    if (!fine.found)
++        w = 1;
++    else if (mother.found)
++    {
++        const float d = fine.lum - mother.lum;
++        const float tol = tolerance * max(fine.lum, mother.lum);
++        const float d2 = max(d * d - tol * tol, 0.0f);
++        w = fine.varMean / max(fine.varMean + d2 + mother.varMean, 1e-12f);
++    }
++    motherWeight = w;
++    radiance = lerp(fine.radiance, mother.radiance, w);
++#if SHARC_MATERIAL_DEMODULATION
++    radiance *= hitData.materialDemodulation;
++#endif
++#if SHARC_SEPARATE_EMISSIVE
++    radiance += hitData.emissive;
++#endif
++    return true;
++}
++
++#endif // KRC_ADAPTIVE_HLSLI
+diff --git a/Samples/Pathtracer/Shaders/Pathtracer.hlsl b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+index 6b2d506..064c91f 100644
+--- a/Samples/Pathtracer/Shaders/Pathtracer.hlsl
++++ b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+@@ -92,6 +92,9 @@ RWStructuredBuffer<HashGridKey>             u_SharcHashEntriesBuffer        : re
+ RWStructuredBuffer<uint>                    u_SharcLockBuffer               : register(u1, space3);
+ RWStructuredBuffer<SharcAccumulationData>   u_SharcAccumulationBuffer       : register(u2, space3);
+ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer           : register(u3, space3);
++RWStructuredBuffer<float4>                  u_KrcMoments                    : register(u4, space3);
++
++#include "KrcAdaptive.hlsli"
+ 
+ RayDesc GeneratePinholeCameraRay(float2 normalizedDeviceCoordinate, float4x4 viewToWorld, float4x4 viewToClip)
+ {
+@@ -560,7 +563,23 @@ void PathTraceRays()
+                 isValidHit &= footprint > voxelSize;
+ 
+                 float3 sharcRadiance;
+-                if (isValidHit && SharcGetCachedRadiance(sharcParameters, sharcHitData, sharcRadiance, false))
++                // branche krc : cellules adaptatives (mélange de la cellule fine et de sa mère)
++                float krcMotherWeight = 0.0f;
++                bool cached = false;
++                if (isValidHit)
++                {
++                    if (g_Lighting.krcAdaptive)
++                        cached = KrcGetCachedRadiance(sharcParameters, sharcHitData, g_Lighting.krcTolerance, u_KrcMoments, sharcRadiance, krcMotherWeight);
++                    else
++                        cached = SharcGetCachedRadiance(sharcParameters, sharcHitData, sharcRadiance, false);
++                }
++                if (cached && g_Lighting.krcDebug && bounce == 1)
++                {
++                    // débogage : part de la mère dans la lecture (rouge = mère, vert = fine)
++                    u_Output[DispatchRaysIndex().xy] = float4(krcMotherWeight, 1.0f - krcMotherWeight, 0.0f, 1.0f);
++                    return;
++                }
++                if (cached)
+                 {
+                     sampleRadiance += sharcRadiance * throughput;
+ 
+diff --git a/Samples/Pathtracer/Shaders/SharcResolve.hlsl b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+index 89e3c63..a43dae7 100644
+--- a/Samples/Pathtracer/Shaders/SharcResolve.hlsl
++++ b/Samples/Pathtracer/Shaders/SharcResolve.hlsl
+@@ -21,6 +21,9 @@ ConstantBuffer<GlobalConstants>             g_Global                    : regist
+ RWStructuredBuffer<HashGridKey>             u_SharcHashEntriesBuffer    : register(u0, space3);
+ RWStructuredBuffer<SharcAccumulationData>   u_SharcAccumulationBuffer   : register(u2, space3);
+ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer       : register(u3, space3);
++RWStructuredBuffer<float4>                  u_KrcMoments                : register(u4, space3);
++
++#include "KrcAdaptive.hlsli"
+ 
+ [numthreads(LINEAR_BLOCK_SIZE, 1, 1)]
+ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+@@ -45,5 +48,26 @@ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+     resolveParameters.cameraPositionPrev = g_Lighting.sharcCameraPositionPrev.xyz;
+     resolveParameters.frameIndex = g_Global.frameIndex;
+ 
++    if (g_Lighting.krcAdaptive)
++        KrcResolveMoments(did.x, sharcParameters, uint(g_Lighting.sharcAccumulationFrameNum), u_KrcMoments);
++
+     SharcResolveEntry(did.x, sharcParameters, resolveParameters);
+-}
+\ No newline at end of file
++}
++
++// branche krc : passe de remontée des cellules fines vers leurs mères, avant sharcResolve
++[numthreads(LINEAR_BLOCK_SIZE, 1, 1)]
++void krcPropagate(in uint2 did : SV_DispatchThreadID)
++{
++    SharcParameters sharcParameters;
++    sharcParameters.hashGridParameters.cameraPosition = g_Lighting.sharcCameraPosition.xyz;
++    sharcParameters.hashGridParameters.sceneScale = g_Lighting.sharcSceneScale;
++    sharcParameters.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
++    sharcParameters.hashGridParameters.levelBias = SHARC_GRID_LEVEL_BIAS;
++    sharcParameters.hashGridData.capacity = g_Lighting.sharcEntriesNum;
++    sharcParameters.hashGridData.hashEntriesBuffer = u_SharcHashEntriesBuffer;
++    sharcParameters.accumulationBuffer = u_SharcAccumulationBuffer;
++    sharcParameters.resolvedBuffer = u_SharcResolvedBuffer;
++    sharcParameters.radianceScale = SHARC_RADIANCE_SCALE;
++
++    KrcPropagateEntry(did.x, sharcParameters);
++}
+diff --git a/Samples/Pathtracer/UI.h b/Samples/Pathtracer/UI.h
+index 9c9780c..9de8919 100644
+--- a/Samples/Pathtracer/UI.h
++++ b/Samples/Pathtracer/UI.h
+@@ -156,6 +156,11 @@ struct UIData
+     int sharcAccumulationFrameNum = 20;
+     int sharcStaleFrameNum = 60;
+     float sharcRoughnessThreshold = 0.4f;
++
++    // branche krc : cellules adaptatives (mélange statistique cellule fine / mère)
++    bool krcAdaptive = false;
++    float krcTolerance = 0.03f;
++    bool krcDebug = false;
+ #endif // ENABLE_SHARC
+ 
+     bool dlssSupported = false;
+diff --git a/Samples/Pathtracer/shaders.cfg b/Samples/Pathtracer/shaders.cfg
+index 085e304..9fc954f 100644
+--- a/Samples/Pathtracer/shaders.cfg
++++ b/Samples/Pathtracer/shaders.cfg
+@@ -4,6 +4,7 @@ Shaders/Pathtracer.hlsl -T lib -D NRC_QUERY=1 -D ENABLE_NRD={0,1} --compilerOpti
+ Shaders/Pathtracer.hlsl -T lib -D SHARC_UPDATE=1 --compilerOptionsDXIL="-enable-payload-qualifiers"
+ Shaders/Pathtracer.hlsl -T lib -D SHARC_QUERY=1 -D ENABLE_NRD={0,1} --compilerOptionsDXIL="-enable-payload-qualifiers"
+ Shaders/SharcResolve.hlsl -T cs -E sharcResolve
++Shaders/SharcResolve.hlsl -T cs -E krcPropagate
+ Shaders/Tonemapping.hlsl -T ps -E main_ps
+ Shaders/Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
+ Shaders/Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1 -D ENABLE_NRC=1
+-- 
+2.55.0.windows.3
+

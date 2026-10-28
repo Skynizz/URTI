@@ -1,0 +1,58 @@
+{
+ "reglages": {
+  "scene": "LivingRoom.scene.json",
+  "name": "salon_cout2",
+  "methods": [
+   "sharc",
+   "krcl_suivi",
+   "krcl",
+   "krca"
+  ],
+  "ref": 2048,
+  "warm": 250,
+  "acc": 64,
+  "eval_only": false
+ },
+ "resultats": {
+  "sharc": {
+   "nrd_flip": 0.07303934264928102,
+   "nrd_flip_ecart": 0.0012226410677830895,
+   "nrd_psnr": 32.181443497203645,
+   "bruit_brut": 0.14355781217300118,
+   "biais_flip": 0.09046359360218048,
+   "biais_relmse": 0.061949831151472734,
+   "lum": 1.022651854987341,
+   "gpu_ms": 3.8483
+  },
+  "krcl_suivi": {
+   "nrd_flip": 0.0757710998877883,
+   "nrd_flip_ecart": 0.001462494056564348,
+   "nrd_psnr": 32.09513898179415,
+   "bruit_brut": 0.14348825965728293,
+   "biais_flip": 0.08815795928239822,
+   "biais_relmse": 0.061172766722424735,
+   "lum": 1.0204604384910818,
+   "gpu_ms": 3.899
+  },
+  "krcl": {
+   "nrd_flip": 0.0741915488615632,
+   "nrd_flip_ecart": 0.001358465011220042,
+   "nrd_psnr": 32.134313490412126,
+   "bruit_brut": 0.14333070904803819,
+   "biais_flip": 0.08768972009420395,
+   "biais_relmse": 0.06092869263212184,
+   "lum": 1.02008564195502,
+   "gpu_ms": 3.8616
+  },
+  "krca": {
+   "nrd_flip": 0.08213770389556885,
+   "nrd_flip_ecart": 0.0017193957266286304,
+   "nrd_psnr": 31.87157400634295,
+   "bruit_brut": 0.13941538217451133,
+   "biais_flip": 0.08473778516054153,
+   "biais_relmse": 0.057513639918843555,
+   "lum": 1.014732367009585,
+   "gpu_ms": 4.0898
+  }
+ }
+}

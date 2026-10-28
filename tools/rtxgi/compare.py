@@ -22,11 +22,16 @@ import run  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 METHODS = {
-    'sharc': ['tech=sharc', 'scale=50', 'guide=0'],
-    'sharc_guide': ['tech=sharc', 'scale=50', 'guide=1'],
-    'krca': ['tech=krc', 'scale=50', 'guide=0'],
-    'krca_guide': ['tech=krc', 'scale=50', 'guide=1'],
-    'path': ['tech=ref', 'guide=0'],   # path tracing complet sans cache, même débruiteur
+    'sharc': ['tech=sharc', 'scale=50', 'guide=0', 'nrdaf=1'],
+    'sharc_guide': ['tech=sharc', 'scale=50', 'guide=1', 'nrdaf=1'],
+    'krca': ['tech=krc', 'scale=50', 'guide=0', 'krcdebug=0', 'nrdaf=1'],
+    'krca_guide': ['tech=krc', 'scale=50', 'guide=1', 'nrdaf=1'],
+    'krca_nomere': ['tech=krc', 'scale=50', 'guide=0', 'krcdebug=2', 'nrdaf=1'],  # tout KRC-A sauf la lecture de la mère
+    'sharc_af0': ['tech=sharc', 'scale=50', 'guide=0', 'nrdaf=0'],  # anti-lucioles de NRD coupé
+    'krca_af0': ['tech=krc', 'scale=50', 'guide=0', 'krcdebug=0', 'nrdaf=0'],
+    'krcl': ['tech=sharc', 'scale=50', 'guide=0', 'relight=1', 'nrdconf=2', 'nrdaf=1'],  # SHaRC + rééclairage exact + historique de NRD rééclairé
+    'krcl_suivi': ['tech=sharc', 'scale=50', 'guide=0', 'relight=1', 'nrdconf=0', 'nrdaf=1'],  # parts des groupes seulement
+    'path': ['tech=ref', 'guide=0', 'nrdaf=1'],   # path tracing complet sans cache, même débruiteur
 }
 FRAMES = 8
 
@@ -35,7 +40,7 @@ def plan(methods, ref_spp, warm, acc):
     cmds = ['20:jitter=0', '20:tech=ref', '20:den=acc', f'{20 + ref_spp}:capture=ref']
     f = 25 + ref_spp
     for name in methods:
-        cmds += [f'{f}:{c}' for c in METHODS[name] + ['den=nrd']]
+        cmds += [f'{f}:{c}' for c in ['relight=0', 'nrdconf=0', 'krcdebug=0'] + METHODS[name] + ['den=nrd']]
         cmds.append(f'{f + warm - 110}:fps=100')
         cmds += [f'{f + warm + k}:capture={name}_nrd{k}' for k in range(FRAMES)]
         g = f + warm + FRAMES

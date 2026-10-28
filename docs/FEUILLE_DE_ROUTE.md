@@ -17,6 +17,56 @@ global : 2 à 4 ms par frame sur GPU, en 1080p à 1440p).
 | Caméra mobile | ✅ qualité ; ⚠️ coût minimal 3 ms à 1280×720 (KRC v2) |
 | Spéculaire | ✅ matériaux PBR (GGX), reflets par pixel lus dans le cache, MIS (RESULTATS §16–17) |
 
+## Analyse (octobre 2026) : optimiser KRC, réduire le bruit, le tester en jeu
+
+Tirée des mesures des trois bancs (Quake II RTX, Doom RT, SDK de NVIDIA ; RESULTATS §18 à §21).
+Classée par gain attendu sur l'image finale, à coût d'effort égal.
+
+**Bruit et justesse de l'image**
+
+1. **Rapport par pixel pour l'historique du débruiteur** (1 jour). Aujourd'hui S vient de la
+   cellule du premier point touché : moyenne entre partie au soleil et à l'ombre, d'où l'erreur
+   restante après un changement (taches de soleil du salon ; Bistro de nuit assombri de 6 % de
+   trop). Au premier point touché, la lumière directe de chaque groupe est connue exactement par
+   pixel ; son ancienne valeur est sa nouvelle divisée par r_g. Rapport = somme lissée « après » /
+   somme lissée « avant » (rapport de sommes, pas moyenne de rapports, sinon bruité). C'était le
+   « rapport de la lumière directe » qui marchait dans Doom.
+2. **Chemins corrélés pour les groupes inconnus** (2 à 3 jours). Une lampe qui s'allume depuis
+   zéro, ou des lampes d'un groupe qui changent différemment, retombent sur le retard de SHaRC.
+   Chaque échantillon de la mise à jour évalue la lampe avec son ancienne et sa nouvelle intensité
+   (même tirage, MIS entre les deux lois pour qu'une lampe éteinte reste tirée) ; la différence,
+   presque sans bruit là où rien ne change, corrige la moyenne de la cellule.
+3. **Allocation adaptative des chemins de mise à jour** (2 jours). SHaRC met à jour 1 pixel sur
+   25, uniformément. Les moments de KRC-A donnent déjà la variance par cellule : répartir le
+   budget en 30 % uniforme + 70 % Neyman, comme dans Doom (bruit brut plus faible là où il compte,
+   sans les zones sombres de Neyman seul).
+4. **Perte d'énergie du NRD de l'exemple** (1 jour d'enquête). 9 à 15 % hors ciel pour toutes les
+   méthodes, même sans cache. La corriger améliore toutes les images et rend la comparaison juste
+   (un cache trop clair est aujourd'hui récompensé). Pistes : tirage probabiliste diffus/spéculaire
+   au premier rebond, démodulation par l'albédo.
+5. **Lumière directe à nombreuses lampes : ReSTIR DI** (NVIDIA RTXDI). Avec plusieurs lampes, le
+   bruit de l'image vient surtout du direct (l'exemple tire 8 candidats sans réutilisation). Pas
+   propre à KRC, mais indispensable dans un vrai jeu.
+6. Abandonné : guidage du premier rebond (aucun gain mesuré, +2 à +3 ms).
+
+**Coût** (KRC-L +0,01 à +0,05 ms, KRC-A +0,24 ms sur SHaRC 3,85 ms, salon 1280×720)
+
+1. Fait : les passes par entrée ne parcourent plus la table en écrivant (−2 ms).
+2. Insertion faite deux fois par sommet (SHaRC, puis KRC pour retrouver la même cellule) : demander
+   à SHaRC l'indice et la décision de relecture, une sonde de moins.
+3. Passe de lissage de S (81 prises, pleine résolution) : seulement après un premier rééclairage ;
+   pour des lampes qui clignotent en permanence, la passer en demi-résolution ou séparable.
+4. Taille de table : 4 M d'entrées dans l'exemple ; 1 M suffit souvent, et divise par 4 le coût
+   des passes par entrée (pour SHaRC aussi).
+
+**Tester en jeu** : KRC est maintenant une extension de SHaRC en bibliothèque indépendante du
+moteur (`krc_sdk/include`, mode d'emploi docs/INTEGRATION.md : cinq points d'accroche).
+1. Quake II RTX (SHaRC officiel déjà branché) : remplacer notre KRC maison par la bibliothèque,
+   pour que les trois bancs testent le même code.
+2. RTX Remix (`dxvk-remix`, open source) : un seul branchement pour Portal, Half-Life 2 et
+   d'autres ; vérifier d'abord dans ses sources quel cache il utilise (NRC annoncé dans la 1.0).
+3. Unreal Engine 5 : plus lourd, plus tard.
+
 ## Vers de vrais jeux (après la vitrine, RESULTATS §17)
 
 **Fait (RESULTATS §18)** : KRC et le SDK officiel de SHaRC tournent dans Quake II RTX, à temps
