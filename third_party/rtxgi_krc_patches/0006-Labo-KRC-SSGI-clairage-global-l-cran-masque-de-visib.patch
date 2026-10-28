@@ -1,0 +1,718 @@
+From a6e7e72ecad24a6063a91a4bf0a51b447419e3de Mon Sep 17 00:00:00 2001
+From: Skynizz <182822215+Skynizz@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:00:52 +0100
+Subject: [PATCH 6/6] =?UTF-8?q?Labo=20KRC-SSGI=20:=20=C3=A9clairage=20glob?=
+ =?UTF-8?q?al=20=C3=A0=20l'=C3=A9cran=20(masque=20de=20visibilit=C3=A9,=20?=
+ =?UTF-8?q?ciel=20vu=20=C3=A0=20l'=C3=A9cran),=20mode=20lumi=C3=A8re=20dir?=
+ =?UTF-8?q?ecte=20seule?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Samples/Pathtracer/KrcBench.cpp             | 171 ++++++++++
+ Samples/Pathtracer/LightingCb.h             |   7 +-
+ Samples/Pathtracer/Pathtracer.cpp           |   7 +-
+ Samples/Pathtracer/Pathtracer.h             |  26 +-
+ Samples/Pathtracer/Shaders/KrcScreenGI.hlsl | 360 ++++++++++++++++++++
+ Samples/Pathtracer/Shaders/Pathtracer.hlsl  |   3 +
+ Samples/Pathtracer/shaders.cfg              |   4 +
+ 7 files changed, 575 insertions(+), 3 deletions(-)
+ create mode 100644 Samples/Pathtracer/Shaders/KrcScreenGI.hlsl
+
+diff --git a/Samples/Pathtracer/KrcBench.cpp b/Samples/Pathtracer/KrcBench.cpp
+index 04600d1..d990301 100644
+--- a/Samples/Pathtracer/KrcBench.cpp
++++ b/Samples/Pathtracer/KrcBench.cpp
+@@ -30,6 +30,11 @@
+  *                              l'historique, 2 normalisation de l'entrée (historique rééclairé)
+  *     nrdreset                 vide l'historique de NRD (ce qu'un moteur peut faire quand ses lampes changent)
+  *     lights                   liste des lampes dans KRC_OUT/lights.txt
++ *     ssgi=0|1                 éclairage global à l'écran (KrcScreenGI.hlsl) sur l'image du « jeu »
++ *                              (bounces=1 den=acc : lumière directe sans bruit) ; capture sa sortie
++ *     ssgiradius, ssgithick, ssgislices, ssgisteps, ssgihistory, ssgifilter : réglages
++ *     ssginormals=0|1, ssgialbedo=0|1 : G-buffer, ou déduits de l'image (comme ReShade)
++ *     ssgidebug=1              indirect seul
+  *     clear                    vide le cache (SHaRC)
+  *     exit                     quitte
+  */
+@@ -49,6 +54,8 @@ using namespace donut::math;
+ #include "Nrc/NrcUtils.h"
+ #endif // ENABLE_NRC
+ #include "LightingCb.h"
++#include "ScopedMarker.h"
++#include <nvrhi/utils.h>
+ 
+ namespace
+ {
+@@ -251,6 +258,31 @@ void Pathtracer::KrcBenchBeforeRender()
+                 std::fclose(f);
+             }
+         }
++        else if (c.key == "direct")
++        {
++            m_krcDirectOnly = std::atoi(c.value.c_str()) != 0;
++            m_resetAccumulation = true;
++        }
++        else if (c.key == "ssgi")
++            m_krcSsgi.enable = std::atoi(c.value.c_str()) != 0;
++        else if (c.key == "ssgiradius")
++            m_krcSsgi.radius = (float)std::atof(c.value.c_str());
++        else if (c.key == "ssgithick")
++            m_krcSsgi.thickness = (float)std::atof(c.value.c_str());
++        else if (c.key == "ssgislices")
++            m_krcSsgi.slices = std::max(1, std::atoi(c.value.c_str()));
++        else if (c.key == "ssgisteps")
++            m_krcSsgi.steps = std::max(1, std::atoi(c.value.c_str()));
++        else if (c.key == "ssginormals")
++            m_krcSsgi.gbufferNormals = std::atoi(c.value.c_str());
++        else if (c.key == "ssgialbedo")
++            m_krcSsgi.gbufferAlbedo = std::atoi(c.value.c_str());
++        else if (c.key == "ssgihistory")
++            m_krcSsgi.historyMax = std::max(1, std::atoi(c.value.c_str()));
++        else if (c.key == "ssgifilter")
++            m_krcSsgi.filterPasses = std::max(0, std::atoi(c.value.c_str()));
++        else if (c.key == "ssgidebug")
++            m_krcSsgi.debug = std::atoi(c.value.c_str());
+         else if (c.key == "nrdreset")
+             m_krcNrdReset = true;
+         else if (c.key == "nrdconf")
+@@ -311,6 +343,8 @@ void Pathtracer::KrcCapture(const std::string& path)
+     nvrhi::IDevice* device = GetDevice();
+     const bool accumulated = m_ui.denoiserType == DenoiserType::Accumulation;
+     nvrhi::ITexture* source = accumulated ? m_accumulationBuffer.Get() : m_renderTargets->outPathTracer.Get();
++    if (m_krcSsgi.enable && m_krcSsgiOut)
++        source = m_krcSsgiOut.Get();
+     if (!source)
+         return;
+ 
+@@ -394,3 +428,140 @@ void Pathtracer::KrcFillRelight(LightingConstants& constants)
+     constants.krcRelightRatio = dm::float4(frame.ratio[0], frame.ratio[1], frame.ratio[2], m_krcRelightSinceClear ? 1.0f : 0.0f);
+     m_krcRelightEvents = constants.krcRelightEvent;
+ }
++
++// Éclairage global à l'écran (Shaders/KrcScreenGI.hlsl) : labo de l'effet ReShade. Quatre passes :
++// tracé, accumulation temporelle, filtre à-trous, composition. Ressources créées au premier appel.
++namespace
++{
++struct KrcSsgiConstantsCpu
++{
++    float radius, thickness, intensity, maxRadiusPixels;
++    int slices, steps, frame, gbufferNormals;
++    int gbufferAlbedo, historyMax, filterStep, debug;
++};
++}
++
++void Pathtracer::KrcScreenGI(nvrhi::ITexture* color)
++{
++    nvrhi::IDevice* device = GetDevice();
++    const nvrhi::TextureDesc& colorDesc = color->getDesc();
++
++    if (!m_krcSsgiLayout)
++    {
++        nvrhi::BindingLayoutDesc layoutDesc;
++        layoutDesc.visibility = nvrhi::ShaderType::Compute;
++        layoutDesc.bindings = {
++            nvrhi::BindingLayoutItem::VolatileConstantBuffer(0),
++            nvrhi::BindingLayoutItem::VolatileConstantBuffer(1),
++            nvrhi::BindingLayoutItem::VolatileConstantBuffer(2),
++        };
++        for (uint32_t i = 0; i <= 11; i++)
++            layoutDesc.bindings.push_back(nvrhi::BindingLayoutItem::Texture_UAV(i));
++        m_krcSsgiLayout = device->createBindingLayout(layoutDesc);
++        m_krcSsgiConstants = device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(sizeof(KrcSsgiConstantsCpu), "KrcSsgiConstants", 16));
++
++        auto makePso = [&](const char* entry) {
++            nvrhi::ComputePipelineDesc desc;
++            desc.bindingLayouts = { m_krcSsgiLayout };
++            desc.CS = m_shaderFactory->CreateShader("app/Shaders/KrcScreenGI.hlsl", entry, nullptr, nvrhi::ShaderType::Compute);
++            return device->createComputePipeline(desc);
++        };
++        m_krcSsgiTracePSO = makePso("krcSsgiTrace");
++        m_krcSsgiTemporalPSO = makePso("krcSsgiTemporal");
++        m_krcSsgiFilterPSO = makePso("krcSsgiFilter");
++        m_krcSsgiCompositePSO = makePso("krcSsgiComposite");
++    }
++
++    if (!m_krcSsgiOut || m_krcSsgiOut->getDesc().width != colorDesc.width || m_krcSsgiOut->getDesc().height != colorDesc.height)
++    {
++        auto makeTexture = [&](nvrhi::Format format, const char* name) {
++            nvrhi::TextureDesc desc;
++            desc.width = colorDesc.width;
++            desc.height = colorDesc.height;
++            desc.format = format;
++            desc.isUAV = true;
++            desc.keepInitialState = true;
++            desc.initialState = nvrhi::ResourceStates::UnorderedAccess;
++            desc.debugName = name;
++            return device->createTexture(desc);
++        };
++        m_krcSsgiRaw = makeTexture(nvrhi::Format::RGBA16_FLOAT, "KrcSsgiRaw");
++        m_krcSsgiHistory[0] = makeTexture(nvrhi::Format::RGBA16_FLOAT, "KrcSsgiHistory0");
++        m_krcSsgiHistory[1] = makeTexture(nvrhi::Format::RGBA16_FLOAT, "KrcSsgiHistory1");
++        m_krcSsgiPrevRadiance = makeTexture(nvrhi::Format::RGBA16_FLOAT, "KrcSsgiPrevRadiance");
++        m_krcSsgiPrevDepth = makeTexture(nvrhi::Format::R32_FLOAT, "KrcSsgiPrevDepth");
++        m_krcSsgiOut = makeTexture(nvrhi::Format::RGBA32_FLOAT, "KrcSsgiOut");
++        m_krcSsgiFilter[0] = makeTexture(nvrhi::Format::RGBA16_FLOAT, "KrcSsgiFilter0");
++        m_krcSsgiFilter[1] = makeTexture(nvrhi::Format::RGBA16_FLOAT, "KrcSsgiFilter1");
++        m_commandList->clearTextureFloat(m_krcSsgiHistory[0], nvrhi::AllSubresources, nvrhi::Color(0.0f));
++        m_commandList->clearTextureFloat(m_krcSsgiHistory[1], nvrhi::AllSubresources, nvrhi::Color(0.0f));
++        m_commandList->clearTextureFloat(m_krcSsgiPrevDepth, nvrhi::AllSubresources, nvrhi::Color(0.0f));
++    }
++
++    nvrhi::ITexture* historyPrev = m_krcSsgiHistory[m_krcSsgiFrame & 1];
++    nvrhi::ITexture* historyCur = m_krcSsgiHistory[(m_krcSsgiFrame + 1) & 1];
++    auto makeSet = [&](nvrhi::ITexture* filterIn, nvrhi::ITexture* filterOut) {
++        nvrhi::BindingSetDesc desc;
++        desc.bindings = {
++            nvrhi::BindingSetItem::ConstantBuffer(0, m_constantBuffer),
++            nvrhi::BindingSetItem::ConstantBuffer(1, m_debugBuffer),
++            nvrhi::BindingSetItem::ConstantBuffer(2, m_krcSsgiConstants),
++            nvrhi::BindingSetItem::Texture_UAV(0, color),
++            nvrhi::BindingSetItem::Texture_UAV(1, m_renderTargets->depth),
++            nvrhi::BindingSetItem::Texture_UAV(2, m_renderTargets->normalRoughness),
++            nvrhi::BindingSetItem::Texture_UAV(3, m_renderTargets->diffuseAlbedo),
++            nvrhi::BindingSetItem::Texture_UAV(4, m_krcSsgiRaw),
++            nvrhi::BindingSetItem::Texture_UAV(5, historyPrev),
++            nvrhi::BindingSetItem::Texture_UAV(6, historyCur),
++            nvrhi::BindingSetItem::Texture_UAV(7, m_krcSsgiPrevRadiance),
++            nvrhi::BindingSetItem::Texture_UAV(8, m_krcSsgiPrevDepth),
++            nvrhi::BindingSetItem::Texture_UAV(9, m_krcSsgiOut),
++            nvrhi::BindingSetItem::Texture_UAV(10, filterIn),
++            nvrhi::BindingSetItem::Texture_UAV(11, filterOut),
++        };
++        return device->createBindingSet(desc, m_krcSsgiLayout);
++    };
++
++    KrcSsgiConstantsCpu constants = {};
++    constants.radius = m_krcSsgi.radius;
++    constants.thickness = m_krcSsgi.thickness;
++    constants.intensity = m_krcSsgi.intensity;
++    constants.maxRadiusPixels = m_krcSsgi.maxRadiusPixels;
++    constants.slices = m_krcSsgi.slices;
++    constants.steps = m_krcSsgi.steps;
++    constants.frame = (int)m_krcSsgiFrame;
++    constants.gbufferNormals = m_krcSsgi.gbufferNormals;
++    constants.gbufferAlbedo = m_krcSsgi.gbufferAlbedo;
++    constants.historyMax = m_krcSsgi.historyMax;
++    constants.debug = m_krcSsgi.debug;
++
++    const uint32_t gx = (colorDesc.width + 7) / 8, gy = (colorDesc.height + 7) / 8;
++    auto run = [&](nvrhi::IComputePipeline* pso, nvrhi::IBindingSet* set, int filterStep) {
++        constants.filterStep = filterStep;
++        m_commandList->writeBuffer(m_krcSsgiConstants, &constants, sizeof(constants));
++        nvrhi::ComputeState state;
++        state.pipeline = pso;
++        state.bindings = { set };
++        m_commandList->setComputeState(state);
++        m_commandList->dispatch(gx, gy);
++    };
++
++    ScopedMarker marker(m_commandList, "KrcScreenGI");
++    nvrhi::BindingSetHandle base = makeSet(historyCur, m_krcSsgiFilter[0]);
++    run(m_krcSsgiTracePSO, base, 1);
++    run(m_krcSsgiTemporalPSO, base, 1);
++
++    // à-trous : historique -> filtre 0 -> filtre 1 -> filtre 0 ...
++    nvrhi::ITexture* in = historyCur;
++    int out = 0;
++    for (int i = 0; i < m_krcSsgi.filterPasses; i++)
++    {
++        nvrhi::BindingSetHandle set = makeSet(in, m_krcSsgiFilter[out]);
++        run(m_krcSsgiFilterPSO, set, 1 << i);
++        in = m_krcSsgiFilter[out];
++        out ^= 1;
++    }
++    nvrhi::BindingSetHandle composite = makeSet(in, m_krcSsgiFilter[out]);
++    run(m_krcSsgiCompositePSO, composite, 1);
++    m_krcSsgiFrame++;
++}
+diff --git a/Samples/Pathtracer/LightingCb.h b/Samples/Pathtracer/LightingCb.h
+index 5a21091..849912b 100644
+--- a/Samples/Pathtracer/LightingCb.h
++++ b/Samples/Pathtracer/LightingCb.h
+@@ -53,7 +53,12 @@ struct LightingConstants
+     int krcRelightEvent;  // un rapport connu est à appliquer avant le tracé de cette frame
+     int krcLightGroups;   // groupe de la lampe i aux bits 2i..2i+1 (0 soleil, 1 et 2 lampes, 3 fixe)
+     int krcNrdConfidence; // confiance de l'historique de NRD tirée du rééclairage des cellules
+-    float4 krcRelightRatio; // w : 1 si un rééclairage a eu lieu depuis la remise à zéro du cache (sinon S = 1) // rapport « après / avant » des groupes 0..2
++    float4 krcRelightRatio; // w : 1 si un rééclairage a eu lieu depuis la remise à zéro du cache (sinon S = 1)
++
++    int krcDirectOnly;    // lumière directe seule, G-buffer compris (labo de KRC-SSGI)
++    int krcPad1;
++    int krcPad2;
++    int krcPad3; // rapport « après / avant » des groupes 0..2
+ 
+     float4 sharcCameraPosition;
+     float4 sharcCameraPositionPrev;
+diff --git a/Samples/Pathtracer/Pathtracer.cpp b/Samples/Pathtracer/Pathtracer.cpp
+index 32998c4..6af670c 100644
+--- a/Samples/Pathtracer/Pathtracer.cpp
++++ b/Samples/Pathtracer/Pathtracer.cpp
+@@ -745,6 +745,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         constants.krcTolerance = m_ui.krcTolerance;
+         constants.krcDebug = m_ui.krcDebug;
+         constants.krcGuide = m_ui.krcGuide ? 1 : 0;
++        constants.krcDirectOnly = m_krcDirectOnly ? 1 : 0;
+         constants.krcNrdConfidence = m_enableNrd ? m_ui.krcNrdConfidence : 0;
+     }
+ 
+@@ -873,7 +874,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+     state.bindings[DescriptorSetIDs::Bindless] = m_descriptorTable->GetDescriptorTable();
+     state.bindings[DescriptorSetIDs::Denoiser] = m_denoiserBindingSet;
+ 
+-    if (enableDlss || m_enableNrd)
++    if (enableDlss || m_enableNrd || m_krcSsgi.enable)
+         m_commandList->clearTextureFloat(m_renderTargets->depth, nvrhi::AllSubresources, nvrhi::Color(0.0f));
+     if (m_enableNrd && m_ui.krcNrdConfidence != 0)
+         m_commandList->clearTextureFloat(m_renderTargets->krcConfidence, nvrhi::AllSubresources, nvrhi::Color(1.0f));
+@@ -1157,6 +1158,10 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         m_commandList->draw(args);
+     }
+ 
++    // branche krc : éclairage global à l'écran, sur l'image du « jeu » (accumulée si den=acc)
++    if (m_krcSsgi.enable)
++        KrcScreenGI(m_ui.denoiserType == DenoiserType::Accumulation ? m_accumulationBuffer.Get() : m_renderTargets->outPathTracer.Get());
++
+     if (m_krcTiming)
+         m_commandList->endTimerQuery(m_krcTimer);
+     m_commandList->close();
+diff --git a/Samples/Pathtracer/Pathtracer.h b/Samples/Pathtracer/Pathtracer.h
+index 03b910b..7e4b36d 100644
+--- a/Samples/Pathtracer/Pathtracer.h
++++ b/Samples/Pathtracer/Pathtracer.h
+@@ -93,6 +93,7 @@ public:
+     void KrcBenchAfterRender();
+     void KrcCapture(const std::string& path);
+     void KrcFillRelight(struct LightingConstants& constants);
++    void KrcScreenGI(nvrhi::ITexture* color); // éclairage global à l'écran (Shaders/KrcScreenGI.hlsl)
+ 
+ private:
+     struct KrcCommand
+@@ -105,7 +106,30 @@ private:
+     KrcRelightHost m_krcRelightHost;     // rapport « après / avant » des groupes (Libraries/Krc)
+     int m_krcRelightEvents = 0;
+     bool m_krcNrdReset = false;
+-    bool m_krcRelightSinceClear = false; // S vaut 1 partout tant qu'aucun rééclairage n'a eu lieu          // historique de NRD vidé à la prochaine frame
++    bool m_krcDirectOnly = false;        // lumière directe seule (labo de KRC-SSGI)
++    bool m_krcRelightSinceClear = false; // S vaut 1 partout tant qu'aucun rééclairage n'a eu lieu
++
++    // éclairage global à l'écran (labo de l'effet ReShade)
++    struct KrcSsgiSettings
++    {
++        bool enable = false;
++        float radius = 2.0f;
++        float thickness = 0.3f;
++        float intensity = 1.0f;
++        float maxRadiusPixels = 200.0f;
++        int slices = 2;
++        int steps = 12;
++        int gbufferNormals = 1;
++        int gbufferAlbedo = 1;
++        int historyMax = 32;
++        int filterPasses = 3;
++        int debug = 0;
++    } m_krcSsgi;
++    nvrhi::BindingLayoutHandle m_krcSsgiLayout;
++    nvrhi::BufferHandle m_krcSsgiConstants;
++    nvrhi::ComputePipelineHandle m_krcSsgiTracePSO, m_krcSsgiTemporalPSO, m_krcSsgiFilterPSO, m_krcSsgiCompositePSO;
++    nvrhi::TextureHandle m_krcSsgiRaw, m_krcSsgiHistory[2], m_krcSsgiPrevRadiance, m_krcSsgiPrevDepth, m_krcSsgiOut, m_krcSsgiFilter[2];
++    uint32_t m_krcSsgiFrame = 0;          // historique de NRD vidé à la prochaine frame
+     std::string m_krcOut;
+     std::string m_krcCaptureName;
+     uint32_t m_krcFrame = 0;
+diff --git a/Samples/Pathtracer/Shaders/KrcScreenGI.hlsl b/Samples/Pathtracer/Shaders/KrcScreenGI.hlsl
+new file mode 100644
+index 0000000..fea78e8
+--- /dev/null
++++ b/Samples/Pathtracer/Shaders/KrcScreenGI.hlsl
+@@ -0,0 +1,360 @@
++/*
++ * Branche krc : éclairage global à l'écran (KRC-SSGI), labo de l'effet ReShade.
++ *
++ * Entrées comme dans un jeu vu par ReShade : couleur sans éclairage indirect et profondeur (plus,
++ * en option, les normales et l'albédo du G-buffer pour la version « idéale »). Sortie : couleur +
++ * albédo × éclairage indirect. Le path tracer complet sert de référence.
++ *
++ * 1. krcSsgiTrace : masque de visibilité (Therrien, Levesque, Gilet, « Screen Space Indirect
++ *    Lighting with Visibility Bitmask », 2023). Par tranche (plan contenant la direction de vue),
++ *    on marche dans la profondeur ; chaque point touché masque un intervalle d'angles [avant,
++ *    arrière] (épaisseur supposée), et les secteurs nouvellement masqués reçoivent sa radiance
++ *    (frame précédente : plusieurs rebonds avec le temps). Secteurs répartis à mesure égale de
++ *    cos θ dω (intégrale de GTAO), donc la moyenne est la radiance incidente pondérée en cosinus.
++ * 2. krcSsgiTemporal : accumulation avec reprojection (caméra) et rejet par la profondeur.
++ * 3. krcSsgiFilter : à-trous arrêté aux arêtes (profondeur, normale), pas 1, 2, 4.
++ * 4. krcSsgiComposite : couleur + albédo × indirect ; garde la radiance et la profondeur.
++ */
++
++#include "../GlobalCb.h"
++#include "../LightingCb.h"
++
++#define KRC_PI 3.14159265f
++
++struct KrcSsgiConstants
++{
++    float radius;        // rayon de recherche (unités du monde)
++    float thickness;     // épaisseur supposée des surfaces (unités du monde)
++    float intensity;
++    float maxRadiusPixels;
++
++    int slices;
++    int steps;           // pas par côté
++    int frame;
++    int gbufferNormals;  // 1 : normales du G-buffer ; 0 : déduites de la profondeur (ReShade)
++
++    int gbufferAlbedo;   // 1 : albédo du G-buffer ; 0 : estimé à partir de la couleur (ReShade)
++    int historyMax;
++    int filterStep;      // pas de la passe à-trous en cours
++    int debug;
++};
++
++ConstantBuffer<LightingConstants>   g_Lighting      : register(b0);
++ConstantBuffer<GlobalConstants>     g_Global        : register(b1);
++ConstantBuffer<KrcSsgiConstants>    g_Ssgi          : register(b2);
++
++RWTexture2D<float4> u_Color         : register(u0); // couleur du « jeu » (HDR linéaire)
++RWTexture2D<float>  u_Depth         : register(u1); // z en espace vue (0 : ciel)
++RWTexture2D<float4> u_NormalRough   : register(u2); // normale du monde (G-buffer)
++RWTexture2D<float4> u_Albedo        : register(u3); // albédo diffus (G-buffer)
++RWTexture2D<float4> u_GiRaw         : register(u4); // radiance incidente moyenne de la frame
++RWTexture2D<float4> u_HistoryPrev   : register(u5); // xyz radiance incidente, w nombre de frames
++RWTexture2D<float4> u_HistoryCur    : register(u6);
++RWTexture2D<float4> u_PrevRadiance  : register(u7); // sortie de la frame précédente
++RWTexture2D<float>  u_PrevDepth     : register(u8);
++RWTexture2D<float4> u_Output        : register(u9);
++RWTexture2D<float4> u_FilterIn      : register(u10);
++RWTexture2D<float4> u_FilterOut     : register(u11);
++
++uint2 ScreenSize()
++{
++    return uint2(g_Lighting.view.viewportSize);
++}
++
++bool InScreen(int2 p)
++{
++    return all(p >= 0) && all(p < int2(ScreenSize()));
++}
++
++// position en espace vue d'un pixel de profondeur z
++float3 ViewPosition(float2 pixel, float z)
++{
++    const float2 clip = (pixel * g_Lighting.view.windowToClipScale) + g_Lighting.view.windowToClipBias;
++    float4 v = mul(float4(clip, 0.5f, 1.0f), g_Lighting.view.matClipToViewNoOffset);
++    v.xyz /= v.w;
++    return v.xyz * (z / v.z);
++}
++
++float3 ViewNormal(int2 p, float3 P)
++{
++    if (g_Ssgi.gbufferNormals != 0)
++        return normalize(mul(float4(u_NormalRough[p].xyz, 0.0f), g_Lighting.view.matWorldToView).xyz);
++
++    // déduite de la profondeur : la plus petite des différences de chaque côté (arêtes nettes)
++    const float zl = u_Depth[p + int2(-1, 0)], zr = u_Depth[p + int2(1, 0)];
++    const float zu = u_Depth[p + int2(0, -1)], zd = u_Depth[p + int2(0, 1)];
++    const float3 Pl = ViewPosition(float2(p) + float2(-0.5f, 0.5f), zl), Pr = ViewPosition(float2(p) + float2(1.5f, 0.5f), zr);
++    const float3 Pu = ViewPosition(float2(p) + float2(0.5f, -0.5f), zu), Pd = ViewPosition(float2(p) + float2(0.5f, 1.5f), zd);
++    const float3 dx = (zl > 0 && abs(Pl.z - P.z) < abs(Pr.z - P.z)) || zr <= 0 ? P - Pl : Pr - P;
++    const float3 dy = (zu > 0 && abs(Pu.z - P.z) < abs(Pd.z - P.z)) || zd <= 0 ? P - Pu : Pd - P;
++    float3 n = normalize(cross(dy, dx));
++    if (dot(n, -P) < 0)
++        n = -n;
++    return n;
++}
++
++float3 ViewToWindow(float3 P)
++{
++    const float4 clip = mul(float4(P, 1.0f), g_Lighting.view.matViewToClipNoOffset);
++    return float3(clip.xy / clip.w * g_Lighting.view.clipToWindowScale + g_Lighting.view.clipToWindowBias, clip.w);
++}
++
++// radiance d'un point vu : sortie de la frame précédente reprojetée, à défaut la couleur actuelle
++float3 SampleRadiance(int2 q, float3 Pq)
++{
++    const float3 world = mul(float4(Pq, 1.0f), g_Lighting.view.matViewToWorld).xyz;
++    const float4 prevClip = mul(float4(world, 1.0f), g_Lighting.viewPrev.matWorldToClipNoOffset);
++    const float2 prevPixel = prevClip.xy / prevClip.w * g_Lighting.viewPrev.clipToWindowScale + g_Lighting.viewPrev.clipToWindowBias;
++    const int2 pp = int2(prevPixel);
++    if (InScreen(pp))
++    {
++        const float prevZ = u_PrevDepth[pp];
++        const float expectedZ = dot(world - g_Lighting.viewPrev.matViewToWorld[3].xyz, g_Lighting.viewPrev.matViewToWorld[2].xyz);
++        if (prevZ > 0 && abs(prevZ - expectedZ) < 0.05f * expectedZ)
++            return u_PrevRadiance[pp].rgb;
++    }
++    return u_Color[q].rgb;
++}
++
++// ∫ cos(x − n) |sin x| dx de n − π/2 à t (mesure de GTAO dans la tranche)
++float SliceMeasure(float t, float n)
++{
++    const float sn = sin(n);
++    const float t0 = n - 0.5f * KRC_PI;
++    const float gm0 = cos(2.0f * t0 - n) * 0.25f - t0 * sn * 0.5f;
++    if (t <= 0.0f)
++        return (cos(2.0f * t - n) * 0.25f - t * sn * 0.5f) - gm0;
++    const float atZero = (cos(-n) * 0.25f) - gm0;
++    return atZero + (-cos(2.0f * t - n) * 0.25f + t * sn * 0.5f) - (-cos(-n) * 0.25f);
++}
++
++uint SectorMask(float ua, float ub)
++{
++    const uint a = uint(clamp(floor(saturate(ua) * 32.0f), 0.0f, 32.0f));
++    const uint b = uint(clamp(ceil(saturate(ub) * 32.0f), 0.0f, 32.0f));
++    const uint count = b > a ? b - a : 0u;
++    if (count == 0u)
++        return 0u;
++    return count >= 32u ? 0xffffffffu : (((1u << count) - 1u) << a);
++}
++
++float InterleavedNoise(uint2 p, uint frame)
++{
++    // bruit à faible discrépance (Jimenez), décalé à chaque frame
++    const float2 q = float2(p) + 5.588238f * float(frame & 63u);
++    return frac(52.9829189f * frac(dot(q, float2(0.06711056f, 0.00583715f))));
++}
++
++[numthreads(8, 8, 1)]
++void krcSsgiTrace(uint2 p : SV_DispatchThreadID)
++{
++    if (any(p >= ScreenSize()))
++        return;
++    const float z = u_Depth[p];
++    if (z <= 0.0f)
++    {
++        u_GiRaw[p] = float4(0, 0, 0, 1);
++        return;
++    }
++
++    const float3 P = ViewPosition(float2(p) + 0.5f, z);
++    const float3 V = normalize(-P);
++    const float3 N = ViewNormal(int2(p), P);
++
++    const float projScale = abs(g_Lighting.view.matViewToClipNoOffset[1][1]) * 0.5f * float(ScreenSize().y);
++    const float radiusPixels = min(g_Ssgi.radius * projScale / z, g_Ssgi.maxRadiusPixels);
++    const float marchPixels = max(radiusPixels, g_Ssgi.maxRadiusPixels); // plus loin pour le ciel
++    const float noiseSlice = InterleavedNoise(p, uint(g_Ssgi.frame));
++    const float noiseStep = InterleavedNoise(p.yx + 17u, uint(g_Ssgi.frame) * 7u + 3u);
++
++    float3 gi = float3(0, 0, 0);
++    float visibility = 0.0f;
++    for (int s = 0; s < g_Ssgi.slices; s++)
++    {
++        const float phi = (float(s) + noiseSlice) / float(g_Ssgi.slices) * KRC_PI;
++        const float2 dir = float2(cos(phi), sin(phi));
++
++        // axes de la tranche : x (direction de l'écran en espace vue, orthogonale à V) et V
++        float3 x = float3(dir.x, -dir.y, 0.0f);
++        x = normalize(x - V * dot(x, V));
++        const float3 axis = cross(x, V);
++        const float3 Np = N - axis * dot(N, axis);
++        const float npLen = length(Np);
++        const float n = clamp(atan2(dot(Np, x), dot(Np, V)), -0.5f * KRC_PI + 1e-3f, 0.5f * KRC_PI - 1e-3f);
++        const float t0 = n - 0.5f * KRC_PI;
++        const float t1 = n + 0.5f * KRC_PI;
++        const float total = SliceMeasure(t1, n);
++
++        uint occluded = 0u;
++        uint skyBits = 0u;
++        float3 skyColor = float3(0, 0, 0);
++        float skyCount = 0.0f;
++        float3 sliceGi = float3(0, 0, 0);
++        for (int side = -1; side <= 1; side += 2)
++        {
++            float prevSkyU = -1.0f;
++            for (int i = 0; i < g_Ssgi.steps; i++)
++            {
++                const float f = (float(i) + noiseStep) / float(g_Ssgi.steps);
++                const float offset = max(f * f * marchPixels, float(i + 1));
++                const int2 q = int2(float2(p) + 0.5f + float(side) * dir * offset);
++                if (!InScreen(q))
++                    break;
++                const float zq = u_Depth[q];
++                if (zq <= 0.0f)
++                {
++                    // ciel vu à l'écran : les rayons de la caméra le long de la tranche sont dans son
++                    // plan, et à l'infini la direction depuis le pixel est celle de la caméra ; les
++                    // pixels de ciel successifs couvrent l'intervalle d'angles entre eux
++                    const float3 D = normalize(ViewPosition(float2(q) + 0.5f, 1.0f));
++                    const float u = SliceMeasure(clamp(atan2(dot(D, x), dot(D, V)), t0, t1), n) / total;
++                    skyBits |= prevSkyU >= 0.0f ? SectorMask(min(u, prevSkyU), max(u, prevSkyU)) : SectorMask(u - 1.0f / 64.0f, u + 1.0f / 64.0f);
++                    skyColor += u_Color[q].rgb;
++                    skyCount += 1.0f;
++                    prevSkyU = u;
++                    continue;
++                }
++                prevSkyU = -1.0f;
++                const float3 Pq = ViewPosition(float2(q) + 0.5f, zq);
++                const float3 d = Pq - P;
++                const float dist = length(d);
++                if (dist > g_Ssgi.radius || dist < 1e-4f)
++                    continue;
++                const float3 db = d - V * g_Ssgi.thickness;
++                const float tf = clamp(atan2(dot(d, x), dot(d, V)), t0, t1);
++                const float tb = clamp(atan2(dot(db, x), dot(db, V)), t0, t1);
++                const float ua = SliceMeasure(min(tf, tb), n) / total;
++                const float ub = SliceMeasure(max(tf, tb), n) / total;
++                const uint mask = SectorMask(ua, ub);
++                const uint fresh = mask & ~occluded;
++                if (fresh != 0u)
++                {
++                    // le point touché n'éclaire que s'il fait face au pixel
++                    const float3 Nq = ViewNormal(q, Pq);
++                    const float facing = saturate(dot(Nq, -d / dist) * 4.0f);
++                    sliceGi += (float(countbits(fresh)) / 32.0f) * facing * SampleRadiance(q, Pq);
++                }
++                occluded |= mask;
++                if (occluded == 0xffffffffu)
++                    break;
++            }
++        }
++        if (skyCount > 0.0f)
++            sliceGi += (float(countbits(skyBits & ~occluded)) / 32.0f) * (skyColor / skyCount);
++        const float weight = npLen * total;
++        gi += weight * sliceGi;
++        visibility += weight * (1.0f - float(countbits(occluded)) / 32.0f);
++    }
++    gi /= float(g_Ssgi.slices);
++    visibility /= float(g_Ssgi.slices);
++    u_GiRaw[p] = float4(gi, visibility);
++}
++
++[numthreads(8, 8, 1)]
++void krcSsgiTemporal(uint2 p : SV_DispatchThreadID)
++{
++    if (any(p >= ScreenSize()))
++        return;
++    const float z = u_Depth[p];
++    const float4 current = u_GiRaw[p];
++    if (z <= 0.0f)
++    {
++        u_HistoryCur[p] = float4(0, 0, 0, 0);
++        return;
++    }
++    const float3 P = ViewPosition(float2(p) + 0.5f, z);
++    const float3 world = mul(float4(P, 1.0f), g_Lighting.view.matViewToWorld).xyz;
++    const float4 prevClip = mul(float4(world, 1.0f), g_Lighting.viewPrev.matWorldToClipNoOffset);
++    const float2 prevPixel = prevClip.xy / prevClip.w * g_Lighting.viewPrev.clipToWindowScale + g_Lighting.viewPrev.clipToWindowBias;
++    const int2 pp = int2(prevPixel);
++
++    float4 history = float4(0, 0, 0, 0);
++    if (InScreen(pp))
++    {
++        const float prevZ = u_PrevDepth[pp];
++        const float expectedZ = dot(world - g_Lighting.viewPrev.matViewToWorld[3].xyz, g_Lighting.viewPrev.matViewToWorld[2].xyz);
++        if (prevZ > 0 && abs(prevZ - expectedZ) < 0.03f * expectedZ)
++            history = u_HistoryPrev[pp];
++    }
++    const float frames = min(history.w + 1.0f, float(g_Ssgi.historyMax));
++    u_HistoryCur[p] = float4(lerp(history.xyz, current.xyz, 1.0f / frames), frames);
++}
++
++[numthreads(8, 8, 1)]
++void krcSsgiFilter(uint2 p : SV_DispatchThreadID)
++{
++    if (any(p >= ScreenSize()))
++        return;
++    const float z = u_Depth[p];
++    if (z <= 0.0f)
++    {
++        u_FilterOut[p] = float4(0, 0, 0, 0);
++        return;
++    }
++    const float3 P = ViewPosition(float2(p) + 0.5f, z);
++    const float3 N = ViewNormal(int2(p), P);
++    const float kernel[3] = { 3.0f / 8.0f, 1.0f / 4.0f, 1.0f / 16.0f };
++
++    float3 sum = float3(0, 0, 0);
++    float sumW = 0.0f;
++    for (int y = -2; y <= 2; y++)
++    {
++        for (int x = -2; x <= 2; x++)
++        {
++            const int2 q = int2(p) + int2(x, y) * g_Ssgi.filterStep;
++            if (!InScreen(q))
++                continue;
++            const float zq = u_Depth[q];
++            if (zq <= 0.0f)
++                continue;
++            const float3 Pq = ViewPosition(float2(q) + 0.5f, zq);
++            const float3 Nq = ViewNormal(q, Pq);
++            const float wPlane = exp(-abs(dot(N, Pq - P)) / (0.02f * z));
++            const float wNormal = pow(saturate(dot(N, Nq)), 16.0f);
++            const float w = kernel[abs(x)] * kernel[abs(y)] * wPlane * wNormal;
++            sum += w * u_FilterIn[q].xyz;
++            sumW += w;
++        }
++    }
++    u_FilterOut[p] = float4(sumW > 0.0f ? sum / sumW : u_FilterIn[p].xyz, u_FilterIn[p].w);
++}
++
++// albédo : G-buffer, ou estimé à partir de la couleur (ReShade) : teinte de la couleur, clarté fixe
++float3 Albedo(int2 p)
++{
++    if (g_Ssgi.gbufferAlbedo != 0)
++        return u_Albedo[p].rgb;
++    const float3 c = u_Color[p].rgb;
++    const float m = max(max(c.r, c.g), max(c.b, 1e-4f));
++    return 0.6f * c / m;
++}
++
++[numthreads(8, 8, 1)]
++void krcSsgiComposite(uint2 p : SV_DispatchThreadID)
++{
++    if (any(p >= ScreenSize()))
++        return;
++    const float z = u_Depth[p];
++    const float3 color = u_Color[p].rgb;
++    float3 result = color;
++    if (z > 0.0f)
++    {
++        const float3 gi = u_FilterIn[p].xyz;
++        result = color + g_Ssgi.intensity * Albedo(int2(p)) * gi;
++        if (g_Ssgi.debug == 1)
++            result = gi;
++        else if (g_Ssgi.debug == 2)
++            result = z.xxx;
++        else if (g_Ssgi.debug == 3)
++            result = ViewNormal(int2(p), ViewPosition(float2(p) + 0.5f, z)) * 0.5f + 0.5f;
++        else if (g_Ssgi.debug == 4)
++            result = u_GiRaw[p].www;
++        else if (g_Ssgi.debug == 5)
++            result = u_GiRaw[p].xyz;
++    }
++    else if (g_Ssgi.debug != 0)
++        result = float3(1, 0, 1);
++    u_Output[p] = float4(result, 1.0f);
++    u_PrevRadiance[p] = float4(result, 1.0f);
++    u_PrevDepth[p] = z;
++}
+diff --git a/Samples/Pathtracer/Shaders/Pathtracer.hlsl b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+index b2c8fb3..9bdd315 100644
+--- a/Samples/Pathtracer/Shaders/Pathtracer.hlsl
++++ b/Samples/Pathtracer/Shaders/Pathtracer.hlsl
+@@ -471,6 +471,9 @@ void PathTraceRays()
+         int bounce;
+         for (bounce = 0; true/* break from the middle */; bounce++)
+         {
++            // branche krc : « jeu » sans éclairage indirect (labo de KRC-SSGI) ; le G-buffer est écrit
++            if (g_Lighting.krcDirectOnly != 0 && bounce >= 1)
++                break;
+             uint rayFlags = RAY_FLAG_NONE;
+             RayPayload payload;
+             TraceRay(SceneBVH, rayFlags, 0xFF, 0, 0, 0, ray, payload);
+diff --git a/Samples/Pathtracer/shaders.cfg b/Samples/Pathtracer/shaders.cfg
+index f841103..85f54d6 100644
+--- a/Samples/Pathtracer/shaders.cfg
++++ b/Samples/Pathtracer/shaders.cfg
+@@ -11,3 +11,7 @@ Shaders/Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_RO
+ Shaders/Denoiser.hlsl -T cs -E resolve -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
+ Shaders/SharcResolve.hlsl -T cs -E krcRelight
+ Shaders/Denoiser.hlsl -T cs -E krcScaleBlur -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
++Shaders/KrcScreenGI.hlsl -T cs -E krcSsgiTrace
++Shaders/KrcScreenGI.hlsl -T cs -E krcSsgiTemporal
++Shaders/KrcScreenGI.hlsl -T cs -E krcSsgiFilter
++Shaders/KrcScreenGI.hlsl -T cs -E krcSsgiComposite
+-- 
+2.55.0.windows.3
+

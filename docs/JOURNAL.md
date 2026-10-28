@@ -501,3 +501,21 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
 - **Bibliothèque** : `Libraries/Krc/include/KrcRelight.h` (GPU, conventions de SHaRC) et
   `KrcRelightHost.h` (CPU) ; l'exemple les utilise ; copie dans `krc_sdk/include`, mode d'emploi
   docs/INTEGRATION.md. Analyse des prochaines étapes : FEUILLE_DE_ROUTE, « Analyse (octobre 2026) ».
+
+## v24 — vers un effet ReShade : labo de l'éclairage global à l'écran
+
+- Question de Skynizz : un système universel qui ajoute le ray tracing à n'importe quel jeu, même
+  DirectX 12 (Red Dead Redemption 2), avec un menu ImGui. Réponse : impossible en vrai path
+  tracing (un jeu DX12 ne donne ni sa géométrie, ni ses matériaux, ni ses lampes ; RTX Remix se
+  limite pour cette raison à DX8/9). Possible à l'écran via ReShade (DX9 à DX12, Vulkan, OpenGL,
+  menu ImGui intégré), qui ne voit que l'image et la profondeur.
+- Labo dans le banc NVIDIA (`tools/rtxgi/ssgi.py`, `Shaders/KrcScreenGI.hlsl`) : le « jeu » est la
+  lumière directe seule (`direct=1`, G-buffer écrit), l'effet ajoute l'indirect, référence = path
+  tracing complet. Effet : masque de visibilité (Therrien et al. 2023), mesure de GTAO dans la
+  tranche, accumulation temporelle reprojetée, à-trous, radiance de la frame précédente (plusieurs
+  rebonds). Ajout propre : le **ciel vu à l'écran** éclaire les directions non masquées (à l'infini,
+  la direction depuis le pixel est celle de la caméra, dans le plan de la tranche).
+- Premiers chiffres (1280×720) : salon (70 % d'indirect venant du ciel, en partie hors champ)
+  ꟻLIP 0,563 → 0,513 avec G-buffer, 0,547 avec la seule image ; Bistro de jour 0,145 → 0,133.
+  Coût 2 à 3 ms en pleine résolution : à passer en demi-résolution.
+- Limite de fond : la lumière hors champ ; c'est là que viendrait le cache en espace monde de KRC.

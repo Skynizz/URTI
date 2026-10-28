@@ -1,7 +1,7 @@
 From fab7c52f028e0c500c79ffc7152e821ee3af9f96 Mon Sep 17 00:00:00 2001
 From: Skynizz <182822215+Skynizz@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 23:49:43 +0200
-Subject: [PATCH 1/5] =?UTF-8?q?Banc=20de=20mesure=20(KrcBench.cpp)=20:=20s?=
+Subject: [PATCH 1/6] =?UTF-8?q?Banc=20de=20mesure=20(KrcBench.cpp)=20:=20s?=
  =?UTF-8?q?c=C3=A9nario,=20captures=20HDR,=20temps=20GPU,=20rendu=20sans?=
  =?UTF-8?q?=20fen=C3=AAtre=20visible?=
 MIME-Version: 1.0
