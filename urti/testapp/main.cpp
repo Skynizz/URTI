@@ -3,6 +3,8 @@
 // Scène : sol, six cubes fixes, un cube qui tourne, un cube déformé par le vertex shader, seize cubes
 // instanciés. Signature racine créée sans ALLOW_STREAM_OUTPUT (comme un jeu) : c'est à l'injecteur
 // de l'ajouter. Fenêtre jamais montrée sauf URTI_SHOW=1 ; URTI_FRAMES frames puis sortie.
+// URTI_ORBIT=1 : la caméra tourne autour de la scène ; URTI_TRUTH=fichier : vérité terrain (position
+// de la caméra et matrice vue × projection de chaque frame, pour vérifier l'estimation de la caméra).
 
 #include <windows.h>
 #include <d3d12.h>
@@ -363,8 +365,10 @@ int main()
     HANDLE fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     UINT64 fenceValue = 0;
 
-    const float eye[3] = { 7.0f, 6.0f, -11.0f }, at[3] = { 0.0f, 0.5f, 1.0f };
-    const Mat4 viewProj = Mul(LookAtLH(eye, at), PerspectiveLH(1.05f, float(kWidth) / float(kHeight), 0.1f, 200.0f));
+    const char* orbitEnv = std::getenv("URTI_ORBIT");
+    const bool orbit = orbitEnv && std::atoi(orbitEnv) != 0;
+    FILE* truth = std::getenv("URTI_TRUTH") ? std::fopen(std::getenv("URTI_TRUTH"), "w") : nullptr;
+    const float at[3] = { 0.0f, 0.5f, 1.0f };
 
     struct Object
     {
@@ -378,6 +382,16 @@ int main()
             DispatchMessageW(&msg);
 
         const float t = frame / 60.0f;
+        const float angle = orbit ? 0.6f * t : 0.0f;
+        const float eye[3] = { at[0] + 13.0f * std::sin(-0.57f + angle), 6.0f, at[2] - 13.0f * std::cos(-0.57f + angle) };
+        const Mat4 viewProj = Mul(LookAtLH(eye, at), PerspectiveLH(1.05f, float(kWidth) / float(kHeight), 0.1f, 200.0f));
+        if (truth)
+        {
+            std::fprintf(truth, "%d %g %g %g", frame, eye[0], eye[1], eye[2]);
+            for (float v : viewProj.m)
+                std::fprintf(truth, " %.9g", v);
+            std::fputc('\n', truth);
+        }
         const UINT bb = swapchain->GetCurrentBackBufferIndex();
         uint8_t* cb = frameCbData + 256 * bb;
         std::memcpy(cb, viewProj.m, sizeof(viewProj.m));
@@ -442,6 +456,8 @@ int main()
         CHECK(fence->SetEventOnCompletion(fenceValue, fenceEvent));
         WaitForSingleObject(fenceEvent, INFINITE);
     }
+    if (truth)
+        std::fclose(truth);
     std::printf("urti_testapp : %d frames\n", frames);
     return 0;
 }

@@ -317,10 +317,12 @@ constexpr uint32_t kSlots = 4;
 constexpr uint64_t kSlotBytes = kSoBytes / kSlots;
 constexpr uint32_t kMaxDraws = 65536;
 
+// un dessin capturé : signature (pour le retrouver d'une frame à l'autre) et place dans son flux
 struct DrawRecord
 {
-    uint64_t offset = 0, maxBytes = 0;
-    uint64_t depth = 0; // ressource de profondeur liée au dessin
+    uint32_t slot = 0, frame = 0, kind = 0; // kind : 0 direct, 1 indexé, 2 indirect
+    uint32_t params[5] = {};                 // paramètres du dessin (nombres, premiers indices…)
+    uint64_t pipeline = 0;
 };
 
 struct CommandListState
@@ -339,7 +341,7 @@ enum class Phase
 struct Capture
 {
     ID3D12Device* device = nullptr; // celui qui présente
-    ComPtr<ID3D12Resource> so, counters, zeros, soReadback, counterReadback, depthReadback;
+    ComPtr<ID3D12Resource> so, counters, zeros, soReadback, counterReadback, depthReadback, marks, marksReadback;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;
@@ -365,6 +367,7 @@ struct Capture
     uint32_t screenW = 0, screenH = 0;
     std::unordered_map<uint64_t, bool> screenLike; // profondeur de la taille de l'écran (pas une carte d'ombres)
     int captureSlot = -1;
+    bool depthReversed = false;
     std::unordered_map<uint64_t, uint32_t> drawsPerDevice; // diagnostic : dessins de tous les appareils pendant la capture
 } g;
 
@@ -390,7 +393,9 @@ bool InitResources(ID3D12Device* device)
     g.zeros = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     g.soReadback = MakeBuffer(device, kSoBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     g.counterReadback = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!g.so || !g.counters || !g.zeros || !g.soReadback || !g.counterReadback)
+    g.marks = MakeBuffer(device, kMaxDraws * 16ull, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.marksReadback = MakeBuffer(device, kMaxDraws * 16ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!g.so || !g.counters || !g.zeros || !g.soReadback || !g.counterReadback || !g.marks || !g.marksReadback)
         return false;
     void* p = nullptr;
     if (FAILED(g.zeros->Map(0, nullptr, &p)))
@@ -505,7 +510,7 @@ int SlotFor(uint64_t depth)
 }
 
 // rejoue le dessin avec le pipeline ombre ; le dessin du jeu a lieu ensuite, inchangé
-void CaptureDraw(ID3D12GraphicsCommandList* list, uint64_t, const std::function<void(ID3D12GraphicsCommandList*)>& issue)
+void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t (&params)[5], const std::function<void(ID3D12GraphicsCommandList*)>& issue)
 {
     g.frameDraws++;
     CommandListState state;
@@ -529,8 +534,18 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint64_t, const std::function<
         g.skippedDraws++;
         return;
     }
-    g.drawCount++;
+    const uint32_t index = g.drawCount++;
+    if (index >= kMaxDraws)
+        return;
     g.slotDraws[slot]++;
+    DrawRecord& r = g.draws[index];
+    r.slot = uint32_t(slot), r.frame = uint32_t(g.frame), r.kind = kind, r.pipeline = state.pipeline;
+    std::memcpy(r.params, params, sizeof(params));
+
+    // début du dessin dans le flux : la valeur du compteur avant lui
+    Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(g.marks.Get(), index * 16ull, g.counters.Get(), slot * 8ull, 8);
+    Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
 
     D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes, kSlotBytes, g.counters->GetGPUVirtualAddress() + slot * 8ull };
     list->SetPipelineState(shadow);
@@ -541,6 +556,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint64_t, const std::function<
     // le dessin suivant doit lire la taille remplie par celui-ci : sinon deux dessins en vol écrivent
     // au même endroit (constaté : 9,7 % de couverture sans cette barrière)
     Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(g.marks.Get(), index * 16ull + 8, g.counters.Get(), slot * 8ull, 8); // fin du dessin
     Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
     list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
 }
@@ -556,7 +572,7 @@ bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uin
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
     if (g.phase == Phase::Capturing && OurDevice(cmd->get_device()))
-        CaptureDraw(Native(cmd), 0, [&](ID3D12GraphicsCommandList* list) {
+        CaptureDraw(Native(cmd), 0, { vertexCount, instanceCount, firstVertex, firstInstance, 0 }, [&](ID3D12GraphicsCommandList* list) {
             list->DrawInstanced(vertexCount, instanceCount, firstVertex, firstInstance);
         });
     return false;
@@ -567,7 +583,7 @@ bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCoun
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
     if (g.phase == Phase::Capturing && OurDevice(cmd->get_device()))
-        CaptureDraw(Native(cmd), 0, [&](ID3D12GraphicsCommandList* list) {
+        CaptureDraw(Native(cmd), 1, { indexCount, instanceCount, firstIndex, uint32_t(vertexOffset), firstInstance }, [&](ID3D12GraphicsCommandList* list) {
             list->DrawIndexedInstanced(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
         });
     return false;
@@ -586,7 +602,7 @@ void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D
     {
         ComPtr<ID3D12Device> owner;
         if (SUCCEEDED(self->GetDevice(IID_PPV_ARGS(&owner))) && owner.Get() == g.device)
-            CaptureDraw(self, 0, [&](ID3D12GraphicsCommandList* list) {
+            CaptureDraw(self, 2, { maxCount, uint32_t(argsOffset), uint32_t(reinterpret_cast<uintptr_t>(args)), uint32_t(reinterpret_cast<uintptr_t>(signature)), 0 }, [&](ID3D12GraphicsCommandList* list) {
                 g_executeIndirect(list, signature, maxCount, args, argsOffset, countBuffer, countOffset);
             });
     }
@@ -794,6 +810,7 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, c
     for (const float v : depth)
         zeros += v == 0.0f, ones += v == 1.0f;
     const bool reversed = zeros > ones;
+    g.depthReversed = reversed;
     const float clearValue = reversed ? 0.0f : 1.0f;
     const uint32_t step = 2;
     const uint32_t w = width / step, h = height / step;
@@ -888,6 +905,38 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, c
         valid ? 100.0 * covered / valid : 0.0, (unsigned long long)covered, (unsigned long long)valid, (unsigned long long)extra, valid ? error / valid : 0.0);
 }
 
+// Capture complète pour l'analyse hors ligne : en-tête, dessins (signature, bornes), flux de la
+// profondeur principale (sommets en espace de découpage), profondeur du jeu.
+void DumpCapture(const std::string& path, const std::vector<float>& depth, uint32_t width, uint32_t height, const uint8_t* so, const uint32_t* counters)
+{
+    const uint64_t* marks = nullptr;
+    if (g.captureSlot < 0 || FAILED(g.marksReadback->Map(0, nullptr, (void**)&marks)) || !marks)
+        return;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f)
+    {
+        g.marksReadback->Unmap(0, nullptr);
+        return;
+    }
+    const uint64_t filled = std::min<uint64_t>(counters[g.captureSlot * 2], kSlotBytes);
+    const uint32_t header[12] = { 0x49545255u /* URTI */, 1, g.captureDrawCount, uint32_t(g.captureSlot), width, height, g.screenW, g.screenH,
+                                  uint32_t(filled & 0xFFFFFFFF), uint32_t(filled >> 32), g.depthReversed ? 1u : 0u, 0 };
+    std::fwrite(header, sizeof(header), 1, f);
+    for (uint32_t d = 0; d < g.captureDrawCount; d++)
+    {
+        const DrawRecord& r = g.draws[d];
+        const uint32_t rec[10] = { r.slot, r.frame, r.kind, r.params[0], r.params[1], r.params[2], r.params[3], r.params[4],
+                                   uint32_t(r.pipeline & 0xFFFFFFFF), uint32_t(r.pipeline >> 32) };
+        std::fwrite(rec, sizeof(rec), 1, f);
+        std::fwrite(&marks[d * 2], 16, 1, f); // début, fin (octets)
+    }
+    std::fwrite(so + g.captureSlot * kSlotBytes, 1, size_t(filled), f);
+    std::fwrite(depth.data(), sizeof(float), depth.size(), f);
+    std::fclose(f);
+    g.marksReadback->Unmap(0, nullptr);
+    Log("URTI : capture écrite pour l'analyse (%s, %.1f Mo)", path.c_str(), (64.0 * g.captureDrawCount + filled + 4.0 * depth.size()) / 1048576.0);
+}
+
 void Finish(ID3D12CommandQueue* q)
 {
     // la file a exécuté la frame suivante jusqu'ici : la copie de profondeur est faite
@@ -913,6 +962,7 @@ void Finish(ID3D12CommandQueue* q)
                                                     : (reinterpret_cast<const uint32_t*>(row)[x] & 0xFFFFFF) / 16777215.0f;
         }
         Analyse(values, width, height, soData, counterData, g.captureDrawCount, prefix);
+        DumpCapture(prefix + ".urti", values, width, height, soData, counterData);
         g.depthReadback->Unmap(0, nullptr);
     }
     else
@@ -1041,6 +1091,9 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         if (used)
             g.list->CopyBufferRegion(g.soReadback.Get(), 0, g.so.Get(), 0, used);
         g.list->CopyBufferRegion(g.counterReadback.Get(), 0, g.counters.Get(), 0, kMaxDraws * 8ull);
+        Transition(g.list.Get(), g.marks.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g.list->CopyBufferRegion(g.marksReadback.Get(), 0, g.marks.Get(), 0, kMaxDraws * 16ull);
+        Transition(g.list.Get(), g.marks.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         Transition(g.list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         Submit(q);
