@@ -749,7 +749,7 @@ void BeginList()
 // image de la frame (pour savoir ce qui a été capturé)
 // ------------------------------------------------------------------------------------------------
 
-void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path)
+void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path, uint32_t step = 2)
 {
     const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -773,7 +773,15 @@ void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const
     const uint8_t* data = nullptr;
     if (FAILED(readback->Map(0, nullptr, (void**)&data)))
         return;
-    const uint32_t w = (uint32_t)desc.Width / 2, h = desc.Height / 2;
+    const uint32_t w = (uint32_t)desc.Width / step, h = desc.Height / step;
+    // HDR10 : PQ -> nits (table), BT.2020 -> BT.709, blanc de référence 203 nits, épaule douce, gamma 2.2
+    static float pq[1024] = {};
+    if (pq[1023] == 0.0f)
+        for (int i = 0; i < 1024; i++)
+        {
+            const double p = std::pow(i / 1023.0, 1.0 / 78.84375);
+            pq[i] = float(10000.0 * std::pow(std::max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125) / 203.0);
+        }
     FILE* f = std::fopen(path.c_str(), "wb");
     if (f)
     {
@@ -781,19 +789,25 @@ void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const
         std::vector<uint8_t> row(size_t(w) * 3);
         for (uint32_t y = 0; y < h; y++)
         {
-            const uint8_t* src = data + fp.Offset + size_t(y * 2) * fp.Footprint.RowPitch;
+            const uint8_t* src = data + fp.Offset + size_t(y * step) * fp.Footprint.RowPitch;
             for (uint32_t x = 0; x < w; x++)
             {
                 uint8_t rgb[3] = {};
                 if (fp.Footprint.Format == DXGI_FORMAT_R10G10B10A2_UNORM || fp.Footprint.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS)
                 {
-                    const uint32_t v = reinterpret_cast<const uint32_t*>(src)[x * 2];
+                    const uint32_t v = reinterpret_cast<const uint32_t*>(src)[x * step];
+                    const float r = pq[v & 1023], gg = pq[(v >> 10) & 1023], b = pq[(v >> 20) & 1023];
+                    const float lin[3] = { 1.6605f * r - 0.5876f * gg - 0.0728f * b, -0.1246f * r + 1.1329f * gg - 0.0083f * b,
+                                           -0.0182f * r - 0.1006f * gg + 1.1187f * b };
                     for (int c = 0; c < 3; c++)
-                        rgb[c] = uint8_t(((v >> (10 * c)) & 1023) >> 2); // HDR10 : valeurs PQ brutes, image délavée mais lisible
+                    {
+                        const float l = std::max(lin[c], 0.0f), t = l * (1.0f + l / 4.0f) / (1.0f + l);
+                        rgb[c] = uint8_t(std::min(255.0f, 255.0f * std::pow(t, 1.0f / 2.2f)));
+                    }
                 }
                 else if (fp.Footprint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
                 {
-                    const uint16_t* hf = reinterpret_cast<const uint16_t*>(src) + x * 2 * 4;
+                    const uint16_t* hf = reinterpret_cast<const uint16_t*>(src) + x * step * 4;
                     for (int c = 0; c < 3; c++)
                     {
                         const uint32_t hb = hf[c], e = (hb >> 10) & 31, m = hb & 1023;
@@ -803,7 +817,7 @@ void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const
                 }
                 else
                 {
-                    const uint8_t* px = src + x * 2 * 4;
+                    const uint8_t* px = src + x * step * 4;
                     const bool bgr = fp.Footprint.Format == DXGI_FORMAT_B8G8R8A8_UNORM || fp.Footprint.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
                                      fp.Footprint.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
                     rgb[0] = px[bgr ? 2 : 0], rgb[1] = px[1], rgb[2] = px[bgr ? 0 : 2];

@@ -380,7 +380,17 @@ int LiveMainSlot()
 
 void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, resource_view)
 {
-    if (!live.enabled || !OurDevice(runtime->get_device()) || g.phase != Phase::Idle)
+    if (!OurDevice(runtime->get_device()))
+        return;
+    if (!live.enabled)
+    {
+        // ombres coupées : l'effet ne doit plus appliquer l'ancienne image d'ombres
+        if (const effect_uniform_variable off = runtime->find_uniform_variable("urti.fx", "UrtiActive"); off.handle)
+            runtime->set_uniform_value_bool(off, false);
+        live.bound = false;
+        return;
+    }
+    if (g.phase != Phase::Idle)
         return;
     ID3D12Device5* device5 = nullptr;
     if (FAILED(g.device->QueryInterface(IID_PPV_ARGS(&device5))))
@@ -574,18 +584,12 @@ void OnReshadePresent(effect_runtime* runtime)
     if (live.enabled && (!live.bound || live.frame < live.boundFrame + 60))
         return; // ombres pas encore prêtes : la photo attend
     DeleteFileA(trigger.c_str());
-    uint32_t w = 0, h = 0;
-    runtime->get_screenshot_width_and_height(&w, &h);
-    std::vector<uint8_t> pixels(size_t(w) * h * 4);
-    if (!w || !h || !runtime->capture_screenshot(pixels.data()))
+    // lecture directe du tampon d'affichage (gère le HDR10 du jeu, que capture_screenshot rend brut)
+    const resource back = runtime->get_current_back_buffer();
+    if (!back.handle)
         return;
     const std::string path = g_dir + "\\urti_photo" + std::to_string(live.photoIndex++) + ".ppm";
-    if (FILE* f = std::fopen(path.c_str(), "wb"))
-    {
-        std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-        for (size_t i = 0; i < size_t(w) * h; i++)
-            std::fwrite(&pixels[i * 4], 1, 3, f);
-        std::fclose(f);
-    }
+    runtime->get_command_queue()->flush_immediate_command_list(); // les effets de cette image d'abord
+    SaveBackBuffer(reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native()), reinterpret_cast<ID3D12Resource*>(back.handle), path, 1);
     Log("URTI : photo %s (ombres RT %s)", path.c_str(), live.enabled ? "actives" : "coupées");
 }
