@@ -42,9 +42,14 @@ struct LiveState
     ComPtr<ID3D12RootSignature> fitRs, voteRs;
     ComPtr<ID3D12PipelineState> fitPso, votePso;
     ComPtr<ID3D12Resource> pairsUpload[3], pairDirs, sunBuf, sunUpload, sunReadback[3];
+    ComPtr<ID3D12Resource> atlasBuf; // copie de la carte d'ombres du jeu, pour recalculer son ombre
+    uint64_t atlasBytes = 0;
+    uint32_t atlasPitch = 0;
+    bool atlasD24 = false;
     uint64_t framesSinceSun = 0, sunFrames = 0, sunAccepted = 0, pairSum = 0;
 } live;
 constexpr uint32_t kLiveMaxPairs = 256;
+constexpr uint32_t kLiveSunBytes = 48 + 8 * 64; // soleil, bilan, nombre de cascades, 8 cascades (application, viewport)
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage : direction du soleil (cartes d'ombres) et loi de profondeur, sur le processeur
@@ -272,7 +277,7 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
 bool LiveCreatePipelines(ID3D12Device* device)
 {
     auto make = [&](const void* code, size_t size, int srvCount, ComPtr<ID3D12RootSignature>& rs, ComPtr<ID3D12PipelineState>& pso, uint32_t constants) {
-        D3D12_ROOT_PARAMETER p[5] = {}; // jusqu'à 3 SRV, 1 UAV, constantes
+        D3D12_ROOT_PARAMETER p[6] = {}; // jusqu'à 4 SRV, 1 UAV, constantes
         for (int i = 0; i < srvCount; i++)
         {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -292,7 +297,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 2, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 3, live.shadowRs, live.shadowPso, 16) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 4, live.shadowRs, live.shadowPso, 16) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4);
 }
@@ -406,12 +411,12 @@ bool LiveEnsureSun(ID3D12Device* device)
     if (live.sunBuf)
         return true;
     for (auto& r : live.pairsUpload)
-        r = MakeBuffer(device, kLiveMaxPairs * 16ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        r = MakeBuffer(device, kLiveMaxPairs * 32ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     for (auto& r : live.sunReadback)
-        r = MakeBuffer(device, 32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    live.pairDirs = UavBuffer(device, kLiveMaxPairs * 16ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    live.sunBuf = UavBuffer(device, 32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    live.sunUpload = MakeBuffer(device, 32, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        r = MakeBuffer(device, 48, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    live.pairDirs = UavBuffer(device, kLiveMaxPairs * 80ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    live.sunBuf = UavBuffer(device, kLiveSunBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    live.sunUpload = MakeBuffer(device, 48, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     return live.sunBuf && live.pairDirs && live.sunUpload && live.pairsUpload[2] && live.sunReadback[2];
 }
 
@@ -494,8 +499,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.forceCalibration = true; // dix secondes sans soleil mesuré : étalonnage complet
             if (live.sunFrames == 300)
             {
-                Log("URTI direct : soleil suivi (%.3f, %.3f, %.3f), mesuré sur %.0f %% des images, %.0f paires par image", r[0], r[1], r[2],
-                    100.0 * live.sunAccepted / live.sunFrames, double(live.pairSum) / live.sunFrames);
+                Log("URTI direct : soleil suivi (%.3f, %.3f, %.3f), mesuré sur %.0f %% des images, %.0f paires par image, %u cascades", r[0], r[1], r[2],
+                    100.0 * live.sunAccepted / live.sunFrames, double(live.pairSum) / live.sunFrames, reinterpret_cast<const uint32_t*>(r)[8]);
                 live.sunFrames = live.sunAccepted = live.pairSum = 0;
             }
         }
@@ -550,16 +555,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         void* p = nullptr;
         if (SUCCEEDED(live.sunUpload->Map(0, nullptr, &p)))
         {
-            const float s[8] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0 };
+            const float s[12] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0, 0, 0, 0, 0 };
             std::memcpy(p, s, sizeof(s));
             live.sunUpload->Unmap(0, nullptr);
         }
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyBufferRegion(live.sunBuf.Get(), 0, live.sunUpload.Get(), 0, 32);
+        list->CopyBufferRegion(live.sunBuf.Get(), 0, live.sunUpload.Get(), 0, 48);
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         live.sunDirty = false;
     }
-    struct Pair { uint32_t cam, map, slots; float weight; };
+    struct Pair { uint32_t cam, map, slots; float weight; float viewport[4]; };
     std::vector<Pair> pairs;
     {
         std::unordered_map<uint64_t, std::vector<uint32_t>> sunByKey;
@@ -577,11 +582,15 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const uint32_t r = rank[marksNow[i].key]++;
             const std::vector<uint32_t>& c = it->second;
             // même rang dans les deux passes : très probablement le même objet (poids 8)
+            auto add = [&](uint32_t m, float w) {
+                const float* v = marksNow[m].viewport;
+                pairs.push_back({ i, m, marksNow[i].slot | (marksNow[m].slot << 8), w, { v[0], v[1], v[2], v[3] } });
+            };
             if (r < c.size())
-                pairs.push_back({ i, c[r], marksNow[i].slot | (marksNow[c[r]].slot << 8), 8.0f });
+                add(c[r], 8.0f);
             for (uint32_t k = 0; k < c.size() && k < 3 && pairs.size() < kLiveMaxPairs; k++)
                 if (k != r)
-                    pairs.push_back({ i, c[k], marksNow[i].slot | (marksNow[c[k]].slot << 8), 1.0f });
+                    add(c[k], 1.0f);
         }
     }
     {
@@ -614,9 +623,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         else
         {
-            // aucune paire : bilan « non mesuré », le soleil précédent reste
+            // aucune paire : bilan « non mesuré », le soleil précédent reste, plus de cascade connue
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 16);
+            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 32);
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
     }
@@ -683,27 +692,73 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), depthCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, depthState);
     Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
 
+    // 3b. carte d'ombres du jeu (son ombre est recalculée pixel par pixel : nos ombres ne s'ajoutent
+    // que là où le jeu n'en met pas)
+    bool atlasValid = false;
+    if (ID3D12Resource* atlas = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth); atlas && g_liveCombine)
+    {
+        uint32_t state = 0;
+        bool known = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g.depthStates.find(g_liveSunDepth);
+            if (it != g.depthStates.end())
+                state = PassD3D12State(it->second), known = true;
+        }
+        const D3D12_RESOURCE_DESC ad = atlas->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT afp = {};
+        UINT64 atotal = 0;
+        g.device->GetCopyableFootprints(&ad, 0, 1, 0, &afp, nullptr, nullptr, &atotal);
+        if (known && (!live.atlasBuf || live.atlasBytes < atotal))
+        {
+            Retire(live.atlasBuf);
+            live.atlasBuf = UavBuffer(g.device, atotal, D3D12_RESOURCE_STATE_COPY_DEST);
+            live.atlasBytes = atotal;
+            Log("URTI direct : carte d'ombres du jeu %llux%u format %d recopiée à chaque image (%.0f Mo)", (unsigned long long)ad.Width, ad.Height,
+                int(ad.Format), atotal / 1048576.0);
+        }
+        if (known && live.atlasBuf)
+        {
+            live.atlasPitch = afp.Footprint.RowPitch;
+            live.atlasD24 = ad.Format == DXGI_FORMAT_R24G8_TYPELESS || ad.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+            Transition(list.Get(), atlas, D3D12_RESOURCE_STATES(state), D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+            dst.pResource = live.atlasBuf.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = afp;
+            src.pResource = atlas;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            Transition(list.Get(), atlas, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATES(state));
+            Transition(list.Get(), live.atlasBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+            atlasValid = true;
+        }
+    }
+
     // 4. un rayon par pixel vers le soleil
     list->SetComputeRootSignature(live.shadowRs.Get());
     list->SetPipelineState(live.shadowPso.Get());
     list->SetComputeRootShaderResourceView(0, live.tlas->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, live.sunBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(3, live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(3, atlasValid ? live.atlasBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(4, live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u);
     const struct
     {
-        float sun[3], bias;
+        float sunSign, gameBias, unused, bias;
         uint32_t width, height, depthPitch, shadowPitch;
         float A, B, p00, p11, clearDepth;
-        uint32_t d24;
-        float pad[2];
-    } sc = { { live.sun[0], live.sun[1], live.sun[2] }, 0.003f, live.width, live.height, live.depthPitch, live.shadowPitch,
-             live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, { 0, 0 } };
-    list->SetComputeRoot32BitConstants(4, 16, &sc, 0);
+        uint32_t d24, atlasPitch, flags;
+    } sc = { live.sunSign, 0.0015f, 0, 0.003f, live.width, live.height, live.depthPitch, live.shadowPitch,
+             live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags };
+    list->SetComputeRoot32BitConstants(5, 16, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+    if (atlasValid)
+        Transition(list.Get(), live.atlasBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 32);
+    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 48);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // 5. image d'ombres pour l'effet

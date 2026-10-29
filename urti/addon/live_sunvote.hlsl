@@ -4,7 +4,8 @@
 // fois à l'étalonnage (sunSign), jamais déduit de l'image précédente. Sans accord net, rien ne change.
 
 ByteAddressBuffer dirs : register(t0); // par paire : direction, poids
-RWByteAddressBuffer sun : register(u0); // float4 soleil (vers le soleil, espace caméra), float4 bilan
+RWByteAddressBuffer sun : register(u0); // float4 soleil (vers le soleil, espace caméra), float4 bilan, uint nombre de
+                                        // cascades (à 32), puis par cascade (à 48 + 64 k) : application (3 float4), viewport
 
 cbuffer Constants : register(b0)
 {
@@ -21,11 +22,11 @@ groupshared uint sIndex[T];
 [numthreads(T, 1, 1)]
 void main(uint t : SV_GroupThreadID)
 {
-    const float4 di = t < pairCount ? asfloat(dirs.Load4(t * 16)) : float4(0, 0, 0, 0);
+    const float4 di = t < pairCount ? asfloat(dirs.Load4(t * 80)) : float4(0, 0, 0, 0);
     float vote = 0, total = 0;
     for (uint j = 0; j < pairCount; j++)
     {
-        const float4 dj = asfloat(dirs.Load4(j * 16));
+        const float4 dj = asfloat(dirs.Load4(j * 80));
         total += dj.w;
         if (di.w > 0 && dj.w > 0 && dot(di.xyz, dj.xyz) > cosTol)
             vote += dj.w;
@@ -42,13 +43,14 @@ void main(uint t : SV_GroupThreadID)
     if (t != 0)
         return;
     float accepted = 0;
+    uint cascades = 0;
     if (sVote[0] > 0 && sVote[0] >= minShare * total)
     {
-        const float3 best = asfloat(dirs.Load3(sIndex[0] * 16));
+        const float3 best = asfloat(dirs.Load3(sIndex[0] * 80));
         float3 sum = float3(0, 0, 0);
         for (uint k = 0; k < pairCount; k++)
         {
-            const float4 dk = asfloat(dirs.Load4(k * 16));
+            const float4 dk = asfloat(dirs.Load4(k * 80));
             if (dk.w > 0 && dot(best, dk.xyz) > cosTol)
                 sum += dk.xyz * dk.w;
         }
@@ -56,7 +58,48 @@ void main(uint t : SV_GroupThreadID)
         {
             sun.Store4(0, asuint(float4(normalize(sum) * sunSign, 1)));
             accepted = 1;
+            // une application par cascade (même viewport) : la paire d'accord de plus grand poids
+            float4 cvp[8];
+            uint cpair[8];
+            float cw[8];
+            for (uint q = 0; q < pairCount; q++)
+            {
+                const float4 dq = asfloat(dirs.Load4(q * 80));
+                if (dq.w <= 0 || dot(best, dq.xyz) <= cosTol)
+                    continue;
+                const float4 vq = asfloat(dirs.Load4(q * 80 + 64));
+                if (vq.z <= 0 || vq.w <= 0)
+                    continue;
+                uint found = cascades;
+                for (uint c = 0; c < cascades; c++)
+                    if (all(cvp[c] == vq))
+                        found = c;
+                if (found == cascades)
+                {
+                    if (cascades == 8)
+                        continue;
+                    cvp[cascades] = vq, cpair[cascades] = q, cw[cascades] = dq.w;
+                    cascades++;
+                }
+                else if (dq.w > cw[found])
+                    cpair[found] = q, cw[found] = dq.w;
+            }
+            // la plus fine d'abord (plus grande échelle caméra -> carte)
+            float scale[8];
+            for (uint c2 = 0; c2 < cascades; c2++)
+                scale[c2] = length(asfloat(dirs.Load3(cpair[c2] * 80 + 16)));
+            for (uint i2 = 0; i2 < cascades; i2++)
+                for (uint j2 = i2 + 1; j2 < cascades; j2++)
+                    if (scale[j2] > scale[i2])
+                    {
+                        const float ts = scale[i2]; scale[i2] = scale[j2]; scale[j2] = ts;
+                        const uint tp = cpair[i2]; cpair[i2] = cpair[j2]; cpair[j2] = tp;
+                    }
+            for (uint c3 = 0; c3 < cascades; c3++)
+                for (uint r = 0; r < 4; r++)
+                    sun.Store4(48 + c3 * 64 + r * 16, dirs.Load4(cpair[c3] * 80 + 16 + r * 16));
         }
     }
     sun.Store4(16, asuint(float4(float(pairCount), sVote[0], total, accepted)));
+    sun.Store(32, cascades);
 }

@@ -66,7 +66,10 @@ struct LiveMark
     uint64_t key = 0;
     uint32_t slot = 0;
     bool sunMap = false;
+    float viewport[4] = {}; // dans la carte d'ombres : la cascade du dessin
 };
+bool g_liveCombine = true;       // urti.ini combine=0 : ombres RT seules, sans tenir compte de celles du jeu
+uint32_t g_liveDebugGame = 0;    // urti.ini debug_game_shadow=1 : affiche l'ombre du jeu recalculée
 std::vector<LiveMark> g_liveMarks;
 std::unordered_set<uint64_t> g_liveSunKeys, g_livePrevSunKeys;
 uint64_t g_liveSunDepth = 0; // profondeur de la carte d'ombres du soleil (trouvée à l'étalonnage)
@@ -128,6 +131,10 @@ void ReadSettings(HMODULE module)
                 g_captureFrames = parseList(l.substr(15));
             if (l.rfind("show_mask=", 0) == 0)
                 g_liveShowMask = std::atoi(l.c_str() + 10) != 0;
+            if (l.rfind("combine=", 0) == 0)
+                g_liveCombine = std::atoi(l.c_str() + 8) != 0;
+            if (l.rfind("debug_game_shadow=", 0) == 0)
+                g_liveDebugGame = uint32_t(std::atoi(l.c_str() + 18));
             if (l.rfind("live=", 0) == 0)
                 g_liveAtStart = std::atoi(l.c_str() + 5) != 0;
             if (l.rfind("calibration_interval=", 0) == 0)
@@ -353,6 +360,7 @@ struct CommandListState
 {
     uint64_t pipeline = 0;
     uint64_t depth = 0;
+    float viewport[4] = {}; // x, y, largeur, hauteur (le premier)
 };
 
 enum class Phase
@@ -487,6 +495,24 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
 }
 
 
+// état de départ des profondeurs (une carte d'ombres peut rester en écriture sans jamais de barrière)
+void OnInitResource(device*, const resource_desc& desc, const subresource_data*, resource_usage initialState, resource res)
+{
+    if ((desc.usage & resource_usage::depth_stencil) == 0)
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g.depthStates.emplace(res.handle, static_cast<uint32_t>(initialState));
+}
+
+void OnBindViewports(command_list* cmd, uint32_t first, uint32_t count, const viewport* viewports)
+{
+    if (first != 0 || !count)
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    float* v = g.lists[cmd->get_native()].viewport;
+    v[0] = viewports[0].x, v[1] = viewports[0].y, v[2] = viewports[0].width, v[3] = viewports[0].height;
+}
+
 void OnBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates)
 {
     PassBarrier(cmd, count, resources, oldStates, newStates);
@@ -595,7 +621,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             if (g_liveMarks.size() < kLiveMaxMarks && (sunMap || g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key)))
             {
                 mark = int(g_liveMarks.size());
-                g_liveMarks.push_back({ key, uint32_t(slot), sunMap });
+                g_liveMarks.push_back({ key, uint32_t(slot), sunMap, { state.viewport[0], state.viewport[1], state.viewport[2], state.viewport[3] } });
             }
         }
         if (sunMap && mark < 0)
@@ -1183,6 +1209,8 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.forceCalibration = true;
     if (GetAsyncKeyState(VK_F5) & 1)
         live.toggleSplit = true;
+    if (const std::string f5 = g_dir + "\urti_f5"; g.frame % 30 == 0 && GetFileAttributesA(f5.c_str()) != INVALID_FILE_ATTRIBUTES)
+        DeleteFileA(f5.c_str()), live.toggleSplit = true; // F5 par fichier (tests automatiques)
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
     // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil
     // image par image est perdu ; sinon le soleil est suivi sur le GPU
@@ -1355,6 +1383,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
         reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
         reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+        reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
+        reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
         reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencil);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);

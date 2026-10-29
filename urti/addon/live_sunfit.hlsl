@@ -6,8 +6,13 @@
 
 ByteAddressBuffer so : register(t0);       // flux de sortie, tous les emplacements
 ByteAddressBuffer marks : register(t1);    // par dessin marqué : compteur avant / après (2 × 8 octets)
-StructuredBuffer<uint4> pairs : register(t2); // marque caméra, marque carte, emplacements (8 bits chacun), facteur de poids
-RWByteAddressBuffer dirs : register(u0);   // par paire : direction (3 float), poids (0 : rejetée)
+struct Pair
+{
+    uint4 ids;    // marque caméra, marque carte, emplacements (8 bits chacun), facteur de poids
+    float4 viewport; // du dessin dans la carte : sa cascade
+};
+StructuredBuffer<Pair> pairs : register(t2);
+RWByteAddressBuffer dirs : register(u0);   // par paire (80 octets) : direction et poids (0 : rejetée), application (12 float), viewport
 
 cbuffer Constants : register(b0)
 {
@@ -36,7 +41,7 @@ bool Sample(uint v, uint cBase, uint lBase, out double x[4], out double s[3])
 [numthreads(T, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
 {
-    const uint4 p = pairs[gid.x];
+    const uint4 p = pairs[gid.x].ids;
     const uint cb = marks.Load(p.x * 16), ce = marks.Load(p.x * 16 + 8);
     const uint lb = marks.Load(p.y * 16), le = marks.Load(p.y * 16 + 8);
     const uint n = ce > cb ? (ce - cb) / 16 : 0;
@@ -44,7 +49,7 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
     if (n < 24 || le <= lb || (le - lb) / 16 != n || ce > slotBytes || le > slotBytes)
     {
         if (t == 0)
-            dirs.Store4(gid.x * 16, uint4(0, 0, 0, 0));
+            dirs.Store4(gid.x * 80, uint4(0, 0, 0, 0));
         return;
     }
     const uint cBase = (p.z & 0xFF) * slotBytes + cb, lBase = ((p.z >> 8) & 0xFF) * slotBytes + lb;
@@ -153,7 +158,7 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
     if (sOk == 0)
     {
         if (t == 0)
-            dirs.Store4(gid.x * 16, uint4(0, 0, 0, 0));
+            dirs.Store4(gid.x * 80, uint4(0, 0, 0, 0));
         return;
     }
 
@@ -197,6 +202,10 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
         const float mean = sRes[0][0] / max(sRes[0][1], 1.0);
         const float scale = max(max(sRes[0][5] - sRes[0][2], sRes[0][6] - sRes[0][3]), sRes[0][7] - sRes[0][4]) + 1e-12;
         const float w = mean <= 2e-3 * scale ? sRes[0][1] * asfloat(p.w) : 0;
-        dirs.Store4(gid.x * 16, asuint(float4(sDir.xyz, w)));
+        dirs.Store4(gid.x * 80, asuint(float4(sDir.xyz, w)));
+        dirs.Store4(gid.x * 80 + 16, asuint(float4(sM[0], sM[1], sM[2], sM[3])));
+        dirs.Store4(gid.x * 80 + 32, asuint(float4(sM[4], sM[5], sM[6], sM[7])));
+        dirs.Store4(gid.x * 80 + 48, asuint(float4(sM[8], sM[9], sM[10], sM[11])));
+        dirs.Store4(gid.x * 80 + 64, asuint(pairs[gid.x].viewport));
     }
 }
