@@ -3,14 +3,17 @@
 // À chaque image : les dessins sur la profondeur de l'écran sont rejoués dans le flux (comme une
 // capture) ; avant les effets de ReShade, sur sa liste de commandes : sommets vers l'espace caméra,
 // structure d'accélération, un rayon par pixel vers le soleil, image d'ombres lue par l'effet urti.fx.
-// La direction du soleil et la loi de profondeur viennent d'un étalonnage (capture complète, cartes
-// d'ombres comprises) fait à l'activation, puis à intervalles réguliers et sur F6.
+// La loi de profondeur et la carte d'ombres du soleil viennent d'un étalonnage (capture complète,
+// cartes d'ombres comprises) fait à l'activation et sur F6 ; ensuite la direction du soleil est
+// mesurée à chaque image sur le GPU (paires de dessins écran / carte d'ombres), sans relecture.
 //
 // Touches : F7 active / coupe ; F6 refait l'étalonnage. Fichier urti_photo à côté de l'add-on : image de
 // l'écran après les effets (urti_photoN.ppm).
 
 #include "live_convert_cs.h" // g_live_convert
 #include "live_shadow_cs.h"  // g_live_shadow
+#include "live_sunfit_cs.h"  // g_live_sunfit
+#include "live_sunvote_cs.h" // g_live_sunvote
 
 struct LiveState
 {
@@ -30,7 +33,16 @@ struct LiveState
     std::vector<ComPtr<ID3D12Resource>> retired[3]; // libérées trois images plus tard
     uint32_t photoIndex = 0;
     uint64_t boundFrame = 0;
+
+    // suivi du soleil à chaque image
+    bool forceCalibration = false, sunDirty = false;
+    uint32_t missedCalibrations = 0;
+    ComPtr<ID3D12RootSignature> fitRs, voteRs;
+    ComPtr<ID3D12PipelineState> fitPso, votePso;
+    ComPtr<ID3D12Resource> pairsUpload[3], pairDirs, sunBuf, sunUpload, sunReadback[3];
+    uint64_t framesSinceSun = 0, sunFrames = 0, sunAccepted = 0, pairSum = 0;
 } live;
+constexpr uint32_t kLiveMaxPairs = 256;
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage : direction du soleil (cartes d'ombres) et loi de profondeur, sur le processeur
@@ -108,6 +120,7 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     // soleil : pour chaque carte d'ombres, une direction par paire de dessins, puis vote
     struct Dir { double d[3]; double w; };
     double bestSun[3] = { 0, 1, 0 }, bestScore = 0;
+    uint32_t bestSlot = 0;
     for (uint32_t s = 0; s < kSlots; s++)
     {
         if (int(s) == mainSlot || !g.slotDepth[s] || g.screenLike[g.slotDepth[s]] == 1)
@@ -216,14 +229,26 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
         if (len <= 0 || std::fabs(sum[1] / len) > 0.995)
             continue;
         bestScore = slotBest;
+        bestSlot = s;
         for (int q = 0; q < 3; q++)
             bestSun[q] = sum[q] / len;
     }
     if (bestScore <= 0)
     {
-        Log("URTI direct : étalonnage sans carte d'ombres du soleil");
+        // ciel couvert, nuit, intérieur : pas de soleil, pas d'ombres (après trois essais de suite)
+        if (++live.missedCalibrations >= 3 && live.calibrated)
+        {
+            live.calibrated = false;
+            Log("URTI direct : plus de carte d'ombres du soleil, ombres RT suspendues");
+        }
+        else
+            Log("URTI direct : étalonnage sans carte d'ombres du soleil");
         return;
     }
+    live.missedCalibrations = 0;
+    g_liveSunDepth = g.slotDepth[bestSlot];
+    live.sunDirty = true;
+    live.framesSinceSun = 0;
     if (bestSun[1] < 0) // le soleil au-dessus de l'horizon
         for (double& v : bestSun)
             v = -v;
@@ -242,7 +267,7 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
 bool LiveCreatePipelines(ID3D12Device* device)
 {
     auto make = [&](const void* code, size_t size, int srvCount, ComPtr<ID3D12RootSignature>& rs, ComPtr<ID3D12PipelineState>& pso, uint32_t constants) {
-        D3D12_ROOT_PARAMETER p[4] = {};
+        D3D12_ROOT_PARAMETER p[5] = {}; // jusqu'à 3 SRV, 1 UAV, constantes
         for (int i = 0; i < srvCount; i++)
         {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -262,7 +287,9 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 2, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 2, live.shadowRs, live.shadowPso, 16);
+           make(g_live_shadow, sizeof(g_live_shadow), 3, live.shadowRs, live.shadowPso, 16) &&
+           make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
+           make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4);
 }
 
 ComPtr<ID3D12Resource> UavBuffer(ID3D12Device* device, uint64_t size, D3D12_RESOURCE_STATES state)
@@ -368,6 +395,21 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     return live.depthBuf && live.shadowBuf;
 }
 
+// tampons du suivi du soleil (créés une fois)
+bool LiveEnsureSun(ID3D12Device* device)
+{
+    if (live.sunBuf)
+        return true;
+    for (auto& r : live.pairsUpload)
+        r = MakeBuffer(device, kLiveMaxPairs * 16ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    for (auto& r : live.sunReadback)
+        r = MakeBuffer(device, 32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    live.pairDirs = UavBuffer(device, kLiveMaxPairs * 16ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    live.sunBuf = UavBuffer(device, 32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    live.sunUpload = MakeBuffer(device, 32, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    return live.sunBuf && live.pairDirs && live.sunUpload && live.pairsUpload[2] && live.sunReadback[2];
+}
+
 int LiveMainSlot()
 {
     int best = -1;
@@ -418,6 +460,45 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     const int slot = LiveMainSlot();
     const uint32_t drawsThisFrame = slot >= 0 ? uint32_t(g.slotDraws[slot]) : 0;
+    std::vector<LiveMark> marksNow;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        marksNow.swap(g_liveMarks);
+        if (!g_liveSunKeys.empty())
+            g_livePrevSunKeys.swap(g_liveSunKeys);
+        g_liveSunKeys.clear();
+        g_liveSunMarked = 0;
+    }
+    // bilan du suivi du soleil, lu trois images plus tard
+    if (const float* r = nullptr; live.sunReadback[live.frame % 3] && SUCCEEDED(live.sunReadback[live.frame % 3]->Map(0, nullptr, (void**)&r)) && r)
+    {
+        if (live.calibrated)
+        {
+            live.sunFrames++, live.pairSum += uint64_t(r[4]);
+            if (r[7] > 0)
+                live.sunAccepted++, live.framesSinceSun = 0;
+            else if (++live.framesSinceSun == 600)
+                live.forceCalibration = true; // dix secondes sans soleil mesuré : étalonnage complet
+            if (live.sunFrames == 300)
+            {
+                Log("URTI direct : soleil suivi (%.3f, %.3f, %.3f), mesuré sur %.0f %% des images, %.0f paires par image", r[0], r[1], r[2],
+                    100.0 * live.sunAccepted / live.sunFrames, double(live.pairSum) / live.sunFrames);
+                live.sunFrames = live.sunAccepted = live.pairSum = 0;
+            }
+        }
+        live.sunReadback[live.frame % 3]->Unmap(0, nullptr);
+    }
+    if (drawsThisFrame == 0 && live.bound)
+    {
+        // image sans dessin du jeu (image générée par DLSS) : l'image d'ombres précédente reste
+        Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kSlots * 8ull);
+        Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+        for (uint32_t s = 0; s < kSlots; s++)
+            g.slotDraws[s] = 0;
+        live.frame++;
+        return;
+    }
     const effect_texture_variable var = runtime->find_texture_variable("urti.fx", "UrtiDepth");
     resource_view depthSrv = {}, depthSrgb = {};
     if (var.handle)
@@ -432,7 +513,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         return;
     }
     const D3D12_RESOURCE_DESC depthDesc = depthCopy->GetDesc();
-    if (!LiveEnsureCapacity(device.Get(), std::max<uint64_t>(live.lastFilled, 300000)) || !LiveEnsureImages(runtime, g.device, depthDesc))
+    if (!LiveEnsureCapacity(device.Get(), std::max<uint64_t>(live.lastFilled, 300000)) || !LiveEnsureImages(runtime, g.device, depthDesc) ||
+        !LiveEnsureSun(g.device))
         return;
 
     const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -448,6 +530,84 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRoot32BitConstants(3, 4, &cc, 0);
     list->Dispatch(UINT((live.capacity + 255) / 256), 1, 1);
     Transition(list.Get(), live.view.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+
+    // 1b. soleil de cette image : paires écran / carte d'ombres de même signature, ajustées puis votées
+    if (live.sunDirty)
+    {
+        void* p = nullptr;
+        if (SUCCEEDED(live.sunUpload->Map(0, nullptr, &p)))
+        {
+            const float s[8] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0 };
+            std::memcpy(p, s, sizeof(s));
+            live.sunUpload->Unmap(0, nullptr);
+        }
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(live.sunBuf.Get(), 0, live.sunUpload.Get(), 0, 32);
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.sunDirty = false;
+    }
+    struct Pair { uint32_t cam, map, slots; float weight; };
+    std::vector<Pair> pairs;
+    {
+        std::unordered_map<uint64_t, std::vector<uint32_t>> sunByKey;
+        for (uint32_t i = 0; i < marksNow.size(); i++)
+            if (marksNow[i].sunMap)
+                sunByKey[marksNow[i].key].push_back(i);
+        std::unordered_map<uint64_t, uint32_t> rank;
+        for (uint32_t i = 0; i < marksNow.size() && pairs.size() < kLiveMaxPairs; i++)
+        {
+            if (marksNow[i].sunMap)
+                continue;
+            auto it = sunByKey.find(marksNow[i].key);
+            if (it == sunByKey.end())
+                continue;
+            const uint32_t r = rank[marksNow[i].key]++;
+            const std::vector<uint32_t>& c = it->second;
+            // même rang dans les deux passes : très probablement le même objet (poids 8)
+            if (r < c.size())
+                pairs.push_back({ i, c[r], marksNow[i].slot | (marksNow[c[r]].slot << 8), 8.0f });
+            for (uint32_t k = 0; k < c.size() && k < 3 && pairs.size() < kLiveMaxPairs; k++)
+                if (k != r)
+                    pairs.push_back({ i, c[k], marksNow[i].slot | (marksNow[c[k]].slot << 8), 1.0f });
+        }
+    }
+    {
+        void* p = nullptr;
+        ID3D12Resource* up = live.pairsUpload[live.frame % 3].Get();
+        if (!pairs.empty() && SUCCEEDED(up->Map(0, nullptr, &p)))
+        {
+            std::memcpy(p, pairs.data(), pairs.size() * sizeof(Pair));
+            up->Unmap(0, nullptr);
+            Transition(list.Get(), g.marks.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+            list->SetComputeRootSignature(live.fitRs.Get());
+            list->SetPipelineState(live.fitPso.Get());
+            list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, g.marks->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, up->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(3, live.pairDirs->GetGPUVirtualAddress());
+            const struct { float p00, p11; uint32_t count, slotBytes; } fc = { live.p00, live.p11, uint32_t(pairs.size()), uint32_t(kSlotBytes) };
+            list->SetComputeRoot32BitConstants(4, 4, &fc, 0);
+            list->Dispatch(UINT(pairs.size()), 1, 1);
+            Transition(list.Get(), g.marks.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+            Transition(list.Get(), live.pairDirs.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+            list->SetComputeRootSignature(live.voteRs.Get());
+            list->SetPipelineState(live.votePso.Get());
+            list->SetComputeRootShaderResourceView(0, live.pairDirs->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(1, live.sunBuf->GetGPUVirtualAddress());
+            const struct { uint32_t count; float cosTol, minShare; uint32_t pad; } vc = { uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.25f, 0 };
+            list->SetComputeRoot32BitConstants(2, 4, &vc, 0);
+            list->Dispatch(1, 1, 1);
+            Transition(list.Get(), live.pairDirs.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        else
+        {
+            // aucune paire : bilan « non mesuré », le soleil précédent reste
+            Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 16);
+            Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+    }
+    Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
     // 2. structures d'accélération
     D3D12_RAYTRACING_GEOMETRY_DESC geom = {};
@@ -515,7 +675,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetPipelineState(live.shadowPso.Get());
     list->SetComputeRootShaderResourceView(0, live.tlas->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(2, live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(2, live.sunBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(3, live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
     const struct
     {
@@ -526,8 +687,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         float pad[2];
     } sc = { { live.sun[0], live.sun[1], live.sun[2] }, 0.003f, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, { 0, 0 } };
-    list->SetComputeRoot32BitConstants(3, 16, &sc, 0);
+    list->SetComputeRoot32BitConstants(4, 16, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+    Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 32);
+    Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // 5. image d'ombres pour l'effet
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);

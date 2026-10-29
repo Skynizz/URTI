@@ -3,11 +3,12 @@
 
 RaytracingAccelerationStructure scene : register(t0);
 ByteAddressBuffer depth : register(t1);   // copie de la profondeur (32 bits par texel, lignes alignées)
+ByteAddressBuffer sunBuf : register(t2);  // soleil de cette image (live_sunvote), espace caméra
 RWByteAddressBuffer shadow : register(u0); // 1 éclairé, 0 à l'ombre (float, lignes alignées)
 
 cbuffer Constants : register(b0)
 {
-    float3 sun;        // vers le soleil, espace caméra
+    float3 unusedSun;  // (le soleil vient de sunBuf)
     float bias;
     uint width;
     uint height;
@@ -29,6 +30,7 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     const uint raw = depth.Load(id.y * depthPitch + id.x * 4);
     const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
+    const float3 sun = asfloat(sunBuf.Load3(0));
     float lit = 1.0;
     const float w = B / (d - A);
     if (d != clearDepth && w > 0 && w < 1e6)

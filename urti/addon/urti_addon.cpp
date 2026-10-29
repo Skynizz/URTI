@@ -38,6 +38,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -58,6 +59,19 @@ uint32_t g_capturePresents = 4; // la capture dure plusieurs présentations (gé
 bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès le lancement
 uint32_t g_calibrationInterval = 180;
 bool g_liveCapture = false;
+// mode direct : dessins marqués de l'image en cours. La carte d'ombres du soleil et l'écran voient les
+// mêmes maillages : les paires de même signature donnent la direction du soleil à chaque image (GPU)
+struct LiveMark
+{
+    uint64_t key = 0;
+    uint32_t slot = 0;
+    bool sunMap = false;
+};
+std::vector<LiveMark> g_liveMarks;
+std::unordered_set<uint64_t> g_liveSunKeys, g_livePrevSunKeys;
+uint64_t g_liveSunDepth = 0; // profondeur de la carte d'ombres du soleil (trouvée à l'étalonnage)
+uint32_t g_liveSunMarked = 0;
+constexpr uint32_t kLiveMaxSunMarks = 1024, kLiveMaxMarks = 4096;
 bool g_liveShowMask = false;     // urti.ini show_mask=1 : l'effet montre les ombres RT seules      // le mode direct capte la profondeur de l'écran à chaque image
 
 void Log(const char* fmt, ...)
@@ -552,10 +566,41 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
     }
     if (g.phase != Phase::Capturing)
     {
-        // mode direct : flux de l'écran seulement, sans bornes par dessin
-        if (g.screenLike[state.depth] != 1)
+        // mode direct : tout le flux de l'écran (structure d'accélération) ; de la carte d'ombres du
+        // soleil, seulement des dessins marqués ; à l'écran, marqués ceux qui ont un pendant dans la carte
+        const bool screen = g.screenLike[state.depth] == 1;
+        const bool sunMap = g_liveSunDepth && state.depth == g_liveSunDepth;
+        if (!screen && !sunMap)
             return;
-        g.slotDraws[slot]++;
+        uint64_t key = kind * 1000003ull;
+        for (uint32_t p : params)
+            key = key * 1315423911ull + p;
+        int mark = -1;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (sunMap)
+            {
+                if (g_liveSunMarked >= kLiveMaxSunMarks)
+                    return;
+                g_liveSunMarked++;
+                g_liveSunKeys.insert(key);
+            }
+            if (g_liveMarks.size() < kLiveMaxMarks && (sunMap || g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key)))
+            {
+                mark = int(g_liveMarks.size());
+                g_liveMarks.push_back({ key, uint32_t(slot), sunMap });
+            }
+        }
+        if (sunMap && mark < 0)
+            return;
+        if (screen)
+            g.slotDraws[slot]++;
+        if (mark >= 0)
+        {
+            Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(g.marks.Get(), mark * 16ull, g.counters.Get(), slot * 8ull, 8);
+            Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
+        }
         D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes, kSlotBytes, g.counters->GetGPUVirtualAddress() + slot * 8ull };
         list->SetPipelineState(shadow);
         list->SOSetTargets(0, 1, &view);
@@ -563,6 +608,8 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         const D3D12_STREAM_OUTPUT_BUFFER_VIEW none = {};
         list->SOSetTargets(0, 1, &none);
         Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (mark >= 0)
+            list->CopyBufferRegion(g.marks.Get(), mark * 16ull + 8, g.counters.Get(), slot * 8ull, 8);
         Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
         return;
@@ -1113,14 +1160,18 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.enabled = !live.enabled;
         Log("URTI : ombres RT en direct %s", live.enabled ? "actives" : "coupées");
     }
-    if ((GetAsyncKeyState(VK_F6) & 1) || (live.enabled && !live.calibrated && g.frame >= live.nextCalibration))
-        live.nextCalibration = g.frame;
+    if (GetAsyncKeyState(VK_F6) & 1)
+        live.forceCalibration = true;
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
-    if (live.enabled && g.phase == Phase::Idle && g.frame >= live.nextCalibration && g.nextCapture == ~0ull)
+    // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil
+    // image par image est perdu ; sinon le soleil est suivi sur le GPU
+    if (live.enabled && g.phase == Phase::Idle && g.nextCapture == ~0ull &&
+        (live.forceCalibration || (!live.calibrated && g.frame >= live.nextCalibration)))
     {
         g.liveCalibration = true;
         g.nextCapture = g.frame + 1;
         live.nextCalibration = g.frame + g_calibrationInterval;
+        live.forceCalibration = false;
     }
     const std::string photoTrigger = g_dir + "\\urti_f7";
     if (g.frame % 30 == 0 && GetFileAttributesA(photoTrigger.c_str()) != INVALID_FILE_ATTRIBUTES)
