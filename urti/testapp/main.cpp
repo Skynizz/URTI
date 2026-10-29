@@ -89,6 +89,13 @@ Mat4 LookAtLH(const float eye[3], const float at[3])
     return r;
 }
 
+Mat4 OrthoLH(float w, float h, float zn, float zf)
+{
+    Mat4 r = {};
+    r.m[0] = 2.0f / w, r.m[5] = 2.0f / h, r.m[10] = 1.0f / (zf - zn), r.m[14] = -zn / (zf - zn), r.m[15] = 1.0f;
+    return r;
+}
+
 Mat4 PerspectiveLH(float fovY, float aspect, float zn, float zf)
 {
     const float h = 1.0f / std::tan(fovY * 0.5f), w = h / aspect;
@@ -240,7 +247,7 @@ int main()
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kBuffers };
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
     CHECK(device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap)));
-    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1 };
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2 }; // écran, carte d'ombres
     CHECK(device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap)));
     const UINT rtvStep = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     ComPtr<ID3D12Resource> backBuffers[kBuffers];
@@ -270,6 +277,28 @@ int main()
         device->CreateDepthStencilView(depth.Get(), nullptr, dsvHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
+    // carte d'ombres du soleil (passe de profondeur seule vue depuis le soleil, comme dans un jeu)
+    constexpr UINT kShadowSize = 2048;
+    ComPtr<ID3D12Resource> shadowMap;
+    D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    shadowDsv.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    {
+        D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = kShadowSize;
+        desc.Height = kShadowSize;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_D32_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE clear = {};
+        clear.Format = DXGI_FORMAT_D32_FLOAT;
+        clear.DepthStencil.Depth = 1.0f;
+        CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&shadowMap)));
+        device->CreateDepthStencilView(shadowMap.Get(), nullptr, shadowDsv);
+    }
+
     // signature racine sans ALLOW_STREAM_OUTPUT, comme dans un jeu
     ComPtr<ID3D12RootSignature> rootSig;
     {
@@ -290,7 +319,7 @@ int main()
         CHECK(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rootSig)));
     }
 
-    ComPtr<ID3D12PipelineState> pso[2];
+    ComPtr<ID3D12PipelineState> pso[2], shadowPso[2];
     for (int inst = 0; inst < 2; inst++)
     {
         ComPtr<ID3DBlob> vs = Compile("vs", "vs_5_1", inst != 0), ps = Compile("ps", "ps_5_1", inst != 0);
@@ -318,6 +347,11 @@ int main()
         desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         desc.SampleDesc.Count = 1;
         CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[inst])));
+        // passe d'ombres : même vertex shader, pas de pixel shader ni de cible de couleur
+        desc.PS = {};
+        desc.NumRenderTargets = 0;
+        desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+        CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&shadowPso[inst])));
     }
 
     std::vector<Vertex> verts;
@@ -333,7 +367,7 @@ int main()
         offsets.push_back(4.0f + 1.5f * (i / 4));
     }
     ComPtr<ID3D12Resource> instances = UploadBuffer(device.Get(), offsets.data(), offsets.size() * sizeof(float));
-    ComPtr<ID3D12Resource> frameCb = UploadBuffer(device.Get(), nullptr, 256 * kBuffers);
+    ComPtr<ID3D12Resource> frameCb = UploadBuffer(device.Get(), nullptr, 256 * kBuffers * 2); // caméra, soleil
     uint8_t* frameCbData = nullptr;
     CHECK(frameCb->Map(0, nullptr, (void**)&frameCbData));
 
@@ -369,6 +403,13 @@ int main()
     const bool orbit = orbitEnv && std::atoi(orbitEnv) != 0;
     FILE* truth = std::getenv("URTI_TRUTH") ? std::fopen(std::getenv("URTI_TRUTH"), "w") : nullptr;
     const float at[3] = { 0.0f, 0.5f, 1.0f };
+    float sun[3] = { -0.45f, 0.8f, -0.35f }; // vers le soleil
+    {
+        const float l = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+        for (float& v : sun) v /= l;
+    }
+    const float sunEye[3] = { at[0] + 40.0f * sun[0], at[1] + 40.0f * sun[1], at[2] + 40.0f * sun[2] };
+    const Mat4 lightViewProj = Mul(LookAtLH(sunEye, at), OrthoLH(32.0f, 32.0f, 1.0f, 80.0f));
 
     struct Object
     {
@@ -390,6 +431,7 @@ int main()
             std::fprintf(truth, "%d %g %g %g", frame, eye[0], eye[1], eye[2]);
             for (float v : viewProj.m)
                 std::fprintf(truth, " %.9g", v);
+            std::fprintf(truth, " %.9g %.9g %.9g", sun[0], sun[1], sun[2]); // direction du soleil (monde)
             std::fputc('\n', truth);
         }
         const UINT bb = swapchain->GetCurrentBackBufferIndex();
@@ -397,6 +439,9 @@ int main()
         std::memcpy(cb, viewProj.m, sizeof(viewProj.m));
         const float time[4] = { t, 0, 0, 0 };
         std::memcpy(cb + 64, time, sizeof(time));
+        uint8_t* lightCb = frameCbData + 256 * (kBuffers + bb);
+        std::memcpy(lightCb, lightViewProj.m, sizeof(lightViewProj.m));
+        std::memcpy(lightCb + 64, time, sizeof(time));
 
         CHECK(allocator->Reset());
         CHECK(cmd->Reset(allocator.Get(), pso[0].Get()));
@@ -414,15 +459,24 @@ int main()
         const float sky[4] = { 0.45f, 0.6f, 0.85f, 1.0f };
         cmd->ClearRenderTargetView(rtv, sky, 0, nullptr);
         cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        cmd->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        const D3D12_VIEWPORT vp = { 0, 0, float(kWidth), float(kHeight), 0, 1 };
-        const D3D12_RECT sr = { 0, 0, (LONG)kWidth, (LONG)kHeight };
-        cmd->RSSetViewports(1, &vp);
-        cmd->RSSetScissorRects(1, &sr);
+        cmd->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         cmd->SetGraphicsRootSignature(rootSig.Get());
-        cmd->SetGraphicsRootConstantBufferView(0, frameCb->GetGPUVirtualAddress() + 256 * bb);
         cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmd->IASetIndexBuffer(&ibv);
+
+        for (int pass = 0; pass < 2; pass++)
+        {
+        const bool shadowPass = pass == 0;
+        if (shadowPass)
+            cmd->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
+        else
+            cmd->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        const D3D12_VIEWPORT vp = shadowPass ? D3D12_VIEWPORT{ 0, 0, float(kShadowSize), float(kShadowSize), 0, 1 } : D3D12_VIEWPORT{ 0, 0, float(kWidth), float(kHeight), 0, 1 };
+        const D3D12_RECT sr = shadowPass ? D3D12_RECT{ 0, 0, (LONG)kShadowSize, (LONG)kShadowSize } : D3D12_RECT{ 0, 0, (LONG)kWidth, (LONG)kHeight };
+        cmd->RSSetViewports(1, &vp);
+        cmd->RSSetScissorRects(1, &sr);
+        cmd->SetPipelineState(shadowPass ? shadowPso[0].Get() : pso[0].Get());
+        cmd->SetGraphicsRootConstantBufferView(0, frameCb->GetGPUVirtualAddress() + 256 * (shadowPass ? kBuffers + bb : bb));
         cmd->IASetVertexBuffers(0, 1, &vbv);
 
         auto draw = [&](const Object& o) {
@@ -438,12 +492,13 @@ int main()
         draw({ Mul(Mul(Scale(1.5f, 1.5f, 1.5f), RotateY(t)), Translate(3.5f, 0.75f, 2.0f)), { 0, 0.9f, 0.85f, 0.2f } }); // tourne
         draw({ Mul(Scale(1.2f, 2.0f, 1.2f), Translate(-2.0f, 1.0f, 2.0f)), { 1, 0.3f, 0.6f, 0.9f } });                  // déformé
 
-        cmd->SetPipelineState(pso[1].Get()); // instanciés
+        cmd->SetPipelineState(shadowPass ? shadowPso[1].Get() : pso[1].Get()); // instanciés
         const D3D12_VERTEX_BUFFER_VIEW both[2] = { vbv, ivbv };
         cmd->IASetVertexBuffers(0, 2, both);
         const Object inst = { Scale(0.8f, 0.8f, 0.8f), { 0, 0.4f, 0.8f, 0.4f } };
         cmd->SetGraphicsRoot32BitConstants(1, 20, &inst, 0);
         cmd->ExecuteIndirect(drawSignature.Get(), 1, argsBuffer.Get(), 0, nullptr, 0);
+        }
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;

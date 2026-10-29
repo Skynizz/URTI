@@ -309,11 +309,11 @@ ID3D12PipelineState* GetShadow(ID3D12Device* device, PipelineInfo& info)
 // capture
 // ------------------------------------------------------------------------------------------------
 
-// Un flux par profondeur de la taille de l'écran (les cartes d'ombres sont laissées de côté) : tous les
+// Un flux par profondeur (l'écran, les cartes d'ombres) : tous les
 // dessins d'un flux partagent son compteur, et D3D12 range leurs sorties à la suite, à leur taille
 // exacte, dans l'ordre d'exécution sur le GPU
 constexpr uint64_t kSoBytes = 512ull << 20; // 32 M sommets
-constexpr uint32_t kSlots = 2; // 256 Mo par flux : plusieurs frames du jeu pour l'auto-étalonnage
+constexpr uint32_t kSlots = 4; // l'écran et jusqu'à trois cartes d'ombres (direction du soleil)
 constexpr uint64_t kSlotBytes = kSoBytes / kSlots;
 constexpr uint32_t kMaxDraws = 65536;
 
@@ -365,7 +365,7 @@ struct Capture
     std::atomic<uint32_t> slotDraws[kSlots];
     std::atomic<uint32_t> offScreenDraws{ 0 };
     uint32_t screenW = 0, screenH = 0;
-    std::unordered_map<uint64_t, bool> screenLike; // profondeur de la taille de l'écran (pas une carte d'ombres)
+    std::unordered_map<uint64_t, int> screenLike; // 1 : profondeur de la taille de l'écran, 0 : autre, -1 : inutilisable
     int captureSlot = -1;
     bool depthReversed = false;
     std::unordered_map<uint64_t, uint32_t> drawsPerDevice; // diagnostic : dessins de tous les appareils pendant la capture
@@ -486,15 +486,20 @@ int SlotFor(uint64_t depth)
     if (it == g.screenLike.end())
     {
         const D3D12_RESOURCE_DESC d = reinterpret_cast<ID3D12Resource*>(depth)->GetDesc();
-        bool like = false;
-        if (g.screenW && g.screenH && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Height)
+        int kind = -1; // -1 inutilisable, 0 autre (cartes d'ombres…), 1 taille de l'écran
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Height && d.SampleDesc.Count == 1)
         {
-            const double a = double(d.Width) / d.Height, s = double(g.screenW) / g.screenH;
-            like = std::fabs(a - s) < 0.05 * s && d.Width >= 0.3 * g.screenW && d.SampleDesc.Count == 1;
+            kind = 0;
+            if (g.screenW && g.screenH)
+            {
+                const double a = double(d.Width) / d.Height, s = double(g.screenW) / g.screenH;
+                if (std::fabs(a - s) < 0.05 * s && d.Width >= 0.3 * g.screenW)
+                    kind = 1;
+            }
         }
-        it = g.screenLike.emplace(depth, like).first;
+        it = g.screenLike.emplace(depth, kind).first;
     }
-    if (!it->second)
+    if (it->second < 0)
         return -1;
     for (uint32_t s = 0; s < kSlots; s++)
     {
@@ -919,9 +924,22 @@ void DumpCapture(const std::string& path, const std::vector<float>& depth, uint3
         return;
     }
     const uint64_t filled = std::min<uint64_t>(counters[g.captureSlot * 2], kSlotBytes);
-    const uint32_t header[12] = { 0x49545255u /* URTI */, 1, g.captureDrawCount, uint32_t(g.captureSlot), width, height, g.screenW, g.screenH,
-                                  uint32_t(filled & 0xFFFFFFFF), uint32_t(filled >> 32), g.depthReversed ? 1u : 0u, 0 };
+    const uint32_t header[12] = { 0x49545255u /* URTI */, 2, g.captureDrawCount, uint32_t(g.captureSlot), width, height, g.screenW, g.screenH,
+                                  uint32_t(filled & 0xFFFFFFFF), uint32_t(filled >> 32), g.depthReversed ? 1u : 0u, kSlots };
     std::fwrite(header, sizeof(header), 1, f);
+    // flux : profondeur (taille, sorte), octets remplis
+    for (uint32_t s = 0; s < kSlots; s++)
+    {
+        uint32_t info[6] = {};
+        if (g.slotDepth[s])
+        {
+            const D3D12_RESOURCE_DESC d = reinterpret_cast<ID3D12Resource*>(g.slotDepth[s])->GetDesc();
+            const uint64_t bytes = std::min<uint64_t>(counters[s * 2], kSlotBytes);
+            info[0] = uint32_t(d.Width), info[1] = d.Height, info[2] = uint32_t(g.screenLike[g.slotDepth[s]] + 1);
+            info[3] = uint32_t(bytes & 0xFFFFFFFF), info[4] = uint32_t(bytes >> 32), info[5] = d.DepthOrArraySize;
+        }
+        std::fwrite(info, sizeof(info), 1, f);
+    }
     for (uint32_t d = 0; d < g.captureDrawCount; d++)
     {
         const DrawRecord& r = g.draws[d];
@@ -930,7 +948,9 @@ void DumpCapture(const std::string& path, const std::vector<float>& depth, uint3
         std::fwrite(rec, sizeof(rec), 1, f);
         std::fwrite(&marks[d * 2], 16, 1, f); // début, fin (octets)
     }
-    std::fwrite(so + g.captureSlot * kSlotBytes, 1, size_t(filled), f);
+    for (uint32_t s = 0; s < kSlots; s++)
+        if (g.slotDepth[s])
+            std::fwrite(so + s * kSlotBytes, 1, size_t(std::min<uint64_t>(counters[s * 2], kSlotBytes)), f);
     std::fwrite(depth.data(), sizeof(float), depth.size(), f);
     std::fclose(f);
     g.marksReadback->Unmap(0, nullptr);
@@ -1076,7 +1096,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         g.captureSlot = -1;
         uint32_t best = 0;
         for (uint32_t s = 0; s < kSlots; s++)
-            if (g.slotDepth[s] && g.slotDraws[s] > best)
+            if (g.slotDepth[s] && g.screenLike[g.slotDepth[s]] == 1 && g.slotDraws[s] > best)
                 best = g.slotDraws[s], g.depthResource = g.slotDepth[s], g.captureSlot = int(s);
 
         Log("URTI : capture %u, frame %llu : %u dessins, %u capturés, %u ignorés (pipeline inutilisable), %u sur une profondeur hors écran, %.1f Mo de sommets ; "
