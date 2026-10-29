@@ -13,3 +13,13 @@ add_library(urti_addon SHARED addon/urti_addon.cpp)
 target_include_directories(urti_addon PRIVATE third_party/reshade/include third_party/imgui)
 target_link_libraries(urti_addon d3d12)
 set_target_properties(urti_addon PROPERTIES OUTPUT_NAME urti SUFFIX ".addon64")
+
+# ombres du soleil en ray tracing sur une capture (outil hors ligne, DXR 1.1)
+set(URTI_DXC "F:/rtxgi/sdk/build/_deps/dxc-src/bin/x64/dxc.exe" CACHE FILEPATH "compilateur de shaders dxc")
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/rtshadow_cs.h
+    COMMAND ${URTI_DXC} -nologo -T cs_6_5 -E main -Vn g_main -Fh ${CMAKE_CURRENT_BINARY_DIR}/rtshadow_cs.h ${CMAKE_CURRENT_SOURCE_DIR}/tools/rtshadow.hlsl
+    DEPENDS tools/rtshadow.hlsl)
+add_executable(urti_rtshadow tools/rtshadow.cpp ${CMAKE_CURRENT_BINARY_DIR}/rtshadow_cs.h)
+target_include_directories(urti_rtshadow PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(urti_rtshadow d3d12)
