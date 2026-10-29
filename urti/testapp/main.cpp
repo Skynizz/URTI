@@ -403,7 +403,7 @@ int main()
     const bool orbit = orbitEnv && std::atoi(orbitEnv) != 0;
     FILE* truth = std::getenv("URTI_TRUTH") ? std::fopen(std::getenv("URTI_TRUTH"), "w") : nullptr;
     const float at[3] = { 0.0f, 0.5f, 1.0f };
-    float sun[3] = { -0.45f, 0.8f, -0.35f }; // vers le soleil
+    float sun[3] = { 0.25f, 0.75f, 0.6f }; // vers le soleil (devant la caméra : ombres portées visibles)
     {
         const float l = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
         for (float& v : sun) v /= l;

@@ -128,8 +128,12 @@ def sun_direction(cap, frame, p11, aspect):
             if d['slot'] == si and d['frame'] == frame:
                 theirs.setdefault((d['kind'], d['params'], d['end'] - d['start']), []).append(d)
         dirs, weights = [], []
+        rank = {}
         for x in mine:
-            for y in theirs.get((x['kind'], x['params'], x['end'] - x['start']), [])[:8]:
+            kx = (x['kind'], x['params'], x['end'] - x['start'])
+            my_rank = rank.get(kx, 0)
+            rank[kx] = my_rank + 1
+            for m, y in enumerate(theirs.get(kx, [])[:64]):
                 c = cap['verts'][x['start'] // 16:x['end'] // 16].astype(np.float64)
                 sv = slot['verts'][y['start'] // 16:y['end'] // 16].astype(np.float64)
                 ok = (c[:, 3] > 1e-3) & (np.abs(sv[:, 3]) > 1e-6)
@@ -149,7 +153,7 @@ def sun_direction(cap, frame, p11, aspect):
                 except np.linalg.LinAlgError:
                     continue
                 dirs.append(-d / np.linalg.norm(d))
-                weights.append(ok.sum())
+                weights.append(ok.sum() * (8 if m == my_rank else 1))  # même rang : sans doute le même objet
         if not dirs:
             continue
         dirs, weights = np.array(dirs), np.array(weights, float)
@@ -178,6 +182,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('capture')
     ap.add_argument('--truth')
+    ap.add_argument('--fov', type=float, help='champ de vision impose (degres), sans auto-etalonnage')
     a = ap.parse_args()
     cap = read_capture(a.capture)
     sw, sh = cap['screen']
@@ -209,6 +214,8 @@ def main():
         if err < best[1]:
             best = (fov, err)
     fov, err = best
+    if a.fov:
+        fov = np.radians(a.fov)
     p11 = 1 / np.tan(fov / 2)
     R, t, err, inliers = rigid_fit(c1, c2, p11, aspect)
     angle = np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))

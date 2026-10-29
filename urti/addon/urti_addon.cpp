@@ -55,6 +55,10 @@ namespace
 std::string g_dir, g_logPath;
 std::vector<uint64_t> g_captureFrames;
 uint32_t g_capturePresents = 4; // la capture dure plusieurs présentations (génération d'images : une sur deux sans dessin du jeu)
+bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès le lancement
+uint32_t g_calibrationInterval = 180;
+bool g_liveCapture = false;
+bool g_liveShowMask = false;     // urti.ini show_mask=1 : l'effet montre les ombres RT seules      // le mode direct capte la profondeur de l'écran à chaque image
 
 void Log(const char* fmt, ...)
 {
@@ -108,6 +112,12 @@ void ReadSettings(HMODULE module)
             l.erase(l.find_last_not_of(" \r\n\t") + 1);
             if (l.rfind("capture_frames=", 0) == 0)
                 g_captureFrames = parseList(l.substr(15));
+            if (l.rfind("show_mask=", 0) == 0)
+                g_liveShowMask = std::atoi(l.c_str() + 10) != 0;
+            if (l.rfind("live=", 0) == 0)
+                g_liveAtStart = std::atoi(l.c_str() + 5) != 0;
+            if (l.rfind("calibration_interval=", 0) == 0)
+                g_calibrationInterval = std::max(30, std::atoi(l.c_str() + 21));
             if (l.rfind("capture_presents=", 0) == 0)
                 g_capturePresents = std::max(1u, (uint32_t)std::strtoul(l.c_str() + 17, nullptr, 10));
         }
@@ -368,6 +378,7 @@ struct Capture
     std::unordered_map<uint64_t, int> screenLike; // 1 : profondeur de la taille de l'écran, 0 : autre, -1 : inutilisable
     int captureSlot = -1;
     bool depthReversed = false;
+    bool liveCalibration = false; // capture d'étalonnage du mode direct : rien n'est écrit sur le disque
     std::unordered_map<uint64_t, uint32_t> drawsPerDevice; // diagnostic : dessins de tous les appareils pendant la capture
 } g;
 
@@ -539,6 +550,23 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         g.skippedDraws++;
         return;
     }
+    if (g.phase != Phase::Capturing)
+    {
+        // mode direct : flux de l'écran seulement, sans bornes par dessin
+        if (g.screenLike[state.depth] != 1)
+            return;
+        g.slotDraws[slot]++;
+        D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes, kSlotBytes, g.counters->GetGPUVirtualAddress() + slot * 8ull };
+        list->SetPipelineState(shadow);
+        list->SOSetTargets(0, 1, &view);
+        issue(list);
+        const D3D12_STREAM_OUTPUT_BUFFER_VIEW none = {};
+        list->SOSetTargets(0, 1, &none);
+        Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
+        list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
+        return;
+    }
     const uint32_t index = g.drawCount++;
     if (index >= kMaxDraws)
         return;
@@ -576,7 +604,7 @@ bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uin
 {
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
-    if (g.phase == Phase::Capturing && OurDevice(cmd->get_device()))
+    if ((g.phase == Phase::Capturing || g_liveCapture) && OurDevice(cmd->get_device()))
         CaptureDraw(Native(cmd), 0, { vertexCount, instanceCount, firstVertex, firstInstance, 0 }, [&](ID3D12GraphicsCommandList* list) {
             list->DrawInstanced(vertexCount, instanceCount, firstVertex, firstInstance);
         });
@@ -587,7 +615,7 @@ bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCoun
 {
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
-    if (g.phase == Phase::Capturing && OurDevice(cmd->get_device()))
+    if ((g.phase == Phase::Capturing || g_liveCapture) && OurDevice(cmd->get_device()))
         CaptureDraw(Native(cmd), 1, { indexCount, instanceCount, firstIndex, uint32_t(vertexOffset), firstInstance }, [&](ID3D12GraphicsCommandList* list) {
             list->DrawIndexedInstanced(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
         });
@@ -603,7 +631,7 @@ PFN_ExecuteIndirect g_executeIndirect = nullptr;
 void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature, UINT maxCount,
     ID3D12Resource* args, UINT64 argsOffset, ID3D12Resource* countBuffer, UINT64 countOffset)
 {
-    if (g.phase == Phase::Capturing && g.device && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
+    if ((g.phase == Phase::Capturing || g_liveCapture) && g.device && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
     {
         ComPtr<ID3D12Device> owner;
         if (SUCCEEDED(self->GetDevice(IID_PPV_ARGS(&owner))) && owner.Get() == g.device)
@@ -653,7 +681,7 @@ void OnFinishEffects(effect_runtime* runtime, command_list* cmd, resource_view, 
 {
     if (g.phase != Phase::WaitingDepth || g.depthCopied || !OurDevice(runtime->get_device()))
         return;
-    const effect_texture_variable var = runtime->find_texture_variable("urti_depth.fx", "UrtiDepth");
+    const effect_texture_variable var = runtime->find_texture_variable("urti.fx", "UrtiDepth");
     if (!var.handle)
         return;
     resource_view srv = {}, srvSrgb = {};
@@ -910,6 +938,8 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, c
         valid ? 100.0 * covered / valid : 0.0, (unsigned long long)covered, (unsigned long long)valid, (unsigned long long)extra, valid ? error / valid : 0.0);
 }
 
+#include "urti_live.inl"
+
 // Capture complète pour l'analyse hors ligne : en-tête, dessins (signature, bornes), flux de la
 // profondeur principale (sommets en espace de découpage), profondeur du jeu.
 void DumpCapture(const std::string& path, const std::vector<float>& depth, uint32_t width, uint32_t height, const uint8_t* so, const uint32_t* counters)
@@ -955,6 +985,23 @@ void DumpCapture(const std::string& path, const std::vector<float>& depth, uint3
     std::fclose(f);
     g.marksReadback->Unmap(0, nullptr);
     Log("URTI : capture écrite pour l'analyse (%s, %.1f Mo)", path.c_str(), (64.0 * g.captureDrawCount + filled + 4.0 * depth.size()) / 1048576.0);
+}
+
+void FinishCalibration()
+{
+    const uint8_t* soData = nullptr;
+    const uint32_t* counterData = nullptr;
+    const uint64_t* marks = nullptr;
+    if (SUCCEEDED(g.soReadback->Map(0, nullptr, (void**)&soData)) && SUCCEEDED(g.counterReadback->Map(0, nullptr, (void**)&counterData)) &&
+        SUCCEEDED(g.marksReadback->Map(0, nullptr, (void**)&marks)) && soData && counterData && marks)
+        Calibrate(soData, counterData, marks);
+    if (soData)
+        g.soReadback->Unmap(0, nullptr);
+    if (counterData)
+        g.counterReadback->Unmap(0, nullptr);
+    if (marks)
+        g.marksReadback->Unmap(0, nullptr);
+    g.liveCalibration = false;
 }
 
 void Finish(ID3D12CommandQueue* q)
@@ -1024,6 +1071,51 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     }
     ID3D12CommandQueue* q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
 
+    if (g_liveAtStart && g.frame == 0)
+        live.enabled = true;
+    // images par seconde, journalisées toutes les 300 présentations (avec ou sans ombres RT)
+    {
+        static LARGE_INTEGER last = {}, freq = {};
+        static double sum = 0;
+        static uint32_t count = 0;
+        static bool lastState = false;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (!freq.QuadPart)
+            QueryPerformanceFrequency(&freq);
+        if (last.QuadPart && lastState == live.enabled)
+            sum += double(now.QuadPart - last.QuadPart) / freq.QuadPart, count++;
+        else
+            sum = 0, count = 0;
+        last = now, lastState = live.enabled;
+        if (count == 300)
+        {
+            Log("URTI : %.1f images par seconde (ombres RT %s)", count / sum, live.enabled ? "actives" : "coupées");
+            sum = 0, count = 0;
+        }
+    }
+    if (GetAsyncKeyState(VK_F7) & 1)
+    {
+        live.enabled = !live.enabled;
+        Log("URTI : ombres RT en direct %s", live.enabled ? "actives" : "coupées");
+    }
+    if ((GetAsyncKeyState(VK_F6) & 1) || (live.enabled && !live.calibrated && g.frame >= live.nextCalibration))
+        live.nextCalibration = g.frame;
+    g_liveCapture = live.enabled && g.phase == Phase::Idle;
+    if (live.enabled && g.phase == Phase::Idle && g.frame >= live.nextCalibration && g.nextCapture == ~0ull)
+    {
+        g.liveCalibration = true;
+        g.nextCapture = g.frame + 1;
+        live.nextCalibration = g.frame + g_calibrationInterval;
+    }
+    const std::string photoTrigger = g_dir + "\\urti_f7";
+    if (g.frame % 30 == 0 && GetFileAttributesA(photoTrigger.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        DeleteFileA(photoTrigger.c_str()); // bascule F7 par fichier (tests automatiques)
+        live.enabled = !live.enabled;
+        Log("URTI : ombres RT en direct %s (fichier)", live.enabled ? "actives" : "coupées");
+    }
+
     if ((GetAsyncKeyState(VK_F9) & 1) && g.phase == Phase::Idle)
     {
         g.nextCapture = g.frame + 1;
@@ -1066,7 +1158,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
             g.offScreenDraws = 0;
             for (uint32_t s = 0; s < kSlots; s++)
                 g.slotDepth[s] = 0, g.slotDraws[s] = 0;
-            g.presentsLeft = g_capturePresents;
+            g.presentsLeft = g.liveCalibration ? 2 : g_capturePresents;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g.drawsPerDevice.clear();
@@ -1117,6 +1209,11 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         Transition(g.list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         Submit(q);
+        if (g.liveCalibration)
+        {
+            FinishCalibration();
+            break;
+        }
         const resource back = swap->get_current_back_buffer();
         if (back.handle)
             SaveBackBuffer(q, reinterpret_cast<ID3D12Resource*>(back.handle), g_dir + "\\urti_capture" + std::to_string(g.captureIndex) + "_image.ppm");
@@ -1175,6 +1272,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
+        reshade::register_event<reshade::addon_event::reshade_begin_effects>(OnBeginEffects);
+        reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_addon(module);
