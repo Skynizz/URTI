@@ -12,7 +12,7 @@
 // création (ID3D12Device::CreateRootSignature).
 //
 // Variables d'environnement : URTI_OUT (dossier du journal, sinon celui de l'exécutable),
-// URTI_CAPTURE_FRAME (frame capturée, 60 par défaut).
+// URTI_CAPTURE_FRAME (frame capturée ; sinon touche F9 en jeu).
 
 #include <imgui.h>
 #include <reshade.hpp>
@@ -271,7 +271,7 @@ struct Capture
     ComPtr<ID3D12Fence> fence;
     uint64_t fenceValue = 0;
 
-    uint64_t frame = 0, captureFrame = 60;
+    uint64_t frame = 0, captureFrame = ~0ull; // F9, ou URTI_CAPTURE_FRAME
     bool capturing = false;
     std::atomic<uint64_t> soUsed{ 0 };
     std::atomic<uint32_t> drawCount{ 0 };
@@ -321,7 +321,7 @@ void OnInitDevice(device* dev)
         g.list->Close();
     device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence));
     g.draws.resize(kMaxDraws);
-    Log("URTI : appareil D3D12 prêt (capture à la frame %llu)", (unsigned long long)g.captureFrame);
+    Log("URTI : appareil D3D12 prêt (F9 : capture)");
 }
 
 void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
