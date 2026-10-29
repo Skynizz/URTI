@@ -60,6 +60,7 @@ uint32_t g_capturePresents = 4; // la capture dure plusieurs présentations (gé
 bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès le lancement
 uint32_t g_calibrationInterval = 180;
 bool g_liveCapture = false;
+std::atomic<uint32_t> g_presentDraws{ 0 }; // dessins du jeu depuis la dernière présentation (0 : image générée)
 // mode direct : dessins marqués de l'image en cours. La carte d'ombres du soleil et l'écran voient les
 // mêmes maillages : les paires de même signature donnent la direction du soleil à chaque image (GPU)
 struct LiveMark
@@ -686,6 +687,7 @@ void CountDevice(command_list* cmd)
 
 bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
+    g_presentDraws.fetch_add(1, std::memory_order_relaxed);
     PassDraw(cmd->get_native(), vertexCount <= 4 && instanceCount == 1);
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
@@ -698,6 +700,7 @@ bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uin
 
 bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
+    g_presentDraws.fetch_add(1, std::memory_order_relaxed);
     PassDraw(cmd->get_native(), false);
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
@@ -718,6 +721,7 @@ void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D
     ID3D12Resource* args, UINT64 argsOffset, ID3D12Resource* countBuffer, UINT64 countOffset)
 {
     PassDraw(reinterpret_cast<uint64_t>(self), false);
+    g_presentDraws.fetch_add(1, std::memory_order_relaxed);
     if ((g.phase == Phase::Capturing || g_liveCapture) && g.device && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
     {
         ComPtr<ID3D12Device> owner;
@@ -1209,6 +1213,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.enabled = !live.enabled;
         Log("URTI : ombres RT en direct %s", live.enabled ? "actives" : "coupées");
     }
+    live.lastPresentDraws = g_presentDraws.exchange(0);
     if (GetAsyncKeyState(VK_F6) & 1)
         live.forceCalibration = true;
     if (GetAsyncKeyState(VK_F5) & 1)
@@ -1223,7 +1228,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     {
         g.liveCalibration = true;
         g.nextCapture = g.frame + 1;
-        live.nextCalibration = g.frame + g_calibrationInterval;
+        live.nextCalibration = g.frame + uint64_t(g_calibrationInterval) * (1ull << std::min<uint32_t>(live.missedCalibrations, 4));
         live.forceCalibration = false;
     }
     const std::string photoTrigger = g_dir + "\\urti_f7";

@@ -38,6 +38,11 @@ struct LiveState
     // suivi du soleil à chaque image
     bool forceCalibration = false, sunDirty = false;
     int iniCombine = -1; // urti.ini combine= : 0 ou 1 impose le mode ; -1 : menu de ReShade (UrtiMode)
+    uint32_t lastPresentDraws = 1; // dessins du jeu avant cette présentation (0 : image générée)
+    uint64_t maskFrame = ~0ull;    // image où le masque d'ombres a été calculé (sinon il ne suit plus la caméra)
+    int lastMode = -1;
+    float lastStrength = -1;
+    bool lastSplit = false, lastShowMask = false, lastTechnique = true;
     std::atomic<bool> toggleSplit{ false }; // F5 : écran partagé (gauche jeu seul, droite avec ombres RT)
     float sunSign = 1; // sens du soleil par rapport à la profondeur des cartes (convention du jeu)
     uint32_t missedCalibrations = 0;
@@ -569,6 +574,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         int32_t m = 0;
         runtime->get_uniform_value_int(mode, &m, 1);
         g_liveCombine = m == 1;
+        if (m != live.lastMode)
+            Log("URTI direct : mode %s (menu de ReShade)", m == 1 ? "seulement les ombres que le jeu n'a pas" : "ombres RT complètes");
+        live.lastMode = m;
     }
 
     // ce que le flux a reçu il y a trois images (lecture sans attente)
@@ -609,7 +617,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         live.sunReadback[live.frame % 3]->Unmap(0, nullptr);
     }
-    if (drawsThisFrame == 0 && live.bound)
+    if (live.lastPresentDraws == 0 && live.bound)
     {
         live.statNoDraw++;
         // image sans dessin du jeu (image générée par DLSS) : l'image d'ombres précédente reste
@@ -892,6 +900,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     for (uint32_t s = 0; s < kSlots; s++)
         g.slotDraws[s] = 0;
 
+    live.maskFrame = live.frame;
     if (active.handle)
         runtime->set_uniform_value_bool(active, true);
     const effect_uniform_variable showMask = runtime->find_uniform_variable("urti.fx", "UrtiShowMask");
@@ -915,6 +924,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 void LiveComposite(effect_runtime* runtime)
 {
     if (!live.enabled || !live.calibrated || !live.bound || !live.shadowBuf || !live.compositePso)
+        return;
+    // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt
+    // que des ombres figées qui ne suivent plus la caméra
+    if (live.maskFrame == ~0ull || live.frame > live.maskFrame + 2)
+        return;
+    const effect_technique technique = runtime->find_technique("urti.fx", "URTI");
+    const bool techniqueOn = runtime->get_effects_state() && (!technique.handle || runtime->get_technique_state(technique));
+    if (techniqueOn != live.lastTechnique)
+        Log("URTI direct : %s dans ReShade", techniqueOn ? "effet URTI actif" : "effet URTI coupé (ou effets coupés) : pas d'ombres RT");
+    live.lastTechnique = techniqueOn;
+    if (!techniqueOn)
         return;
     const resource back = runtime->get_current_back_buffer();
     if (!back.handle)
@@ -955,6 +975,9 @@ void LiveComposite(effect_runtime* runtime)
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiShowMask"); v.handle)
         runtime->get_uniform_value_bool(v, &showMask, 1);
     showMask = showMask || g_liveShowMask;
+    if (strength != live.lastStrength || split != live.lastSplit || showMask != live.lastShowMask)
+        Log("URTI direct : réglages du menu : force %.2f, écran partagé %d, masque seul %d", strength, split, showMask);
+    live.lastStrength = strength, live.lastSplit = split, live.lastShowMask = showMask;
 
     const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     D3D12_TEXTURE_COPY_LOCATION tex = {}, buf = {};
