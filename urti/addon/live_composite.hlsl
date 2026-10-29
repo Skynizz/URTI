@@ -128,8 +128,14 @@ void main(uint2 id : SV_DispatchThreadID)
     lit /= wsum;
 
     // reflet : pixel de rendu correspondant
-    const int2 rp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
-    const float4 rf = asfloat(reflection.Load4((uint(rp.y) * maskWidth + uint(rp.x)) * 16));
+    // (lu seulement si les reflets sont actifs : sinon le tampon lié n'a pas cette taille, et une lecture
+    // hors d'un tampon racine fait tomber le GPU)
+    float4 rf = float4(0, 0, 0, 0);
+    if (reflStrength > 0 || debugReflect != 0)
+    {
+        const int2 rp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+        rf = asfloat(reflection.Load4((uint(rp.y) * maskWidth + uint(rp.x)) * 16));
+    }
     if (debugReflect == 1)
     {
         StoreLinear(px, rf.www);
