@@ -36,6 +36,7 @@ struct LiveState
 
     // suivi du soleil à chaque image
     bool forceCalibration = false, sunDirty = false;
+    float sunSign = 1; // sens du soleil par rapport à la profondeur des cartes (convention du jeu)
     uint32_t missedCalibrations = 0;
     ComPtr<ID3D12RootSignature> fitRs, voteRs;
     ComPtr<ID3D12PipelineState> fitPso, votePso;
@@ -249,7 +250,10 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     g_liveSunDepth = g.slotDepth[bestSlot];
     live.sunDirty = true;
     live.framesSinceSun = 0;
-    if (bestSun[1] < 0) // le soleil au-dessus de l'horizon
+    // les directions par paire ont un sens défini (profondeur décroissante de la carte) ; le soleil est
+    // au-dessus de l'horizon : ce choix fixe la convention du jeu pour le suivi image par image
+    live.sunSign = bestSun[1] < 0 ? -1.0f : 1.0f;
+    if (bestSun[1] < 0)
         for (double& v : bestSun)
             v = -v;
     for (int q = 0; q < 3; q++)
@@ -594,7 +598,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetPipelineState(live.votePso.Get());
             list->SetComputeRootShaderResourceView(0, live.pairDirs->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(1, live.sunBuf->GetGPUVirtualAddress());
-            const struct { uint32_t count; float cosTol, minShare; uint32_t pad; } vc = { uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.25f, 0 };
+            const struct { uint32_t count; float cosTol, minShare, sunSign; } vc = { uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.25f, live.sunSign };
             list->SetComputeRoot32BitConstants(2, 4, &vc, 0);
             list->Dispatch(1, 1, 1);
             Transition(list.Get(), live.pairDirs.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

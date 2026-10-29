@@ -26,9 +26,9 @@ for ($k = 0; $k -lt 3; $k++) {
 "en jeu : attente ($Settle s) puis photos"
 Start-Sleep $Settle
 Trigger 'urti_photo'; "photo 1 (ombres RT actives, écran partagé)"; Start-Sleep 25
-& (Join-Path $PSScriptRoot 'mousemove.ps1') -Dx 15 -Steps 60 -Delay 15
-Start-Sleep 15
-Trigger 'urti_photo'; "photo 2 (autre angle)"; Start-Sleep 25
+Trigger 'urti_photo'; "photo 2 (pendant que la caméra tourne)"
+& (Join-Path $PSScriptRoot 'mousemove.ps1') -Dx 15 -Steps 120 -Delay 15
+Start-Sleep 25
 Trigger 'urti_f7'; "ombres RT coupées"; Start-Sleep 25
 Trigger 'urti_photo'; "photo 3 (ombres coupées)"; Start-Sleep 25
 Trigger 'urti_f7'; "ombres RT remises"; Start-Sleep 30
