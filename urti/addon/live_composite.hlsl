@@ -1,26 +1,28 @@
-// URTI en direct : application des ombres RT à l'image présentée, à chaque présentation (images du jeu
-// et images générées par DLSS / FSR, qui ne passent pas par les effets de ReShade). L'image affichée est
-// recopiée dans un tampon, décodée en lumière linéaire (sRGB, HDR10 PQ ou scRGB), assombrie là où le
-// masque d'ombres (résolution de rendu, filtré 3×3) le demande, réencodée et recopiée.
+// URTI en direct : application des ombres et des reflets RT à l'image présentée, à chaque présentation
+// (images du jeu et images générées par DLSS / FSR, qui ne passent pas par les effets de ReShade).
+// L'image affichée est recopiée dans un tampon, décodée en lumière linéaire (sRGB, HDR10 PQ ou scRGB) ;
+// reflets : couleur lue dans l'image à l'endroit du point reflété, mélangée selon le poids (Fresnel ×
+// lissé) ; ombres : assombrissement là où le masque (résolution de rendu, filtré) le demande.
 
-ByteAddressBuffer image : register(t0);   // copie de l'image présentée (lignes alignées)
-ByteAddressBuffer mask : register(t1);    // 1 éclairé, 0 ombre ajoutée (float, résolution de rendu)
-RWByteAddressBuffer output : register(u0); // même disposition que image
+ByteAddressBuffer image : register(t0);      // copie de l'image présentée (lignes alignées)
+ByteAddressBuffer mask : register(t1);       // 1 éclairé, 0 ombre ajoutée (float, résolution de rendu)
+ByteAddressBuffer reflection : register(t2); // float4 par pixel de rendu : u, v, poids, lissé
+RWByteAddressBuffer output : register(u0);   // même disposition que image
 
 cbuffer Constants : register(b0)
 {
     uint width;
     uint height;
     uint pitch;
-    uint format;      // 0 RGBA8, 1 BGRA8, 2 RGB10A2 en HDR10 (PQ), 3 RGBA16F (scRGB)
+    uint format;        // 0 RGBA8, 1 BGRA8, 2 RGB10A2 en HDR10 (PQ), 3 RGBA16F (scRGB)
     uint maskWidth;
     uint maskHeight;
     uint maskPitch;
-    float strength;   // assombrissement à l'ombre (0 : rien, 1 : noir)
-    uint split;       // 1 : moitié gauche sans ombres RT, trait au centre
-    uint showMask;    // 1 : masque seul
-    uint pad0;
-    uint pad;
+    float strength;     // assombrissement à l'ombre (0 : rien, 1 : noir)
+    uint split;         // 1 : moitié gauche sans RT, trait au centre
+    uint showMask;      // 1 : masque d'ombres seul
+    float reflStrength; // 0 : pas de reflets RT
+    uint debugReflect;  // 1 lissé du matériau, 2 poids des reflets, 3 couleur reflétée seule
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -35,7 +37,48 @@ float3 NitsToPq(float3 l)
     const float3 y = pow(saturate(l / 10000.0), 0.1593017578125);
     return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
 }
-float HalfToFloat(uint h) { return f16tof32(h); }
+
+uint Address(int2 px) { return uint(px.y) * pitch + uint(px.x) * (format == 3 ? 8 : 4); }
+
+// lumière linéaire (HDR10 : nits / 203, blanc de référence à 1)
+float3 LoadLinear(int2 px)
+{
+    px = clamp(px, int2(0, 0), int2(width - 1, height - 1));
+    const uint a = Address(px);
+    if (format == 3)
+    {
+        const uint2 raw = image.Load2(a);
+        return float3(f16tof32(raw.x & 0xFFFF), f16tof32(raw.x >> 16), f16tof32(raw.y & 0xFFFF));
+    }
+    const uint raw = image.Load(a);
+    if (format == 2)
+        return PqToNits(float3(raw & 1023, (raw >> 10) & 1023, (raw >> 20) & 1023) / 1023.0) / 203.0;
+    const float3 c = float3(raw & 255, (raw >> 8) & 255, (raw >> 16) & 255) / 255.0;
+    return SrgbToLinear(format == 1 ? c.bgr : c);
+}
+
+void StoreLinear(int2 px, float3 c)
+{
+    const uint a = Address(px);
+    if (format == 3)
+    {
+        const uint keep = image.Load2(a).y & 0xFFFF0000;
+        output.Store2(a, uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b) | keep));
+        return;
+    }
+    const uint keep = image.Load(a);
+    if (format == 2)
+    {
+        const uint3 q = uint3(round(saturate(NitsToPq(max(c, 0.0) * 203.0)) * 1023.0));
+        output.Store(a, q.x | (q.y << 10) | (q.z << 20) | (keep & 0xC0000000));
+        return;
+    }
+    float3 e = LinearToSrgb(saturate(c));
+    if (format == 1)
+        e = e.bgr;
+    const uint3 q = uint3(round(e * 255.0));
+    output.Store(a, q.x | (q.y << 8) | (q.z << 16) | (keep & 0xFF000000));
+}
 
 float MaskAt(int2 t)
 {
@@ -43,12 +86,34 @@ float MaskAt(int2 t)
     return asfloat(mask.Load(t.y * maskPitch + t.x * 4));
 }
 
+// couleur bilinéaire de l'image à une position (0..1)
+float3 SampleLinear(float2 uv)
+{
+    const float2 q = uv * float2(width, height) - 0.5;
+    const int2 b = int2(floor(q));
+    const float2 f = q - b;
+    return lerp(lerp(LoadLinear(b), LoadLinear(b + int2(1, 0)), f.x), lerp(LoadLinear(b + int2(0, 1)), LoadLinear(b + int2(1, 1)), f.x), f.y);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint2 id : SV_DispatchThreadID)
 {
     if (id.x >= width || id.y >= height)
         return;
-    // masque : bilinéaire à la résolution de rendu, adouci par une tente 3×3 (bords d'ombre moins durs)
+    const int2 px = int2(id);
+    if (split != 0 && id.x == width / 2)
+    {
+        StoreLinear(px, float3(1, 1, 1));
+        return;
+    }
+    float3 c = LoadLinear(px);
+    if (split != 0 && id.x < width / 2)
+    {
+        StoreLinear(px, c);
+        return;
+    }
+
+    // masque d'ombres : bilinéaire à la résolution de rendu, adouci par une tente (bords moins durs)
     const float2 m = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5;
     const int2 b = int2(floor(m));
     const float2 f = m - b;
@@ -62,45 +127,34 @@ void main(uint2 id : SV_DispatchThreadID)
         }
     lit /= wsum;
 
-    const uint addr = id.y * pitch + id.x * (format == 3 ? 8 : 4);
-    if (split != 0 && id.x == width / 2)
+    // reflet : pixel de rendu correspondant
+    const int2 rp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+    const float4 rf = asfloat(reflection.Load4((uint(rp.y) * maskWidth + uint(rp.x)) * 16));
+    if (debugReflect == 1)
     {
-        if (format == 3)
-            output.Store2(addr, uint2(f32tof16(1.0) | (f32tof16(1.0) << 16), f32tof16(1.0) | (f32tof16(1.0) << 16)));
-        else
-            output.Store(addr, 0xFFFFFFFF);
+        StoreLinear(px, rf.www);
         return;
     }
-    float shade = 1.0 - strength * (1.0 - lit);
-    if (split != 0 && id.x < width / 2)
-        shade = 1.0;
+    if (debugReflect == 2)
+    {
+        StoreLinear(px, rf.zzz);
+        return;
+    }
+    if (reflStrength > 0 && rf.z > 0)
+    {
+        const float3 reflected = SampleLinear(rf.xy);
+        if (debugReflect == 3)
+        {
+            StoreLinear(px, reflected * rf.z);
+            return;
+        }
+        c = lerp(c, reflected, saturate(rf.z * reflStrength));
+    }
 
-    if (format == 3)
+    if (showMask != 0)
     {
-        const uint2 raw = image.Load2(addr);
-        float3 c = float3(HalfToFloat(raw.x & 0xFFFF), HalfToFloat(raw.x >> 16), HalfToFloat(raw.y & 0xFFFF));
-        c = showMask != 0 ? lit.xxx : c * shade;
-        output.Store2(addr, uint2(f32tof16(c.r) | (f32tof16(c.g) << 16), f32tof16(c.b) | (raw.y & 0xFFFF0000)));
+        StoreLinear(px, lit.xxx);
         return;
     }
-    const uint raw = image.Load(addr);
-    if (format == 2)
-    {
-        float3 e = float3(raw & 1023, (raw >> 10) & 1023, (raw >> 20) & 1023) / 1023.0;
-        // l'ombre : 203 nits comme blanc de référence pour le masque seul
-        float3 c = showMask != 0 ? NitsToPq(lit.xxx * 203.0) : NitsToPq(PqToNits(e) * shade);
-        const uint3 q = uint3(round(saturate(c) * 1023.0));
-        output.Store(addr, q.x | (q.y << 10) | (q.z << 20) | (raw & 0xC0000000));
-        return;
-    }
-    float3 c = float3(raw & 255, (raw >> 8) & 255, (raw >> 16) & 255) / 255.0;
-    if (format == 1)
-        c = c.bgr;
-    float3 linearColor = SrgbToLinear(c); // image 8 bits : encodée sRGB
-    linearColor = showMask != 0 ? lit.xxx : linearColor * shade;
-    c = LinearToSrgb(saturate(linearColor));
-    if (format == 1)
-        c = c.bgr;
-    const uint3 q = uint3(round(c * 255.0));
-    output.Store(addr, q.x | (q.y << 8) | (q.z << 16) | (raw & 0xFF000000));
+    StoreLinear(px, c * (1.0 - strength * (1.0 - lit)));
 }

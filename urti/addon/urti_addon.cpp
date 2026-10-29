@@ -61,6 +61,10 @@ bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès l
 uint32_t g_calibrationInterval = 180;
 bool g_liveCapture = false;
 std::atomic<uint32_t> g_presentDraws{ 0 }; // dessins du jeu depuis la dernière présentation (0 : image générée)
+// G-buffer du jeu : cibles de rendu liées avec la profondeur de l'écran (au moins trois)
+uint64_t g_liveGbuffer[8] = {};
+uint32_t g_liveGbufferCount = 0;
+void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates);
 // mode direct : dessins marqués de l'image en cours. La carte d'ombres du soleil et l'écran voient les
 // mêmes maillages : les paires de même signature donnent la direction du soleil à chaque image (GPU)
 struct LiveMark
@@ -495,8 +499,18 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
 {
     PassBind(cmd, count, rtvs, dsv);
     const uint64_t depth = dsv.handle ? cmd->get_device()->get_resource_from_view(dsv).handle : 0;
+    uint64_t targets[8] = {};
+    if (g_liveCapture && depth && count >= 3)
+        for (uint32_t i = 0; i < count && i < 8; i++)
+            targets[i] = rtvs[i].handle ? cmd->get_device()->get_resource_from_view(rtvs[i]).handle : 0;
     std::lock_guard<std::mutex> lock(g_mutex);
     g.lists[cmd->get_native()].depth = depth;
+    if (targets[0])
+        if (auto it = g.screenLike.find(depth); it != g.screenLike.end() && it->second == 1 && count >= g_liveGbufferCount)
+        {
+            std::memcpy(g_liveGbuffer, targets, sizeof(targets));
+            g_liveGbufferCount = std::min<uint32_t>(count, 8);
+        }
 }
 
 
@@ -521,6 +535,7 @@ void OnBindViewports(command_list* cmd, uint32_t first, uint32_t count, const vi
 void OnBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates)
 {
     PassBarrier(cmd, count, resources, oldStates, newStates);
+    LiveGbufferBarrier(cmd, count, resources, oldStates, newStates);
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < count; i++)
         if (g.depthStates.count(resources[i].handle) || (static_cast<uint32_t>(newStates[i]) & 0x30))

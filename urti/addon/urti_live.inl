@@ -15,6 +15,7 @@
 #include "live_sunfit_cs.h"  // g_live_sunfit
 #include "live_sunvote_cs.h" // g_live_sunvote
 #include "live_composite_cs.h" // g_live_composite
+#include "live_reflect_cs.h"   // g_live_reflect
 
 struct LiveState
 {
@@ -39,6 +40,14 @@ struct LiveState
     bool forceCalibration = false, sunDirty = false;
     int iniCombine = -1; // urti.ini combine= : 0 ou 1 impose le mode ; -1 : menu de ReShade (UrtiMode)
     uint32_t lastPresentDraws = 1; // dessins du jeu avant cette présentation (0 : image générée)
+    // reflets : matériau du G-buffer copié à chaque image, rayons réfléchis
+    ComPtr<ID3D12RootSignature> reflectRs;
+    ComPtr<ID3D12PipelineState> reflectPso;
+    ComPtr<ID3D12Resource> materialBuf, reflectBuf;
+    uint64_t materialBytes = 0, materialFrame = ~0ull, reflectBytes = 0;
+    uint32_t materialPitch = 0, materialWidth = 0, materialHeight = 0, materialFormat = 0;
+    float reflStrength = 1.0f, smoothMin = 0.6f, f0 = 0.04f;
+    uint32_t reflChannel = 0, reflInvert = 0, debugReflect = 0, materialSlot = 2, reflEverywhere = 0;
     uint64_t maskFrame = ~0ull;    // image où le masque d'ombres a été calculé (sinon il ne suit plus la caméra)
     int lastMode = -1;
     float lastStrength = -1;
@@ -58,7 +67,7 @@ struct LiveState
     // bilan par 300 présentations : sans dessin du jeu, effets de ReShade, ombres appliquées
     uint32_t statPresents = 0, statNoDraw = 0, statEffects = 0, statComposited = 0;
     // rechargement à chaud : réglages (urti.ini) et shaders (urti_shaders\*.cso), sans relancer le jeu
-    FILETIME iniTime = {}, shaderTime[2] = {};
+    FILETIME iniTime = {}, shaderTime[3] = {};
     std::vector<ComPtr<ID3D12PipelineState>> retiredPso[3];
     uint64_t atlasBytes = 0;
     uint32_t atlasPitch = 0;
@@ -317,7 +326,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_shadow, sizeof(g_live_shadow), 4, live.shadowRs, live.shadowPso, 16) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
-           make(g_live_composite, sizeof(g_live_composite), 2, live.compositeRs, live.compositePso, 12);
+           make(g_live_composite, sizeof(g_live_composite), 3, live.compositeRs, live.compositePso, 12) &&
+           make(g_live_reflect, sizeof(g_live_reflect), 3, live.reflectRs, live.reflectPso, 16);
 }
 
 ComPtr<ID3D12Resource> UavBuffer(ID3D12Device* device, uint64_t size, D3D12_RESOURCE_STATES state)
@@ -463,6 +473,7 @@ void LiveHotReload(ID3D12Device* device)
         {
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
+            float refl = 1.0f, channel = 0, invert = 0, smoothMin = 0.6f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -474,19 +485,27 @@ void LiveHotReload(ID3D12Device* device)
                 };
                 value("combine=", combine), value("show_mask=", mask), value("debug_game_shadow=", debug);
                 value("game_bias=", gameBias), value("ray_bias=", rayBias), value("sun_radius=", sunRadius);
+                value("reflect=", refl), value("reflect_channel=", channel), value("reflect_invert=", invert), value("smooth_min=", smoothMin);
+                value("reflect_f0=", f0), value("debug_reflect=", debugReflect), value("material_slot=", slot), value("reflect_everywhere=", everywhere);
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
             g_liveShowMask = mask != 0, g_liveDebugGame = uint32_t(debug);
             g_liveGameBias = gameBias, g_liveRayBias = rayBias, g_liveSunRadius = sunRadius;
+            live.reflStrength = refl, live.reflChannel = uint32_t(channel) & 3, live.reflInvert = invert != 0, live.smoothMin = smoothMin;
+            live.f0 = f0, live.debugReflect = uint32_t(debugReflect), live.materialSlot = uint32_t(slot) & 7, live.reflEverywhere = everywhere != 0;
         }
         if (!first)
-            Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f°)", live.iniCombine,
-                g_liveShowMask, g_liveDebugGame, g_liveGameBias, g_liveRayBias, g_liveSunRadius);
+            Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
+                "canal %u%s, lissé min %.2f, f0 %.3f, contrôle %u, cible %u)", live.iniCombine, g_liveShowMask, g_liveDebugGame, g_liveGameBias,
+                g_liveRayBias, g_liveSunRadius, live.reflStrength, live.reflChannel, live.reflInvert ? " inversé" : "", live.smoothMin, live.f0,
+                live.debugReflect, live.materialSlot);
     }
     struct Hot { const char* name; ID3D12RootSignature* rs; ComPtr<ID3D12PipelineState>* pso; };
-    const Hot hot[2] = { { "live_shadow", live.shadowRs.Get(), std::addressof(live.shadowPso) }, { "live_composite", live.compositeRs.Get(), std::addressof(live.compositePso) } };
-    for (int i = 0; i < 2; i++)
+    const Hot hot[3] = { { "live_shadow", live.shadowRs.Get(), std::addressof(live.shadowPso) },
+                         { "live_composite", live.compositeRs.Get(), std::addressof(live.compositePso) },
+                         { "live_reflect", live.reflectRs.Get(), std::addressof(live.reflectPso) } };
+    for (int i = 0; i < 3; i++)
     {
         const std::string path = g_dir + "\\urti_shaders\\" + hot[i].name + ".cso";
         const FILETIME t = FileTime(path);
@@ -514,6 +533,59 @@ void LiveHotReload(ID3D12Device* device)
         live.retiredPso[live.frame % 3].push_back(*hot[i].pso);
         *hot[i].pso = pso;
         Log("URTI direct : shader %s rechargé à chaud", hot[i].name);
+    }
+}
+
+void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates)
+{
+    if (!g_liveCapture || !live.enabled || live.reflStrength <= 0 || !OurDevice(cmd->get_device()))
+        return;
+    uint64_t target = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (live.materialSlot < g_liveGbufferCount)
+            target = g_liveGbuffer[live.materialSlot];
+    }
+    if (!target)
+        return;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (resources[i].handle != target)
+            continue;
+        const uint32_t before = PassD3D12State(static_cast<uint32_t>(oldStates[i])), after = PassD3D12State(static_cast<uint32_t>(newStates[i]));
+        if (!(before & D3D12_RESOURCE_STATE_RENDER_TARGET) || (after & D3D12_RESOURCE_STATE_RENDER_TARGET))
+            continue;
+        ID3D12Resource* res = reinterpret_cast<ID3D12Resource*>(target);
+        const D3D12_RESOURCE_DESC d = res->GetDesc();
+        if (PassTexelBytes(uint32_t(d.Format)) != 4 || d.SampleDesc.Count != 1)
+            return;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT64 total = 0;
+        g.device->GetCopyableFootprints(&d, 0, 1, 0, &fp, nullptr, nullptr, &total);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!live.materialBuf || live.materialBytes < total)
+        {
+            Retire(live.materialBuf);
+            live.materialBuf = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
+            live.materialBytes = total;
+            Log("URTI direct : matériau du G-buffer (cible %u) %llux%u format %d copié à chaque image", live.materialSlot, (unsigned long long)d.Width,
+                d.Height, int(d.Format));
+        }
+        if (!live.materialBuf)
+            return;
+        ID3D12GraphicsCommandList* list = Native(cmd);
+        Transition(list, res, D3D12_RESOURCE_STATES(after), D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+        dst.pResource = live.materialBuf.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = fp;
+        src.pResource = res;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Transition(list, res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATES(after));
+        live.materialPitch = fp.Footprint.RowPitch, live.materialWidth = uint32_t(d.Width), live.materialHeight = d.Height;
+        live.materialFormat = uint32_t(d.Format), live.materialFrame = live.frame;
+        return;
     }
 }
 
@@ -873,6 +945,50 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 48);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    // 4b. reflets : un rayon réfléchi par pixel lisse (matériau du G-buffer copié dans cette image)
+    if (live.reflStrength > 0 || live.debugReflect)
+    {
+        const uint64_t bytes = uint64_t(live.width) * live.height * 16;
+        if (!live.reflectBuf || live.reflectBytes < bytes)
+        {
+            Retire(live.reflectBuf);
+            live.reflectBuf = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.reflectBytes = bytes;
+        }
+        const bool material = live.materialBuf && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 2 &&
+                              live.materialWidth == live.width && live.materialHeight == live.height;
+        if (live.reflectBuf && live.reflectPso)
+        {
+            if (live.materialBuf)
+                Transition(list.Get(), live.materialBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+            list->SetComputeRootSignature(live.reflectRs.Get());
+            list->SetPipelineState(live.reflectPso.Get());
+            list->SetComputeRootShaderResourceView(0, live.tlas->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, live.materialBuf ? live.materialBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(3, live.reflectBuf->GetGPUVirtualAddress());
+            const struct
+            {
+                uint32_t width, height, depthPitch, materialPitch;
+                float A, B, p00, p11, clearDepth;
+                uint32_t d24, channel;
+                float smoothMin, bias;
+                uint32_t flags;
+                float f0;
+                uint32_t reflectPitch;
+            } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
+                     d24 ? 1u : 0u, live.reflChannel, live.smoothMin, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u), live.f0, live.width * 16 };
+            list->SetComputeRoot32BitConstants(4, 16, &rc, 0);
+            list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+            if (live.materialBuf)
+                Transition(list.Get(), live.materialBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_BARRIER uavb = {};
+            uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uavb.UAV.pResource = live.reflectBuf.Get();
+            list->ResourceBarrier(1, &uavb);
+        }
+    }
+
     // 5. image d'ombres pour l'effet
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(list.Get(), live.mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -990,21 +1106,29 @@ void LiveComposite(effect_runtime* runtime)
     list->CopyTextureRegion(&buf, 0, 0, 0, &tex, nullptr);
     Transition(list.Get(), live.imageIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    const bool reflections = live.reflectBuf && (live.reflStrength > 0 || live.debugReflect);
+    if (reflections)
+        Transition(list.Get(), live.reflectBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootSignature(live.compositeRs.Get());
     list->SetPipelineState(live.compositePso.Get());
     list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(1, live.shadowBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(2, live.imageOut->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(2, reflections ? live.reflectBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(3, live.imageOut->GetGPUVirtualAddress());
     const struct
     {
         uint32_t width, height, pitch, format, maskWidth, maskHeight, maskPitch;
         float strength;
-        uint32_t split, showMask, pad0, pad;
+        uint32_t split, showMask;
+        float reflStrength;
+        uint32_t debugReflect;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
-             split ? 1u : 0u, showMask ? 1u : 0u, 0, 0 };
-    list->SetComputeRoot32BitConstants(3, 12, &cc, 0);
+             split ? 1u : 0u, showMask ? 1u : 0u, reflections ? live.reflStrength : 0.0f, reflections ? live.debugReflect : 0u };
+    list->SetComputeRoot32BitConstants(4, 12, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (reflections)
+        Transition(list.Get(), live.reflectBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(list.Get(), live.imageIn.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
