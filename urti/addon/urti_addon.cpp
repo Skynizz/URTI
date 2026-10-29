@@ -1,18 +1,25 @@
-// URTI (Universal Ray Tracing Injector), add-on ReShade, version 0 : capture de la géométrie d'un jeu
+// URTI (Universal Ray Tracing Injector), add-on ReShade, version 0.2 : capture de la géométrie d'un jeu
 // DirectX 12 sans toucher à son rendu, et test de couverture.
 //
 // Pour chaque pipeline graphique du jeu, un pipeline « ombre » : même vertex shader, même signature
 // racine, sortie de flux (stream output) de SV_Position, sans rastérisation ni pixel shader. Pendant
-// la frame capturée, chaque dessin est rejoué une fois avec ce pipeline : on obtient les triangles
-// tels que le jeu les a transformés (animation, instanciation, compression comprises), en espace de
-// découpage. Test : ces triangles, rastérisés à nouveau, doivent reproduire la profondeur du jeu
-// (aucune caméra nécessaire).
+// la frame capturée, chaque dessin (direct ou ExecuteIndirect) est rejoué une fois avec ce pipeline :
+// on obtient les triangles tels que le jeu les a transformés (animation, instanciation, compression
+// comprises), en espace de découpage. Test : ces triangles, rastérisés à nouveau, doivent reproduire
+// la profondeur du jeu (aucune caméra nécessaire).
 //
 // D3D12 exige ALLOW_STREAM_OUTPUT dans la signature racine : on l'ajoute à celles du jeu à leur
 // création (ID3D12Device::CreateRootSignature).
 //
-// Variables d'environnement : URTI_OUT (dossier du journal, sinon celui de l'exécutable),
-// URTI_CAPTURE_FRAME (frame capturée ; sinon touche F9 en jeu).
+// Prudence dans un vrai jeu :
+//  - un jeu crée souvent plusieurs appareils D3D12 (essais, upscaleurs) : seul celui qui présente
+//    l'image est utilisé, choisi à la première présentation ;
+//  - la profondeur est copiée à l'effacement suivant, où D3D12 garantit son état (écriture de
+//    profondeur), plutôt qu'à la présentation où son état est inconnu.
+//
+// Réglages : urti.ini à côté de l'add-on (capture_frames=3000,6000 ; sinon touche F9), ou variable
+// d'environnement URTI_CAPTURE_FRAME. Sorties à côté de l'add-on (ou dans URTI_OUT) : urti_log.txt,
+// profondeurs du jeu et de la géométrie captée (PFM), image de la frame (PPM).
 
 #include <imgui.h>
 #include <reshade.hpp>
@@ -22,12 +29,12 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdarg>
-#include <cstring>
-#include <functional>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -37,15 +44,17 @@ using Microsoft::WRL::ComPtr;
 using namespace reshade::api;
 
 extern "C" __declspec(dllexport) const char* NAME = "URTI";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Universal Ray Tracing Injector : capture de la géométrie (version 0).";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Universal Ray Tracing Injector : capture de la géométrie (version 0.2).";
 
 namespace
 {
 // ------------------------------------------------------------------------------------------------
-// journal
+// journal et réglages
 // ------------------------------------------------------------------------------------------------
 
-std::string g_logPath;
+std::string g_dir, g_logPath;
+std::vector<uint64_t> g_captureFrames;
+uint32_t g_capturePresents = 4; // la capture dure plusieurs présentations (génération d'images : une sur deux sans dessin du jeu)
 
 void Log(const char* fmt, ...)
 {
@@ -61,6 +70,50 @@ void Log(const char* fmt, ...)
         std::fclose(f);
     }
     reshade::log::message(reshade::log::level::info, text);
+}
+
+void ReadSettings(HMODULE module)
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    std::string self = path;
+    g_dir = self.substr(0, self.find_last_of("\\/"));
+    if (const char* out = std::getenv("URTI_OUT"))
+        g_dir = out;
+    g_logPath = g_dir + "\\urti_log.txt";
+
+    auto parseList = [](const std::string& s) {
+        std::vector<uint64_t> v;
+        size_t i = 0;
+        while (i < s.size())
+        {
+            const size_t j = s.find(',', i);
+            const std::string part = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
+            if (!part.empty())
+                v.push_back(std::strtoull(part.c_str(), nullptr, 10));
+            if (j == std::string::npos)
+                break;
+            i = j + 1;
+        }
+        return v;
+    };
+    if (const char* f = std::getenv("URTI_CAPTURE_FRAME"))
+        g_captureFrames = parseList(f);
+    if (FILE* f = std::fopen((self.substr(0, self.find_last_of("\\/")) + "\\urti.ini").c_str(), "r"))
+    {
+        char line[512];
+        while (std::fgets(line, sizeof(line), f))
+        {
+            std::string l = line;
+            l.erase(l.find_last_not_of(" \r\n\t") + 1);
+            if (l.rfind("capture_frames=", 0) == 0)
+                g_captureFrames = parseList(l.substr(15));
+            if (l.rfind("capture_presents=", 0) == 0)
+                g_capturePresents = std::max(1u, (uint32_t)std::strtoul(l.c_str() + 17, nullptr, 10));
+        }
+        std::fclose(f);
+    }
+    std::sort(g_captureFrames.begin(), g_captureFrames.end());
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -97,18 +150,18 @@ HRESULT STDMETHODCALLTYPE HookCreateRootSignature(ID3D12Device* self, UINT nodeM
     return g_createRootSignature(self, nodeMask, blob, size, riid, out);
 }
 
-void PatchDevice(ID3D12Device* device)
+void PatchVtable(void* object, int index, void* hook, void** original, const char* name)
 {
-    void** vtable = *reinterpret_cast<void***>(device);
-    constexpr int kCreateRootSignature = 16; // IUnknown (3) + ID3D12Object (4) + ID3D12Device jusqu'à CreateRootSignature
-    if (vtable[kCreateRootSignature] == reinterpret_cast<void*>(&HookCreateRootSignature))
+    void** vtable = *reinterpret_cast<void***>(object);
+    if (vtable[index] == hook)
         return;
     DWORD old = 0;
-    VirtualProtect(&vtable[kCreateRootSignature], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
-    g_createRootSignature = reinterpret_cast<PFN_CreateRootSignature>(vtable[kCreateRootSignature]);
-    vtable[kCreateRootSignature] = reinterpret_cast<void*>(&HookCreateRootSignature);
-    VirtualProtect(&vtable[kCreateRootSignature], sizeof(void*), old, &old);
-    Log("URTI : CreateRootSignature intercepté");
+    VirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+    if (!*original)
+        *original = vtable[index];
+    vtable[index] = hook;
+    VirtualProtect(&vtable[index], sizeof(void*), old, &old);
+    Log("URTI : %s intercepté", name);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -122,13 +175,14 @@ struct PipelineInfo
     std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
     ID3D12RootSignature* rootSignature = nullptr;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    bool usable = false;           // vertex shader seul (pas de géométrie / tessellation / mesh)
+    bool usable = false; // vertex shader seul (pas de géométrie / tessellation / mesh)
     ComPtr<ID3D12PipelineState> shadow;
     bool shadowFailed = false;
 };
 
 std::mutex g_mutex;
 std::unordered_map<uint64_t, PipelineInfo> g_pipelines;
+std::atomic<uint32_t> g_pipelinesSeen{ 0 }, g_pipelinesUsable{ 0 }, g_shadowFailures{ 0 };
 
 void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects, pipeline pipe)
 {
@@ -163,13 +217,10 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
         case pipeline_subobject_type::input_layout:
         {
             const input_element* e = static_cast<const input_element*>(s.data);
-            info.semantics.reserve(s.count);
-            for (uint32_t k = 0; k < s.count; k++)
-                info.semantics.push_back(e[k].semantic ? e[k].semantic : "");
             for (uint32_t k = 0; k < s.count; k++)
             {
+                info.semantics.push_back(e[k].semantic ? e[k].semantic : "");
                 D3D12_INPUT_ELEMENT_DESC d = {};
-                d.SemanticName = info.semantics[k].c_str();
                 d.SemanticIndex = e[k].semantic_index;
                 d.Format = static_cast<DXGI_FORMAT>(e[k].format); // les formats de ReShade suivent DXGI
                 d.InputSlot = e[k].buffer_binding;
@@ -197,13 +248,15 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
     }
     if (!hasVs)
         return;
+    g_pipelinesSeen++;
     info.rootSignature = reinterpret_cast<ID3D12RootSignature*>(layout.handle);
     info.usable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature;
-    // les noms de sémantique pointent dans info.semantics : à refaire après le déplacement
+    if (info.usable)
+        g_pipelinesUsable++;
     std::lock_guard<std::mutex> lock(g_mutex);
     PipelineInfo& stored = g_pipelines[pipe.handle] = std::move(info);
     for (size_t k = 0; k < stored.layout.size(); k++)
-        stored.layout[k].SemanticName = stored.semantics[k].c_str();
+        stored.layout[k].SemanticName = stored.semantics[k].c_str(); // après le déplacement
 }
 
 void OnDestroyPipeline(device*, pipeline pipe)
@@ -237,7 +290,8 @@ ID3D12PipelineState* GetShadow(ID3D12Device* device, PipelineInfo& info)
     if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&info.shadow))))
     {
         info.shadowFailed = true;
-        Log("URTI : pipeline ombre refusé (vertex shader de %zu octets)", info.vs.size());
+        if (g_shadowFailures++ < 10)
+            Log("URTI : pipeline ombre refusé (vertex shader de %zu octets)", info.vs.size());
     }
     return info.shadow.Get();
 }
@@ -246,14 +300,18 @@ ID3D12PipelineState* GetShadow(ID3D12Device* device, PipelineInfo& info)
 // capture
 // ------------------------------------------------------------------------------------------------
 
-constexpr uint64_t kSoBytes = 128ull << 20; // 8 M sommets
-constexpr uint32_t kMaxDraws = 16384;
+// Un flux par profondeur de la taille de l'écran (les cartes d'ombres sont laissées de côté) : tous les
+// dessins d'un flux partagent son compteur, et D3D12 range leurs sorties à la suite, à leur taille
+// exacte, dans l'ordre d'exécution sur le GPU
+constexpr uint64_t kSoBytes = 512ull << 20; // 32 M sommets
+constexpr uint32_t kSlots = 4;
+constexpr uint64_t kSlotBytes = kSoBytes / kSlots;
+constexpr uint32_t kMaxDraws = 65536;
 
 struct DrawRecord
 {
     uint64_t offset = 0, maxBytes = 0;
-    uint64_t pipeline = 0;
-    uint64_t depth = 0;   // ressource de profondeur liée au dessin
+    uint64_t depth = 0; // ressource de profondeur liée au dessin
 };
 
 struct CommandListState
@@ -262,23 +320,43 @@ struct CommandListState
     uint64_t depth = 0;
 };
 
+enum class Phase
+{
+    Idle,
+    Capturing,    // frame en cours de capture
+    WaitingDepth, // frame suivante : copie de la profondeur à son effacement
+};
+
 struct Capture
 {
-    ID3D12Device* device = nullptr;
+    ID3D12Device* device = nullptr; // celui qui présente
     ComPtr<ID3D12Resource> so, counters, zeros, soReadback, counterReadback, depthReadback;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;
     uint64_t fenceValue = 0;
 
-    uint64_t frame = 0, captureFrame = ~0ull; // F9, ou URTI_CAPTURE_FRAME
-    bool capturing = false;
+    uint64_t frame = 0, nextCapture = ~0ull;
+    size_t captureListIndex = 0;
+    std::atomic<Phase> phase{ Phase::Idle };
     std::atomic<uint64_t> soUsed{ 0 };
-    std::atomic<uint32_t> drawCount{ 0 };
+    std::atomic<uint32_t> drawCount{ 0 }, frameDraws{ 0 }, skippedDraws{ 0 }, overflowDraws{ 0 };
     std::vector<DrawRecord> draws;
-    std::atomic<uint32_t> framesDraws{ 0 }, skippedDraws{ 0 };
     std::unordered_map<uint64_t, CommandListState> lists;
     std::unordered_map<uint64_t, uint32_t> depthStates; // dernier état connu (barrières)
+
+    uint64_t depthResource = 0;
+    std::atomic<bool> depthCopied{ false };
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthFootprint = {};
+    D3D12_RESOURCE_DESC depthDesc = {};
+    uint32_t captureDrawCount = 0, captureIndex = 0, presentsLeft = 0;
+    uint64_t slotDepth[kSlots] = {};
+    std::atomic<uint32_t> slotDraws[kSlots];
+    std::atomic<uint32_t> offScreenDraws{ 0 };
+    uint32_t screenW = 0, screenH = 0;
+    std::unordered_map<uint64_t, bool> screenLike; // profondeur de la taille de l'écran (pas une carte d'ombres)
+    int captureSlot = -1;
+    std::unordered_map<uint64_t, uint32_t> drawsPerDevice; // diagnostic : dessins de tous les appareils pendant la capture
 } g;
 
 ComPtr<ID3D12Resource> MakeBuffer(ID3D12Device* device, uint64_t size, D3D12_HEAP_TYPE heapType, D3D12_RESOURCE_STATES state)
@@ -296,32 +374,56 @@ ComPtr<ID3D12Resource> MakeBuffer(ID3D12Device* device, uint64_t size, D3D12_HEA
     return r;
 }
 
+bool InitResources(ID3D12Device* device)
+{
+    g.so = MakeBuffer(device, kSoBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT);
+    g.counters = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT);
+    g.zeros = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    g.soReadback = MakeBuffer(device, kSoBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    g.counterReadback = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!g.so || !g.counters || !g.zeros || !g.soReadback || !g.counterReadback)
+        return false;
+    void* p = nullptr;
+    if (FAILED(g.zeros->Map(0, nullptr, &p)))
+        return false;
+    std::memset(p, 0, kMaxDraws * 8ull);
+    g.zeros->Unmap(0, nullptr);
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g.allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.allocator.Get(), nullptr, IID_PPV_ARGS(&g.list))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence))))
+        return false;
+    g.list->Close();
+    g.draws.resize(kMaxDraws);
+    g.device = device;
+    return true;
+}
+
+bool OurDevice(device* dev)
+{
+    return dev->get_api() == device_api::d3d12 && g.device && dev->get_native() == reinterpret_cast<uint64_t>(g.device);
+}
+
 void OnInitDevice(device* dev)
 {
     if (dev->get_api() != device_api::d3d12)
         return;
-    ID3D12Device* device = reinterpret_cast<ID3D12Device*>(dev->get_native());
-    PatchDevice(device);
-    g.device = device;
-    g.so = MakeBuffer(device, kSoBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT);
-    g.counters = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT);
-    g.zeros = MakeBuffer(device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (g.zeros)
-    {
-        void* p = nullptr;
-        if (SUCCEEDED(g.zeros->Map(0, nullptr, &p)))
-        {
-            std::memset(p, 0, kMaxDraws * 8ull);
-            g.zeros->Unmap(0, nullptr);
-        }
-    }
-    device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g.allocator));
-    device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.allocator.Get(), nullptr, IID_PPV_ARGS(&g.list));
-    if (g.list)
-        g.list->Close();
-    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence));
-    g.draws.resize(kMaxDraws);
-    Log("URTI : appareil D3D12 prêt (F9 : capture)");
+    PatchVtable(reinterpret_cast<void*>(dev->get_native()), 16, reinterpret_cast<void*>(&HookCreateRootSignature),
+                reinterpret_cast<void**>(&g_createRootSignature), "CreateRootSignature");
+}
+
+void OnDestroyDevice(device* dev)
+{
+    if (!OurDevice(dev))
+        return;
+    g.phase = Phase::Idle;
+    g.so.Reset(), g.counters.Reset(), g.zeros.Reset(), g.soReadback.Reset(), g.counterReadback.Reset(), g.depthReadback.Reset();
+    g.list.Reset(), g.allocator.Reset(), g.fence.Reset();
+    g.device = nullptr;
+}
+
+ID3D12GraphicsCommandList* Native(command_list* cmd)
+{
+    return reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
 }
 
 void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
@@ -339,113 +441,13 @@ void OnBindRenderTargets(command_list* cmd, uint32_t, const resource_view*, reso
     g.lists[cmd->get_native()].depth = depth;
 }
 
+
 void OnBarrier(command_list*, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* newStates)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < count; i++)
         if (g.depthStates.count(resources[i].handle) || (static_cast<uint32_t>(newStates[i]) & 0x30))
             g.depthStates[resources[i].handle] = static_cast<uint32_t>(newStates[i]);
-}
-
-// rejoue le dessin avec le pipeline ombre ; renvoie false (le dessin du jeu a lieu ensuite)
-bool CaptureDraw(ID3D12GraphicsCommandList* list, uint64_t verticesOut, const std::function<void(ID3D12GraphicsCommandList*)>& issue)
-{
-    if (!g.capturing)
-        return false;
-    g.framesDraws++;
-    CommandListState state;
-    PipelineInfo* info = nullptr;
-    ID3D12PipelineState* shadow = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        state = g.lists[(uint64_t)list];
-        auto it = g_pipelines.find(state.pipeline);
-        if (it != g_pipelines.end() && it->second.usable)
-        {
-            info = &it->second;
-            shadow = GetShadow(g.device, *info);
-        }
-    }
-    const uint64_t bytes = verticesOut * 16;
-    if (!shadow || bytes == 0)
-    {
-        g.skippedDraws++;
-        return false;
-    }
-    const uint32_t index = g.drawCount++;
-    const uint64_t offset = g.soUsed.fetch_add(bytes);
-    if (index >= kMaxDraws || offset + bytes > kSoBytes)
-    {
-        g.skippedDraws++;
-        return false;
-    }
-    g.draws[index] = { offset, bytes, state.pipeline, state.depth };
-
-    D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + offset, bytes, g.counters->GetGPUVirtualAddress() + index * 8ull };
-    list->SetPipelineState(shadow);
-    list->SOSetTargets(0, 1, &view);
-    issue(list);
-    const D3D12_STREAM_OUTPUT_BUFFER_VIEW none = {};
-    list->SOSetTargets(0, 1, &none);
-    list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
-    return false;
-}
-
-ID3D12GraphicsCommandList* Native(command_list* cmd)
-{
-    return reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
-}
-
-bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
-{
-    if (cmd->get_device()->get_api() != device_api::d3d12)
-        return false;
-    return CaptureDraw(Native(cmd), 3ull * vertexCount * instanceCount, [&](ID3D12GraphicsCommandList* list) {
-        list->DrawInstanced(vertexCount, instanceCount, firstVertex, firstInstance);
-    });
-}
-
-bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
-{
-    if (cmd->get_device()->get_api() != device_api::d3d12)
-        return false;
-    return CaptureDraw(Native(cmd), 3ull * indexCount * instanceCount, [&](ID3D12GraphicsCommandList* list) {
-        list->DrawIndexedInstanced(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
-    });
-}
-
-// ExecuteIndirect : l'événement de ReShade ne donne pas la signature de commande ; on rejoue l'appel
-// natif tel quel avec le pipeline ombre (une signature ne change pas de pipeline), dans un budget
-// fixe de sommets, les dessins de l'appel s'ajoutant à la suite dans le flux
-using PFN_ExecuteIndirect = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
-PFN_ExecuteIndirect g_executeIndirect = nullptr;
-constexpr uint64_t kIndirectBudget = 16ull << 20;
-
-void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature, UINT maxCount,
-    ID3D12Resource* args, UINT64 argsOffset, ID3D12Resource* countBuffer, UINT64 countOffset)
-{
-    if (g.capturing && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
-        CaptureDraw(self, kIndirectBudget / 16, [&](ID3D12GraphicsCommandList* list) {
-            g_executeIndirect(list, signature, maxCount, args, argsOffset, countBuffer, countOffset);
-        });
-    g_executeIndirect(self, signature, maxCount, args, argsOffset, countBuffer, countOffset);
-}
-
-void OnInitCommandList(command_list* cmd)
-{
-    if (cmd->get_device()->get_api() != device_api::d3d12 || g_executeIndirect)
-        return;
-    ID3D12GraphicsCommandList* list = Native(cmd);
-    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
-        return;
-    void** vtable = *reinterpret_cast<void***>(list);
-    constexpr int kExecuteIndirect = 59; // index dans ID3D12GraphicsCommandListVtbl (Windows SDK)
-    DWORD old = 0;
-    VirtualProtect(&vtable[kExecuteIndirect], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
-    g_executeIndirect = reinterpret_cast<PFN_ExecuteIndirect>(vtable[kExecuteIndirect]);
-    vtable[kExecuteIndirect] = reinterpret_cast<void*>(&HookExecuteIndirect);
-    VirtualProtect(&vtable[kExecuteIndirect], sizeof(void*), old, &old);
-    Log("URTI : ExecuteIndirect intercepté");
 }
 
 void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -461,6 +463,175 @@ void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOUR
     list->ResourceBarrier(1, &b);
 }
 
+// flux de la profondeur (créé à la première rencontre) ; -1 : profondeur hors écran ou plus de place
+int SlotFor(uint64_t depth)
+{
+    if (!depth)
+        return -1;
+    auto it = g.screenLike.find(depth);
+    if (it == g.screenLike.end())
+    {
+        const D3D12_RESOURCE_DESC d = reinterpret_cast<ID3D12Resource*>(depth)->GetDesc();
+        bool like = false;
+        if (g.screenW && g.screenH && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Height)
+        {
+            const double a = double(d.Width) / d.Height, s = double(g.screenW) / g.screenH;
+            like = std::fabs(a - s) < 0.05 * s && d.Width >= 0.3 * g.screenW && d.SampleDesc.Count == 1;
+        }
+        it = g.screenLike.emplace(depth, like).first;
+    }
+    if (!it->second)
+        return -1;
+    for (uint32_t s = 0; s < kSlots; s++)
+    {
+        if (g.slotDepth[s] == depth)
+            return int(s);
+        if (!g.slotDepth[s])
+        {
+            g.slotDepth[s] = depth;
+            return int(s);
+        }
+    }
+    return -1;
+}
+
+// rejoue le dessin avec le pipeline ombre ; le dessin du jeu a lieu ensuite, inchangé
+void CaptureDraw(ID3D12GraphicsCommandList* list, uint64_t, const std::function<void(ID3D12GraphicsCommandList*)>& issue)
+{
+    g.frameDraws++;
+    CommandListState state;
+    ID3D12PipelineState* shadow = nullptr;
+    int slot = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        state = g.lists[(uint64_t)list];
+        slot = SlotFor(state.depth);
+        auto it = g_pipelines.find(state.pipeline);
+        if (slot >= 0 && it != g_pipelines.end() && it->second.usable)
+            shadow = GetShadow(g.device, it->second);
+    }
+    if (slot < 0)
+    {
+        g.offScreenDraws++;
+        return;
+    }
+    if (!shadow)
+    {
+        g.skippedDraws++;
+        return;
+    }
+    g.drawCount++;
+    g.slotDraws[slot]++;
+
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes, kSlotBytes, g.counters->GetGPUVirtualAddress() + slot * 8ull };
+    list->SetPipelineState(shadow);
+    list->SOSetTargets(0, 1, &view);
+    issue(list);
+    const D3D12_STREAM_OUTPUT_BUFFER_VIEW none = {};
+    list->SOSetTargets(0, 1, &none);
+    // le dessin suivant doit lire la taille remplie par celui-ci : sinon deux dessins en vol écrivent
+    // au même endroit (constaté : 9,7 % de couverture sans cette barrière)
+    Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
+    list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
+}
+
+void CountDevice(command_list* cmd)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g.drawsPerDevice[cmd->get_device()->get_native()]++;
+}
+
+bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
+{
+    if (g.phase == Phase::Capturing)
+        CountDevice(cmd);
+    if (g.phase == Phase::Capturing && OurDevice(cmd->get_device()))
+        CaptureDraw(Native(cmd), 0, [&](ID3D12GraphicsCommandList* list) {
+            list->DrawInstanced(vertexCount, instanceCount, firstVertex, firstInstance);
+        });
+    return false;
+}
+
+bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
+{
+    if (g.phase == Phase::Capturing)
+        CountDevice(cmd);
+    if (g.phase == Phase::Capturing && OurDevice(cmd->get_device()))
+        CaptureDraw(Native(cmd), 0, [&](ID3D12GraphicsCommandList* list) {
+            list->DrawIndexedInstanced(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+        });
+    return false;
+}
+
+// ExecuteIndirect : l'événement de ReShade ne donne pas la signature de commande ; on rejoue l'appel
+// natif tel quel avec le pipeline ombre (une signature ne change pas de pipeline), dans un budget
+// fixe de sommets, les dessins de l'appel s'ajoutant à la suite dans le flux
+using PFN_ExecuteIndirect = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
+PFN_ExecuteIndirect g_executeIndirect = nullptr;
+
+void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature, UINT maxCount,
+    ID3D12Resource* args, UINT64 argsOffset, ID3D12Resource* countBuffer, UINT64 countOffset)
+{
+    if (g.phase == Phase::Capturing && g.device && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
+    {
+        ComPtr<ID3D12Device> owner;
+        if (SUCCEEDED(self->GetDevice(IID_PPV_ARGS(&owner))) && owner.Get() == g.device)
+            CaptureDraw(self, 0, [&](ID3D12GraphicsCommandList* list) {
+                g_executeIndirect(list, signature, maxCount, args, argsOffset, countBuffer, countOffset);
+            });
+    }
+    g_executeIndirect(self, signature, maxCount, args, argsOffset, countBuffer, countOffset);
+}
+
+void OnInitCommandList(command_list* cmd)
+{
+    if (cmd->get_device()->get_api() != device_api::d3d12)
+        return;
+    ID3D12GraphicsCommandList* list = Native(cmd);
+    if (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
+        PatchVtable(list, 59, reinterpret_cast<void*>(&HookExecuteIndirect), reinterpret_cast<void**>(&g_executeIndirect), "ExecuteIndirect");
+}
+
+// copie de la profondeur de la frame capturée, à son effacement dans la frame suivante : D3D12
+// garantit alors l'état DEPTH_WRITE
+void CopyDepthAtClear(command_list* cmd, resource_view dsv)
+{
+    if (g.phase != Phase::WaitingDepth || g.depthCopied || !dsv.handle || !OurDevice(cmd->get_device()) || !g.depthReadback)
+        return;
+    const resource r = cmd->get_device()->get_resource_from_view(dsv);
+    if (r.handle != g.depthResource)
+        return;
+    ID3D12GraphicsCommandList* list = Native(cmd);
+    ID3D12Resource* depth = reinterpret_cast<ID3D12Resource*>(r.handle);
+    Transition(list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = g.depthReadback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = g.depthFootprint;
+    src.pResource = depth;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    g.depthCopied = true;
+}
+
+bool OnClearDepthStencil(command_list* cmd, resource_view dsv, const float*, const uint8_t*, uint32_t, const rect*)
+{
+    CopyDepthAtClear(cmd, dsv);
+    return false;
+}
+
+bool OnBeginRenderPass(command_list* cmd, uint32_t, const render_pass_render_target_desc*, const render_pass_depth_stencil_desc* ds, render_pass_flags)
+{
+    // passe qui efface sa profondeur : appelé avant BeginRenderPass, la profondeur est en DEPTH_WRITE
+    if (ds && ds->depth_load_op == render_pass_load_op::clear)
+        CopyDepthAtClear(cmd, ds->view);
+    OnBindRenderTargets(cmd, 0, nullptr, ds ? ds->view : resource_view{ 0 });
+    return false;
+}
+
 void Submit(ID3D12CommandQueue* queue)
 {
     g.list->Close();
@@ -469,47 +640,137 @@ void Submit(ID3D12CommandQueue* queue)
     queue->Signal(g.fence.Get(), ++g.fenceValue);
     HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.fence->SetEventOnCompletion(g.fenceValue, e);
-    WaitForSingleObject(e, 10000);
+    WaitForSingleObject(e, 20000);
     CloseHandle(e);
+}
+
+void BeginList()
+{
+    g.allocator->Reset();
+    g.list->Reset(g.allocator.Get(), nullptr);
+}
+
+// ------------------------------------------------------------------------------------------------
+// image de la frame (pour savoir ce qui a été capturé)
+// ------------------------------------------------------------------------------------------------
+
+void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path)
+{
+    const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    UINT64 total = 0;
+    g.device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    ComPtr<ID3D12Resource> readback = MakeBuffer(g.device, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!readback)
+        return;
+    BeginList();
+    Transition(g.list.Get(), backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    src.pResource = backBuffer;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(g.list.Get(), backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    Submit(queue);
+
+    const uint8_t* data = nullptr;
+    if (FAILED(readback->Map(0, nullptr, (void**)&data)))
+        return;
+    const uint32_t w = (uint32_t)desc.Width / 2, h = desc.Height / 2;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f)
+    {
+        std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+        std::vector<uint8_t> row(size_t(w) * 3);
+        for (uint32_t y = 0; y < h; y++)
+        {
+            const uint8_t* src = data + fp.Offset + size_t(y * 2) * fp.Footprint.RowPitch;
+            for (uint32_t x = 0; x < w; x++)
+            {
+                uint8_t rgb[3] = {};
+                if (fp.Footprint.Format == DXGI_FORMAT_R10G10B10A2_UNORM || fp.Footprint.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS)
+                {
+                    const uint32_t v = reinterpret_cast<const uint32_t*>(src)[x * 2];
+                    for (int c = 0; c < 3; c++)
+                        rgb[c] = uint8_t(((v >> (10 * c)) & 1023) >> 2); // HDR10 : valeurs PQ brutes, image délavée mais lisible
+                }
+                else if (fp.Footprint.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                {
+                    const uint16_t* hf = reinterpret_cast<const uint16_t*>(src) + x * 2 * 4;
+                    for (int c = 0; c < 3; c++)
+                    {
+                        const uint32_t hb = hf[c], e = (hb >> 10) & 31, m = hb & 1023;
+                        const float v = e ? std::ldexp(1.0f + m / 1024.0f, int(e) - 15) : std::ldexp(m / 1024.0f, -14);
+                        rgb[c] = uint8_t(std::min(255.0f, 255.0f * std::pow(std::max(v, 0.0f) / (1.0f + v), 1.0f / 2.2f)));
+                    }
+                }
+                else
+                {
+                    const uint8_t* px = src + x * 2 * 4;
+                    const bool bgr = fp.Footprint.Format == DXGI_FORMAT_B8G8R8A8_UNORM || fp.Footprint.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                                     fp.Footprint.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+                    rgb[0] = px[bgr ? 2 : 0], rgb[1] = px[1], rgb[2] = px[bgr ? 0 : 2];
+                }
+                std::memcpy(&row[size_t(x) * 3], rgb, 3);
+            }
+            std::fwrite(row.data(), 1, row.size(), f);
+        }
+        std::fclose(f);
+    }
+    readback->Unmap(0, nullptr);
 }
 
 // ------------------------------------------------------------------------------------------------
 // analyse : couverture de la profondeur du jeu par la géométrie capturée
 // ------------------------------------------------------------------------------------------------
 
-void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, uint64_t depthResource,
-             const uint8_t* so, const uint32_t* counters, uint32_t drawCount)
+void WritePfm(const std::string& path, uint32_t w, uint32_t h, const std::function<float(uint32_t, uint32_t)>& value)
 {
-    // valeur d'effacement : la plus fréquente sur le bord de l'image (ciel)
-    const float corner = depth[0];
-    const bool reversed = corner < 0.5f;
-    const uint32_t step = 2; // grille d'évaluation : un pixel sur deux
+    if (FILE* f = std::fopen(path.c_str(), "wb"))
+    {
+        std::fprintf(f, "Pf\n%u %u\n-1.0\n", w, h);
+        for (int y = int(h) - 1; y >= 0; y--)
+            for (uint32_t x = 0; x < w; x++)
+            {
+                const float v = value(x, uint32_t(y));
+                std::fwrite(&v, 4, 1, f);
+            }
+        std::fclose(f);
+    }
+}
+
+void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, const uint8_t* so, const uint32_t* counters, uint32_t drawCount, const std::string& prefix)
+{
+    // valeur d'effacement : celle du coin de l'image (ciel, ou fond) ; profondeur inversée si proche de 0
+    const float clearValue = depth[0];
+    const bool reversed = clearValue < 0.5f;
+    const uint32_t step = 2;
     const uint32_t w = width / step, h = height / step;
-    std::vector<float> z(size_t(w) * h, reversed ? 0.0f : 1.0f);
+    const float empty = reversed ? 0.0f : 1.0f;
+    std::vector<float> z(size_t(w) * h, empty);
     uint64_t triangles = 0, clipped = 0, drawsOnDepth = 0;
 
-    for (uint32_t d = 0; d < drawCount && d < kMaxDraws; d++)
+    if (g.captureSlot >= 0)
     {
-        const DrawRecord& r = g.draws[d];
-        if (r.depth != depthResource)
-            continue;
-        drawsOnDepth++;
-        const uint64_t bytes = std::min<uint64_t>(counters[d * 2], r.maxBytes);
-        const float* v = reinterpret_cast<const float*>(so + r.offset);
+        drawsOnDepth = g.slotDraws[g.captureSlot];
+        const uint64_t filled = counters[g.captureSlot * 2];
+        if (filled > kSlotBytes)
+            Log("URTI : flux plein (%llu Mo demandés) : géométrie tronquée", (unsigned long long)(filled >> 20));
+        const uint64_t bytes = std::min<uint64_t>(filled, kSlotBytes);
+        const float* v = reinterpret_cast<const float*>(so + g.captureSlot * kSlotBytes);
         const uint64_t verts = bytes / 16;
         for (uint64_t t = 0; t + 2 < verts; t += 3)
         {
-            const float* a = v + 4 * t;
-            const float* b = a + 4;
-            const float* c = b + 4;
-            if (a[3] <= 1e-5f || b[3] <= 1e-5f || c[3] <= 1e-5f)
+            const float* p[3] = { v + 4 * t, v + 4 * t + 4, v + 4 * t + 8 };
+            if (p[0][3] <= 1e-5f || p[1][3] <= 1e-5f || p[2][3] <= 1e-5f)
             {
-                clipped++; // version 0 : triangles qui traversent le plan proche ignorés
+                clipped++; // triangles qui traversent le plan proche : ignorés dans ce test
                 continue;
             }
             triangles++;
             float sx[3], sy[3], sz[3];
-            const float* p[3] = { a, b, c };
             for (int k = 0; k < 3; k++)
             {
                 sx[k] = (p[k][0] / p[k][3] * 0.5f + 0.5f) * w;
@@ -517,12 +778,14 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, u
                 sz[k] = p[k][2] / p[k][3];
             }
             const float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
-            if (std::fabs(area) < 1e-12f)
+            if (!(std::fabs(area) > 1e-12f))
                 continue;
             const int x0 = std::max(0, (int)std::floor(std::min({ sx[0], sx[1], sx[2] })));
             const int x1 = std::min((int)w - 1, (int)std::ceil(std::max({ sx[0], sx[1], sx[2] })));
             const int y0 = std::max(0, (int)std::floor(std::min({ sy[0], sy[1], sy[2] })));
             const int y1 = std::min((int)h - 1, (int)std::ceil(std::max({ sy[0], sy[1], sy[2] })));
+            if (x1 < x0 || y1 < y0 || (int64_t)(x1 - x0) * (y1 - y0) > (int64_t)w * h)
+                continue;
             for (int y = y0; y <= y1; y++)
             {
                 for (int x = x0; x <= x1; x++)
@@ -543,23 +806,9 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, u
         }
     }
 
-    // images de contrôle (PFM) : profondeur du jeu et profondeur de la géométrie captée
-    auto writePfm = [&](const char* name, auto value) {
-        const std::string path = g_logPath.substr(0, g_logPath.find_last_of("\\/")) + "\\" + name;
-        if (FILE* f = std::fopen(path.c_str(), "wb"))
-        {
-            std::fprintf(f, "Pf\n%u %u\n-1.0\n", w, h);
-            for (int y = int(h) - 1; y >= 0; y--)
-                for (uint32_t x = 0; x < w; x++)
-                {
-                    const float v = value(x, uint32_t(y));
-                    std::fwrite(&v, 4, 1, f);
-                }
-            std::fclose(f);
-        }
-    };
-    writePfm("urti_profondeur_jeu.pfm", [&](uint32_t x, uint32_t y) { return depth[size_t(y * step + step / 2) * width + x * step + step / 2]; });
-    writePfm("urti_profondeur_captee.pfm", [&](uint32_t x, uint32_t y) { return z[size_t(y) * w + x]; });
+    auto game = [&](uint32_t x, uint32_t y) { return depth[size_t(y * step + step / 2) * width + x * step + step / 2]; };
+    WritePfm(prefix + "_profondeur_jeu.pfm", w, h, game);
+    WritePfm(prefix + "_profondeur_captee.pfm", w, h, [&](uint32_t x, uint32_t y) { return z[size_t(y) * w + x]; });
 
     uint64_t valid = 0, covered = 0, extra = 0;
     double error = 0;
@@ -567,15 +816,15 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, u
     {
         for (uint32_t x = 0; x < w; x++)
         {
-            const float game = depth[size_t(y * step + step / 2) * width + x * step + step / 2];
+            const float gz = game(x, y);
             const float ours = z[size_t(y) * w + x];
-            const bool gameHas = game != corner;
-            const bool oursHas = ours != (reversed ? 0.0f : 1.0f);
+            const bool gameHas = gz != clearValue;
+            const bool oursHas = ours != empty;
             if (gameHas)
             {
                 valid++;
-                const float diff = std::fabs(ours - game);
-                if (oursHas && diff <= 1e-4f + 1e-3f * std::fabs(game))
+                const float diff = std::fabs(ours - gz);
+                if (oursHas && diff <= 1e-4f + 1e-3f * std::fabs(gz))
                     covered++;
                 if (oursHas)
                     error += diff;
@@ -590,67 +839,154 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, u
         valid ? 100.0 * covered / valid : 0.0, (unsigned long long)covered, (unsigned long long)valid, (unsigned long long)extra, valid ? error / valid : 0.0);
 }
 
-void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*)
+void Finish(ID3D12CommandQueue* q)
 {
-    if (!g.device || !g.list)
-        return;
-    ID3D12CommandQueue* q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
-    if ((GetAsyncKeyState(VK_F9) & 1) && !g.capturing)
+    // la file a exécuté la frame suivante jusqu'ici : la copie de profondeur est faite
+    BeginList();
+    Submit(q);
+    const std::string prefix = g_dir + "\\urti_capture" + std::to_string(g.captureIndex);
+    const uint8_t* soData = nullptr;
+    const uint32_t* counterData = nullptr;
+    const uint8_t* depthData = nullptr;
+    g.soReadback->Map(0, nullptr, (void**)&soData);
+    g.counterReadback->Map(0, nullptr, (void**)&counterData);
+    if (g.depthCopied && g.depthReadback && SUCCEEDED(g.depthReadback->Map(0, nullptr, (void**)&depthData)) && soData && counterData)
     {
-        g.captureFrame = g.frame + 1; // F9 : capture de la frame suivante, au moment choisi en jeu
-        Log("URTI : F9, capture de la frame %llu", (unsigned long long)g.captureFrame);
-    }
-
-    if (g.frame + 1 == g.captureFrame)
-    {
-        // compteurs du flux remis à zéro avant la frame capturée
-        g.allocator->Reset();
-        g.list->Reset(g.allocator.Get(), nullptr);
-        Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST);
-        g.list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kMaxDraws * 8ull);
-        Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
-        Submit(q);
-        g.soUsed = 0;
-        g.drawCount = 0;
-        g.framesDraws = 0;
-        g.skippedDraws = 0;
-        g.capturing = true;
-    }
-    else if (g.capturing)
-    {
-        g.capturing = false;
-        const uint32_t drawCount = std::min<uint32_t>(g.drawCount, kMaxDraws);
-        const uint64_t used = std::min<uint64_t>(g.soUsed, kSoBytes);
-
-        // profondeur principale : celle du plus grand nombre de dessins capturés
-        std::unordered_map<uint64_t, uint32_t> votes;
-        for (uint32_t d = 0; d < drawCount; d++)
-            if (g.draws[d].depth)
-                votes[g.draws[d].depth]++;
-        uint64_t depthHandle = 0;
-        uint32_t best = 0;
-        for (auto& v : votes)
-            if (v.second > best)
-                best = v.second, depthHandle = v.first;
-
-        Log("URTI : frame %llu : %u dessins, %u capturés, %u ignorés, %.1f Mo de sommets ; %d signatures racines modifiées",
-            (unsigned long long)g.frame, (unsigned)g.framesDraws, drawCount, (unsigned)g.skippedDraws, used / 1048576.0, g_rootSignaturesPatched.load());
-
-        g.soReadback = MakeBuffer(g.device, std::max<uint64_t>(used, 16), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        g.counterReadback = MakeBuffer(g.device, kMaxDraws * 8ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-        ID3D12Resource* depth = reinterpret_cast<ID3D12Resource*>(depthHandle);
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-        D3D12_RESOURCE_DESC depthDesc = {};
-        if (depth)
+        const uint32_t width = (uint32_t)g.depthDesc.Width, height = g.depthDesc.Height;
+        const DXGI_FORMAT fmt = g.depthFootprint.Footprint.Format;
+        const bool d32 = fmt == DXGI_FORMAT_R32_TYPELESS || fmt == DXGI_FORMAT_D32_FLOAT || fmt == DXGI_FORMAT_R32_FLOAT;
+        std::vector<float> values(size_t(width) * height);
+        for (uint32_t y = 0; y < height; y++)
         {
-            depthDesc = depth->GetDesc();
-            UINT64 total = 0;
-            g.device->GetCopyableFootprints(&depthDesc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
-            g.depthReadback = MakeBuffer(g.device, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            const uint8_t* row = depthData + g.depthFootprint.Offset + size_t(y) * g.depthFootprint.Footprint.RowPitch;
+            for (uint32_t x = 0; x < width; x++)
+                values[size_t(y) * width + x] = d32 ? reinterpret_cast<const float*>(row)[x]
+                                                    : (reinterpret_cast<const uint32_t*>(row)[x] & 0xFFFFFF) / 16777215.0f;
         }
+        Analyse(values, width, height, soData, counterData, g.captureDrawCount, prefix);
+        g.depthReadback->Unmap(0, nullptr);
+    }
+    else
+        Log("URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture");
+    if (soData)
+        g.soReadback->Unmap(0, nullptr);
+    if (counterData)
+        g.counterReadback->Unmap(0, nullptr);
+    g.depthReadback.Reset();
+    g.captureIndex++;
+}
 
-        g.allocator->Reset();
-        g.list->Reset(g.allocator.Get(), nullptr);
+void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, uint32_t, const rect*)
+{
+    device* dev = queue->get_device();
+    if (dev->get_api() != device_api::d3d12)
+        return;
+    if (!g.device)
+    {
+        // l'appareil qui présente l'image : c'est le seul qu'on utilise
+        if (!InitResources(reinterpret_cast<ID3D12Device*>(dev->get_native())))
+        {
+            Log("URTI : ressources impossibles à créer, capture désactivée");
+            g.device = reinterpret_cast<ID3D12Device*>(1); // ne plus réessayer
+            return;
+        }
+        Log("URTI : appareil qui présente choisi ; %zu captures prévues ; F9 : capture", g_captureFrames.size());
+    }
+    if (!OurDevice(dev) || !g.list)
+        return;
+    if (!g.screenW)
+    {
+        const resource back = swap->get_current_back_buffer();
+        if (back.handle)
+        {
+            const D3D12_RESOURCE_DESC d = reinterpret_cast<ID3D12Resource*>(back.handle)->GetDesc();
+            g.screenW = (uint32_t)d.Width, g.screenH = d.Height;
+        }
+    }
+    ID3D12CommandQueue* q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+
+    if ((GetAsyncKeyState(VK_F9) & 1) && g.phase == Phase::Idle)
+    {
+        g.nextCapture = g.frame + 1;
+        Log("URTI : F9, capture de la frame %llu", (unsigned long long)g.nextCapture);
+    }
+    // déclencheur sans clavier (tests automatiques) : fichier urti_capture_maintenant à côté de l'add-on
+    if (g.frame % 30 == 0 && g.phase == Phase::Idle)
+    {
+        const std::string trigger = g_dir + "\\urti_capture_maintenant";
+        if (GetFileAttributesA(trigger.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            DeleteFileA(trigger.c_str());
+            g.nextCapture = g.frame + 1;
+            Log("URTI : déclencheur, capture de la frame %llu", (unsigned long long)g.nextCapture);
+        }
+    }
+    while (g.captureListIndex < g_captureFrames.size() && g_captureFrames[g.captureListIndex] <= g.frame)
+    {
+        if (g.phase == Phase::Idle && g.nextCapture == ~0ull)
+            g.nextCapture = g.frame + 1;
+        g.captureListIndex++;
+    }
+
+    switch (g.phase.load())
+    {
+    case Phase::Idle:
+        if (g.frame + 1 == g.nextCapture)
+        {
+            // compteurs du flux remis à zéro avant la frame capturée
+            BeginList();
+            Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST);
+            g.list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kMaxDraws * 8ull);
+            Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+            Submit(q);
+            g.soUsed = 0;
+            g.drawCount = 0;
+            g.frameDraws = 0;
+            g.skippedDraws = 0;
+            g.overflowDraws = 0;
+            g.offScreenDraws = 0;
+            for (uint32_t s = 0; s < kSlots; s++)
+                g.slotDepth[s] = 0, g.slotDraws[s] = 0;
+            g.presentsLeft = g_capturePresents;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g.drawsPerDevice.clear();
+            }
+            g.phase = Phase::Capturing;
+        }
+        break;
+
+    case Phase::Capturing:
+    {
+        if (--g.presentsLeft > 0)
+            break; // la capture continue sur la présentation suivante
+        g.phase = Phase::Idle; // plus aucun dessin rejoué
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            std::string perDevice;
+            for (auto& d : g.drawsPerDevice)
+                perDevice += " " + std::to_string(d.second) + (d.first == reinterpret_cast<uint64_t>(g.device) ? " (celui qui présente)" : " (autre)");
+            Log("URTI : dessins par appareil pendant la capture :%s", perDevice.empty() ? " aucun" : perDevice.c_str());
+        }
+        g.nextCapture = ~0ull;
+        g.captureDrawCount = std::min<uint32_t>(g.drawCount, kMaxDraws);
+        const uint64_t used = kSoBytes; // les compteurs disent ce qui est rempli
+
+        // profondeur principale : le flux qui a reçu le plus de dessins
+        g.depthResource = 0;
+        g.captureSlot = -1;
+        uint32_t best = 0;
+        for (uint32_t s = 0; s < kSlots; s++)
+            if (g.slotDepth[s] && g.slotDraws[s] > best)
+                best = g.slotDraws[s], g.depthResource = g.slotDepth[s], g.captureSlot = int(s);
+
+        Log("URTI : capture %u, frame %llu : %u dessins, %u capturés, %u ignorés (pipeline inutilisable), %u sur une profondeur hors écran, %.1f Mo de sommets ; "
+            "%u pipelines à vertex shader dont %u utilisables, %d signatures racines modifiées",
+            g.captureIndex, (unsigned long long)g.frame, (unsigned)g.frameDraws, g.captureDrawCount, (unsigned)g.skippedDraws, (unsigned)g.offScreenDraws,
+            used / 1048576.0, (unsigned)g_pipelinesSeen, (unsigned)g_pipelinesUsable, g_rootSignaturesPatched.load());
+
+        // sommets et compteurs vers la mémoire lisible ; image de la frame
+        BeginList();
         Transition(g.list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
         if (used)
@@ -658,59 +994,35 @@ void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint3
         g.list->CopyBufferRegion(g.counterReadback.Get(), 0, g.counters.Get(), 0, kMaxDraws * 8ull);
         Transition(g.list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         Transition(g.list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
-        D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        if (depth && g.depthReadback)
-        {
-            {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                auto it = g.depthStates.find(depthHandle);
-                if (it != g.depthStates.end())
-                    depthState = static_cast<D3D12_RESOURCE_STATES>(it->second);
-            }
-            Transition(g.list.Get(), depth, depthState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-            dst.pResource = g.depthReadback.Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            dst.PlacedFootprint = footprint;
-            src.pResource = depth;
-            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            src.SubresourceIndex = 0;
-            g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            Transition(g.list.Get(), depth, D3D12_RESOURCE_STATE_COPY_SOURCE, depthState);
-        }
         Submit(q);
+        const resource back = swap->get_current_back_buffer();
+        if (back.handle)
+            SaveBackBuffer(q, reinterpret_cast<ID3D12Resource*>(back.handle), g_dir + "\\urti_capture" + std::to_string(g.captureIndex) + "_image.ppm");
 
-        const uint8_t* soData = nullptr;
-        const uint32_t* counterData = nullptr;
-        const uint8_t* depthData = nullptr;
-        g.soReadback->Map(0, nullptr, (void**)&soData);
-        g.counterReadback->Map(0, nullptr, (void**)&counterData);
-        if (depth && g.depthReadback && SUCCEEDED(g.depthReadback->Map(0, nullptr, (void**)&depthData)) && soData && counterData)
+        // la profondeur sera copiée à son effacement dans la frame suivante
+        ID3D12Resource* depth = reinterpret_cast<ID3D12Resource*>(g.depthResource);
+        g.depthCopied = false;
+        if (depth)
         {
-            const uint32_t width = (uint32_t)depthDesc.Width, height = depthDesc.Height;
-            std::vector<float> values(size_t(width) * height);
-            const bool d32 = footprint.Footprint.Format == DXGI_FORMAT_R32_TYPELESS || footprint.Footprint.Format == DXGI_FORMAT_D32_FLOAT ||
-                             footprint.Footprint.Format == DXGI_FORMAT_R32_FLOAT;
-            for (uint32_t y = 0; y < height; y++)
-            {
-                const uint8_t* row = depthData + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch;
-                for (uint32_t x = 0; x < width; x++)
-                {
-                    if (d32)
-                        values[size_t(y) * width + x] = reinterpret_cast<const float*>(row)[x];
-                    else // D24S8 : 24 bits de profondeur
-                        values[size_t(y) * width + x] = (reinterpret_cast<const uint32_t*>(row)[x] & 0xFFFFFF) / 16777215.0f;
-                }
-            }
-            Analyse(values, width, height, depthHandle, soData, counterData, drawCount);
-            g.depthReadback->Unmap(0, nullptr);
+            g.depthDesc = depth->GetDesc();
+            UINT64 total = 0;
+            g.device->GetCopyableFootprints(&g.depthDesc, 0, 1, 0, &g.depthFootprint, nullptr, nullptr, &total);
+            g.depthReadback = MakeBuffer(g.device, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            Log("URTI : profondeur %llux%u, format %d, %u dessins dessus", (unsigned long long)g.depthDesc.Width, g.depthDesc.Height, (int)g.depthDesc.Format, best);
+            g.phase = Phase::WaitingDepth;
         }
         else
-            Log("URTI : pas de profondeur à comparer (format %d)", (int)depthDesc.Format);
-        if (soData)
-            g.soReadback->Unmap(0, nullptr);
-        if (counterData)
-            g.counterReadback->Unmap(0, nullptr);
+        {
+            Log("URTI : aucun dessin capturé sur une profondeur");
+            g.captureIndex++;
+        }
+        break;
+    }
+
+    case Phase::WaitingDepth:
+        g.phase = Phase::Idle;
+        Finish(q);
+        break;
     }
     g.frame++;
 }
@@ -721,32 +1033,23 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
-    {
         if (!reshade::register_addon(module))
             return FALSE;
-        char path[MAX_PATH] = {};
-        if (const char* out = std::getenv("URTI_OUT"))
-            g_logPath = std::string(out) + "\\urti_log.txt";
-        else
-        {
-            GetModuleFileNameA(nullptr, path, MAX_PATH);
-            std::string exe = path;
-            g_logPath = exe.substr(0, exe.find_last_of("\\/")) + "\\urti_log.txt";
-        }
-        if (const char* f = std::getenv("URTI_CAPTURE_FRAME"))
-            g.captureFrame = std::max(2, std::atoi(f));
+        ReadSettings(module);
         reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
         reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+        reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
         reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
+        reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
         reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+        reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencil);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-        reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
         break;
-    }
     case DLL_PROCESS_DETACH:
         reshade::unregister_addon(module);
         break;
