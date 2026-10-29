@@ -176,6 +176,7 @@ struct PipelineInfo
     ID3D12RootSignature* rootSignature = nullptr;
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     bool usable = false; // vertex shader seul (pas de géométrie / tessellation / mesh)
+    bool writesDepth = true; // passes d'éclairage différé, décals, transparents : profondeur en lecture seule
     ComPtr<ID3D12PipelineState> shadow;
     bool shadowFailed = false;
 };
@@ -231,6 +232,13 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
             }
             break;
         }
+        case pipeline_subobject_type::depth_stencil_state:
+        {
+            const depth_stencil_desc* d = static_cast<const depth_stencil_desc*>(s.data);
+            if (d)
+                info.writesDepth = d->depth_enable && d->depth_write_mask;
+            break;
+        }
         case pipeline_subobject_type::primitive_topology:
         {
             const primitive_topology t = *static_cast<const primitive_topology*>(s.data);
@@ -250,7 +258,8 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
         return;
     g_pipelinesSeen++;
     info.rootSignature = reinterpret_cast<ID3D12RootSignature*>(layout.handle);
-    info.usable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature;
+    // seule la géométrie qui écrit la profondeur compte : une passe plein écran qui la lit ne décrit pas la scène
+    info.usable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && info.writesDepth;
     if (info.usable)
         g_pipelinesUsable++;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -780,9 +789,12 @@ void WritePfm(const std::string& path, uint32_t w, uint32_t h, const std::functi
 
 void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, const uint8_t* so, const uint32_t* counters, uint32_t drawCount, const std::string& prefix)
 {
-    // valeur d'effacement : celle du coin de l'image (ciel, ou fond) ; profondeur inversée si proche de 0
-    const float clearValue = depth[0];
-    const bool reversed = clearValue < 0.5f;
+    // profondeur inversée si plus de pixels à 0 qu'à 1 (ciel) ; la valeur d'effacement est alors 0
+    size_t zeros = 0, ones = 0;
+    for (const float v : depth)
+        zeros += v == 0.0f, ones += v == 1.0f;
+    const bool reversed = zeros > ones;
+    const float clearValue = reversed ? 0.0f : 1.0f;
     const uint32_t step = 2;
     const uint32_t w = width / step, h = height / step;
     const float empty = reversed ? 0.0f : 1.0f;
