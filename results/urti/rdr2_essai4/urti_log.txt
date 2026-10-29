@@ -1,0 +1,19 @@
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : appareil qui présente choisi ; 0 captures prévues ; F9 : capture
+URTI : déclencheur, capture de la frame 5611
+URTI : dessins par appareil pendant la capture : 2959 (celui qui présente)
+URTI : capture 0, frame 5614 : 3166 dessins, 1210 capturés, 30 ignorés (pipeline inutilisable), 1926 sur une profondeur hors écran, 512.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15646 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 1031 dessins dessus
+URTI : profondeur copiée par ReShade (1706x960, format 19)
+URTI : profondeur 1706x960 inversée ; 1031 dessins sur cette profondeur, 658478 triangles (67215 traversant le plan proche)
+URTI : COUVERTURE 0.00 % des pixels de profondeur du jeu (0 / 409440) ; géométrie en trop sur 0 pixels ; écart moyen 9.59e-01
+URTI : déclencheur, capture de la frame 10831
+URTI : dessins par appareil pendant la capture : 2899 (celui qui présente)
+URTI : capture 1, frame 10834 : 3109 dessins, 1222 capturés, 23 ignorés (pipeline inutilisable), 1864 sur une profondeur hors écran, 512.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15646 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 1043 dessins dessus
+URTI : profondeur copiée par ReShade (1706x960, format 19)
+URTI : profondeur 1706x960 inversée ; 1043 dessins sur cette profondeur, 640147 triangles (77662 traversant le plan proche)
+URTI : COUVERTURE 0.00 % des pixels de profondeur du jeu (0 / 246991) ; géométrie en trop sur 162449 pixels ; écart moyen 9.18e-01

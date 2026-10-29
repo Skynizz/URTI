@@ -519,3 +519,24 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   ꟻLIP 0,563 → 0,513 avec G-buffer, 0,547 avec la seule image ; Bistro de jour 0,145 → 0,133.
   Coût 2 à 3 ms en pleine résolution : à passer en demi-résolution.
 - Limite de fond : la lumière hors champ ; c'est là que viendrait le cache en espace monde de KRC.
+
+## v25 — URTI, étape 1 validée dans Red Dead Redemption 2
+
+- URTI (idée de Skynizz : injecteur de ray tracing universel) : add-on ReShade qui capte la géométrie
+  d'un jeu DX12 sans toucher à son rendu. Pipeline « ombre » par pipeline du jeu (même vertex shader,
+  sortie de flux de SV_Position, sans rastérisation), dessins rejoués pendant la capture, y compris
+  `ExecuteIndirect` (intercepté directement) ; `ALLOW_STREAM_OUTPUT` ajouté aux signatures racines du
+  jeu. Banc DX12 à géométrie connue : 99,80 % de couverture.
+- RDR2 (DX12, OptiScaler, DLSS et génération d'images DLSS-G, 2560×1440, rendu 1706×960) : **97,5 à
+  97,6 % de la profondeur du jeu reproduite** par la géométrie captée (3 captures, écart moyen 1e-4),
+  personnages animés compris ; le critère de l'étape (> 95 %) est atteint. Scène : la scène de
+  chargement du mode histoire, rendue par le moteur (~3 300 dessins, 520 000 à 650 000 triangles).
+- Pièges du vrai jeu, un par essai : plusieurs appareils D3D12 (plantage à F9) ; une présentation
+  sur deux sans dessin (génération d'images) ; budget de sommets trop large ; dessins successifs qui
+  s'écrasent dans un flux partagé (barrière) ; profondeur jamais effacée de façon visible (copie de
+  ReShade) ; passes d'éclairage plein écran prises pour de la géométrie (pipelines sans écriture de
+  profondeur exclus).
+- Tests menés sans Skynizz : lancement, menu (clic sur « Histoire » ; l'Entrée injectée est ignorée),
+  captures par fichier déclencheur (`tools/reshade/urti_rdr2.ps1`). Mode histoire uniquement.
+- Reste à faire pour l'étape 2 : caméra (matrices) pour passer en espace monde, géométrie
+  persistante, BVH, ombres RT du soleil ; essai en monde ouvert (pas seulement la scène de chargement).

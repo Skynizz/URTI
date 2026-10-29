@@ -8,7 +8,7 @@ rayons, sans modifier ses shaders. Plan complet et avis de faisabilité : docs/U
 | Étape | Contenu | État |
 |---|---|---|
 | 0 | Banc : application DX12 en rastérisation à géométrie connue (`testapp/`), fenêtre cachée | fait |
-| 1 | Capture de la géométrie par sortie de flux, test de couverture | **99,80 %** sur le banc ; jeu réel à faire |
+| 1 | Capture de la géométrie par sortie de flux, test de couverture | **99,80 %** sur le banc ; **97,5 à 97,6 % dans Red Dead Redemption 2** (DX12, DLSS + génération d'images, 3 captures) |
 | 2 | Caméra estimée, géométrie persistante en espace monde, BVH, ombres RT du soleil | à faire |
 | 3 | Cache de lumière en espace monde (KRC), reflets et éclairage indirect | à faire |
 
@@ -24,7 +24,16 @@ rayons, sans modifier ses shaders. Plan complet et avis de faisabilité : docs/U
 - Test de couverture : les triangles captés, rastérisés à nouveau, doivent reproduire la profondeur
   du jeu. Aucune caméra n'est nécessaire pour ce test.
 
-Limites de la version 0 : dessins indirects (`ExecuteIndirect`) comptés mais pas capturés ;
+Ce qu'il a fallu pour un vrai jeu (RDR2) :
+- n'utiliser que l'appareil D3D12 qui présente l'image (le jeu en crée plusieurs : plantage sinon) ;
+- un flux partagé par profondeur de la taille de l'écran, les dessins s'y rangeant à la suite (barrière
+  sur le compteur entre deux dessins, sinon ils s'écrasent) ; cartes d'ombres laissées de côté ;
+- lire la profondeur dans la copie que fait ReShade (effet invisible `reshade/urti_depth.fx`) : RDR2
+  ne l'efface ni par `ClearDepthStencilView` ni par une passe de rendu ;
+- capture sur 4 présentations (avec la génération d'images, une sur deux n'a aucun dessin du jeu) ;
+- ne comparer que les pipelines qui écrivent la profondeur (les passes d'éclairage plein écran la lisent).
+
+Limites : dessins indirects (`ExecuteIndirect`) comptés mais pas capturés ;
 pipelines avec geometry / tessellation / mesh shaders ignorés ; triangles qui traversent le plan
 proche ignorés dans le test.
 

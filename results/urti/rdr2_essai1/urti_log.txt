@@ -1,0 +1,19 @@
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : appareil qui présente choisi ; 5 captures prévues ; F9 : capture
+URTI : capture 0, frame 2001 : 75 dessins, 75 capturés, 0 ignorés (pipeline inutilisable), 0 hors budget, 0.1 Mo de sommets ; 2442 pipelines à vertex shader dont 2407 utilisables, 15639 signatures racines modifiées
+URTI : profondeur 2560x1440, format 19, 74 dessins dessus
+URTI : profondeur 2560x1440 inversée ; 74 dessins sur cette profondeur, 926 triangles (0 traversant le plan proche)
+URTI : COUVERTURE 0.00 % des pixels de profondeur du jeu (0 / 0) ; géométrie en trop sur 0 pixels ; écart moyen 0.00e+00
+URTI : capture 1, frame 5001 : 75 dessins, 75 capturés, 0 ignorés (pipeline inutilisable), 0 hors budget, 0.1 Mo de sommets ; 2442 pipelines à vertex shader dont 2407 utilisables, 15639 signatures racines modifiées
+URTI : profondeur 2560x1440, format 19, 74 dessins dessus
+URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture
+URTI : capture 2, frame 9001 : 75 dessins, 75 capturés, 0 ignorés (pipeline inutilisable), 0 hors budget, 0.1 Mo de sommets ; 2442 pipelines à vertex shader dont 2407 utilisables, 15639 signatures racines modifiées
+URTI : profondeur 2560x1440, format 19, 74 dessins dessus
+URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture
+URTI : capture 3, frame 14001 : 4 dessins, 4 capturés, 0 ignorés (pipeline inutilisable), 0 hors budget, 0.0 Mo de sommets ; 2442 pipelines à vertex shader dont 2407 utilisables, 15645 signatures racines modifiées
+URTI : aucun dessin capturé sur une profondeur
+URTI : capture 4, frame 20001 : 0 dessins, 0 capturés, 0 ignorés (pipeline inutilisable), 0 hors budget, 0.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15645 signatures racines modifiées
+URTI : aucun dessin capturé sur une profondeur

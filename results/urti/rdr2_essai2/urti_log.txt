@@ -1,0 +1,25 @@
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : appareil qui présente choisi ; 0 captures prévues ; F9 : capture
+URTI : déclencheur, capture de la frame 5641
+URTI : dessins par appareil pendant la capture : 2778 (celui qui présente)
+URTI : capture 0, frame 5644 : 2988 dessins, 2929 capturés, 59 ignorés (pipeline inutilisable), 2850 hors budget, 512.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15645 signatures racines modifiées
+URTI : profondeur 1024x1024, format 19, 27 dessins dessus
+URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture
+URTI : déclencheur, capture de la frame 10951
+URTI : dessins par appareil pendant la capture : 2743 (celui qui présente)
+URTI : capture 1, frame 10954 : 2954 dessins, 2895 capturés, 59 ignorés (pipeline inutilisable), 2719 hors budget, 512.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15645 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 87 dessins dessus
+URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture
+URTI : déclencheur, capture de la frame 16321
+URTI : dessins par appareil pendant la capture : 2657 (celui qui présente)
+URTI : capture 2, frame 16324 : 2833 dessins, 2772 capturés, 61 ignorés (pipeline inutilisable), 2697 hors budget, 512.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15645 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 121 dessins dessus
+URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture
+URTI : déclencheur, capture de la frame 21601
+URTI : dessins par appareil pendant la capture : 2772 (celui qui présente)
+URTI : capture 3, frame 21604 : 2943 dessins, 2869 capturés, 74 ignorés (pipeline inutilisable), 2764 hors budget, 512.0 Mo de sommets ; 2443 pipelines à vertex shader dont 2408 utilisables, 15645 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 100 dessins dessus
+URTI : profondeur non copiée (aucun effacement vu dans la frame suivante) : pas de test de couverture
