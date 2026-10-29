@@ -349,7 +349,7 @@ struct Capture
     std::atomic<bool> depthCopied{ false };
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthFootprint = {};
     D3D12_RESOURCE_DESC depthDesc = {};
-    uint32_t captureDrawCount = 0, captureIndex = 0, presentsLeft = 0;
+    uint32_t captureDrawCount = 0, captureIndex = 0, presentsLeft = 0, depthWaits = 0;
     uint64_t slotDepth[kSlots] = {};
     std::atomic<uint32_t> slotDraws[kSlots];
     std::atomic<uint32_t> offScreenDraws{ 0 };
@@ -615,6 +615,43 @@ void CopyDepthAtClear(command_list* cmd, resource_view dsv)
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     Transition(list, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     g.depthCopied = true;
+}
+
+// Copie de la profondeur par ReShade (module Generic Depth, effet urti_depth.fx) : la voie la plus sûre
+// dans un vrai jeu, ReShade sachant quand et comment la copier ; sa copie est en lecture par les shaders.
+void OnFinishEffects(effect_runtime* runtime, command_list* cmd, resource_view, resource_view)
+{
+    if (g.phase != Phase::WaitingDepth || g.depthCopied || !OurDevice(runtime->get_device()))
+        return;
+    const effect_texture_variable var = runtime->find_texture_variable("urti_depth.fx", "UrtiDepth");
+    if (!var.handle)
+        return;
+    resource_view srv = {}, srvSrgb = {};
+    runtime->get_texture_binding(var, &srv, &srvSrgb);
+    if (!srv.handle)
+        return;
+    ID3D12Resource* copy = reinterpret_cast<ID3D12Resource*>(runtime->get_device()->get_resource_from_view(srv).handle);
+    if (!copy)
+        return;
+    g.depthDesc = copy->GetDesc();
+    UINT64 total = 0;
+    g.device->GetCopyableFootprints(&g.depthDesc, 0, 1, 0, &g.depthFootprint, nullptr, nullptr, &total);
+    g.depthReadback = MakeBuffer(g.device, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!g.depthReadback)
+        return;
+    ID3D12GraphicsCommandList* list = Native(cmd);
+    const D3D12_RESOURCE_STATES srvState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    Transition(list, copy, srvState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = g.depthReadback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = g.depthFootprint;
+    src.pResource = copy;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(list, copy, D3D12_RESOURCE_STATE_COPY_SOURCE, srvState);
+    g.depthCopied = true;
+    Log("URTI : profondeur copiée par ReShade (%llux%u, format %d)", (unsigned long long)g.depthDesc.Width, g.depthDesc.Height, (int)g.depthDesc.Format);
 }
 
 bool OnClearDepthStencil(command_list* cmd, resource_view dsv, const float*, const uint8_t*, uint32_t, const rect*)
@@ -1009,6 +1046,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
             g.device->GetCopyableFootprints(&g.depthDesc, 0, 1, 0, &g.depthFootprint, nullptr, nullptr, &total);
             g.depthReadback = MakeBuffer(g.device, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
             Log("URTI : profondeur %llux%u, format %d, %u dessins dessus", (unsigned long long)g.depthDesc.Width, g.depthDesc.Height, (int)g.depthDesc.Format, best);
+            g.depthWaits = 0;
             g.phase = Phase::WaitingDepth;
         }
         else
@@ -1020,6 +1058,8 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     }
 
     case Phase::WaitingDepth:
+        if (!g.depthCopied && g.depthWaits++ < 2)
+            break; // la copie de ReShade (effets) vient après notre événement de présentation
         g.phase = Phase::Idle;
         Finish(q);
         break;
@@ -1049,6 +1089,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
+        reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_addon(module);
