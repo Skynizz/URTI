@@ -555,3 +555,24 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   terrain dans le jeu ; la cohérence des estimations est le seul contrôle.
 - Couverture en jeu, caméra en mouvement, sur 8 présentations : 70 à 94 % (la géométrie de plusieurs
   frames est comparée à la profondeur de la dernière) ; à refaire frame par frame.
+
+## v27 — URTI, étape 2b : soleil retrouvé, premières ombres en ray tracing dans RDR2
+
+- Le banc a maintenant un soleil et une passe de carte d'ombres, comme un jeu. L'add-on capte tous
+  les flux de profondeur (écran et cartes d'ombres) ; le fichier `.urti` passe en version 2.
+- **Direction du soleil** : le même maillage vu par la caméra et dans la carte d'ombres (projection
+  parallèle) est relié par une application affine ; la direction qu'elle envoie sur l'axe de
+  profondeur de la carte est celle du soleil. Ajustement par paire de dessins puis vote (un maillage
+  figure dans plusieurs cascades d'un atlas). Banc : écart 0,01°. RDR2 : l'atlas 2048×8192 des
+  cascades donne une direction nette (82 à 84 % des paires d'accord) ; les petites cartes (1024², 512²,
+  64²) sont des vues verticales (pluie, occlusion), pas le soleil. Signe : celui qui laisse la scène
+  éclairée (l'autre met tout à l'ombre, soleil sous l'horizon).
+- **Ombres en ray tracing** (`urti/tools/urti_rtshadow`, DXR 1.1, requêtes en ligne) : géométrie de
+  la dernière frame en espace caméra (linéaire en espace de découpage), structure d'accélération,
+  pixel reconstruit depuis la profondeur du jeu (profondeur = A + B / w ajustés sur les sommets),
+  rayon vers le soleil. Le résultat ne dépend pas d'une erreur de champ de vision (application
+  affine : les intersections sont conservées). Banc : ombres portées justes. RDR2 (1,7 M triangles,
+  BLAS 38 Mo) : ombres cohérentes (épaules éclairées, ombre portée du personnage, structure du quai) ;
+  scène brumeuse, peu d'ombres nettes du jeu pour comparer.
+- Champ de vision par auto-étalonnage dans RDR2 : instable (51,5° ici, 37° avant) quand la caméra
+  tourne peu ; sans effet sur les ombres, mais à fiabiliser pour l'éclairage.

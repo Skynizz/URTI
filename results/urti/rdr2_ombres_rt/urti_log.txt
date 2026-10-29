@@ -1,0 +1,37 @@
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : CreateRootSignature intercepté
+URTI : ExecuteIndirect intercepté
+URTI : appareil qui présente choisi ; 0 captures prévues ; F9 : capture
+URTI : déclencheur, capture de la frame 27361
+URTI : dessins par appareil pendant la capture : 7087 (celui qui présente)
+URTI : capture 0, frame 27368 : 7264 dessins, 5180 capturés, 990 ignorés (pipeline inutilisable), 1094 sur une profondeur hors écran, 512.0 Mo de sommets ; 2444 pipelines à vertex shader dont 1489 utilisables, 15646 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 2265 dessins dessus
+URTI : profondeur copiée par ReShade (1706x960, format 19)
+URTI : profondeur 1706x960 inversée ; 2265 dessins sur cette profondeur, 1607042 triangles (90686 traversant le plan proche)
+URTI : COUVERTURE 47.88 % des pixels de profondeur du jeu (129593 / 270684) ; géométrie en trop sur 9610 pixels ; écart moyen 3.57e-03
+URTI : capture écrite pour l'analyse (F:\Red Dead Redemption 2\urti_capture0.urti, 84.3 Mo)
+URTI : déclencheur, capture de la frame 33451
+URTI : dessins par appareil pendant la capture : 5883 (celui qui présente)
+URTI : capture 1, frame 33458 : 6113 dessins, 4173 capturés, 859 ignorés (pipeline inutilisable), 1081 sur une profondeur hors écran, 512.0 Mo de sommets ; 2444 pipelines à vertex shader dont 1489 utilisables, 15646 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 2133 dessins dessus
+URTI : profondeur copiée par ReShade (1706x960, format 19)
+URTI : profondeur 1706x960 inversée ; 2133 dessins sur cette profondeur, 1420311 triangles (93898 traversant le plan proche)
+URTI : COUVERTURE 84.12 % des pixels de profondeur du jeu (225940 / 268587) ; géométrie en trop sur 4342 pixels ; écart moyen 3.20e-04
+URTI : capture écrite pour l'analyse (F:\Red Dead Redemption 2\urti_capture1.urti, 75.8 Mo)
+URTI : déclencheur, capture de la frame 39931
+URTI : dessins par appareil pendant la capture : 5919 (celui qui présente)
+URTI : capture 2, frame 39938 : 6126 dessins, 4166 capturés, 783 ignorés (pipeline inutilisable), 1177 sur une profondeur hors écran, 512.0 Mo de sommets ; 2444 pipelines à vertex shader dont 1489 utilisables, 15646 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 2183 dessins dessus
+URTI : profondeur copiée par ReShade (1706x960, format 19)
+URTI : profondeur 1706x960 inversée ; 2183 dessins sur cette profondeur, 1394560 triangles (97728 traversant le plan proche)
+URTI : COUVERTURE 54.44 % des pixels de profondeur du jeu (145448 / 267152) ; géométrie en trop sur 12788 pixels ; écart moyen 4.68e-04
+URTI : capture écrite pour l'analyse (F:\Red Dead Redemption 2\urti_capture2.urti, 74.8 Mo)
+URTI : déclencheur, capture de la frame 46501
+URTI : dessins par appareil pendant la capture : 5836 (celui qui présente)
+URTI : capture 3, frame 46508 : 6040 dessins, 4074 capturés, 711 ignorés (pipeline inutilisable), 1255 sur une profondeur hors écran, 512.0 Mo de sommets ; 2444 pipelines à vertex shader dont 1489 utilisables, 15646 signatures racines modifiées
+URTI : profondeur 1706x960, format 19, 2133 dessins dessus
+URTI : profondeur copiée par ReShade (1706x960, format 19)
+URTI : profondeur 1706x960 inversée ; 2133 dessins sur cette profondeur, 1274553 triangles (104627 traversant le plan proche)
+URTI : COUVERTURE 63.06 % des pixels de profondeur du jeu (170402 / 270222) ; géométrie en trop sur 14134 pixels ; écart moyen 6.20e-04
+URTI : capture écrite pour l'analyse (F:\Red Dead Redemption 2\urti_capture3.urti, 69.6 Mo)

@@ -111,46 +111,57 @@ def rigid_fit(c1, c2, p11, aspect, iterations=4):
 
 
 def sun_direction(cap, frame, p11, aspect):
-    """Direction du soleil (vers lui) dans l'espace caméra, à partir des cartes d'ombres de la frame."""
+    """Direction du soleil (vers lui) dans l'espace caméra, à partir des cartes d'ombres de la frame.
+
+    Un même maillage peut figurer plusieurs fois dans une carte (cascades d'un atlas, chacune avec sa
+    projection) : on ajuste une application affine par paire « dessin de la vue / dessin de la carte »,
+    chacune donne une direction, et on garde la direction sur laquelle s'accorde le plus de sommets.
+    """
     results = []
     main = cap['main']
+    mine = [d for d in cap['all_draws'] if d['slot'] == main and d['frame'] == frame]
     for si, slot in enumerate(cap['slots']):
         if si == main or not slot['used'] or slot['screen']:
             continue
-        # mêmes dessins (même maillage, mêmes paramètres) dans la vue et dans la carte, appariés dans l'ordre
-        mine = [d for d in cap['all_draws'] if d['slot'] == main and d['frame'] == frame]
-        theirs = [d for d in cap['all_draws'] if d['slot'] == si and d['frame'] == frame]
-        groups = {}
-        for d in mine:
-            groups.setdefault((d['kind'], d['params']), [[], []])[0].append(d)
-        for d in theirs:
-            groups.setdefault((d['kind'], d['params']), [[], []])[1].append(d)
-        A_all, B_all = [], []
-        for (_, _), (a_list, b_list) in groups.items():
-            if len(a_list) != len(b_list):
-                continue
-            for x, y in zip(a_list, b_list):
-                if x['end'] - x['start'] != y['end'] - y['start']:
-                    continue
+        theirs = {}
+        for d in cap['all_draws']:
+            if d['slot'] == si and d['frame'] == frame:
+                theirs.setdefault((d['kind'], d['params'], d['end'] - d['start']), []).append(d)
+        dirs, weights = [], []
+        for x in mine:
+            for y in theirs.get((x['kind'], x['params'], x['end'] - x['start']), [])[:8]:
                 c = cap['verts'][x['start'] // 16:x['end'] // 16].astype(np.float64)
-                s = slot['verts'][y['start'] // 16:y['end'] // 16].astype(np.float64)
-                ok = c[:, 3] > 1e-3
-                A_all.append(to_view(c[ok], p11, aspect))
-                B_all.append(s[ok, :3] / s[ok, 3:4])
-        if not A_all:
+                sv = slot['verts'][y['start'] // 16:y['end'] // 16].astype(np.float64)
+                ok = (c[:, 3] > 1e-3) & (np.abs(sv[:, 3]) > 1e-6)
+                if ok.sum() < 24:
+                    continue
+                V = to_view(c[ok], p11, aspect)
+                S = sv[ok, :3] / sv[ok, 3:4]
+                X = np.concatenate([V, np.ones((len(V), 1))], 1)
+                M, *_ = np.linalg.lstsq(X, S, rcond=None)
+                r = np.linalg.norm(X @ M - S, axis=1)
+                scale = np.abs(S - S.mean(0)).max() + 1e-12
+                if np.median(r) > 1e-3 * scale or np.linalg.cond(X) > 1e8:
+                    continue  # pas une projection parallèle de ce maillage (autre objet, ou animé)
+                A = M[:3, :].T
+                try:
+                    d = np.linalg.solve(A, np.array([0.0, 0.0, 1.0]))
+                except np.linalg.LinAlgError:
+                    continue
+                dirs.append(-d / np.linalg.norm(d))
+                weights.append(ok.sum())
+        if not dirs:
             continue
-        V, S = np.concatenate(A_all), np.concatenate(B_all)
-        X = np.concatenate([V, np.ones((len(V), 1))], 1)
-        # application affine robuste (des dessins mal appariés ou animés sont écartés)
-        keep = np.ones(len(V), bool)
-        for _ in range(4):
-            M, *_ = np.linalg.lstsq(X[keep], S[keep], rcond=None)
-            r = np.linalg.norm(X @ M - S, axis=1)
-            keep = r < np.median(r) * 3 + 1e-9
-        A = M[:3, :].T  # S ≈ A V + b
-        d = np.linalg.solve(A, np.array([0.0, 0.0, 1.0]))  # le long de la profondeur de la carte : vers la scène
-        toward_sun = -d / np.linalg.norm(d)
-        results.append((si, toward_sun, len(V), float(np.median(r)), keep.mean()))
+        dirs, weights = np.array(dirs), np.array(weights, float)
+        # direction (au signe près) sur laquelle s'accordent le plus de sommets, à 2° près
+        cos = np.abs(dirs @ dirs.T)
+        votes = (cos > np.cos(np.radians(2))) @ weights
+        best = int(np.argmax(votes))
+        agree = np.abs(dirs @ dirs[best]) > np.cos(np.radians(2))
+        aligned = dirs[agree] * np.sign(dirs[agree] @ dirs[best])[:, None]
+        sun = aligned.T @ weights[agree]
+        sun /= np.linalg.norm(sun)
+        results.append((si, sun, int(weights[agree].sum()), len(dirs), agree.sum() / len(dirs)))
     return results
 
 
@@ -205,9 +216,9 @@ def main():
           f'{100 * inliers.mean():.1f} % des sommets immobiles')
     print(f'mouvement de la caméra : rotation {angle:.3f}°, translation {np.linalg.norm(t):.3f} (unités du jeu)')
     suns = sun_direction(cap, fb, p11, aspect)
-    for si, sun, n, res, kept in suns:
-        print(f'soleil (carte d\'ombres du flux {si}, {cap["slots"][si]["size"][0]}x{cap["slots"][si]["size"][1]}) : direction vers le soleil '
-              f'dans l\'espace caméra {np.round(sun, 4)} ; {n} sommets, {100 * kept:.0f} % gardés')
+    for si, sun, n, pairs, agree in suns:
+        print(f'soleil (carte d\'ombres du flux {si}, {cap["slots"][si]["size"][0]}x{cap["slots"][si]["size"][1]}) : direction '
+              f'dans l\'espace caméra {np.round(sun, 4)} (au signe près) ; {pairs} paires, {100 * agree:.0f} % d\'accord, {n} sommets')
     if not suns:
         print('soleil : aucune carte d\'ombres appariée')
 
