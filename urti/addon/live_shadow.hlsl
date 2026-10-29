@@ -59,6 +59,30 @@ float GameLit(float3 p)
     return 1.0;
 }
 
+// point de l'espace caméra du pixel (z = w ; w <= 0 si ciel ou hors image)
+float3 PointAt(int2 t)
+{
+    if (t.x < 0 || t.y < 0 || t.x >= int(width) || t.y >= int(height))
+        return float3(0, 0, -1);
+    const uint raw = depth.Load(t.y * depthPitch + t.x * 4);
+    const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
+    const float w = B / (d - A);
+    if (d == clearDepth || !(w > 0 && w < 1e6))
+        return float3(0, 0, -1);
+    const float2 ndc = float2((t.x + 0.5) / width * 2 - 1, 1 - (t.y + 0.5) / height * 2);
+    return float3(ndc.x * w / p00, ndc.y * w / p11, w);
+}
+
+// normale de la surface tirée de la profondeur : côté le plus proche de chaque axe (bords d'objets)
+float3 NormalAt(int2 t, float3 p)
+{
+    const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
+    const float3 dx = (r.z > 0 && (l.z <= 0 || abs(r.z - p.z) < abs(l.z - p.z))) ? r - p : p - l;
+    const float3 dy = (b.z > 0 && (u.z <= 0 || abs(b.z - p.z) < abs(u.z - p.z))) ? b - p : p - u;
+    float3 n = normalize(cross(dx, dy));
+    return dot(n, p) > 0 ? -n : n; // tournée vers la caméra
+}
+
 [numthreads(8, 8, 1)]
 void main(uint2 id : SV_DispatchThreadID)
 {
@@ -93,7 +117,12 @@ void main(uint2 id : SV_DispatchThreadID)
             q.Proceed();
             lit += q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 0.25;
         }
-        if (flags & 1)
+        // face tournée à l'opposé du soleil : le jeu l'assombrit déjà par son éclairage ; une ombre RT en
+        // plus y ferait des taches (le test de sa carte la voit éclairée, la surface étant son propre écran)
+        const bool facesSun = dot(NormalAt(int2(id), p), sun) > 0.08;
+        if (!facesSun && (flags & 4))
+            lit = 1.0;
+        else if (flags & 1)
         {
             const float game = GameLit(p);
             if (flags & 8)

@@ -599,3 +599,29 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   voisins éclairés, ou n'agir que sur les pixels où l'ombre du jeu manque : lointain, petits objets),
   ignorer les faces dos au soleil (normales tirées de la profondeur), BLAS mise à jour plutôt que
   reconstruite pour réduire le coût.
+
+## v29 — URTI : ombres RT stables dans RDR2, génération d'images, rechargement à chaud
+
+- **Soleil mesuré à chaque image sur le GPU** : paires de dessins écran / carte d'ombres du soleil de
+  même signature, ajustement affine par paire, vote ; 220 à 250 paires par image dans RDR2, mesuré
+  sur 90 à 100 % des images. Plus d'étalonnage lourd périodique (seulement au départ et sur F6). Le
+  sens du soleil vient de la convention de profondeur de la carte (fixée une fois), plus de
+  l'image précédente : F7 off/on ne fait plus partir les ombres dans tous les sens.
+- **Génération d'images (OptiScaler, DLSS-G)** : les images générées sont fabriquées à partir de
+  l'image du jeu avant ReShade, d'où l'alternance « native / RT ». Les ombres sont maintenant posées
+  par l'add-on sur chaque image présentée (300 / 300, dont ~140 générées), en lumière linéaire
+  (HDR10 PQ décodé).
+- **Ombre du jeu recalculée** depuis sa carte d'ombres (cascades repérées par leur viewport,
+  application caméra -> carte mesurée à chaque image). Mode « seulement les ombres que le jeu n'a pas »
+  et mode « ombres RT complètes » (plus contrastées), au choix dans le menu de ReShade (UrtiMode).
+  Constat : les ombres de RDR2 sont déjà précises ; le RT apporte surtout le détail fin (roues,
+  pattes du cheval) et le contraste en mode complet.
+- Faces tournées à l'opposé du soleil (normale tirée de la profondeur) : pas d'ombre RT ajoutée en
+  mode combiné (taches sur les façades à contre-jour supprimées). Quatre rayons par pixel dans le
+  disque solaire (0,5°) et filtre 3×3 : bords d'ombre doux.
+- RDR2 n'a pas de masque d'ombre séparé : relevé des passes (F8) avec instantanés pris à la fin de
+  l'écriture de chaque image ; G-buffer trouvé (normales, matériaux) pour les reflets.
+- **Tests rapides** : réglages (`urti.ini`) et shaders (`urti_shaders/*.cso`, `tools/reshade/urti_shaders.sh`)
+  rechargés à chaud dans le jeu en ~2 s ; lancement piloté par le journal (`urti_rdr2_rapide.ps1`).
+- Corrigés en route : `&` sur un `ComPtr` (le libère), paramètres de l'effet retirés par le
+  compilateur de ReShade s'ils ne sont plus lus, barrières sans ressource, états ReShade -> D3D12.

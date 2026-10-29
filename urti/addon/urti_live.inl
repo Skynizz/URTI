@@ -37,6 +37,7 @@ struct LiveState
 
     // suivi du soleil à chaque image
     bool forceCalibration = false, sunDirty = false;
+    int iniCombine = -1; // urti.ini combine= : 0 ou 1 impose le mode ; -1 : menu de ReShade (UrtiMode)
     std::atomic<bool> toggleSplit{ false }; // F5 : écran partagé (gauche jeu seul, droite avec ombres RT)
     float sunSign = 1; // sens du soleil par rapport à la profondeur des cartes (convention du jeu)
     uint32_t missedCalibrations = 0;
@@ -455,25 +456,27 @@ void LiveHotReload(ID3D12Device* device)
         live.iniTime = t;
         if (FILE* f = std::fopen(ini.c_str(), "r"))
         {
+            // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
+            float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
                 std::string l = line;
                 l.erase(l.find_last_not_of(" \r\n\t") + 1);
-                auto value = [&](const char* key, auto& out) {
-                    const size_t n = std::strlen(key);
+                auto value = [&](const char* key, float& out) {
                     if (l.rfind(key, 0) == 0)
-                        out = std::remove_reference_t<decltype(out)>(std::atof(l.c_str() + n));
+                        out = float(std::atof(l.c_str() + std::strlen(key)));
                 };
-                float combine = g_liveCombine ? 1.0f : 0.0f, mask = g_liveShowMask ? 1.0f : 0.0f, debug = float(g_liveDebugGame);
                 value("combine=", combine), value("show_mask=", mask), value("debug_game_shadow=", debug);
-                value("game_bias=", g_liveGameBias), value("ray_bias=", g_liveRayBias), value("sun_radius=", g_liveSunRadius);
-                g_liveCombine = combine != 0, g_liveShowMask = mask != 0, g_liveDebugGame = uint32_t(debug);
+                value("game_bias=", gameBias), value("ray_bias=", rayBias), value("sun_radius=", sunRadius);
             }
             std::fclose(f);
+            live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
+            g_liveShowMask = mask != 0, g_liveDebugGame = uint32_t(debug);
+            g_liveGameBias = gameBias, g_liveRayBias = rayBias, g_liveSunRadius = sunRadius;
         }
         if (!first)
-            Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f°)", g_liveCombine,
+            Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f°)", live.iniCombine,
                 g_liveShowMask, g_liveDebugGame, g_liveGameBias, g_liveRayBias, g_liveSunRadius);
     }
     struct Hot { const char* name; ID3D12RootSignature* rs; ComPtr<ID3D12PipelineState>* pso; };
@@ -559,6 +562,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         return;
     }
     LiveHotReload(g.device);
+    if (live.iniCombine >= 0)
+        g_liveCombine = live.iniCombine != 0;
+    else if (const effect_uniform_variable mode = runtime->find_uniform_variable("urti.fx", "UrtiMode"); mode.handle)
+    {
+        int32_t m = 0;
+        runtime->get_uniform_value_int(mode, &m, 1);
+        g_liveCombine = m == 1;
+    }
 
     // ce que le flux a reçu il y a trois images (lecture sans attente)
     if (const uint64_t* c = nullptr; live.counterReadback[live.frame % 3] && SUCCEEDED(live.counterReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
