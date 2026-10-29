@@ -1,0 +1,4 @@
+1812 dessins sur la profondeur principale, frames [37294, 37296, 37298], 4468071 sommets
+441 dessins retrouvés entre les frames 37294 et 37298
+champ de vision vertical estimé : 39.05° ; erreur de rigidité 0.015 % ; 74.8 % des sommets immobiles
+mouvement de la caméra : rotation 0.269°, translation 0.008 (unités du jeu)

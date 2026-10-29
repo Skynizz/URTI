@@ -9,7 +9,8 @@ rayons, sans modifier ses shaders. Plan complet et avis de faisabilité : docs/U
 |---|---|---|
 | 0 | Banc : application DX12 en rastérisation à géométrie connue (`testapp/`), fenêtre cachée | fait |
 | 1 | Capture de la géométrie par sortie de flux, test de couverture | **99,80 %** sur le banc ; **97,5 à 97,6 % dans Red Dead Redemption 2** (DX12, DLSS + génération d'images, 3 captures) |
-| 2 | Caméra estimée, géométrie persistante en espace monde, BVH, ombres RT du soleil | à faire |
+| 2a | Caméra estimée par auto-étalonnage (`tools/analyse.py`) | banc : 60,15° pour 60,16° ; RDR2 : 36,5 à 37° quand la caméra tourne |
+| 2b | Géométrie persistante en espace monde, BVH, ombres RT du soleil | à faire |
 | 3 | Cache de lumière en espace monde (KRC), reflets et éclairage indirect | à faire |
 
 ## Principe de la capture (add-on ReShade, `addon/urti_addon.cpp`)

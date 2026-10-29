@@ -540,3 +540,18 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   captures par fichier déclencheur (`tools/reshade/urti_rdr2.ps1`). Mode histoire uniquement.
 - Reste à faire pour l'étape 2 : caméra (matrices) pour passer en espace monde, géométrie
   persistante, BVH, ombres RT du soleil ; essai en monde ouvert (pas seulement la scène de chargement).
+
+## v26 — URTI, étape 2a : la caméra retrouvée sans rien savoir du jeu
+
+- Capture enrichie (fichier `.urti`) : signature et bornes de chaque dessin dans le flux (début et
+  fin lus sur le compteur du GPU), profondeur. Analyse hors ligne `urti/tools/analyse.py`.
+- **Auto-étalonnage** : w de l'espace de découpage donne la profondeur le long de l'axe de vue ; avec
+  le champ de vision, chaque sommet devient un point de l'espace caméra ; un objet immobile vu dans
+  deux frames doit bouger d'un seul mouvement rigide : on cherche le champ de vision le plus rigide
+  (ajustement robuste, les objets qui bougent eux-mêmes sont écartés).
+- Banc (caméra en orbite, vérité terrain) : 60,15° pour 60,16°, déplacement 0,390 pour 0,390.
+- RDR2 en jeu (souris injectée pour tourner la caméra) : 36,95° et 36,50° sur les deux captures où la
+  caméra tourne de plus de 1° ; 38,8 à 39,1° quand elle tourne à peine (mal contraint). Pas de vérité
+  terrain dans le jeu ; la cohérence des estimations est le seul contrôle.
+- Couverture en jeu, caméra en mouvement, sur 8 présentations : 70 à 94 % (la géométrie de plusieurs
+  frames est comparée à la profondeur de la dernière) ; à refaire frame par frame.

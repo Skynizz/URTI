@@ -313,7 +313,7 @@ ID3D12PipelineState* GetShadow(ID3D12Device* device, PipelineInfo& info)
 // dessins d'un flux partagent son compteur, et D3D12 range leurs sorties à la suite, à leur taille
 // exacte, dans l'ordre d'exécution sur le GPU
 constexpr uint64_t kSoBytes = 512ull << 20; // 32 M sommets
-constexpr uint32_t kSlots = 4;
+constexpr uint32_t kSlots = 2; // 256 Mo par flux : plusieurs frames du jeu pour l'auto-étalonnage
 constexpr uint64_t kSlotBytes = kSoBytes / kSlots;
 constexpr uint32_t kMaxDraws = 65536;
 
