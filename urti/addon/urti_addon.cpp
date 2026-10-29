@@ -476,7 +476,7 @@ void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
 // relevé des passes (urti_passes.inl)
 void PassBind(command_list* cmd, uint32_t count, const resource_view* rtvs, resource_view dsv);
 void PassDraw(uint64_t list, bool fullscreen);
-void PassBarrier(uint32_t count, const resource* resources, const resource_usage* newStates);
+void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates);
 
 void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view* rtvs, resource_view dsv)
 {
@@ -487,9 +487,9 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
 }
 
 
-void OnBarrier(command_list*, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* newStates)
+void OnBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates)
 {
-    PassBarrier(count, resources, newStates);
+    PassBarrier(cmd, count, resources, oldStates, newStates);
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < count; i++)
         if (g.depthStates.count(resources[i].handle) || (static_cast<uint32_t>(newStates[i]) & 0x30))
@@ -1181,6 +1181,8 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     }
     if (GetAsyncKeyState(VK_F6) & 1)
         live.forceCalibration = true;
+    if (GetAsyncKeyState(VK_F5) & 1)
+        live.toggleSplit = true;
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
     // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil
     // image par image est perdu ; sinon le soleil est suivi sur le GPU

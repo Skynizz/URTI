@@ -36,6 +36,7 @@ struct LiveState
 
     // suivi du soleil à chaque image
     bool forceCalibration = false, sunDirty = false;
+    std::atomic<bool> toggleSplit{ false }; // F5 : écran partagé (gauche jeu seul, droite avec ombres RT)
     float sunSign = 1; // sens du soleil par rapport à la profondeur des cartes (convention du jeu)
     uint32_t missedCalibrations = 0;
     ComPtr<ID3D12RootSignature> fitRs, voteRs;
@@ -428,6 +429,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 {
     if (!OurDevice(runtime->get_device()))
         return;
+    if (live.toggleSplit.exchange(false))
+        if (const effect_uniform_variable split = runtime->find_uniform_variable("urti.fx", "UrtiSplit"); split.handle)
+        {
+            bool on = false;
+            runtime->get_uniform_value_bool(split, &on, 1);
+            runtime->set_uniform_value_bool(split, !on);
+            Log("URTI : écran partagé %s", on ? "coupé" : "actif");
+        }
     if (!live.enabled)
     {
         // ombres coupées : l'effet ne doit plus appliquer l'ancienne image d'ombres

@@ -20,7 +20,12 @@ struct PassSurvey
     std::unordered_map<uint64_t, PassTarget> targets;
     std::unordered_map<uint64_t, std::vector<uint64_t>> current; // liste de commandes -> cibles liées
     std::unordered_map<uint64_t, uint32_t> states;               // dernier état connu de chaque ressource
+    // instantanés : copie d'une image de la taille de l'écran au moment où le jeu finit de l'écrire
+    // (passage cible de rendu / UAV -> lecture), avant que sa mémoire ne serve à autre chose
+    struct Snapshot { ComPtr<ID3D12Resource> copy; uint32_t order, format, width, height; };
+    std::vector<Snapshot> snapshots;
 } g_pass;
+constexpr uint32_t kPassMaxSnapshots = 48;
 
 PassTarget& PassTargetFor(uint64_t res)
 {
@@ -48,6 +53,8 @@ void PassBind(command_list* cmd, uint32_t count, const resource_view* rtvs, reso
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint64_t r : bound)
     {
+        if (!r)
+            continue;
         PassTarget& t = PassTargetFor(r);
         t.binds++;
         t.withSunDepth |= depth && depth == g_liveSunDepth;
@@ -83,17 +90,48 @@ uint32_t PassD3D12State(uint32_t usage)
     return s;
 }
 
-void PassBarrier(uint32_t count, const resource* resources, const resource_usage* newStates)
+bool PassDecode(uint32_t fmt, const uint8_t* p, float rgb[3], int& channels);
+
+void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates)
 {
-    if (g_pass.state != 2)
+    if (g_pass.state != 2 || !OurDevice(cmd->get_device()))
         return;
+    ID3D12GraphicsCommandList* list = Native(cmd);
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < count; i++)
     {
+        if (!resources[i].handle) // barrière UAV globale ou d'alias : sans ressource
+            continue;
         const uint32_t s = PassD3D12State(static_cast<uint32_t>(newStates[i]));
+        const uint32_t before = PassD3D12State(static_cast<uint32_t>(oldStates[i]));
         g_pass.states[resources[i].handle] = s;
+        PassTarget& t = PassTargetFor(resources[i].handle);
         if (s & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-            PassTargetFor(resources[i].handle).uavTransitions++;
+            t.uavTransitions++;
+        // fin d'écriture d'une image de la taille de l'écran : instantané
+        const bool written = (before & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) &&
+                             (s & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) &&
+                             !(s & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        const bool screenSized = t.width && g.screenW && t.width >= g.screenW / 4 && t.height >= g.screenH / 4 &&
+                                 std::fabs(double(t.width) / t.height - double(g.screenW) / g.screenH) < 0.1;
+        if (!written || !screenSized || g_pass.snapshots.size() >= kPassMaxSnapshots)
+            continue;
+        ID3D12Resource* res = reinterpret_cast<ID3D12Resource*>(resources[i].handle);
+        D3D12_RESOURCE_DESC d = res->GetDesc();
+        float probe[3];
+        int ch = 0;
+        const uint8_t zero[16] = {};
+        if (d.SampleDesc.Count > 1 || (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || !PassDecode(uint32_t(d.Format), zero, probe, ch))
+            continue;
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+        ComPtr<ID3D12Resource> copy;
+        if (FAILED(g.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&copy))))
+            continue;
+        Transition(list, res, D3D12_RESOURCE_STATES(s), D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyResource(copy.Get(), res);
+        Transition(list, res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATES(s));
+        g_pass.snapshots.push_back({ copy, t.order, t.format, t.width, t.height });
     }
 }
 
@@ -167,6 +205,12 @@ uint32_t PassTexelBytes(uint32_t fmt)
 bool PassSave(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STATES state, const std::string& path)
 {
     const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    // ni multi-échantillons, ni profondeur, ni format inconnu
+    float probe[3];
+    int probeChannels = 0;
+    const uint8_t zero[16] = {};
+    if (desc.SampleDesc.Count > 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || !PassDecode(uint32_t(desc.Format), zero, probe, probeChannels))
+        return false;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
     UINT64 total = 0;
     g.device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
@@ -233,7 +277,7 @@ void PassPresent(ID3D12CommandQueue* queue)
     {
         DeleteFileA(trigger.c_str());
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_pass.targets.clear(), g_pass.current.clear(), g_pass.states.clear();
+        g_pass.targets.clear(), g_pass.current.clear(), g_pass.states.clear(), g_pass.snapshots.clear();
         g_pass.presents = g_pass.order = g_pass.draws = 0;
         g_pass.state = 2;
         Log("URTI : relevé des passes commencé");
@@ -272,5 +316,15 @@ void PassPresent(ID3D12CommandQueue* queue)
         Log("URTI : passe %03u : %ux%u format %u, %u liaisons, %u dessins dont %u plein écran, %u passages en UAV%s %s", t.order, t.width,
             t.height, t.format, t.binds, t.draws, t.fullscreen, t.uavTransitions, t.withSunDepth ? ", avec la carte d'ombres" : "", file.c_str());
     }
-    Log("URTI : relevé des passes fini, %u images copiées", saved);
+    // instantanés pris à la fin de l'écriture de chaque image (dans l'ordre de l'image)
+    uint32_t index = 0;
+    for (const auto& snap : g_pass.snapshots)
+    {
+        char name[64];
+        std::snprintf(name, sizeof(name), "urti_instant_%02u_passe_%03u.ppm", index++, snap.order);
+        const bool ok = PassSave(queue, snap.copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, g_dir + "\\" + name);
+        Log("URTI : instantané %s : %ux%u format %u%s", name, snap.width, snap.height, snap.format, ok ? "" : " (non écrit)");
+    }
+    g_pass.snapshots.clear();
+    Log("URTI : relevé des passes fini, %u images copiées, %u instantanés", saved, index);
 }

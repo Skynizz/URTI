@@ -1,7 +1,7 @@
 # Essai des ombres RT en direct dans RDR2 : lancement, menu « Histoire », chargement, puis photos de
 # l'écran (écran partagé : gauche jeu seul, droite avec les ombres RT), ombres coupées puis remises
 # (fichiers déclencheurs de l'add-on). Mode histoire uniquement.
-param([int]$MenuWait = 60, [int]$LoadWait = 150, [int]$Settle = 60)
+param([int]$MenuWait = 60, [int]$LoadWait = 150, [int]$Settle = 60, [switch]$NoPhotos)
 
 $game = 'F:\Red Dead Redemption 2'
 $log = Join-Path $game 'urti_log.txt'
@@ -23,6 +23,7 @@ for ($k = 0; $k -lt 3; $k++) {
     & (Join-Path $PSScriptRoot 'click.ps1') -Process RDR2 -X 0.5 -Y 0.5
     Start-Sleep 20
 }
+if ($NoPhotos) { "en jeu"; exit 0 }
 "en jeu : attente ($Settle s) puis photos"
 Start-Sleep $Settle
 Trigger 'urti_photo'; "photo 1 (ombres RT actives, écran partagé)"; Start-Sleep 25
