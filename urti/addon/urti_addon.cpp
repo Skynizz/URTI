@@ -473,8 +473,14 @@ void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
     g.lists[cmd->get_native()].pipeline = pipe.handle;
 }
 
-void OnBindRenderTargets(command_list* cmd, uint32_t, const resource_view*, resource_view dsv)
+// relevé des passes (urti_passes.inl)
+void PassBind(command_list* cmd, uint32_t count, const resource_view* rtvs, resource_view dsv);
+void PassDraw(uint64_t list, bool fullscreen);
+void PassBarrier(uint32_t count, const resource* resources, const resource_usage* newStates);
+
+void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view* rtvs, resource_view dsv)
 {
+    PassBind(cmd, count, rtvs, dsv);
     const uint64_t depth = dsv.handle ? cmd->get_device()->get_resource_from_view(dsv).handle : 0;
     std::lock_guard<std::mutex> lock(g_mutex);
     g.lists[cmd->get_native()].depth = depth;
@@ -483,6 +489,7 @@ void OnBindRenderTargets(command_list* cmd, uint32_t, const resource_view*, reso
 
 void OnBarrier(command_list*, uint32_t count, const resource* resources, const resource_usage*, const resource_usage* newStates)
 {
+    PassBarrier(count, resources, newStates);
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < count; i++)
         if (g.depthStates.count(resources[i].handle) || (static_cast<uint32_t>(newStates[i]) & 0x30))
@@ -649,6 +656,7 @@ void CountDevice(command_list* cmd)
 
 bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
+    PassDraw(cmd->get_native(), vertexCount <= 4 && instanceCount == 1);
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
     if ((g.phase == Phase::Capturing || g_liveCapture) && OurDevice(cmd->get_device()))
@@ -660,6 +668,7 @@ bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uin
 
 bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
+    PassDraw(cmd->get_native(), false);
     if (g.phase == Phase::Capturing)
         CountDevice(cmd);
     if ((g.phase == Phase::Capturing || g_liveCapture) && OurDevice(cmd->get_device()))
@@ -678,6 +687,7 @@ PFN_ExecuteIndirect g_executeIndirect = nullptr;
 void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* signature, UINT maxCount,
     ID3D12Resource* args, UINT64 argsOffset, ID3D12Resource* countBuffer, UINT64 countOffset)
 {
+    PassDraw(reinterpret_cast<uint64_t>(self), false);
     if ((g.phase == Phase::Capturing || g_liveCapture) && g.device && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
     {
         ComPtr<ID3D12Device> owner;
@@ -765,12 +775,20 @@ bool OnClearDepthStencil(command_list* cmd, resource_view dsv, const float*, con
     return false;
 }
 
-bool OnBeginRenderPass(command_list* cmd, uint32_t, const render_pass_render_target_desc*, const render_pass_depth_stencil_desc* ds, render_pass_flags)
+bool OnBeginRenderPass(command_list* cmd, uint32_t count, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc* ds, render_pass_flags)
 {
+    {
+        resource_view views[8] = {};
+        for (uint32_t i = 0; i < count && i < 8 && rts; i++)
+            views[i] = rts[i].view;
+        PassBind(cmd, std::min<uint32_t>(count, 8), views, ds ? ds->view : resource_view{ 0 });
+    }
     // passe qui efface sa profondeur : appelé avant BeginRenderPass, la profondeur est en DEPTH_WRITE
     if (ds && ds->depth_load_op == render_pass_load_op::clear)
         CopyDepthAtClear(cmd, ds->view);
-    OnBindRenderTargets(cmd, 0, nullptr, ds ? ds->view : resource_view{ 0 });
+    const uint64_t depth = ds && ds->view.handle ? cmd->get_device()->get_resource_from_view(ds->view).handle : 0;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g.lists[cmd->get_native()].depth = depth;
     return false;
 }
 
@@ -999,6 +1017,7 @@ void Analyse(const std::vector<float>& depth, uint32_t width, uint32_t height, c
         valid ? 100.0 * covered / valid : 0.0, (unsigned long long)covered, (unsigned long long)valid, (unsigned long long)extra, valid ? error / valid : 0.0);
 }
 
+#include "urti_passes.inl"
 #include "urti_live.inl"
 
 // Capture complète pour l'analyse hors ligne : en-tête, dessins (signature, bornes), flux de la
@@ -1181,6 +1200,8 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         Log("URTI : ombres RT en direct %s (fichier)", live.enabled ? "actives" : "coupées");
     }
 
+    if (g.phase == Phase::Idle)
+        PassPresent(q);
     if ((GetAsyncKeyState(VK_F9) & 1) && g.phase == Phase::Idle)
     {
         g.nextCapture = g.frame + 1;
