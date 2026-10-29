@@ -576,3 +576,26 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   scène brumeuse, peu d'ombres nettes du jeu pour comparer.
 - Champ de vision par auto-étalonnage dans RDR2 : instable (51,5° ici, 37° avant) quand la caméra
   tourne peu ; sans effet sur les ombres, mais à fiabiliser pour l'éclairage.
+
+## v28 — URTI, ombres du soleil en ray tracing en direct dans RDR2
+
+- Mode direct (`live=1` dans `urti.ini`, F7 : actives / coupées, F6 : réétalonner) : à chaque image,
+  la géométrie de l'écran captée par flux de sortie devient une structure d'accélération (BLAS
+  reconstruite, 4,6 à 8,4 M sommets en jeu), puis un rayon par pixel de la profondeur du jeu part
+  vers le soleil (DXR 1.1, requêtes en ligne). L'effet `urti.fx` assombrit les pixels à l'ombre
+  (force 0,55, écran partagé possible). Soleil et loi de profondeur réétalonnés toutes les 120 images.
+- Photos : le jeu affiche en HDR10 ; elles sont lues dans le tampon d'affichage après les effets,
+  PQ décodé, BT.2020 → BT.709, blanc à 203 nits. Corrigé aussi : F7 laissait l'ancienne image
+  d'ombres affichée.
+- RDR2 (gare de Saint-Denis, `results/urti/rdr2_direct/`) : les ombres RT tombent au même endroit que
+  celles du jeu (auvent de la gare sur le sol), ce qui valide la chaîne (géométrie, soleil, profondeur).
+  Mais le jeu a déjà ses ombres : l'assombrissement s'ajoute par-dessus et rend les zones déjà
+  ombrées trop noires. Les faces tournées à l'opposé du soleil (wagons à contre-jour) sont aussi
+  noircies alors que le jeu les éclaire déjà moins.
+- Sous la pluie, ciel couvert : le jeu ne dessine pas de carte d'ombres du soleil, donc pas de soleil
+  à retrouver et pas d'ombres RT (comportement voulu).
+- Coût : environ 124 → 81 images par seconde (génération d'images DLSS active), soit −35 %.
+- Suite : ne pas assombrir ce qui est déjà à l'ombre dans l'image du jeu (comparer la luminance aux
+  voisins éclairés, ou n'agir que sur les pixels où l'ombre du jeu manque : lointain, petits objets),
+  ignorer les faces dos au soleil (normales tirées de la profondeur), BLAS mise à jour plutôt que
+  reconstruite pour réduire le coût.
