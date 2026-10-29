@@ -11,7 +11,7 @@ cbuffer Constants : register(b0)
 {
     float sunSign;     // +1 : la profondeur de la carte croît en s'éloignant du soleil
     float gameBias;    // tolérance du test de profondeur de la carte du jeu
-    float unused;
+    float sunRadius;   // rayon apparent du soleil (radians) : pénombre
     float bias;
     uint width;
     uint height;
@@ -74,15 +74,25 @@ void main(uint2 id : SV_DispatchThreadID)
         const float2 ndc = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p = float3(ndc.x * w / p00, ndc.y * w / p11, w);
         const float dist = length(p);
-        RayDesc ray;
-        ray.Origin = p * (1.0 - bias) + sun * bias * dist;
-        ray.Direction = sun;
-        ray.TMin = 0.0;
-        ray.TMax = 1e5;
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
-        q.Proceed();
-        lit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+        // quatre rayons répartis dans le disque solaire (strates 2×2 tournées par pixel) : pénombre lisse
+        const float3 t1 = normalize(abs(sun.y) < 0.99 ? cross(sun, float3(0, 1, 0)) : cross(sun, float3(1, 0, 0)));
+        const float3 t2 = cross(sun, t1);
+        const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))));
+        lit = 0.0;
+        for (uint k = 0; k < 4; k++)
+        {
+            const float u = (float(k & 1) + 0.5) * 0.5, v = (float(k >> 1) + 0.5) * 0.5;
+            const float r = sunRadius * sqrt(u), a = 6.2831853 * v + rot;
+            RayDesc ray;
+            ray.Origin = p * (1.0 - bias) + sun * bias * dist;
+            ray.Direction = normalize(sun + t1 * (r * cos(a)) + t2 * (r * sin(a)));
+            ray.TMin = 0.0;
+            ray.TMax = 1e5;
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+            q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+            q.Proceed();
+            lit += q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 0.25;
+        }
         if (flags & 1)
         {
             const float game = GameLit(p);

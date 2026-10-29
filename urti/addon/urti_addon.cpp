@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -70,6 +71,9 @@ struct LiveMark
 };
 bool g_liveCombine = true;       // urti.ini combine=0 : ombres RT seules, sans tenir compte de celles du jeu
 uint32_t g_liveDebugGame = 0;    // urti.ini debug_game_shadow=1 : affiche l'ombre du jeu recalculée
+float g_liveGameBias = 0.0015f;  // urti.ini game_bias= : tolérance du test de la carte d'ombres du jeu
+float g_liveRayBias = 0.003f;    // urti.ini ray_bias= : départ du rayon décalé vers le soleil (part de la distance)
+float g_liveSunRadius = 0.5f;    // urti.ini sun_radius= (degrés) : taille apparente du soleil, adoucit les bords
 std::vector<LiveMark> g_liveMarks;
 std::unordered_set<uint64_t> g_liveSunKeys, g_livePrevSunKeys;
 uint64_t g_liveSunDepth = 0; // profondeur de la carte d'ombres du soleil (trouvée à l'étalonnage)

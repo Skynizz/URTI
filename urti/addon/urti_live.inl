@@ -14,6 +14,7 @@
 #include "live_shadow_cs.h"  // g_live_shadow
 #include "live_sunfit_cs.h"  // g_live_sunfit
 #include "live_sunvote_cs.h" // g_live_sunvote
+#include "live_composite_cs.h" // g_live_composite
 
 struct LiveState
 {
@@ -43,6 +44,16 @@ struct LiveState
     ComPtr<ID3D12PipelineState> fitPso, votePso;
     ComPtr<ID3D12Resource> pairsUpload[3], pairDirs, sunBuf, sunUpload, sunReadback[3];
     ComPtr<ID3D12Resource> atlasBuf; // copie de la carte d'ombres du jeu, pour recalculer son ombre
+    // application à l'image présentée (toutes les présentations, images générées comprises)
+    ComPtr<ID3D12RootSignature> compositeRs;
+    ComPtr<ID3D12PipelineState> compositePso;
+    ComPtr<ID3D12Resource> imageIn, imageOut;
+    uint64_t imageBytes = 0;
+    // bilan par 300 présentations : sans dessin du jeu, effets de ReShade, ombres appliquées
+    uint32_t statPresents = 0, statNoDraw = 0, statEffects = 0, statComposited = 0;
+    // rechargement à chaud : réglages (urti.ini) et shaders (urti_shaders\*.cso), sans relancer le jeu
+    FILETIME iniTime = {}, shaderTime[2] = {};
+    std::vector<ComPtr<ID3D12PipelineState>> retiredPso[3];
     uint64_t atlasBytes = 0;
     uint32_t atlasPitch = 0;
     bool atlasD24 = false;
@@ -299,7 +310,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
     return make(g_live_convert, sizeof(g_live_convert), 2, live.convertRs, live.convertPso, 4) &&
            make(g_live_shadow, sizeof(g_live_shadow), 4, live.shadowRs, live.shadowPso, 16) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
-           make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4);
+           make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
+           make(g_live_composite, sizeof(g_live_composite), 2, live.compositeRs, live.compositePso, 12);
 }
 
 ComPtr<ID3D12Resource> UavBuffer(ID3D12Device* device, uint64_t size, D3D12_RESOURCE_STATES state)
@@ -420,6 +432,83 @@ bool LiveEnsureSun(ID3D12Device* device)
     return live.sunBuf && live.pairDirs && live.sunUpload && live.pairsUpload[2] && live.sunReadback[2];
 }
 
+FILETIME FileTime(const std::string& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a))
+        return {};
+    return a.ftLastWriteTime;
+}
+
+bool Newer(const FILETIME& a, const FILETIME& b) { return CompareFileTime(&a, &b) > 0; }
+
+// toutes les 30 images : urti.ini modifié -> réglages relus ; shader recompilé dans urti_shaders -> pipeline
+// recréé (l'ancien est libéré trois images plus tard)
+void LiveHotReload(ID3D12Device* device)
+{
+    if (live.frame % 30 != 0)
+        return;
+    const std::string ini = g_dir + "\\urti.ini";
+    if (const FILETIME t = FileTime(ini); Newer(t, live.iniTime))
+    {
+        const bool first = live.iniTime.dwLowDateTime == 0 && live.iniTime.dwHighDateTime == 0;
+        live.iniTime = t;
+        if (FILE* f = std::fopen(ini.c_str(), "r"))
+        {
+            char line[256];
+            while (std::fgets(line, sizeof(line), f))
+            {
+                std::string l = line;
+                l.erase(l.find_last_not_of(" \r\n\t") + 1);
+                auto value = [&](const char* key, auto& out) {
+                    const size_t n = std::strlen(key);
+                    if (l.rfind(key, 0) == 0)
+                        out = std::remove_reference_t<decltype(out)>(std::atof(l.c_str() + n));
+                };
+                float combine = g_liveCombine ? 1.0f : 0.0f, mask = g_liveShowMask ? 1.0f : 0.0f, debug = float(g_liveDebugGame);
+                value("combine=", combine), value("show_mask=", mask), value("debug_game_shadow=", debug);
+                value("game_bias=", g_liveGameBias), value("ray_bias=", g_liveRayBias), value("sun_radius=", g_liveSunRadius);
+                g_liveCombine = combine != 0, g_liveShowMask = mask != 0, g_liveDebugGame = uint32_t(debug);
+            }
+            std::fclose(f);
+        }
+        if (!first)
+            Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f°)", g_liveCombine,
+                g_liveShowMask, g_liveDebugGame, g_liveGameBias, g_liveRayBias, g_liveSunRadius);
+    }
+    struct Hot { const char* name; ID3D12RootSignature* rs; ComPtr<ID3D12PipelineState>* pso; };
+    const Hot hot[2] = { { "live_shadow", live.shadowRs.Get(), std::addressof(live.shadowPso) }, { "live_composite", live.compositeRs.Get(), std::addressof(live.compositePso) } };
+    for (int i = 0; i < 2; i++)
+    {
+        const std::string path = g_dir + "\\urti_shaders\\" + hot[i].name + ".cso";
+        const FILETIME t = FileTime(path);
+        if (!Newer(t, live.shaderTime[i]) || !hot[i].rs)
+            continue;
+        live.shaderTime[i] = t;
+        std::vector<char> code;
+        if (FILE* f = std::fopen(path.c_str(), "rb"))
+        {
+            std::fseek(f, 0, SEEK_END);
+            code.resize(size_t(std::ftell(f)));
+            std::fseek(f, 0, SEEK_SET);
+            code.resize(std::fread(code.data(), 1, code.size(), f));
+            std::fclose(f);
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+        cd.pRootSignature = hot[i].rs;
+        cd.CS = { code.data(), code.size() };
+        ComPtr<ID3D12PipelineState> pso;
+        if (code.empty() || FAILED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso))))
+        {
+            Log("URTI direct : shader %s refusé (signature ou code invalide), l'ancien reste", hot[i].name);
+            continue;
+        }
+        live.retiredPso[live.frame % 3].push_back(*hot[i].pso);
+        *hot[i].pso = pso;
+        Log("URTI direct : shader %s rechargé à chaud", hot[i].name);
+    }
+}
+
 int LiveMainSlot()
 {
     int best = -1;
@@ -452,6 +541,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     if (g.phase != Phase::Idle)
         return;
+    live.statEffects++;
     ID3D12Device5* device5 = nullptr;
     if (FAILED(g.device->QueryInterface(IID_PPV_ARGS(&device5))))
         return;
@@ -461,12 +551,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (FAILED(Native(cmd)->QueryInterface(IID_PPV_ARGS(&list))))
         return;
     live.retired[live.frame % 3].clear();
+    live.retiredPso[live.frame % 3].clear();
     if (!live.convertPso && !LiveCreatePipelines(g.device))
     {
         Log("URTI direct : shaders refusés, mode direct coupé");
         live.enabled = false;
         return;
     }
+    LiveHotReload(g.device);
 
     // ce que le flux a reçu il y a trois images (lecture sans attente)
     if (const uint64_t* c = nullptr; live.counterReadback[live.frame % 3] && SUCCEEDED(live.counterReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
@@ -508,6 +600,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     if (drawsThisFrame == 0 && live.bound)
     {
+        live.statNoDraw++;
         // image sans dessin du jeu (image générée par DLSS) : l'image d'ombres précédente reste
         Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kSlots * 8ull);
@@ -751,7 +844,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t width, height, depthPitch, shadowPitch;
         float A, B, p00, p11, clearDepth;
         uint32_t d24, atlasPitch, flags;
-    } sc = { live.sunSign, 0.0015f, 0, 0.003f, live.width, live.height, live.depthPitch, live.shadowPitch,
+    } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags };
     list->SetComputeRoot32BitConstants(5, 16, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
@@ -804,11 +897,102 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     live.frame++;
 }
 
+// ombres RT posées sur l'image présentée, sur la liste immédiate de ReShade (exécutée avant la
+// présentation). Toutes les présentations passent ici, y compris les images générées par la génération
+// d'images (DLSS-G / FSR), qui sont fabriquées à partir de l'image du jeu avant ReShade : sans cela,
+// une image sur deux n'aurait pas les ombres RT.
+void LiveComposite(effect_runtime* runtime)
+{
+    if (!live.enabled || !live.calibrated || !live.bound || !live.shadowBuf || !live.compositePso)
+        return;
+    const resource back = runtime->get_current_back_buffer();
+    if (!back.handle)
+        return;
+    ID3D12Resource* bb = reinterpret_cast<ID3D12Resource*>(back.handle);
+    const D3D12_RESOURCE_DESC bd = bb->GetDesc();
+    uint32_t format = 0;
+    switch (bd.Format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS: format = 0; break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS: format = 1; break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS: format = 2; break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: format = 3; break;
+    default: return;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    UINT64 total = 0;
+    g.device->GetCopyableFootprints(&bd, 0, 1, 0, &fp, nullptr, nullptr, &total);
+    if (!live.imageIn || live.imageBytes < total)
+    {
+        Retire(live.imageIn), Retire(live.imageOut);
+        live.imageIn = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
+        live.imageOut = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.imageBytes = total;
+        if (!live.imageIn || !live.imageOut)
+            return;
+    }
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(reinterpret_cast<IUnknown*>(runtime->get_command_queue()->get_immediate_command_list()->get_native())->QueryInterface(IID_PPV_ARGS(&list))))
+        return;
+    // réglages de l'effet (menu de ReShade) : force, écran partagé, masque seul
+    float strength = 0.55f;
+    bool split = false, showMask = false;
+    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiStrength"); v.handle)
+        runtime->get_uniform_value_float(v, &strength, 1);
+    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiSplit"); v.handle)
+        runtime->get_uniform_value_bool(v, &split, 1);
+    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiShowMask"); v.handle)
+        runtime->get_uniform_value_bool(v, &showMask, 1);
+    showMask = showMask || g_liveShowMask;
+
+    const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    D3D12_TEXTURE_COPY_LOCATION tex = {}, buf = {};
+    tex.pResource = bb;
+    tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    buf.PlacedFootprint = fp;
+    Transition(list.Get(), bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    buf.pResource = live.imageIn.Get();
+    list->CopyTextureRegion(&buf, 0, 0, 0, &tex, nullptr);
+    Transition(list.Get(), live.imageIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+    Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    list->SetComputeRootSignature(live.compositeRs.Get());
+    list->SetPipelineState(live.compositePso.Get());
+    list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(1, live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2, live.imageOut->GetGPUVirtualAddress());
+    const struct
+    {
+        uint32_t width, height, pitch, format, maskWidth, maskHeight, maskPitch;
+        float strength;
+        uint32_t split, showMask, pad0, pad;
+    } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
+             split ? 1u : 0u, showMask ? 1u : 0u, 0, 0 };
+    list->SetComputeRoot32BitConstants(3, 12, &cc, 0);
+    list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
+    Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Transition(list.Get(), live.imageIn.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+    Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    buf.pResource = live.imageOut.Get();
+    list->CopyTextureRegion(&tex, 0, 0, 0, &buf, nullptr);
+    Transition(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    live.statComposited++;
+}
+
 // photo de l'écran après les effets (fichier déclencheur urti_photo)
 void OnReshadePresent(effect_runtime* runtime)
 {
     if (!OurDevice(runtime->get_device()))
         return;
+    LiveComposite(runtime);
+    if (++live.statPresents == 300)
+    {
+        Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées",
+            live.statNoDraw, live.statEffects, live.statComposited);
+        live.statPresents = live.statNoDraw = live.statEffects = live.statComposited = 0;
+    }
     const std::string trigger = g_dir + "\\urti_photo";
     // pas avant que ReShade ait fini de charger ses effets (quelques dixièmes de seconde)
     if (g.frame < 300 || g.frame % 15 != 0 || GetFileAttributesA(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
