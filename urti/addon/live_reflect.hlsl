@@ -75,17 +75,21 @@ void main(uint2 id : SV_DispatchThreadID)
     gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
     gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
     const float3 p = PointAt(int2(id));
-    const float s = Smoothness(int2(id));
+    // sol mouillé (smoothMin < 0 : -smoothMin = quantité d'eau) : les surfaces tournées vers le haut
+    // deviennent lisses comme une rue après la pluie
+    const float wet = smoothMin < 0 ? -smoothMin : 0.0;
+    const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
+    const float3 n = p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
+    const float s = max(Smoothness(int2(id)), wet * saturate((n.y - 0.55) / 0.3));
     float4 result = float4(0, 0, 0, s);
-    if (p.z > 0 && s >= smoothMin)
+    if (p.z > 0 && s >= sMin)
     {
-        const float3 n = NormalAt(int2(id), p);
         const float3 v = normalize(p);
         const float3 r = reflect(v, n);
         const float cosTheta = saturate(dot(-v, n));
         // Fresnel (Schlick) ; le lissé au-dessus du seuil module le poids
         const float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
-        const float weight = fresnel * saturate((s - smoothMin) / max(1e-3, 1.0 - smoothMin));
+        const float weight = fresnel * saturate((s - sMin) / max(1e-3, 1.0 - sMin));
         RayDesc ray;
         ray.Origin = p + n * (bias * p.z);
         ray.Direction = r;
@@ -94,7 +98,19 @@ void main(uint2 id : SV_DispatchThreadID)
         RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
         q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
         q.Proceed();
-        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && r.z > -0.999)
+        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT && r.z > 1e-3)
+        {
+            // rien de touché : le rayon part vers le ciel ; le ciel étant à l'infini, son reflet est le ciel
+            // vu dans cette direction, s'il est visible à l'écran
+            const float2 ndc = float2(r.x * p00 / r.z, r.y * p11 / r.z);
+            const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            if (all(uv > 0.001) && all(uv < 0.999) && PointAt(int2(uv * float2(width, height))).z <= 0)
+            {
+                const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
+                result = float4(uv, weight * edge.x * edge.y, s);
+            }
+        }
+        else if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && r.z > -0.999)
         {
             const float3 h = ray.Origin + r * q.CommittedRayT();
             if (h.z > 1e-3)

@@ -58,7 +58,7 @@ struct LiveState
     ComPtr<ID3D12Resource> materialBuf, reflectBuf;
     uint64_t materialBytes = 0, materialFrame = ~0ull, reflectBytes = 0;
     uint32_t materialPitch = 0, materialWidth = 0, materialHeight = 0, materialFormat = 0;
-    float reflStrength = 1.0f, smoothMin = 0.5f, f0 = 0.04f;
+    float reflStrength = 1.0f, smoothMin = 0.5f, f0 = 0.04f, reflEffective = 1.0f;
     uint32_t reflChannel = 1, reflInvert = 0, debugReflect = 0, materialSlot = 2, reflEverywhere = 0;
     uint64_t maskFrame = ~0ull;    // image où le masque d'ombres a été calculé (sinon il ne suit plus la caméra)
     int lastMode = -1;
@@ -1106,8 +1106,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     LiveTime(list.Get(), 4);
+    // réglages des reflets dans le menu de ReShade : force, sol mouillé (urti.ini garde la main s'il impose
+    // un lissé négatif, c'est-à-dire un sol mouillé)
+    float menuReflect = 1.0f, menuWet = 0.0f;
+    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiReflect"); v.handle)
+        runtime->get_uniform_value_float(v, &menuReflect, 1);
+    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiWet"); v.handle)
+        runtime->get_uniform_value_float(v, &menuWet, 1);
+    live.reflEffective = live.reflStrength * menuReflect;
+    const float smoothMinEffective = live.smoothMin < 0 ? live.smoothMin : (menuWet > 0.01f ? -menuWet : live.smoothMin);
     // 4b. reflets : un rayon réfléchi par pixel lisse (matériau du G-buffer copié dans cette image)
-    if (live.reflStrength > 0 || live.debugReflect)
+    if (live.reflEffective > 0 || live.debugReflect)
     {
         const uint64_t bytes = uint64_t(live.width) * live.height * 16;
         if (!live.reflectBuf || live.reflectBytes < bytes)
@@ -1140,7 +1149,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 float f0;
                 uint32_t reflectPitch;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
-                     d24 ? 1u : 0u, live.reflChannel, live.smoothMin, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u), live.f0, live.width * 16 };
+                     d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u), live.f0, live.width * 16 };
             list->SetComputeRoot32BitConstants(5, 16, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1278,7 +1287,7 @@ void LiveComposite(effect_runtime* runtime)
     list->CopyTextureRegion(&buf, 0, 0, 0, &tex, nullptr);
     Transition(list.Get(), live.imageIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-    const bool reflections = live.reflectBuf && (live.reflStrength > 0 || live.debugReflect);
+    const bool reflections = live.reflectBuf && (live.reflEffective > 0 || live.debugReflect);
     if (reflections)
         Transition(list.Get(), live.reflectBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootSignature(live.compositeRs.Get());
@@ -1295,7 +1304,7 @@ void LiveComposite(effect_runtime* runtime)
         float reflStrength;
         uint32_t debugReflect;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
-             split ? 1u : 0u, showMask ? 1u : 0u, reflections ? live.reflStrength : 0.0f, reflections ? live.debugReflect : 0u };
+             split ? 1u : 0u, showMask ? 1u : 0u, reflections ? live.reflEffective : 0.0f, reflections ? live.debugReflect : 0u };
     list->SetComputeRoot32BitConstants(4, 12, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
