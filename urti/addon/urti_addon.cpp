@@ -56,6 +56,7 @@ namespace
 
 std::string g_dir, g_logPath;
 std::vector<uint64_t> g_captureFrames;
+std::vector<uint64_t> g_photoFrames; // urti.ini photo_frames= : photos à ces présentations (bac à sable, tests)
 uint32_t g_capturePresents = 4; // la capture dure plusieurs présentations (génération d'images : une sur deux sans dessin du jeu)
 bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès le lancement
 uint32_t g_calibrationInterval = 180;
@@ -132,7 +133,14 @@ void ReadSettings(HMODULE module)
             const size_t j = s.find(',', i);
             const std::string part = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
             if (!part.empty())
-                v.push_back(std::strtoull(part.c_str(), nullptr, 10));
+            {
+                // « a-b » : toutes les valeurs de a à b
+                char* end = nullptr;
+                const uint64_t a = std::strtoull(part.c_str(), &end, 10);
+                const uint64_t b = (end && *end == '-') ? std::strtoull(end + 1, nullptr, 10) : a;
+                for (uint64_t x = a; x <= b && x < a + 10000; x++)
+                    v.push_back(x);
+            }
             if (j == std::string::npos)
                 break;
             i = j + 1;
@@ -150,6 +158,8 @@ void ReadSettings(HMODULE module)
             l.erase(l.find_last_not_of(" \r\n\t") + 1);
             if (l.rfind("capture_frames=", 0) == 0)
                 g_captureFrames = parseList(l.substr(15));
+            if (l.rfind("photo_frames=", 0) == 0)
+                g_photoFrames = parseList(l.substr(13));
             if (l.rfind("show_mask=", 0) == 0)
                 g_liveShowMask = std::atoi(l.c_str() + 10) != 0;
             if (l.rfind("combine=", 0) == 0)
@@ -166,6 +176,7 @@ void ReadSettings(HMODULE module)
         std::fclose(f);
     }
     std::sort(g_captureFrames.begin(), g_captureFrames.end());
+    std::sort(g_photoFrames.begin(), g_photoFrames.end());
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1288,7 +1299,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.forceCalibration = true;
     if (GetAsyncKeyState(VK_F5) & 1)
         live.toggleSplit = true;
-    if (const std::string f5 = g_dir + "\urti_f5"; g.frame % 30 == 0 && GetFileAttributesA(f5.c_str()) != INVALID_FILE_ATTRIBUTES)
+    if (const std::string f5 = g_dir + "\\urti_f5"; g.frame % 30 == 0 && GetFileAttributesA(f5.c_str()) != INVALID_FILE_ATTRIBUTES)
         DeleteFileA(f5.c_str()), live.toggleSplit = true; // F5 par fichier (tests automatiques)
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
     // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil

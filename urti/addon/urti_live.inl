@@ -1716,7 +1716,8 @@ bool OnOpenOverlay(effect_runtime*, bool open, input_source)
     return false;
 }
 
-// photo de l'écran après les effets (fichier déclencheur urti_photo)
+// photo de l'écran après les effets (fichier déclencheur urti_photo, ou présentations listées dans urti.ini
+// photo_frames= : urti_photo_<présentation>.ppm, pour comparer deux lancements image par image)
 void OnReshadePresent(effect_runtime* runtime)
 {
     if (!OurDevice(runtime->get_device()))
@@ -1727,6 +1728,16 @@ void OnReshadePresent(effect_runtime* runtime)
         Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées",
             live.statNoDraw, live.statEffects, live.statComposited);
         live.statPresents = live.statNoDraw = live.statEffects = live.statComposited = 0;
+    }
+    if (std::binary_search(g_photoFrames.begin(), g_photoFrames.end(), g.frame))
+    {
+        if (const resource back = runtime->get_current_back_buffer(); back.handle)
+        {
+            runtime->get_command_queue()->flush_immediate_command_list();
+            SaveBackBuffer(reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native()), reinterpret_cast<ID3D12Resource*>(back.handle),
+                           g_dir + "\\urti_photo_" + std::to_string(g.frame) + ".ppm", 1);
+        }
+        return;
     }
     const std::string trigger = g_dir + "\\urti_photo";
     // pas avant que ReShade ait fini de charger ses effets (quelques dixièmes de seconde)

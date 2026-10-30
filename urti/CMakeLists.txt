@@ -7,6 +7,8 @@ add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 # application de test DirectX 12 (géométrie connue)
 add_executable(urti_testapp testapp/main.cpp)
 target_link_libraries(urti_testapp d3d12 dxgi d3dcompiler)
+add_executable(urti_sandbox sandbox/main.cpp)
+target_link_libraries(urti_sandbox d3d12 dxgi d3dcompiler)
 
 # add-on ReShade (.addon64), avec les shaders du mode direct compilés par dxc
 set(URTI_DXC "F:/rtxgi/sdk/build/_deps/dxc-src/bin/x64/dxc.exe" CACHE FILEPATH "compilateur de shaders dxc")

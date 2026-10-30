@@ -664,3 +664,26 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   de L_préc⁻¹ L_cour, la translation des cascades ne la touche pas), translation déduite du vecteur de
   mouvement de la surface et de la profondeur virtuelle (distance + distance de touche).
 - Neuf vues de diagnostic (menu ReShade et `debug_view`), images générées (DLSS-G) au choix.
+
+## v32 — URTI : bac à sable « jeu AAA » (urti_sandbox)
+
+Un mini-jeu D3D12 qui reproduit les conditions de RDR2, pour tester URTI en quelques secondes au lieu
+de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`).
+
+- Rendu comme un jeu récent : G-buffer différé à 2/3 de la résolution avec décalage sous-pixel (comme
+  DLSS), mêmes formats que RDR2 (matériau RGBA8 avec le lissé dans le canal 1 de la cible 2, vecteurs de
+  mouvement R16G16 en pixels), profondeur inversée à l'infini D32S8, profondeur à mi-résolution, atlas de
+  4 cascades 2048×8192 D16 qui suivent la caméra, éclairage plein écran, mise à l'échelle, sortie HDR10
+  (PQ). Signature racine sans stream-output, ExecuteIndirect, génération d'images en option.
+- Scène difficile : rue, bâtiments à vitres lisses, flaques, poteaux et câbles fins qui pendent et se
+  balancent au vent, arbres (branches et feuilles au vent), charrettes et passants qui avancent, clôtures
+  (un piquet = un dessin), tonneaux. 226 objets, ~1 200 dessins par image. Caméra scriptée (marche,
+  regards, demi-tours rapides), identique à chaque lancement ; cadence fixée à 90 i/s.
+- URTI le reconnaît comme un jeu : loi de profondeur exacte (0,15 / w = plan proche), soleil sur 98 %
+  des images, cascades, rotation de la caméra, vecteurs de mouvement dans la même convention que RDR2 (2).
+- Photos à des présentations précises (`photo_frames=800-830` dans urti.ini) ; `--photos` fait deux
+  lancements identiques (RT puis natif) et `urti_sandbox_compare.py` mesure l'effet du RT, le
+  scintillement ajouté et la carte des points qui sautent. Référence : effet 2,1 %, scintillement ajouté
+  +0,16 %, 0,9 % de pixels qui sautent, concentrés sur les reflets lointains dans les flaques — le
+  défaut vu dans RDR2 (`results/urti/bac_a_sable/`).
+- Test complet (deux lancements et mesures) : ~30 s.
