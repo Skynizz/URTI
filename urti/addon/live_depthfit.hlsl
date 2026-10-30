@@ -1,33 +1,51 @@
 // URTI en direct : loi de profondeur du jeu mesurée à chaque image (z de découpage = A w + B, d'où
 // profondeur = A + B / w), par moindres carrés sur des sommets de la géométrie de l'écran captée dans
-// cette image. Écrite dans le tampon du soleil (octets 36 à 47 : A, B, validité) ; sans assez de
-// sommets, la valeur précédente reste.
+// cette image (zones par dessin, seulement leur partie remplie). Écrite dans le tampon du soleil
+// (octets 36 à 47 : A, B, validité) ; sans assez de sommets, la valeur précédente reste.
 
-ByteAddressBuffer so : register(t0);       // flux de l'écran (sommets en espace de découpage)
-ByteAddressBuffer counters : register(t1); // octets écrits dans chaque flux
+ByteAddressBuffer so : register(t0);            // flux de l'écran (début de son emplacement)
+ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
+StructuredBuffer<uint4> regions : register(t2); // par dessin : début (octets), taille, compteur
 RWByteAddressBuffer sun : register(u0);
 
 cbuffer Constants : register(b0)
 {
-    uint slotOffset;    // octets : début du flux de l'écran
-    uint counterOffset; // octets : compteur du flux de l'écran
-    uint slotBytes;
-    uint pad;
+    uint regionCount;
+    uint totalBytes; // octets des zones de l'image
+    uint pad0;
+    uint pad1;
 };
 
 #define T 256
 #define SAMPLES 8192
 groupshared double sAcc[T][5];
 
+uint4 RegionOf(uint byte)
+{
+    uint lo = 0, hi = regionCount;
+    while (lo + 1 < hi)
+    {
+        const uint mid = (lo + hi) >> 1;
+        if (regions[mid].x <= byte)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return regions[lo];
+}
+
 [numthreads(T, 1, 1)]
 void main(uint t : SV_GroupThreadID)
 {
-    const uint filled = min(counters.Load(counterOffset), slotBytes) / 16;
-    const uint step = max(1u, filled / SAMPLES);
+    const uint vertices = totalBytes / 16;
+    const uint step = max(1u, vertices / SAMPLES);
     double acc[5] = { 0, 0, 0, 0, 0 }; // n, Σw, Σz, Σw², Σwz
-    for (uint i = t * step; i < filled; i += T * step)
+    for (uint i = t * step; i < vertices && regionCount > 0; i += T * step)
     {
-        const float4 c = asfloat(so.Load4(slotOffset + i * 16));
+        const uint4 r = RegionOf(i * 16);
+        if (i * 16 < r.x || i * 16 - r.x >= min(counters.Load(r.z * 8), r.y))
+            continue;
+        const float4 c = asfloat(so.Load4(i * 16));
         if (c.w > 1e-3 && c.w < 1e6 && abs(c.z) < 1e6)
             acc[0] += 1, acc[1] += c.w, acc[2] += c.z, acc[3] += double(c.w) * c.w, acc[4] += double(c.w) * c.z;
     }

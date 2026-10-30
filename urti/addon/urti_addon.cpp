@@ -73,7 +73,17 @@ struct LiveMark
     uint32_t slot = 0;
     bool sunMap = false;
     float viewport[4] = {}; // dans la carte d'ombres : la cascade du dessin
+    uint32_t offset = 0, capacity = 0, counter = 0; // zone du dessin dans le flux de son emplacement
 };
+// en direct, chaque dessin a sa zone du flux et son compteur : aucune barrière entre dessins (le
+// compteur commun imposait une attente du GPU à chaque dessin, des milliers par image)
+struct LiveRegion
+{
+    uint32_t offset = 0, capacity = 0, counter = 0, pad = 0;
+};
+std::vector<LiveRegion> g_liveRegions[4]; // par emplacement (kSlots), dans l'ordre d'attribution
+uint32_t g_liveCursor[4] = {};            // octets attribués dans chaque emplacement
+uint32_t g_liveNextCounter = 4;           // compteurs par dessin après ceux des emplacements
 bool g_liveCombine = true;       // urti.ini combine=0 : ombres RT seules, sans tenir compte de celles du jeu
 uint32_t g_liveDebugGame = 0;    // urti.ini debug_game_shadow=1 : affiche l'ombre du jeu recalculée
 float g_liveGameBias = 0.0015f;  // urti.ini game_bias= : tolérance du test de la carte d'ombres du jeu
@@ -666,42 +676,44 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         uint64_t key = kind * 1000003ull;
         for (uint32_t p : params)
             key = key * 1315423911ull + p;
-        int mark = -1;
+        // taille de la zone : sommets connus du dessin (listes de triangles) ; indirect : budget fixe
+        const uint64_t vertices = kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]);
+        const uint32_t capacity = uint32_t(std::min<uint64_t>(vertices * 16, kSlotBytes));
+        LiveRegion region;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            bool marked = false;
             if (sunMap)
             {
                 if (g_liveSunMarked >= kLiveMaxSunMarks)
                     return;
                 g_liveSunMarked++;
                 g_liveSunKeys.insert(key);
+                marked = g_liveMarks.size() < kLiveMaxMarks;
+                if (!marked)
+                    return;
             }
-            if (g_liveMarks.size() < kLiveMaxMarks && (sunMap || g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key)))
-            {
-                mark = int(g_liveMarks.size());
-                g_liveMarks.push_back({ key, uint32_t(slot), sunMap, { state.viewport[0], state.viewport[1], state.viewport[2], state.viewport[3] } });
-            }
+            else
+                marked = g_liveMarks.size() < kLiveMaxMarks && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
+            if (!capacity || uint64_t(g_liveCursor[slot]) + capacity > kSlotBytes || g_liveNextCounter >= kMaxDraws)
+                return; // emplacement plein : ce dessin n'est pas capté
+            region = { g_liveCursor[slot], capacity, g_liveNextCounter++, 0 };
+            g_liveCursor[slot] += (capacity + 15) & ~15u;
+            if (screen)
+                g_liveRegions[slot].push_back(region);
+            if (marked)
+                g_liveMarks.push_back({ key, uint32_t(slot), sunMap, { state.viewport[0], state.viewport[1], state.viewport[2], state.viewport[3] },
+                                        region.offset, region.capacity, region.counter });
         }
-        if (sunMap && mark < 0)
-            return;
         if (screen)
             g.slotDraws[slot]++;
-        if (mark >= 0)
-        {
-            Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            list->CopyBufferRegion(g.marks.Get(), mark * 16ull, g.counters.Get(), slot * 8ull, 8);
-            Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
-        }
-        D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes, kSlotBytes, g.counters->GetGPUVirtualAddress() + slot * 8ull };
+        D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes + region.offset, region.capacity,
+                                                 g.counters->GetGPUVirtualAddress() + region.counter * 8ull };
         list->SetPipelineState(shadow);
         list->SOSetTargets(0, 1, &view);
         issue(list);
         const D3D12_STREAM_OUTPUT_BUFFER_VIEW none = {};
         list->SOSetTargets(0, 1, &none);
-        Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        if (mark >= 0)
-            list->CopyBufferRegion(g.marks.Get(), mark * 16ull + 8, g.counters.Get(), slot * 8ull, 8);
-        Transition(list, g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
         list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
         return;
     }
@@ -1332,6 +1344,12 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
             Submit(q);
             g.soUsed = 0;
             g.drawCount = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for (uint32_t s = 0; s < kSlots; s++)
+                    g_liveRegions[s].clear(), g_liveCursor[s] = 0;
+                g_liveNextCounter = kSlots;
+            }
             g.frameDraws = 0;
             g.skippedDraws = 0;
             g.overflowDraws = 0;

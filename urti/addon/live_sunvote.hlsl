@@ -54,7 +54,26 @@ void main(uint t : SV_GroupThreadID)
             if (dk.w > 0 && dot(best, dk.xyz) > cosTol)
                 sum += dk.xyz * dk.w;
         }
-        if (dot(sum, sum) > 0)
+        // affinage : moyenne des seules directions à moins de 0,75° de la première moyenne (deux passes)
+        float share = sVote[0] / max(total, 1e-6);
+        for (uint pass = 0; pass < 2 && dot(sum, sum) > 0; pass++)
+        {
+            const float3 center = normalize(sum);
+            float3 tight = float3(0, 0, 0);
+            float wTight = 0;
+            for (uint k2 = 0; k2 < pairCount; k2++)
+            {
+                const float4 dk = asfloat(dirs.Load4(k2 * 80));
+                if (dk.w > 0 && dot(center, dk.xyz) > 0.99991) // 0,75°
+                    tight += dk.xyz * dk.w, wTight += dk.w;
+            }
+            if (wTight > 0)
+                sum = tight, share = wTight / max(total, 1e-6);
+        }
+        // saut brusque soutenu par peu de paires : mesure rejetée (le soleil de l'image précédente reste)
+        const float3 old = asfloat(sun.Load3(0));
+        const bool jump = dot(old, old) > 0.5 && dot(normalize(sum) * sunSign, old) < 0.99863 && share < 0.6; // 3°
+        if (dot(sum, sum) > 0 && !jump)
         {
             sun.Store4(0, asuint(float4(normalize(sum) * sunSign, 1)));
             accepted = 1;

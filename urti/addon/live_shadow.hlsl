@@ -138,5 +138,9 @@ void main(uint2 id : SV_DispatchThreadID)
                 lit = 1.0 - game * (1.0 - lit); // n'ajouter de l'ombre que là où le jeu éclaire
         }
     }
+    // au loin, le jeu noie le paysage dans la brume : une ombre RT pleine y fait des taches noires ; elle
+    // s'efface entre 120 et 300 unités (mètres dans RDR2)
+    if (w > 0)
+        lit = lerp(lit, 1.0, saturate((w - 120.0) / 180.0));
     shadow.Store(id.y * shadowPitch + id.x * 4, asuint(lit));
 }

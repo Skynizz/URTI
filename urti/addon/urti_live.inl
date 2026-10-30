@@ -76,6 +76,7 @@ struct LiveState
     ComPtr<ID3D12RootSignature> fitRs, voteRs;
     ComPtr<ID3D12PipelineState> fitPso, votePso;
     ComPtr<ID3D12Resource> pairsUpload[3], pairDirs, sunBuf, sunUpload, sunReadback[3];
+    ComPtr<ID3D12Resource> regionUpload[3]; // table des zones de l'écran pour le GPU (par image)
     ComPtr<ID3D12Resource> atlasBuf; // copie de la carte d'ombres du jeu, pour recalculer son ombre
     // application à l'image présentée (toutes les présentations, images générées comprises)
     ComPtr<ID3D12RootSignature> compositeRs;
@@ -411,13 +412,13 @@ bool LiveCreatePipelines(ID3D12Device* device)
         cd.CS = { code, size };
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
-    return make(g_live_convert, sizeof(g_live_convert), 2, live.convertRs, live.convertPso, 4) &&
+    return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
            make(g_live_shadow, sizeof(g_live_shadow), 4, live.shadowRs, live.shadowPso, 16) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
            make(g_live_composite, sizeof(g_live_composite), 4, live.compositeRs, live.compositePso, 12) &&
            make(g_live_reflect, sizeof(g_live_reflect), 4, live.reflectRs, live.reflectPso, 16) &&
-           make(g_live_depthfit, sizeof(g_live_depthfit), 2, live.depthfitRs, live.depthfitPso, 4);
+           make(g_live_depthfit, sizeof(g_live_depthfit), 3, live.depthfitRs, live.depthfitPso, 4);
 }
 
 ComPtr<ID3D12Resource> UavBuffer(ID3D12Device* device, uint64_t size, D3D12_RESOURCE_STATES state)
@@ -530,7 +531,7 @@ bool LiveEnsureSun(ID3D12Device* device)
     if (live.sunBuf)
         return true;
     for (auto& r : live.pairsUpload)
-        r = MakeBuffer(device, kLiveMaxPairs * 32ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        r = MakeBuffer(device, kLiveMaxPairs * 48ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     for (auto& r : live.sunReadback)
         r = MakeBuffer(device, 48, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     live.pairDirs = UavBuffer(device, kLiveMaxPairs * 80ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -762,9 +763,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const int slot = LiveMainSlot();
     const uint32_t drawsThisFrame = slot >= 0 ? uint32_t(g.slotDraws[slot]) : 0;
     std::vector<LiveMark> marksNow;
+    std::vector<LiveRegion> regionsNow;
+    uint32_t cursorNow = 0, countersUsed = kSlots;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         marksNow.swap(g_liveMarks);
+        if (slot >= 0)
+            regionsNow.swap(g_liveRegions[slot]), cursorNow = g_liveCursor[slot];
+        for (uint32_t s = 0; s < kSlots; s++)
+            g_liveRegions[s].clear(), g_liveCursor[s] = 0;
+        countersUsed = g_liveNextCounter;
+        g_liveNextCounter = kSlots;
         if (!g_liveSunKeys.empty())
             g_livePrevSunKeys.swap(g_liveSunKeys);
         g_liveSunKeys.clear();
@@ -812,7 +821,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.statNoDraw++;
         // image sans dessin du jeu (image générée par DLSS) : l'image d'ombres précédente reste
         Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kSlots * 8ull);
+        list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, uint64_t(std::max(countersUsed, kSlots)) * 8ull);
         Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
         for (uint32_t s = 0; s < kSlots; s++)
             g.slotDraws[s] = 0;
@@ -841,6 +850,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const D3D12_RESOURCE_DESC depthDesc = depthCopy->GetDesc();
     if (live.fromStore && live.p00 == 0)
         LiveSetProjection(depthDesc);
+    live.lastFilled = cursorNow / 16;
     if (!LiveEnsureCapacity(device.Get(), std::max<uint64_t>(live.lastFilled, 300000)) || !LiveEnsureImages(runtime, g.device, depthDesc) ||
         !LiveEnsureSun(g.device))
         return;
@@ -880,14 +890,36 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // 1. sommets de l'écran vers l'espace caméra (NaN au-delà de ce qui a été rempli)
     Transition(list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
+    ID3D12Resource* regionsBuf = nullptr;
+    {
+        ComPtr<ID3D12Resource>& up = live.regionUpload[live.frame % 3];
+        const uint64_t bytes = std::max<size_t>(regionsNow.size(), 1) * sizeof(LiveRegion);
+        if (!up || up->GetDesc().Width < bytes)
+            Retire(up), up = MakeBuffer(g.device, std::max<uint64_t>(bytes * 2, 65536), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* p = nullptr;
+        if (up && SUCCEEDED(up->Map(0, nullptr, &p)))
+        {
+            if (!regionsNow.empty())
+                std::memcpy(p, regionsNow.data(), regionsNow.size() * sizeof(LiveRegion));
+            else
+                std::memset(p, 0, sizeof(LiveRegion));
+            up->Unmap(0, nullptr);
+            regionsBuf = up.Get();
+        }
+    }
+    if (!regionsBuf)
+        return;
     list->SetComputeRootSignature(live.convertRs.Get());
     list->SetPipelineState(live.convertPso.Get());
     list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
     list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(2, live.view->GetGPUVirtualAddress());
-    const struct { float p00, p11; uint32_t count, counterOffset; } cc = { live.p00, live.p11, uint32_t(live.capacity), uint32_t(slot * 8) };
-    list->SetComputeRoot32BitConstants(3, 4, &cc, 0);
+    list->SetComputeRootShaderResourceView(2, regionsBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(3, live.view->GetGPUVirtualAddress());
+    const uint32_t converted = uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity));
+    const struct { float p00, p11; uint32_t count, regionCount; } cc = { live.p00, live.p11, uint32_t(live.capacity), uint32_t(regionsNow.size()) };
+    list->SetComputeRoot32BitConstants(4, 4, &cc, 0);
     list->Dispatch(UINT((live.capacity + 255) / 256), 1, 1);
+    (void)converted;
     Transition(list.Get(), live.view.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
     LiveTime(list.Get(), 1);
@@ -906,7 +938,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         live.sunDirty = false;
     }
-    struct Pair { uint32_t cam, map, slots; float weight; float viewport[4]; };
+    struct Pair
+    {
+        uint32_t camBase, mapBase, camCounter, mapCounter; // débuts dans le flux (octets), compteurs
+        float viewport[4];
+        float weight;
+        uint32_t camCapacity, mapCapacity, pad;
+    };
     std::vector<Pair> pairs;
     {
         std::unordered_map<uint64_t, std::vector<uint32_t>> sunByKey;
@@ -925,8 +963,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const std::vector<uint32_t>& c = it->second;
             // même rang dans les deux passes : très probablement le même objet (poids 8)
             auto add = [&](uint32_t m, float w) {
-                const float* v = marksNow[m].viewport;
-                pairs.push_back({ i, m, marksNow[i].slot | (marksNow[m].slot << 8), w, { v[0], v[1], v[2], v[3] } });
+                const LiveMark &a = marksNow[i], &b = marksNow[m];
+                pairs.push_back({ uint32_t(a.slot * kSlotBytes + a.offset), uint32_t(b.slot * kSlotBytes + b.offset), a.counter, b.counter,
+                                  { b.viewport[0], b.viewport[1], b.viewport[2], b.viewport[3] }, w, a.capacity, b.capacity, 0 });
             };
             if (r < c.size())
                 add(c[r], 8.0f);
@@ -942,23 +981,21 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             std::memcpy(p, pairs.data(), pairs.size() * sizeof(Pair));
             up->Unmap(0, nullptr);
-            Transition(list.Get(), g.marks.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
             list->SetComputeRootSignature(live.fitRs.Get());
             list->SetPipelineState(live.fitPso.Get());
             list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(1, g.marks->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(2, up->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(3, live.pairDirs->GetGPUVirtualAddress());
             const struct { float p00, p11; uint32_t count, slotBytes; } fc = { live.p00, live.p11, uint32_t(pairs.size()), uint32_t(kSlotBytes) };
             list->SetComputeRoot32BitConstants(4, 4, &fc, 0);
             list->Dispatch(UINT(pairs.size()), 1, 1);
-            Transition(list.Get(), g.marks.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
             Transition(list.Get(), live.pairDirs.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
             list->SetComputeRootSignature(live.voteRs.Get());
             list->SetPipelineState(live.votePso.Get());
             list->SetComputeRootShaderResourceView(0, live.pairDirs->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(1, live.sunBuf->GetGPUVirtualAddress());
-            const struct { uint32_t count; float cosTol, minShare, sunSign; } vc = { uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.25f, live.sunSign };
+            const struct { uint32_t count; float cosTol, minShare, sunSign; } vc = { uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.35f, live.sunSign };
             list->SetComputeRoot32BitConstants(2, 4, &vc, 0);
             list->Dispatch(1, 1, 1);
             Transition(list.Get(), live.pairDirs.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -979,11 +1016,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->ResourceBarrier(1, &ub);
         list->SetComputeRootSignature(live.depthfitRs.Get());
         list->SetPipelineState(live.depthfitPso.Get());
-        list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
         list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
-        list->SetComputeRootUnorderedAccessView(2, live.sunBuf->GetGPUVirtualAddress());
-        const uint32_t dc[4] = { uint32_t(slot * kSlotBytes), uint32_t(slot * 8), uint32_t(kSlotBytes), 0 };
-        list->SetComputeRoot32BitConstants(3, 4, dc, 0);
+        list->SetComputeRootShaderResourceView(2, regionsBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(3, live.sunBuf->GetGPUVirtualAddress());
+        const uint32_t dc[4] = { uint32_t(regionsNow.size()), cursorNow, 0, 0 };
+        list->SetComputeRoot32BitConstants(4, 4, dc, 0);
         list->Dispatch(1, 1, 1);
     }
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
@@ -1217,7 +1255,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), g.counters.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(live.counterReadback[live.frame % 3].Get(), 0, g.counters.Get(), 0, kSlots * 8ull);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kSlots * 8ull);
+    list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, uint64_t(std::max(countersUsed, kSlots)) * 8ull);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
     Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
     for (uint32_t s = 0; s < kSlots; s++)
