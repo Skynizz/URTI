@@ -7,6 +7,7 @@
 ByteAddressBuffer image : register(t0);      // copie de l'image présentée (lignes alignées)
 ByteAddressBuffer mask : register(t1);       // 1 éclairé, 0 ombre ajoutée (float, résolution de rendu)
 ByteAddressBuffer reflection : register(t2); // float4 par pixel de rendu : u, v, poids, lissé
+ByteAddressBuffer prevMask : register(t3);   // masque de l'image réelle précédente (images générées, mélange)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 
 cbuffer Constants : register(b0)
@@ -22,7 +23,7 @@ cbuffer Constants : register(b0)
     uint split;         // 1 : moitié gauche sans RT, trait au centre
     uint showMask;      // 1 : masque d'ombres seul
     float reflStrength; // 0 : pas de reflets RT
-    uint debugReflect;  // 1 lissé du matériau, 2 poids des reflets, 3 couleur reflétée seule
+    uint debugReflect;  // 1 lissé du matériau, 2 poids des reflets, 3 couleur reflétée seule ; bit 8 : mélanger avec prevMask
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -83,7 +84,9 @@ void StoreLinear(int2 px, float3 c)
 float MaskAt(int2 t)
 {
     t = clamp(t, int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
-    return asfloat(mask.Load(t.y * maskPitch + t.x * 4));
+    const float m = asfloat(mask.Load(t.y * maskPitch + t.x * 4));
+    // image générée (à mi-chemin entre deux images réelles) : moyenne des deux derniers masques
+    return (debugReflect & 0x100) ? 0.5 * (m + asfloat(prevMask.Load(t.y * maskPitch + t.x * 4))) : m;
 }
 
 // couleur bilinéaire de l'image à une position (0..1)
@@ -131,17 +134,17 @@ void main(uint2 id : SV_DispatchThreadID)
     // (lu seulement si les reflets sont actifs : sinon le tampon lié n'a pas cette taille, et une lecture
     // hors d'un tampon racine fait tomber le GPU)
     float4 rf = float4(0, 0, 0, 0);
-    if (reflStrength > 0 || debugReflect != 0)
+    if (reflStrength > 0 || (debugReflect & 0xFF) != 0)
     {
         const int2 rp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
         rf = asfloat(reflection.Load4((uint(rp.y) * maskWidth + uint(rp.x)) * 16));
     }
-    if (debugReflect == 1)
+    if ((debugReflect & 0xFF) == 1)
     {
         StoreLinear(px, rf.www);
         return;
     }
-    if (debugReflect == 2)
+    if ((debugReflect & 0xFF) == 2)
     {
         StoreLinear(px, rf.zzz);
         return;
@@ -149,7 +152,7 @@ void main(uint2 id : SV_DispatchThreadID)
     if (reflStrength > 0 && rf.z > 0)
     {
         const float3 reflected = SampleLinear(rf.xy);
-        if (debugReflect == 3)
+        if ((debugReflect & 0xFF) == 3)
         {
             StoreLinear(px, reflected * rf.z);
             return;
