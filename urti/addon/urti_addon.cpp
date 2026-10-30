@@ -588,9 +588,35 @@ int SlotFor(uint64_t depth)
     }
     if (it->second < 0)
         return -1;
-    // en direct, les emplacements ne servent qu'à l'écran et à la carte d'ombres du soleil
-    if (g.phase != Phase::Capturing && it->second != 1 && depth != g_liveSunDepth)
-        return -1;
+    // en direct, les emplacements ne servent qu'à l'écran et à la carte d'ombres du soleil, qui a le
+    // dernier, réservé (sinon plusieurs profondeurs de la taille de l'écran les prennent tous)
+    if (g.phase != Phase::Capturing)
+    {
+        if (depth == g_liveSunDepth)
+        {
+            g.slotDepth[kSlots - 1] = depth;
+            return int(kSlots - 1);
+        }
+        if (it->second != 1)
+            return -1;
+        for (uint32_t s = 0; s + 1 < kSlots; s++)
+        {
+            if (g.slotDepth[s] == depth)
+                return int(s);
+            if (!g.slotDepth[s] || g.slotDepth[s] == g_liveSunDepth)
+            {
+                g.slotDepth[s] = depth;
+                return int(s);
+            }
+        }
+        // emplacements pleins : celui qui a le moins servi dans cette image est repris
+        uint32_t least = 0;
+        for (uint32_t s = 1; s + 1 < kSlots; s++)
+            if (g.slotDraws[s] < g.slotDraws[least])
+                least = s;
+        g.slotDepth[least] = depth;
+        return int(least);
+    }
     for (uint32_t s = 0; s < kSlots; s++)
     {
         if (g.slotDepth[s] == depth)

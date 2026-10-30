@@ -58,8 +58,8 @@ struct LiveState
     ComPtr<ID3D12Resource> materialBuf, reflectBuf;
     uint64_t materialBytes = 0, materialFrame = ~0ull, reflectBytes = 0;
     uint32_t materialPitch = 0, materialWidth = 0, materialHeight = 0, materialFormat = 0;
-    float reflStrength = 1.0f, smoothMin = 0.6f, f0 = 0.04f;
-    uint32_t reflChannel = 0, reflInvert = 0, debugReflect = 0, materialSlot = 2, reflEverywhere = 0;
+    float reflStrength = 1.0f, smoothMin = 0.5f, f0 = 0.04f;
+    uint32_t reflChannel = 1, reflInvert = 0, debugReflect = 0, materialSlot = 2, reflEverywhere = 0;
     uint64_t maskFrame = ~0ull;    // image où le masque d'ombres a été calculé (sinon il ne suit plus la caméra)
     int lastMode = -1;
     float lastStrength = -1;
@@ -557,7 +557,7 @@ void LiveHotReload(ID3D12Device* device)
         {
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
-            float refl = 1.0f, channel = 0, invert = 0, smoothMin = 0.6f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 4;
+            float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
