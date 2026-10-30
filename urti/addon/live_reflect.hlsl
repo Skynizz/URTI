@@ -38,7 +38,8 @@ cbuffer Constants : register(b0)
     float smoothMin;   // en dessous : pas de reflet RT
     float bias;
     uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle),
-                       // 8 diagnostic : distance de touche normalisée ; 16 diagnostic : lissé
+                       // 8 diagnostic : distance de touche normalisée ; 16 diagnostic : lissé ;
+                       // 32 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le rayon
                        // (sinon la 4e composante est la distance de touche, 1e4 pour le ciel)
     float f0;          // réflectance à incidence normale (diélectrique ~0,04)
     uint reflectPitch;
@@ -104,6 +105,21 @@ float3 PointAt(int2 t)
         return float3(0, 0, -1);
     const float2 ndc = float2((t.x + 0.5) / width * 2 - 1, 1 - (t.y + 0.5) / height * 2);
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
+}
+
+// un point que la caméra voit à travers (elle voit plus loin que lui, ou le ciel) n'est pas solide : c'est
+// un trou d'une plaque découpée par alpha test (feuillage, herbe, grillage, franges), dont la géométrie
+// captée n'a que le rectangle. Hors de l'écran, on ne sait pas : on le suppose plein.
+bool SeenThrough(float3 h)
+{
+    if (h.z <= 1e-3)
+        return false;
+    const float2 ndc = float2(h.x * p00 / h.z, h.y * p11 / h.z);
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv <= 0) || any(uv >= 1))
+        return false;
+    const float3 seen = PointAt(int2(uv * float2(width, height)));
+    return seen.z <= 0 || seen.z > h.z * 1.03 + 0.05;
 }
 
 float3 NormalAt(int2 t, float3 p)
@@ -180,9 +196,12 @@ void main(uint2 id : SV_DispatchThreadID)
         ray.Direction = r;
         ray.TMin = 0.0;
         ray.TMax = 1e5;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        // chaque triangle rencontré est examiné : gardé sauf si c'est un trou que la caméra voit à travers
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
         q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
-        q.Proceed();
+        while (q.Proceed())
+            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && ((flags & 32) == 0 || !SeenThrough(ray.Origin + r * q.CandidateTriangleRayT())))
+                q.CommitNonOpaqueTriangleHit();
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT && r.z > 1e-3)
         {
             // rien de touché : le rayon part vers le ciel ; le ciel étant à l'infini, son reflet est le ciel

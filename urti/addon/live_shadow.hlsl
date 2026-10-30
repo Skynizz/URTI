@@ -27,7 +27,8 @@ cbuffer Constants : register(b0)
     float clearDepth;
     uint depth24;      // 1 : D24S8 (24 bits de profondeur)
     uint atlasPitch;
-    uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil
+    uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
+                       // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil
     uint motionPitch;
     uint motionConvention; // 0..15 (live_mvcal), 255 : pas d'accumulation
     float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
@@ -72,6 +73,41 @@ float GameLit(float3 p)
     return 1.0;
 }
 
+// le soleil voit-il à travers ce point h, sur le rayon qui part du récepteur ? La carte d'ombres du jeu
+// est la vue du soleil, alpha test compris. Le jeu y note chaque obstacle un peu plus loin du soleil
+// qu'il n'est (son décalage contre l'acné) : h n'est un trou que si le premier obstacle noté à son texel
+// est au moins à mi-chemin entre h et le récepteur (feuillage découpé, le soleil passe jusqu'au sol).
+// Trop près du récepteur pour trancher, ou hors des cascades : on ne sait pas.
+bool SunSeesThrough(float3 h, float3 receiver)
+{
+    if ((flags & 1) == 0)
+        return false;
+    const uint count = min(sunBuf.Load(32), 8u);
+    for (uint k = 0; k < count; k++)
+    {
+        const uint base = 48 + k * 64;
+        const float4 m0 = asfloat(sunBuf.Load4(base)), m1 = asfloat(sunBuf.Load4(base + 16)), m2 = asfloat(sunBuf.Load4(base + 32));
+        const float4 vp = asfloat(sunBuf.Load4(base + 48));
+        const float M[12] = { m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w, m2.x, m2.y, m2.z, m2.w };
+        float3 s, r;
+        for (uint c = 0; c < 3; c++)
+        {
+            s[c] = M[9 + c] + h.x * M[c] + h.y * M[3 + c] + h.z * M[6 + c];
+            r[c] = M[9 + c] + receiver.x * M[c] + receiver.y * M[3 + c] + receiver.z * M[6 + c];
+        }
+        if (abs(s.x) > 0.98 || abs(s.y) > 0.98 || s.z <= 0 || s.z >= 1)
+            continue;
+        const float gap = sunSign * (r.z - s.z); // > 0 : h entre le soleil et le récepteur
+        if (gap <= 2.0 * gameBias)
+            return false;
+        const uint2 t = uint2(vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw);
+        const uint raw = atlas.Load(t.y * atlasPitch + t.x * 4);
+        const float stored = (flags & 2) ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
+        return sunSign * (stored - s.z) > 0.5 * gap;
+    }
+    return false;
+}
+
 // point de l'espace caméra du pixel (z = w ; w <= 0 si ciel ou hors image)
 float3 PointAt(int2 t)
 {
@@ -87,6 +123,28 @@ float3 PointAt(int2 t)
 }
 
 // normale de la surface tirée de la profondeur : côté le plus proche de chaque axe (bords d'objets)
+// un point que la caméra voit à travers (elle voit plus loin que lui, ou le ciel) n'est pas solide : c'est
+// un trou d'une plaque découpée par alpha test (feuillage, herbe, grillage, franges), dont la géométrie
+// captée n'a que le rectangle. 1 : trou ; 0 : plein ; -1 : hors de l'écran, la caméra ne sait pas.
+int ScreenSees(float3 h)
+{
+    if (h.z <= 1e-3)
+        return -1;
+    const float2 ndc = float2(h.x * p00 / h.z, h.y * p11 / h.z);
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv <= 0) || any(uv >= 1))
+        return -1;
+    const float3 seen = PointAt(int2(uv * float2(width, height)));
+    return (seen.z <= 0 || seen.z > h.z * 1.03 + 0.05) ? 1 : 0;
+}
+
+// trou d'une plaque découpée : la caméra le voit à travers ; hors de l'écran, le soleil (sa carte)
+bool Hole(float3 h, float3 receiver)
+{
+    const int screen = ScreenSees(h);
+    return screen >= 0 ? screen == 1 : SunSeesThrough(h, receiver);
+}
+
 float3 NormalAt(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
@@ -130,10 +188,18 @@ void main(uint2 id : SV_DispatchThreadID)
             ray.Direction = normalize(sun + t1 * (r * cos(a)) + t2 * (r * sin(a)));
             ray.TMin = 0.0;
             ray.TMax = 1e5;
-            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+            // premier triangle qui n'est pas un trou vu à travers par la caméra ou par le soleil : ombre
+            RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
-            q.Proceed();
-            lit += q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0 / rays;
+            bool blocked = false;
+            while (q.Proceed())
+                if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
+                    ((flags & 2048) == 0 || !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p)))
+                {
+                    blocked = true;
+                    q.Abort();
+                }
+            lit += blocked ? 0.0 : 1.0 / rays;
         }
         // face tournée à l'opposé du soleil : le jeu l'assombrit déjà par son éclairage ; une ombre RT en
         // plus y ferait des taches (le test de sa carte la voit éclairée, la surface étant son propre écran)

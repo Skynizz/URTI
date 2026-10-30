@@ -13,14 +13,16 @@
 //    est stable d'une image à l'autre, comme dans un vrai jeu ;
 //  - génération d'images en option : une présentation sur deux sans aucun dessin (copie seule).
 // Scène difficile pour le RT : rue, bâtiments, poteaux et câbles très fins, arbres dont les branches
-// bougent au vent, charrettes et passants qui avancent, flaques (sol lisse par endroits), tonneaux par
+// bougent au vent (feuillage en plaques découpées par alpha test, comme dans les jeux : la géométrie est un
+// rectangle, la texture le découpe), charrettes et passants qui avancent, flaques (sol lisse par endroits), tonneaux par
 // ExecuteIndirect. Caméra scriptée, la même à chaque lancement (marche, regards, demi-tours rapides).
 //
 // Réglages (variables d'environnement) : URTI_FRAMES (nombre d'images, défaut 600), URTI_SHOW=1 (fenêtre
 // visible), URTI_SANDBOX_CAMERA=marche|fixe|orbite|batiment|arbre|rue|occlusion (les quatre derniers :
 // plans fixes des tests, voir tools/reshade/urti_sandbox_suite.sh), URTI_SANDBOX_FG=1 (génération d'images),
 // URTI_SANDBOX_SDR=1 (sortie sRGB au lieu de HDR10), URTI_SANDBOX_START=secondes (début du scénario),
-// URTI_SANDBOX_WIND=facteur (0 : pas de vent), URTI_SANDBOX_MOVERS=0 (charrettes et passants immobiles),
+// URTI_SANDBOX_LEAVES=blocs (feuilles en petits blocs pleins au lieu de plaques découpées),
+// URTI_SANDBOX_JITTER=0 (sans décalage sous-pixel), URTI_SANDBOX_WIND=facteur (0 : pas de vent), URTI_SANDBOX_MOVERS=0 (charrettes et passants immobiles),
 // URTI_SANDBOX_WET=0..1 (part du sol couverte d'eau ; défaut : flaques éparses), URTI_SANDBOX_TRUTH=1 (vérité
 // terrain : le sol reflète la scène exacte, rendue en miroir, mélangée avec la même règle qu'URTI ; un
 // lancement sans URTI dans ce mode est l'image que les reflets RT devraient donner), URTI_SANDBOX_FPS=cadence maximale (défaut 90, 0 : sans limite ;
@@ -241,6 +243,7 @@ struct VSIn
     float3 nrm : NORMAL;
     float4 col : COLOR;  // alpha : lissé
     float wind : WIND;   // poids du vent du sommet
+    float2 uv : TEXCOORD; // plaque de feuillage : coordonnées dans la texture découpée ; < 0 : surface pleine
 #ifdef INSTANCED
     float4 inst : INSTOFFSET;
 #endif
@@ -271,6 +274,7 @@ struct GVSOut
     float4 pos : SV_Position;
     float3 nrm : NORMAL;
     float4 col : COLOR;
+    float2 uv : TEXCOORD;
     float3 wpos : WORLDPOS;
     float4 cur : CURCLIP;
     float4 prev : PREVCLIP;
@@ -286,11 +290,30 @@ GVSOut vsGbuffer(VSIn i)
     o.prev = mul(float4(pwp, 1), prevViewProjNJ);
     o.nrm = normalize(mul(float4(i.nrm, 0), world).xyz);
     o.col = i.col;
+    o.uv = i.uv;
     o.wpos = wp;
     return o;
 }
 
 float Hash(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
+
+// « texture » d'une plaque de feuillage : un bouquet de feuilles (ellipses) ; ailleurs, transparent
+// (alpha test : le pixel est jeté, la carte d'ombres et l'écran voient à travers)
+bool LeafCut(float2 uv)
+{
+    if (uv.x < 0)
+        return false;
+    float a = -1;
+    for (int k = 0; k < 12; k++)
+    {
+        const float2 c = float2(Hash(float2(k, 1.7)), Hash(float2(k, 9.1))) * 0.7 + 0.15;
+        const float ang = Hash(float2(k, 4.2)) * 6.2831853;
+        const float2 d = uv - c;
+        const float2 r = float2(d.x * cos(ang) - d.y * sin(ang), d.x * sin(ang) + d.y * cos(ang));
+        a = max(a, 1 - length(r / float2(0.2, 0.08)));
+    }
+    return a <= 0;
+}
 float Noise(float2 p)
 {
     const float2 i = floor(p), f = frac(p), u = f * f * (3 - 2 * f);
@@ -308,6 +331,8 @@ struct GOut
 
 GOut psGbuffer(GVSOut i)
 {
+    if (LeafCut(i.uv))
+        discard;
     GOut o;
     float3 albedo = color.rgb * i.col.rgb;
     float smooth = i.col.a;
@@ -329,9 +354,20 @@ GOut psGbuffer(GVSOut i)
     return o;
 }
 
-float4 vsShadow(VSIn i) : SV_Position
+struct SVSOut { float4 pos : SV_Position; float2 uv : TEXCOORD; };
+SVSOut vsShadow(VSIn i)
 {
-    return mul(float4(WorldPos(i, world, cameraPos.w), 1), lightViewProj[cascade]);
+    SVSOut o;
+    o.pos = mul(float4(WorldPos(i, world, cameraPos.w), 1), lightViewProj[cascade]);
+    o.uv = i.uv;
+    return o;
+}
+
+// carte d'ombres : le feuillage est découpé comme à l'écran
+void psShadow(SVSOut i)
+{
+    if (LeafCut(i.uv))
+        discard;
 }
 
 struct FullOut { float4 pos : SV_Position; float2 uv : TEXCOORD; };
@@ -386,13 +422,14 @@ GVSOut vsMirror(VSIn i)
     o.cur = o.prev = o.pos;
     o.nrm = normalize(mul(float4(i.nrm, 0), world).xyz);
     o.col = i.col;
+    o.uv = i.uv;
     o.wpos = wp;
     return o;
 }
 
 float4 psMirror(GVSOut i) : SV_Target
 {
-    if (i.wpos.y < -0.01)
+    if (i.wpos.y < -0.01 || LeafCut(i.uv))
         discard;
     return float4(Shade(color.rgb * i.col.rgb, normalize(i.nrm), i.wpos), 1);
 }
@@ -494,7 +531,7 @@ ComPtr<ID3DBlob> Compile(const char* entry, const char* target, bool instanced)
 // sommet : position, normale, couleur (alpha : lissé), poids du vent (0 : immobile)
 struct Vertex
 {
-    float p[3], n[3], c[4], wind;
+    float p[3], n[3], c[4], wind, uv[2];
 };
 
 // un maillage : sa plage dans le tampon d'indices commun (comme un jeu, chaque modèle a la sienne)
@@ -543,6 +580,7 @@ struct Geometry
                     x.p[c] = lp[0] * m.m[c] + lp[1] * m.m[4 + c] + lp[2] * m.m[8 + c] + m.m[12 + c], x.n[c] = wn[c] / l;
                 x.c[0] = r, x.c[1] = g, x.c[2] = b, x.c[3] = smooth;
                 x.wind = wind(x.p[0], x.p[1], x.p[2]);
+                x.uv[0] = x.uv[1] = -1; // surface pleine
                 verts.push_back(x);
             }
             const uint32_t q[6] = { 0, 1, 2, 0, 2, 3 };
@@ -553,6 +591,32 @@ struct Geometry
     void Box(const Mat4& m, float r, float g, float b, float smooth)
     {
         Box(m, r, g, b, smooth, [](float, float, float) { return 0.0f; });
+    }
+    // plaque de feuillage carrée (côté size) centrée en c, tournée de yaw, inclinée de tilt, normale n
+    // (vers l'extérieur de l'arbre, comme les jeux le font pour éclairer le feuillage), découpée par alpha test
+    template <class WindFn>
+    void Card(const float c[3], float size, float yaw, float tilt, const float n[3], float r, float g, float b, WindFn wind)
+    {
+        const float ux = std::cos(yaw), uz = -std::sin(yaw);
+        const float vx = -std::sin(tilt) * uz, vy = std::cos(tilt), vz = std::sin(tilt) * ux;
+        const uint32_t base = uint32_t(verts.size());
+        const float corner[4][2] = { { -0.5f, -0.5f }, { 0.5f, -0.5f }, { 0.5f, 0.5f }, { -0.5f, 0.5f } };
+        for (const auto& k : corner)
+        {
+            Vertex x;
+            x.p[0] = c[0] + (k[0] * ux + k[1] * vx) * size;
+            x.p[1] = c[1] + k[1] * vy * size;
+            x.p[2] = c[2] + (k[0] * uz + k[1] * vz) * size;
+            for (int i = 0; i < 3; i++)
+                x.n[i] = n[i];
+            x.c[0] = r, x.c[1] = g, x.c[2] = b, x.c[3] = 0.35f;
+            x.wind = wind(x.p[0], x.p[1], x.p[2]);
+            x.uv[0] = k[0] + 0.5f, x.uv[1] = 0.5f - k[1];
+            verts.push_back(x);
+        }
+        const uint32_t q[6] = { 0, 1, 2, 0, 2, 3 };
+        for (uint32_t k : q)
+            idx.push_back(base + k);
     }
     // pavé fin de a à b (câble, branche), section s
     template <class WindFn>
@@ -597,7 +661,7 @@ float Rand(uint32_t& s)
 
 // la scène : des modèles comme dans un jeu (un arbre, un bâtiment, une portée de câbles = un maillage,
 // donc un dessin par passe), plus de petits accessoires dessinés un par un (piquets de clôture)
-std::vector<Object> BuildScene(Geometry& geo)
+std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
 {
     std::vector<Object> o;
     uint32_t seed = 12345;
@@ -698,8 +762,21 @@ std::vector<Object> BuildScene(Geometry& geo)
             for (int l = 0; l < 70; l++)
             {
                 const float a = Rand(seed) * 2 * kPi, r = 0.6f + 2.0f * Rand(seed), y = 4.0f + 2.6f * Rand(seed), s = 0.35f + 0.35f * Rand(seed);
-                geo.Box(Mul(Mul(Scale(s, s * 0.6f, s), RotateY(Rand(seed) * kPi)), Translate(tx + std::cos(a) * r, y, tz + std::sin(a) * r)), 0.18f + 0.1f * Rand(seed),
-                        0.35f + 0.15f * Rand(seed), 0.12f, 0.35f, windTree);
+                const float yaw = Rand(seed) * kPi, cr = 0.18f + 0.1f * Rand(seed), cg = 0.35f + 0.15f * Rand(seed);
+                if (!leafCards)
+                {
+                    geo.Box(Mul(Mul(Scale(s, s * 0.6f, s), RotateY(yaw)), Translate(tx + std::cos(a) * r, y, tz + std::sin(a) * r)), cr, cg, 0.12f, 0.35f, windTree);
+                    continue;
+                }
+                // bouquet : deux plaques croisées, trois fois plus grandes qu'un bloc (la texture en découpe les feuilles)
+                const float c[3] = { tx + std::cos(a) * r, y, tz + std::sin(a) * r };
+                float n[3] = { std::cos(a), 0.6f, std::sin(a) };
+                const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                for (float& v : n)
+                    v /= nl;
+                const float tilt = (Rand(seed) - 0.5f) * 0.8f;
+                geo.Card(c, s * 3.0f, yaw, tilt, n, cr, cg, 0.12f, windTree);
+                geo.Card(c, s * 3.0f, yaw + kPi * 0.5f, -tilt, n, cr, cg, 0.12f, windTree);
             }
             geo.End(m);
             add(m);
@@ -779,7 +856,7 @@ void CameraAt(const std::string& mode, float t, float eye[3], float at[3])
     struct Shot { const char* name; float eye[3], at[3]; };
     static const Shot shots[] = {
         { "batiment", { -5, 1.7f, 3 }, { -5, 2.5f, 11 } },       // façade, vitres, rien ne bouge
-        { "arbre", { 4, 1.7f, -2 }, { 4, 1.6f, -10.5f } },       // un arbre et son reflet
+        { "arbre", { 4, 1.7f, 4 }, { 4, 0.2f, -10.5f } },        // un arbre et son reflet dans la flaque
         { "rue", { -12, 1.7f, -2 }, { -12, 1.0f, 5 } },          // des passants traversent
         { "occlusion", { 1, 1.7f, -3 }, { 1, 1.4f, 5 } },        // des passants disparaissent derrière le mur
     };
@@ -874,6 +951,7 @@ int main()
     const bool movers = env("URTI_SANDBOX_MOVERS", "1") != "0";
     const float wet = float(std::atof(env("URTI_SANDBOX_WET", "-1").c_str()));
     const bool truth = env("URTI_SANDBOX_TRUTH", "0") != "0";
+    const bool leafCards = env("URTI_SANDBOX_LEAVES", "cartes") != "blocs"; // feuillage en plaques découpées (défaut) ou en blocs
     const float jitter = float(std::atof(env("URTI_SANDBOX_JITTER", "1").c_str())); // 0 : sans décalage sous-pixel
     const double fpsCap = std::atof(env("URTI_SANDBOX_FPS", "90").c_str());
 
@@ -1041,6 +1119,7 @@ int main()
         { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "WIND", 0, DXGI_FORMAT_R32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 44, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "INSTOFFSET", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
     };
     auto geometryPso = [&](const char* vs, const char* ps, bool instanced, UINT targets, const DXGI_FORMAT* formats, DXGI_FORMAT dsvFormat,
@@ -1065,7 +1144,7 @@ int main()
         d.DepthStencilState.DepthEnable = dsvFormat != DXGI_FORMAT_UNKNOWN;
         d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         d.DepthStencilState.DepthFunc = depthBias ? D3D12_COMPARISON_FUNC_LESS : D3D12_COMPARISON_FUNC_GREATER; // ombres : normal ; écran : inversé
-        d.InputLayout = { layout, instanced ? 5u : 4u };
+        d.InputLayout = { layout, instanced ? 6u : 5u };
         d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         d.NumRenderTargets = targets;
         for (UINT i = 0; i < targets; i++)
@@ -1096,8 +1175,8 @@ int main()
     };
     ComPtr<ID3D12PipelineState> gbufferPso = geometryPso("vsGbuffer", "psGbuffer", false, 5, gFormats, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 0);
     ComPtr<ID3D12PipelineState> gbufferInstPso = geometryPso("vsGbuffer", "psGbuffer", true, 5, gFormats, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 0);
-    ComPtr<ID3D12PipelineState> shadowPso = geometryPso("vsShadow", nullptr, false, 0, nullptr, DXGI_FORMAT_D16_UNORM, 600);
-    ComPtr<ID3D12PipelineState> shadowInstPso = geometryPso("vsShadow", nullptr, true, 0, nullptr, DXGI_FORMAT_D16_UNORM, 600);
+    ComPtr<ID3D12PipelineState> shadowPso = geometryPso("vsShadow", "psShadow", false, 0, nullptr, DXGI_FORMAT_D16_UNORM, 40);
+    ComPtr<ID3D12PipelineState> shadowInstPso = geometryPso("vsShadow", "psShadow", true, 0, nullptr, DXGI_FORMAT_D16_UNORM, 40);
     ComPtr<ID3D12PipelineState> halfPso = geometryPso("vsGbuffer", nullptr, false, 0, nullptr, DXGI_FORMAT_D32_FLOAT, 0);
     const DXGI_FORMAT mirrorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
     ComPtr<ID3D12PipelineState> mirrorPso = geometryPso("vsMirror", "psMirror", false, 1, &mirrorFormat, DXGI_FORMAT_D32_FLOAT, 0);
@@ -1108,7 +1187,7 @@ int main()
 
     // ---------------- maillages, tonneaux par ExecuteIndirect ----------------
     Geometry geo;
-    std::vector<Object> scene = BuildScene(geo);
+    std::vector<Object> scene = BuildScene(geo, leafCards);
     const int barrelMesh = geo.Begin();
     geo.Box(Scale(0.7f, 1.0f, 0.7f), 0.35f, 0.22f, 0.12f, 0.3f);
     geo.Box(Mul(Scale(0.74f, 0.08f, 0.74f), Translate(0, 0.3f, 0)), 0.15f, 0.15f, 0.15f, 0.6f); // cerclage métallique
@@ -1241,7 +1320,8 @@ int main()
             Mat4 lv = LookAtLH(lightEye, c);
             const float texel = cascadeSize[k] / kAtlas;
             lv.m[12] = std::floor(lv.m[12] / texel) * texel, lv.m[13] = std::floor(lv.m[13] / texel) * texel;
-            lightVP[k] = Mul(lv, OrthoLH(cascadeSize[k], cascadeSize[k], 1, 700));
+            // profondeur sur 400 m autour du centre (D16 : 6 mm par pas), décalage de 40 pas (~25 cm) comme un jeu
+            lightVP[k] = Mul(lv, OrthoLH(cascadeSize[k], cascadeSize[k], 100, 500));
         }
 
         FrameConstants& fc = *frameData;

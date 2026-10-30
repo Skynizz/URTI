@@ -742,3 +742,25 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
 - Correction : l'ombre s'applique avant le reflet (qui la remplace en partie). Sauts 1,257 → 1,168 %,
   superposition 0,062 → 0,037 % ; sur les 7 scènes, écart à la vérité et sauts en baisse partout
   (`results/urti/bac_a_sable/suite/tableau_v34.txt`, `results/urti/bac_a_sable/superposition/`).
+
+## v35 — URTI : feuillage découpé par alpha test (trous reconnus par la caméra et par le soleil)
+
+- Pourquoi le feuillage de RDR2 « saute » et pas celui du bac à sable : les jeux dessinent le feuillage
+  (herbe, franges, grillages) en plaques dont la texture découpe les feuilles (alpha test). URTI capte la
+  géométrie, pas la texture : pour lui chaque plaque est un rectangle plein ; un rayon qui tape un trou
+  est rejeté (le reflet disparaît) ou fait une ombre en rectangle, et le vent fait alterner.
+- Bac à sable : feuillage en plaques croisées découpées (écran, carte d'ombres, miroir de la vérité
+  terrain), `URTI_SANDBOX_LEAVES=blocs` pour l'ancien ; cadrage du test arbre avec son reflet dans la
+  flaque ; carte d'ombres réaliste (profondeur sur 400 m, décalage de 40 pas D16 au lieu de 600 : ~25 cm
+  au lieu de plusieurs mètres). Le défaut est reproduit : reflet de l'arbre troué et fait de rectangles
+  (`results/urti/bac_a_sable/feuillage/`).
+- Correction (`alpha_screen=1`, par défaut) : chaque triangle rencontré par un rayon est examiné.
+  - À l'écran : si la caméra voit plus loin que ce point (ou le ciel), c'est un trou : le rayon continue.
+  - Hors de l'écran (ombres de la couronne au-dessus de la caméra) : la carte d'ombres du jeu est la vue
+    du soleil, alpha test compris ; le point est un trou si le premier obstacle qu'elle a noté est au
+    moins à mi-chemin entre lui et le récepteur (le jeu note ses obstacles un peu plus loin qu'ils ne
+    sont : un seuil fixe faisait disparaître toutes les ombres RT, vu au masque et corrigé). La carte du
+    jeu est donc aussi copiée hors du mode combiné (+0,17 ms).
+- Mesures (avec les plaques) : marche, sauts 1,294 → 1,177 %, clignotement 0,952 → 0,853 %, écart à la
+  vérité 1,14 → 1,01 % ; arbre, écart 2,67 → 2,46 %. Les 7 scènes : `suite/tableau_v35.txt` (le bac à
+  sable a changé : feuillage et carte d'ombres, les tableaux précédents ne se comparent pas ligne à ligne).

@@ -82,6 +82,7 @@ struct LiveState
     // ancrage coupé par défaut : mesuré sur le bac à sable, il ne réduit pas le clignotement (le passage
     // d'un filtre à l'autre selon les pixels en ajoute) ; anchor_alpha=0.1 dans urti.ini pour l'essayer
     float anchorAlpha = 0.0f, anchorGamma = 2.5f;
+    bool alphaScreen = true; // trous des plaques découpées reconnus à l'écran (urti.ini alpha_screen=0 : coupé)
     uint64_t boundFrame = 0;
 
     // suivi du soleil à chaque image
@@ -625,7 +626,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -643,6 +644,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("refl_alpha_min=", reflAlphaMin), value("refl_alpha_max=", reflAlphaMax);
                 value("refl_gamma=", reflGamma), value("refl_depth_tol=", reflDepthTol);
                 value("anchor_alpha=", anchorAlpha), value("anchor_gamma=", anchorGamma); // anchor_alpha=0 : ancrage coupé
+                value("alpha_screen=", alphaScreen);
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -654,6 +656,7 @@ void LiveHotReload(ID3D12Device* device)
             live.iniDebugView = int(debugView);
             live.reflAlphaMin = std::clamp(reflAlphaMin, 0.01f, 1.0f), live.reflAlphaMax = std::clamp(reflAlphaMax, live.reflAlphaMin, 1.0f);
             live.reflGamma = reflGamma, live.reflDepthTol = reflDepthTol, live.anchorAlpha = anchorAlpha, live.anchorGamma = anchorGamma;
+            live.alphaScreen = alphaScreen != 0;
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1287,7 +1290,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // 3b. carte d'ombres du jeu (son ombre est recalculée pixel par pixel : nos ombres ne s'ajoutent
     // que là où le jeu n'en met pas)
     bool atlasValid = false;
-    if (ID3D12Resource* atlas = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth); atlas && g_liveCombine && live.calibrated)
+    // (lue aussi pour reconnaître les trous du feuillage découpé : la carte est la vue du soleil)
+    if (ID3D12Resource* atlas = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth); atlas && (g_liveCombine || live.alphaScreen) && live.calibrated)
     {
         uint32_t state = 0;
         bool known = false;
@@ -1359,7 +1363,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     const bool sunNow = live.calibrated && live.framesSinceSun < 30;
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
-                           (sunNow ? 0u : 16u) | (live.shadowRays << 8);
+                           (sunNow ? 0u : 16u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -1521,7 +1525,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 uint32_t reflectPitch, regionCount, anchors, prevVertexCount, pad1;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
-                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u), live.f0, live.width * 16,
+                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u), live.f0, live.width * 16,
                      uint32_t(regionsNow.size()), live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity), 0 };
             list->SetComputeRoot32BitConstants(10, 20, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
