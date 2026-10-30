@@ -27,7 +27,7 @@ cbuffer Constants : register(b0)
     uint depth24;
     float alpha;         // part de l'image courante
     float maxLuminance;  // plafond de la couleur reflétée (lumière linéaire, 1 = blanc de référence)
-    uint flags;          // 1 : historique valide ; 2 : image générée (pas de mise à jour)
+    uint flags;          // 1 : historique valide ; 2 : image générée (pas de mise à jour) ; 4 : diagnostic, confiance
     uint pad0;
     uint pad1;
     uint pad2;
@@ -130,8 +130,17 @@ void main(uint2 id : SV_DispatchThreadID)
                 const float4 hist = asfloat(history.Load4((uint(p.y) * renderWidth + uint(p.x)) * 16));
                 // historique borné par le voisinage courant : un reflet qui a bougé ne laisse pas de trace
                 result = lerp(clamp(hist, lo, hi), cur, alpha);
+                if (flags & 4)
+                {
+                    // confiance : part de l'historique gardée après bornage (blanc : stable, noir : rejeté)
+                    const float kept = 1.0 - saturate(length(clamp(hist, lo, hi) - hist) / max(length(hist), 1e-3));
+                    resolved.Store4(dst, asuint(float4(kept.xxx, 1)));
+                    return;
+                }
             }
         }
     }
+    if (flags & 4)
+        result = float4(0, 0, 0, 1); // pas d'historique repris
     resolved.Store4(dst, asuint(result));
 }

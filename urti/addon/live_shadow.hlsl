@@ -31,7 +31,11 @@ cbuffer Constants : register(b0)
     uint motionPitch;
     uint motionConvention; // 0..15 (live_mvcal), 255 : pas d'accumulation
     float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
-    uint pad3;
+    uint debugMode;        // 1 ombre brute (sans accumulation), 2 vecteurs de mouvement, 3 historique gardé
+    uint frameIndex;       // fait tourner le motif des rayons d'une image à l'autre (l'accumulation le moyenne)
+    uint pad4;
+    uint pad5;
+    uint pad6;
 };
 
 static float gA, gB, gClear;
@@ -114,7 +118,7 @@ void main(uint2 id : SV_DispatchThreadID)
         // quatre rayons répartis dans le disque solaire (strates 2×2 tournées par pixel) : pénombre lisse
         const float3 t1 = normalize(abs(sun.y) < 0.99 ? cross(sun, float3(0, 1, 0)) : cross(sun, float3(1, 0, 0)));
         const float3 t2 = cross(sun, t1);
-        const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))));
+        const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))) + 0.61803399 * float(frameIndex & 1023));
         lit = 0.0;
         const uint rays = clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
         for (uint k = 0; k < rays; k++)
@@ -149,6 +153,9 @@ void main(uint2 id : SV_DispatchThreadID)
     // s'efface entre 120 et 300 unités (mètres dans RDR2)
     if (w > 0)
         lit = lerp(lit, 1.0, saturate((w - 120.0) / 180.0));
+    const float rawLit = lit;
+    float motionPixels = 0;
+    bool historyUsed = false;
     // accumulation dans le temps : le masque de l'image précédente, lu là où le vecteur de mouvement du jeu
     // dit que ce point se trouvait, si la profondeur y correspond (sinon : point découvert, rien à reprendre)
     if (motionConvention < 16 && w > 0 && w < 1e5)
@@ -162,6 +169,7 @@ void main(uint2 id : SV_DispatchThreadID)
         if (k & 8)
             mv.y = -mv.y;
         const float2 prevUv = (float2(id) + 0.5) / float2(width, height) + mv;
+        motionPixels = length(mv * float2(width, height));
         if (all(isfinite(mv)) && all(prevUv > 0) && all(prevUv < 1))
         {
             const float2 q = prevUv * float2(width, height) - 0.5;
@@ -179,8 +187,15 @@ void main(uint2 id : SV_DispatchThreadID)
                     hist += asfloat(prevShadow.Load(t.y * shadowPitch + t.x * 4)) * bw, wsum += bw;
             }
             if (wsum > 0.25)
-                lit = lerp(hist / wsum, lit, temporalAlpha);
+                lit = lerp(hist / wsum, lit, temporalAlpha), historyUsed = true;
         }
     }
+    // vues de diagnostic (affichées par la vue « masque »)
+    if (debugMode == 1)
+        lit = rawLit;
+    else if (debugMode == 2)
+        lit = saturate(motionPixels / 20.0); // blanc : 20 pixels de mouvement ou plus
+    else if (debugMode == 3)
+        lit = historyUsed ? 1.0 : 0.0;       // noir : historique rejeté (point découvert, profondeur changée)
     shadow.Store(id.y * shadowPitch + id.x * 4, asuint(lit));
 }

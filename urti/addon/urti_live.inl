@@ -43,6 +43,8 @@ struct LiveState
     uint32_t mvPitch = 0, mvWidth = 0, mvHeight = 0, mvConvention = 255, mvMovingFrames = 0;
     double mvErr[16] = {}, mvCount[16] = {};
     float temporalAlpha = 0.3f;
+    uint32_t debugView = 0;    // vue de diagnostic (menu UrtiDebug ou urti.ini debug_view=)
+    int iniDebugView = -1;
     // reflets stabilisés : historique à la résolution de rendu (deux tampons alternés)
     ComPtr<ID3D12RootSignature> resolveRs;
     ComPtr<ID3D12PipelineState> resolvePso;
@@ -432,7 +434,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 20) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 24) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
@@ -588,7 +590,7 @@ void LiveHotReload(ID3D12Device* device)
         {
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
-            float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2;
+            float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -602,7 +604,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("game_bias=", gameBias), value("ray_bias=", rayBias), value("sun_radius=", sunRadius);
                 value("reflect=", refl), value("reflect_channel=", channel), value("reflect_invert=", invert), value("smooth_min=", smoothMin);
                 value("reflect_f0=", f0), value("debug_reflect=", debugReflect), value("material_slot=", slot), value("reflect_everywhere=", everywhere);
-                value("shadow_rays=", rays);
+                value("shadow_rays=", rays), value("debug_view=", debugView);
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -611,6 +613,7 @@ void LiveHotReload(ID3D12Device* device)
             live.reflStrength = refl, live.reflChannel = uint32_t(channel) & 3, live.reflInvert = invert != 0, live.smoothMin = smoothMin;
             live.f0 = f0, live.debugReflect = uint32_t(debugReflect), live.materialSlot = uint32_t(slot) & 7, live.reflEverywhere = everywhere != 0;
             live.shadowRays = std::clamp(uint32_t(rays), 1u, 4u);
+            live.iniDebugView = int(debugView);
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1283,11 +1286,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t d24, atlasPitch, flags;
         uint32_t motionPitch, motionConvention;
         float temporalAlpha;
-        uint32_t pad;
+        uint32_t debugMode, frameIndex, pad4, pad5, pad6;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
-             live.mvPitch, motionOk && live.prevShadowBuf ? live.mvConvention : 255u, live.temporalAlpha, 0 };
-    list->SetComputeRoot32BitConstants(8, 20, &sc, 0);
+             live.mvPitch, motionOk && live.prevShadowBuf ? live.mvConvention : 255u, live.temporalAlpha,
+             live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u, uint32_t(live.frame), 0, 0, 0 };
+    list->SetComputeRoot32BitConstants(8, 24, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     // recherche de la convention des vecteurs de mouvement (tant qu'elle n'est pas trouvée)
     if (motionOk && live.mvConvention == 255 && live.mvcalPso)
@@ -1335,6 +1339,18 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // réglages des reflets dans le menu de ReShade : force, sol mouillé (urti.ini garde la main s'il impose
     // un lissé négatif, c'est-à-dire un sol mouillé)
     float menuReflect = 1.0f, menuWet = 0.0f;
+    {
+        int32_t view = live.iniDebugView;
+        if (view < 0)
+        {
+            view = 0;
+            if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiDebug"); v.handle)
+                runtime->get_uniform_value_int(v, &view, 1);
+        }
+        if (uint32_t(view) != live.debugView)
+            Log("URTI direct : vue de diagnostic %d", view);
+        live.debugView = uint32_t(std::clamp(view, 0, 8));
+    }
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiGenerated"); v.handle)
     {
         int32_t m = 0;
@@ -1381,7 +1397,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 float f0;
                 uint32_t reflectPitch;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
-                     d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u), live.f0, live.width * 16 };
+                     d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u), live.f0, live.width * 16 };
             list->SetComputeRoot32BitConstants(5, 16, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1502,7 +1518,7 @@ void LiveComposite(effect_runtime* runtime)
         runtime->get_uniform_value_bool(v, &split, 1);
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiShowMask"); v.handle)
         runtime->get_uniform_value_bool(v, &showMask, 1);
-    showMask = showMask || g_liveShowMask;
+    showMask = showMask || g_liveShowMask || (live.debugView >= 1 && live.debugView <= 3);
     if (strength != live.lastStrength || split != live.lastSplit || showMask != live.lastShowMask)
         Log("URTI direct : réglages du menu : force %.2f, écran partagé %d, masque seul %d", strength, split, showMask);
     live.lastStrength = strength, live.lastSplit = split, live.lastShowMask = showMask;
@@ -1521,7 +1537,10 @@ void LiveComposite(effect_runtime* runtime)
     list->CopyTextureRegion(&buf, 0, 0, 0, &tex, nullptr);
     Transition(list.Get(), live.imageIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-    const bool reflections = live.reflectBuf && (live.reflEffective > 0 || live.debugReflect);
+    // vues 4 à 8 : lissé, poids, couleur reflétée, distance de touche (dans le canal du lissé), confiance
+    const uint32_t reflectView = live.debugView == 4 ? 1u : live.debugView == 5 ? 2u : live.debugView == 6 ? 3u : live.debugView == 7 ? 1u :
+                                 live.debugView == 8 ? 3u : live.debugReflect;
+    const bool reflections = live.reflectBuf && (live.reflEffective > 0 || reflectView);
     if (reflections)
         Transition(list.Get(), live.reflectBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     // reflets stabilisés dans le temps (image réelle : mise à jour de l'historique ; image générée : le
@@ -1572,7 +1591,8 @@ void LiveComposite(effect_runtime* runtime)
                     float alpha, maxLuminance;
                     uint32_t flags, pad0, pad1, pad2;
                 } rc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.mvPitch,
-                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, 0.2f, 4.0f, motionOk ? 1u : 0u, 0, 0, 0 };
+                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, 0.2f, 4.0f,
+                         (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u), 0, 0, 0 };
                 list->SetComputeRoot32BitConstants(8, 16, &rc, 0);
                 list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
                 if (prev >= 0)
@@ -1614,8 +1634,8 @@ void LiveComposite(effect_runtime* runtime)
         float reflStrength;
         uint32_t debugReflect;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
-             split ? 1u : 0u, showMask ? 1u : 0u, (reflections && !(generated && live.fgMode == 2)) ? live.reflEffective : 0.0f,
-             (reflections ? live.debugReflect : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) };
+             split ? 1u : 0u, showMask ? 1u : 0u, (reflections && !(generated && live.fgMode == 2)) ? std::max(live.reflEffective, reflectView ? 1.0f : 0.0f) : 0.0f,
+             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) };
     list->SetComputeRoot32BitConstants(6, 12, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

@@ -25,7 +25,8 @@ cbuffer Constants : register(b0)
     uint channel;      // canal du matériau qui porte le lissé (0 à 3)
     float smoothMin;   // en dessous : pas de reflet RT
     float bias;
-    uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle)
+    uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle),
+                       // 8 diagnostic : distance de touche à la place du lissé
     float f0;          // réflectance à incidence normale (diélectrique ~0,04)
     uint reflectPitch;
 };
@@ -126,7 +127,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     {
                         // fondu vers les bords de l'écran (couleur inconnue au-delà)
                         const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
-                        result = float4(uv, weight * edge.x * edge.y, s);
+                        result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(q.CommittedRayT() / 50.0) : s);
                     }
                 }
             }
