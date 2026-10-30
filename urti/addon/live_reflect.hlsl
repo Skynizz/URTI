@@ -47,7 +47,8 @@ float3 PointAt(int2 t)
 
 float3 NormalAt(int2 t, float3 p)
 {
-    const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
+    // différences sur deux pixels (normale moins bruitée qu'à un pixel : moins de reflets qui tremblent)
+    const float3 l = PointAt(t - int2(2, 0)), r = PointAt(t + int2(2, 0)), u = PointAt(t - int2(0, 2)), b = PointAt(t + int2(0, 2));
     const float3 dx = (r.z > 0 && (l.z <= 0 || abs(r.z - p.z) < abs(l.z - p.z))) ? r - p : p - l;
     const float3 dy = (b.z > 0 && (u.z <= 0 || abs(b.z - p.z) < abs(u.z - p.z))) ? b - p : p - u;
     float3 n = normalize(cross(dx, dy));

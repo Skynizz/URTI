@@ -18,6 +18,7 @@
 #include "live_reflect_cs.h"   // g_live_reflect
 #include "live_depthfit_cs.h"  // g_live_depthfit
 #include "live_mvcal_cs.h"     // g_live_mvcal
+#include "live_reflresolve_cs.h" // g_live_reflresolve
 
 struct LiveState
 {
@@ -42,6 +43,12 @@ struct LiveState
     uint32_t mvPitch = 0, mvWidth = 0, mvHeight = 0, mvConvention = 255, mvMovingFrames = 0;
     double mvErr[16] = {}, mvCount[16] = {};
     float temporalAlpha = 0.3f;
+    // reflets stabilisés : historique à la résolution de rendu (deux tampons alternés)
+    ComPtr<ID3D12RootSignature> resolveRs;
+    ComPtr<ID3D12PipelineState> resolvePso;
+    ComPtr<ID3D12Resource> reflHist[2];
+    uint64_t reflHistBytes = 0;
+    int reflHistLast = -1; // tampon écrit à la dernière image réelle
     uint32_t fgMode = 0;                  // images générées : 0 même masque, 1 sans RT, 2 mélange des deux dernières
     // stabilité du soleil : écart d'une image mesurée à la suivante
     float lastSun[3] = {};
@@ -429,7 +436,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
-           make(g_live_composite, sizeof(g_live_composite), 4, live.compositeRs, live.compositePso, 12) &&
+           make(g_live_composite, sizeof(g_live_composite), 5, live.compositeRs, live.compositePso, 12) &&
+           make(g_live_reflresolve, sizeof(g_live_reflresolve), 7, live.resolveRs, live.resolvePso, 16) &&
            make(g_live_reflect, sizeof(g_live_reflect), 4, live.reflectRs, live.reflectPso, 16) &&
            make(g_live_depthfit, sizeof(g_live_depthfit), 3, live.depthfitRs, live.depthfitPso, 4);
 }
@@ -1516,6 +1524,76 @@ void LiveComposite(effect_runtime* runtime)
     const bool reflections = live.reflectBuf && (live.reflEffective > 0 || live.debugReflect);
     if (reflections)
         Transition(list.Get(), live.reflectBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    // reflets stabilisés dans le temps (image réelle : mise à jour de l'historique ; image générée : le
+    // dernier résultat est repris tel quel)
+    const bool isGenerated = live.lastPresentDraws == 0;
+    int reflHistOut = -1;
+    if (reflections && live.resolvePso)
+    {
+        const uint64_t bytes = uint64_t(live.width) * live.height * 16;
+        if (!live.reflHist[0] || live.reflHistBytes < bytes)
+        {
+            Retire(live.reflHist[0]), Retire(live.reflHist[1]);
+            live.reflHist[0] = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.reflHist[1] = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.reflHistBytes = bytes, live.reflHistLast = -1;
+        }
+        if (live.reflHist[0] && live.reflHist[1])
+        {
+            if (isGenerated && live.reflHistLast >= 0)
+                reflHistOut = live.reflHistLast;
+            else if (!isGenerated)
+            {
+                const int prev = live.reflHistLast, cur = prev == 0 ? 1 : 0;
+                const bool motionOk = live.mvBuf && live.mvFrame != ~0ull && live.frame <= live.mvFrame + 2 && live.mvWidth == live.width &&
+                                      live.mvHeight == live.height && live.depthPrevBuf && prev >= 0;
+                Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+                if (live.depthPrevBuf)
+                    Transition(list.Get(), live.depthPrevBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+                if (live.mvBuf)
+                    Transition(list.Get(), live.mvBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+                Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+                if (prev >= 0)
+                    Transition(list.Get(), live.reflHist[prev].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+                list->SetComputeRootSignature(live.resolveRs.Get());
+                list->SetPipelineState(live.resolvePso.Get());
+                list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(1, live.reflectBuf->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2, live.reflHist[prev >= 0 ? prev : cur]->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(3, live.mvBuf ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(4, live.depthBuf->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(5, live.depthPrevBuf ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(6, live.sunBuf->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(7, live.reflHist[cur]->GetGPUVirtualAddress());
+                const bool d24r = live.depthFormat == DXGI_FORMAT_R24G8_TYPELESS || live.depthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT;
+                const struct
+                {
+                    uint32_t width, height, pitch, format, renderWidth, renderHeight, motionPitch, motionConvention, depthPitch, depth24;
+                    float alpha, maxLuminance;
+                    uint32_t flags, pad0, pad1, pad2;
+                } rc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.mvPitch,
+                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, 0.2f, 4.0f, motionOk ? 1u : 0u, 0, 0, 0 };
+                list->SetComputeRoot32BitConstants(8, 16, &rc, 0);
+                list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+                if (prev >= 0)
+                    Transition(list.Get(), live.reflHist[prev].Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (live.mvBuf)
+                    Transition(list.Get(), live.mvBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+                if (live.depthPrevBuf)
+                    Transition(list.Get(), live.depthPrevBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+                Transition(list.Get(), live.depthBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_RESOURCE_BARRIER ub = {};
+                ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                ub.UAV.pResource = live.reflHist[cur].Get();
+                list->ResourceBarrier(1, &ub);
+                live.reflHistLast = cur;
+                reflHistOut = cur;
+            }
+        }
+        if (reflHistOut >= 0)
+            Transition(list.Get(), live.reflHist[reflHistOut].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    }
     list->SetComputeRootSignature(live.compositeRs.Get());
     list->SetPipelineState(live.compositePso.Get());
     list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
@@ -1526,7 +1604,8 @@ void LiveComposite(effect_runtime* runtime)
     if (blend)
         Transition(list.Get(), live.prevShadowBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     list->SetComputeRootShaderResourceView(3, blend ? live.prevShadowBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(4, live.imageOut->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(4, reflHistOut >= 0 ? live.reflHist[reflHistOut]->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(5, live.imageOut->GetGPUVirtualAddress());
     const struct
     {
         uint32_t width, height, pitch, format, maskWidth, maskHeight, maskPitch;
@@ -1536,12 +1615,14 @@ void LiveComposite(effect_runtime* runtime)
         uint32_t debugReflect;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u, (reflections && !(generated && live.fgMode == 2)) ? live.reflEffective : 0.0f,
-             (reflections ? live.debugReflect : 0u) | (blend ? 0x100u : 0u) };
-    list->SetComputeRoot32BitConstants(5, 12, &cc, 0);
+             (reflections ? live.debugReflect : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) };
+    list->SetComputeRoot32BitConstants(6, 12, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (blend)
         Transition(list.Get(), live.prevShadowBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (reflHistOut >= 0)
+        Transition(list.Get(), live.reflHist[reflHistOut].Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (reflections)
         Transition(list.Get(), live.reflectBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(list.Get(), live.imageIn.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);

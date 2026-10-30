@@ -8,6 +8,7 @@ ByteAddressBuffer image : register(t0);      // copie de l'image présentée (li
 ByteAddressBuffer mask : register(t1);       // 1 éclairé, 0 ombre ajoutée (float, résolution de rendu)
 ByteAddressBuffer reflection : register(t2); // float4 par pixel de rendu : u, v, poids, lissé
 ByteAddressBuffer prevMask : register(t3);   // masque de l'image réelle précédente (images générées, mélange)
+ByteAddressBuffer resolvedRefl : register(t4); // reflets stabilisés (live_reflresolve) : couleur × poids, poids
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 
 cbuffer Constants : register(b0)
@@ -23,7 +24,8 @@ cbuffer Constants : register(b0)
     uint split;         // 1 : moitié gauche sans RT, trait au centre
     uint showMask;      // 1 : masque d'ombres seul
     float reflStrength; // 0 : pas de reflets RT
-    uint debugReflect;  // 1 lissé du matériau, 2 poids des reflets, 3 couleur reflétée seule ; bit 8 : mélanger avec prevMask
+    uint debugReflect;  // 1 lissé du matériau, 2 poids des reflets, 3 couleur reflétée seule ; bit 8 : mélanger avec prevMask ;
+                        // bit 9 : reflets stabilisés disponibles (resolvedRefl)
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -149,7 +151,27 @@ void main(uint2 id : SV_DispatchThreadID)
         StoreLinear(px, rf.zzz);
         return;
     }
-    if (reflStrength > 0 && rf.z > 0)
+    if (reflStrength > 0 && (debugReflect & 0x200))
+    {
+        // reflet stabilisé, bilinéaire à la résolution de rendu (couleur prémultipliée par son poids)
+        const float2 q = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5;
+        const int2 b0 = int2(floor(q));
+        const float2 f0 = q - b0;
+        float4 r = 0;
+        for (int j = 0; j < 4; j++)
+        {
+            const int2 t = clamp(b0 + int2(j & 1, j >> 1), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+            r += asfloat(resolvedRefl.Load4((uint(t.y) * maskWidth + uint(t.x)) * 16)) * (((j & 1) ? f0.x : 1 - f0.x) * ((j >> 1) ? f0.y : 1 - f0.y));
+        }
+        if ((debugReflect & 0xFF) == 3)
+        {
+            StoreLinear(px, r.rgb);
+            return;
+        }
+        const float a = saturate(r.a * reflStrength);
+        c = c * (1.0 - a) + r.rgb * saturate(reflStrength);
+    }
+    else if (reflStrength > 0 && rf.z > 0)
     {
         const float3 reflected = SampleLinear(rf.xy);
         if ((debugReflect & 0xFF) == 3)
