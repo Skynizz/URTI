@@ -8,16 +8,22 @@
 //  - profondeur inversée à l'infini (D32S8, effacée à 0) ; une seconde profondeur à mi-résolution ;
 //  - atlas de 4 cascades d'ombres 2048×8192 en D16, chacune dans son viewport, qui suivent la caméra
 //    par pas de texel ; éclairage plein écran qui lit l'atlas (filtrage 3×3) ;
-//  - mise à l'échelle vers l'écran, sortie HDR10 (PQ, R10G10B10A2) comme RDR2 ;
+//  - anti-crénelage temporel (TAA) et mise à l'échelle vers l'écran (historique reprojeté par les vecteurs
+//    de mouvement, borné par le voisinage), sortie HDR10 (PQ, R10G10B10A2) comme RDR2 : l'image présentée
+//    est stable d'une image à l'autre, comme dans un vrai jeu ;
 //  - génération d'images en option : une présentation sur deux sans aucun dessin (copie seule).
 // Scène difficile pour le RT : rue, bâtiments, poteaux et câbles très fins, arbres dont les branches
 // bougent au vent, charrettes et passants qui avancent, flaques (sol lisse par endroits), tonneaux par
 // ExecuteIndirect. Caméra scriptée, la même à chaque lancement (marche, regards, demi-tours rapides).
 //
 // Réglages (variables d'environnement) : URTI_FRAMES (nombre d'images, défaut 600), URTI_SHOW=1 (fenêtre
-// visible), URTI_SANDBOX_CAMERA=marche|fixe|orbite, URTI_SANDBOX_FG=1 (génération d'images),
+// visible), URTI_SANDBOX_CAMERA=marche|fixe|orbite|batiment|arbre|rue|occlusion (les quatre derniers :
+// plans fixes des tests, voir tools/reshade/urti_sandbox_suite.sh), URTI_SANDBOX_FG=1 (génération d'images),
 // URTI_SANDBOX_SDR=1 (sortie sRGB au lieu de HDR10), URTI_SANDBOX_START=secondes (début du scénario),
-// URTI_SANDBOX_WIND=facteur (0 : pas de vent), URTI_SANDBOX_FPS=cadence maximale (défaut 90, 0 : sans limite ;
+// URTI_SANDBOX_WIND=facteur (0 : pas de vent), URTI_SANDBOX_MOVERS=0 (charrettes et passants immobiles),
+// URTI_SANDBOX_WET=0..1 (part du sol couverte d'eau ; défaut : flaques éparses), URTI_SANDBOX_TRUTH=1 (vérité
+// terrain : le sol reflète la scène exacte, rendue en miroir, mélangée avec la même règle qu'URTI ; un
+// lancement sans URTI dans ce mode est l'image que les reflets RT devraient donner), URTI_SANDBOX_FPS=cadence maximale (défaut 90, 0 : sans limite ;
 // un lancement natif et un lancement avec RT atteignent ainsi la même image au même moment, après que
 // ReShade a retiré son bandeau d'accueil).
 
@@ -207,7 +213,9 @@ cbuffer Frame : register(b0)
     float4 renderSize; // largeur, hauteur, 1 / largeur, 1 / hauteur
     float4 splits;     // distances de fin des cascades
     float4 camForward; // w : vent
-    float4 output;     // x : 1 HDR10, 0 sRGB ; y : exposition
+    float4 output;     // x : 1 HDR10, 0 sRGB ; y : exposition ; zw : décalage sous-pixel (NDC)
+    float4 misc;       // x : eau au sol (< 0 : flaques éparses) ; y : 1 = historique du TAA à oublier ;
+                       // z : 1 = reflets exacts du sol (vérité terrain)
 };
 cbuffer Object : register(b1)
 {
@@ -223,6 +231,7 @@ Texture2D<float4> gNormal : register(t1);
 Texture2D<float4> gMaterial : register(t2);
 Texture2D<float> gDepth : register(t3);
 Texture2D<float> gAtlas : register(t4);
+Texture2D<float4> gMirror : register(t5); // scène vue dans le miroir du sol (vérité terrain)
 SamplerState linearClamp : register(s0);
 SamplerComparisonState shadowCmp : register(s1);
 
@@ -305,14 +314,15 @@ GOut psGbuffer(GVSOut i)
     if (params.y > 0.5)
     {
         // sol : pavés et flaques (lisses comme un miroir, plus sombres)
-        const float puddle = smoothstep(0.58, 0.66, Noise(i.wpos.xz * 0.18) * 0.7 + Noise(i.wpos.xz * 0.9) * 0.3);
+        const float n = Noise(i.wpos.xz * 0.18) * 0.7 + Noise(i.wpos.xz * 0.9) * 0.3;
+        const float puddle = misc.x < 0 ? smoothstep(0.58, 0.66, n) : smoothstep(1.02 - misc.x * 1.1, 1.08 - misc.x * 1.1, n);
         const float cobble = 0.85 + 0.15 * Noise(i.wpos.xz * 3.0);
         albedo *= lerp(cobble, 0.45, puddle);
         smooth = lerp(0.25, 0.97, puddle);
     }
     o.albedo = float4(albedo, 1);
     o.normal = float4(normalize(i.nrm) * 0.5 + 0.5, 1);
-    o.material = float4(0.5, smooth, params.w, 1);
+    o.material = float4(0.5, smooth, params.w, params.y > 0.5 ? 0.5 : 1.0); // alpha 0,5 : sol
     o.misc = float4(0, 0, 0, 1);
     const float2 curNdc = i.cur.xy / i.cur.w, prevNdc = i.prev.xy / i.prev.w;
     o.velocity = (prevNdc - curNdc) * float2(0.5, -0.5) * renderSize.xy; // pixels, vers l'image précédente
@@ -357,6 +367,36 @@ float3 Sky(float3 dir)
     return sky;
 }
 
+// éclairage direct et ambiant d'un point (sans reflet)
+float3 Shade(float3 albedo, float3 n, float3 p)
+{
+    const float ndl = saturate(dot(n, sunDir.xyz));
+    const float shadow = ndl > 0 ? ShadowAt(p, ndl) : 0;
+    const float3 sunColor = float3(3.2, 2.9, 2.5);
+    const float3 ambient = lerp(float3(0.18, 0.17, 0.16), float3(0.35, 0.42, 0.55), n.y * 0.5 + 0.5);
+    return albedo * (sunColor * ndl * shadow + ambient);
+}
+
+// vérité terrain : la scène dessinée en miroir sous le sol (y -> -y), éclairée à sa vraie place
+GVSOut vsMirror(VSIn i)
+{
+    GVSOut o;
+    const float3 wp = WorldPos(i, world, cameraPos.w);
+    o.pos = mul(float4(wp.x, -wp.y, wp.z, 1), viewProj);
+    o.cur = o.prev = o.pos;
+    o.nrm = normalize(mul(float4(i.nrm, 0), world).xyz);
+    o.col = i.col;
+    o.wpos = wp;
+    return o;
+}
+
+float4 psMirror(GVSOut i) : SV_Target
+{
+    if (i.wpos.y < -0.01)
+        discard;
+    return float4(Shade(color.rgb * i.col.rgb, normalize(i.nrm), i.wpos), 1);
+}
+
 float4 psLighting(FullOut i) : SV_Target
 {
     const int2 px = int2(i.pos.xy);
@@ -371,19 +411,53 @@ float4 psLighting(FullOut i) : SV_Target
     const float3 albedo = gAlbedo.Load(int3(px, 0)).rgb;
     const float3 n = normalize(gNormal.Load(int3(px, 0)).xyz * 2 - 1);
     const float4 mat = gMaterial.Load(int3(px, 0));
-    const float ndl = saturate(dot(n, sunDir.xyz));
-    const float shadow = ndl > 0 ? ShadowAt(p, ndl) : 0;
-    const float3 sunColor = float3(3.2, 2.9, 2.5);
-    const float3 ambient = lerp(float3(0.18, 0.17, 0.16), float3(0.35, 0.42, 0.55), n.y * 0.5 + 0.5);
-    float3 c = albedo * (sunColor * ndl * shadow + ambient);
+    float3 c = Shade(albedo, n, p);
     // reflet « du jeu » (ciel seulement, comme un jeu sans RT) : Fresnel selon le lissé
     const float3 r = reflect(viewDir, n);
     const float fres = 0.04 + 0.96 * pow(1 - saturate(dot(-viewDir, n)), 5);
     c = lerp(c, Sky(r) * 0.8, fres * mat.y * mat.y);
+    if (misc.z > 0.5 && mat.w < 0.75)
+    {
+        // vérité terrain : reflet exact du sol, mélangé comme URTI le fait (Fresnel f0 = 0,04, lissé au-dessus
+        // de 0,35, sol mouillé 0,9 ; couleur plafonnée à 4)
+        const float sm = max(mat.y, 0.9 * saturate((n.y - 0.55) / 0.3));
+        const float w = (0.04 + 0.96 * pow(1 - saturate(dot(-viewDir, n)), 5)) * saturate((sm - 0.35) / 0.65);
+        const float4 m = gMirror.Load(int3(px, 0));
+        float3 rc = m.a > 0 ? m.rgb : Sky(r);
+        const float lum = dot(rc, float3(0.2126, 0.7152, 0.0722));
+        if (lum > 4.0)
+            rc *= 4.0 / lum;
+        c = lerp(c, rc, w);
+    }
     return float4(c, 1);
 }
 
 Texture2D<float4> gLit : register(t0);
+Texture2D<float2> gVelocity : register(t1);
+Texture2D<float4> gHistory : register(t2);
+
+// TAA : image courante (débarrassée du décalage sous-pixel) mélangée à l'historique reprojeté, borné par
+// le voisinage 3×3 de l'image courante ; sortie à la résolution de l'écran
+float4 psTaa(FullOut i) : SV_Target
+{
+    const float2 rs = renderSize.xy;
+    const float2 uvCur = i.uv + float2(output.z, -output.w) * 0.5;
+    const float3 cur = gLit.SampleLevel(linearClamp, uvCur, 0).rgb;
+    const int2 c = int2(uvCur * rs);
+    float3 lo = cur, hi = cur;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++)
+        {
+            const float3 n = gLit.Load(int3(clamp(c + int2(x, y), int2(0, 0), int2(rs) - 1), 0)).rgb;
+            lo = min(lo, n), hi = max(hi, n);
+        }
+    const float2 vel = gVelocity.Load(int3(clamp(int2(i.uv * rs), int2(0, 0), int2(rs) - 1), 0));
+    const float2 prevUv = i.uv + vel / rs;
+    if (misc.y > 0.5 || any(prevUv < 0) || any(prevUv > 1))
+        return float4(cur, 1);
+    const float3 hist = clamp(gHistory.SampleLevel(linearClamp, prevUv, 0).rgb, lo, hi);
+    return float4(lerp(hist, cur, 0.1), 1);
+}
 float3 NitsToPq(float3 l)
 {
     const float3 y = pow(saturate(l / 10000.0), 0.1593017578125);
@@ -512,7 +586,7 @@ struct ObjectConstants
 struct FrameConstants
 {
     Mat4 viewProj, viewProjNJ, prevViewProjNJ, invViewProj, lightViewProj[4];
-    float cameraPos[4], sunDir[4], renderSize[4], splits[4], camForward[4], output[4];
+    float cameraPos[4], sunDir[4], renderSize[4], splits[4], camForward[4], output[4], misc[4];
 };
 
 float Rand(uint32_t& s)
@@ -647,6 +721,13 @@ std::vector<Object> BuildScene(Geometry& geo)
             add(post);
         }
     }
+    // un mur au milieu de la rue : deux passants passent derrière (test d'occlusion)
+    {
+        const int m = geo.Begin();
+        geo.Box(Mul(Scale(4, 2.2f, 0.3f), Translate(1, 1.1f, 4)), 0.55f, 0.5f, 0.45f, 0.15f);
+        geo.End(m);
+        add(m);
+    }
     // charrettes (caisse, roues, brancards) et passants : ils avancent (vecteurs de mouvement d'objets)
     for (int c = 0; c < 3; c++)
     {
@@ -694,6 +775,21 @@ void CameraAt(const std::string& mode, float t, float eye[3], float at[3])
         eye[0] = -6, eye[1] = 1.7f, eye[2] = -3, at[0] = 6, at[1] = 2.5f, at[2] = 3;
         return;
     }
+    // plans fixes des tests (sol mouillé conseillé : les reflets couvrent l'image)
+    struct Shot { const char* name; float eye[3], at[3]; };
+    static const Shot shots[] = {
+        { "batiment", { -5, 1.7f, 3 }, { -5, 2.5f, 11 } },       // façade, vitres, rien ne bouge
+        { "arbre", { 4, 1.7f, -2 }, { 4, 1.6f, -10.5f } },       // un arbre et son reflet
+        { "rue", { -12, 1.7f, -2 }, { -12, 1.0f, 5 } },          // des passants traversent
+        { "occlusion", { 1, 1.7f, -3 }, { 1, 1.4f, 5 } },        // des passants disparaissent derrière le mur
+    };
+    for (const Shot& shot : shots)
+        if (mode == shot.name)
+        {
+            for (int c = 0; c < 3; c++)
+                eye[c] = shot.eye[c], at[c] = shot.at[c];
+            return;
+        }
     if (mode == "orbite")
     {
         eye[0] = 20 * std::cos(t * 0.2f), eye[1] = 6, eye[2] = 20 * std::sin(t * 0.2f), at[0] = 0, at[1] = 2, at[2] = 0;
@@ -775,6 +871,10 @@ int main()
     const bool hdr = env("URTI_SANDBOX_SDR", "0") == "0";
     const float start = float(std::atof(env("URTI_SANDBOX_START", "0").c_str()));
     const float wind = float(std::atof(env("URTI_SANDBOX_WIND", "1").c_str()));
+    const bool movers = env("URTI_SANDBOX_MOVERS", "1") != "0";
+    const float wet = float(std::atof(env("URTI_SANDBOX_WET", "-1").c_str()));
+    const bool truth = env("URTI_SANDBOX_TRUTH", "0") != "0";
+    const float jitter = float(std::atof(env("URTI_SANDBOX_JITTER", "1").c_str())); // 0 : sans décalage sous-pixel
     const double fpsCap = std::atof(env("URTI_SANDBOX_FPS", "90").c_str());
 
     WNDCLASSW wc = {};
@@ -845,9 +945,17 @@ int main()
                                               D3D12_RESOURCE_STATE_COPY_SOURCE, &finalClear);
 
     // ---------------- descripteurs ----------------
-    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8 };
-    D3D12_DESCRIPTOR_HEAP_DESC dsvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 3 };
-    D3D12_DESCRIPTOR_HEAP_DESC srvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 10 };
+    ComPtr<ID3D12Resource> mirror = Texture(device.Get(), kRenderW, kRenderH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &litClear);
+    ComPtr<ID3D12Resource> mirrorDepth = Texture(device.Get(), kRenderW, kRenderH, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE, &halfClear);
+    D3D12_DESCRIPTOR_HEAP_DESC dsvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4 };
+    ComPtr<ID3D12Resource> taaHistory[2];
+    for (auto& h : taaHistory)
+        h = Texture(device.Get(), kWidth, kHeight, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    &litClear);
+    D3D12_DESCRIPTOR_HEAP_DESC srvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 32, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap, srvHeap;
     CHECK(device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&rtvHeap)));
     CHECK(device->CreateDescriptorHeap(&dsvDesc, IID_PPV_ARGS(&dsvHeap)));
@@ -863,6 +971,9 @@ int main()
         device->CreateRenderTargetView(gbuffer[i].Get(), nullptr, rtv(i));
     device->CreateRenderTargetView(lit.Get(), nullptr, rtv(5));
     device->CreateRenderTargetView(finalTex.Get(), nullptr, rtv(6));
+    device->CreateRenderTargetView(taaHistory[0].Get(), nullptr, rtv(7));
+    device->CreateRenderTargetView(taaHistory[1].Get(), nullptr, rtv(8));
+    device->CreateRenderTargetView(mirror.Get(), nullptr, rtv(9));
     {
         D3D12_DEPTH_STENCIL_VIEW_DESC d = {};
         d.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
@@ -871,6 +982,7 @@ int main()
         device->CreateDepthStencilView(atlas.Get(), &d, dsv(1));
         d.Format = DXGI_FORMAT_D32_FLOAT;
         device->CreateDepthStencilView(halfDepth.Get(), &d, dsv(2));
+        device->CreateDepthStencilView(mirrorDepth.Get(), &d, dsv(3));
     }
     auto srv2d = [&](ID3D12Resource* r, DXGI_FORMAT f, UINT slot) {
         D3D12_SHADER_RESOURCE_VIEW_DESC s = {};
@@ -883,14 +995,28 @@ int main()
         srv2d(gbuffer[i].Get(), gFormats[i], i);
     srv2d(depth.Get(), DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, 3);
     srv2d(atlas.Get(), DXGI_FORMAT_R16_UNORM, 4);
-    srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 5);
+    srv2d(mirror.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 5); // t5 de l'éclairage
     for (int i = 6; i < 10; i++)
+        srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, i);
+    // tables du TAA (écrit l'historique k, lit l'historique 1 - k) : 10 + 5 k ; de la sortie : 20 + 5 k
+    for (int k = 0; k < 2; k++)
+    {
+        srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 10 + 5 * k);
+        srv2d(gbuffer[4].Get(), gFormats[4], 11 + 5 * k);
+        srv2d(taaHistory[1 - k].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 12 + 5 * k);
+        srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 13 + 5 * k);
+        srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 14 + 5 * k);
+        srv2d(taaHistory[k].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 20 + 5 * k);
+        for (int j = 1; j < 5; j++)
+            srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 20 + 5 * k + j);
+    }
+    for (int i = 30; i < 32; i++) // les tables lisent 6 descripteurs : la dernière déborde ici
         srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, i);
 
     // ---------------- signature racine (sans ALLOW_STREAM_OUTPUT, comme un jeu) ----------------
     ComPtr<ID3D12RootSignature> rootSig;
     {
-        D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0 };
+        D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6, 0, 0, 0 };
         D3D12_ROOT_PARAMETER p[4] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, p[1].Descriptor.ShaderRegister = 1;
@@ -973,8 +1099,12 @@ int main()
     ComPtr<ID3D12PipelineState> shadowPso = geometryPso("vsShadow", nullptr, false, 0, nullptr, DXGI_FORMAT_D16_UNORM, 600);
     ComPtr<ID3D12PipelineState> shadowInstPso = geometryPso("vsShadow", nullptr, true, 0, nullptr, DXGI_FORMAT_D16_UNORM, 600);
     ComPtr<ID3D12PipelineState> halfPso = geometryPso("vsGbuffer", nullptr, false, 0, nullptr, DXGI_FORMAT_D32_FLOAT, 0);
+    const DXGI_FORMAT mirrorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    ComPtr<ID3D12PipelineState> mirrorPso = geometryPso("vsMirror", "psMirror", false, 1, &mirrorFormat, DXGI_FORMAT_D32_FLOAT, 0);
+    ComPtr<ID3D12PipelineState> mirrorInstPso = geometryPso("vsMirror", "psMirror", true, 1, &mirrorFormat, DXGI_FORMAT_D32_FLOAT, 0);
     ComPtr<ID3D12PipelineState> lightingPso = fullscreenPso("psLighting", DXGI_FORMAT_R16G16B16A16_FLOAT);
     ComPtr<ID3D12PipelineState> upscalePso = fullscreenPso("psUpscale", outFormat);
+    ComPtr<ID3D12PipelineState> taaPso = fullscreenPso("psTaa", DXGI_FORMAT_R16G16B16A16_FLOAT);
 
     // ---------------- maillages, tonneaux par ExecuteIndirect ----------------
     Geometry geo;
@@ -1089,8 +1219,8 @@ int main()
         const Mat4 proj = ReversedInfiniteLH(fovY, aspect, zNear);
         Mat4 projJ = proj;
         const int jitterIndex = (frame % 8) + 1;
-        projJ.m[8] = (Halton(jitterIndex, 2) - 0.5f) * 2.0f / kRenderW;
-        projJ.m[9] = (Halton(jitterIndex, 3) - 0.5f) * 2.0f / kRenderH;
+        projJ.m[8] = jitter * (Halton(jitterIndex, 2) - 0.5f) * 2.0f / kRenderW;
+        projJ.m[9] = jitter * (Halton(jitterIndex, 3) - 0.5f) * 2.0f / kRenderH;
         const Mat4 viewProj = Mul(view, projJ), viewProjNJ = Mul(view, proj);
         if (frame == 0)
             prevViewProjNJ = viewProjNJ;
@@ -1124,14 +1254,15 @@ int main()
         for (int k = 0; k < 4; k++)
             fc.splits[k] = splitDist[k];
         fc.camForward[0] = fwd[0], fc.camForward[1] = fwd[1], fc.camForward[2] = fwd[2], fc.camForward[3] = wind;
-        fc.output[0] = hdr ? 1.0f : 0.0f, fc.output[1] = 1.0f;
+        fc.output[0] = hdr ? 1.0f : 0.0f, fc.output[1] = 1.0f, fc.output[2] = projJ.m[8], fc.output[3] = projJ.m[9];
+        fc.misc[0] = wet, fc.misc[1] = frame == 0 ? 1.0f : 0.0f, fc.misc[2] = truth ? 1.0f : 0.0f;
 
         // objets : positions de cette image et de la précédente (vecteurs de mouvement)
         for (size_t i = 0; i < scene.size(); i++)
         {
             Object& o = scene[i];
             if (o.mover >= 0)
-                o.world = MoverMatrix(o, t), o.prevWorld = frame == 0 ? o.world : MoverMatrix(o, tPrev);
+                o.world = MoverMatrix(o, movers ? t : start), o.prevWorld = frame == 0 ? o.world : MoverMatrix(o, movers ? tPrev : start);
             ObjectConstants& oc = objectData[i];
             oc.world = o.world, oc.prevWorld = o.prevWorld;
             std::memcpy(oc.color, o.color, sizeof(o.color));
@@ -1202,6 +1333,29 @@ int main()
             Barrier(list.Get(), gbuffer[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Barrier(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+        // 2b. vérité terrain : la scène en miroir sous le sol (sans le sol lui-même)
+        if (truth)
+        {
+            Barrier(list.Get(), mirror.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->OMSetRenderTargets(1, &rtv(9), FALSE, &dsv(3));
+            list->ClearRenderTargetView(rtv(9), zero, 0, nullptr);
+            list->ClearDepthStencilView(dsv(3), D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+            list->SetGraphicsRootDescriptorTable(3, srvGpu(0));
+            list->SetPipelineState(mirrorPso.Get());
+            list->IASetVertexBuffers(0, 1, &vbv);
+            for (size_t i = 1; i < scene.size(); i++)
+            {
+                list->SetGraphicsRootConstantBufferView(1, objectBuf->GetGPUVirtualAddress() + i * sizeof(ObjectConstants));
+                list->DrawIndexedInstanced(geo.meshes[scene[i].mesh].indexCount, 1, geo.meshes[scene[i].mesh].firstIndex, 0, 0);
+            }
+            list->SetPipelineState(mirrorInstPso.Get());
+            const D3D12_VERTEX_BUFFER_VIEW views[2] = { vbv, instView };
+            list->IASetVertexBuffers(0, 2, views);
+            list->SetGraphicsRootConstantBufferView(1, objectBuf->GetGPUVirtualAddress() + scene.size() * sizeof(ObjectConstants));
+            list->DrawIndexedInstanced(indirect.IndexCountPerInstance, indirect.InstanceCount, indirect.StartIndexLocation, 0, 0);
+            Barrier(list.Get(), mirror.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+
         stamp(2);
         // 3. profondeur à mi-résolution (comme une passe d'occlusion ambiante)
         list->OMSetRenderTargets(0, nullptr, FALSE, &dsv(2));
@@ -1230,15 +1384,22 @@ int main()
         Barrier(list.Get(), lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         stamp(4);
-        // 5. mise à l'échelle vers l'écran, HDR10 ou sRGB
-        Barrier(list.Get(), finalTex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        list->OMSetRenderTargets(1, &rtv(6), FALSE, nullptr);
+        // 5. TAA et mise à l'échelle vers l'écran, puis sortie HDR10 ou sRGB
+        const int k = frame & 1;
         const D3D12_VIEWPORT dvp = { 0, 0, float(kWidth), float(kHeight), 0, 1 };
         const D3D12_RECT dsr = { 0, 0, LONG(kWidth), LONG(kHeight) };
         list->RSSetViewports(1, &dvp);
         list->RSSetScissorRects(1, &dsr);
+        Barrier(list.Get(), taaHistory[k].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->OMSetRenderTargets(1, &rtv(7 + k), FALSE, nullptr);
+        list->SetPipelineState(taaPso.Get());
+        list->SetGraphicsRootDescriptorTable(3, srvGpu(10 + 5 * k));
+        list->DrawInstanced(3, 1, 0, 0);
+        Barrier(list.Get(), taaHistory[k].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Barrier(list.Get(), finalTex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->OMSetRenderTargets(1, &rtv(6), FALSE, nullptr);
         list->SetPipelineState(upscalePso.Get());
-        list->SetGraphicsRootDescriptorTable(3, srvGpu(5));
+        list->SetGraphicsRootDescriptorTable(3, srvGpu(20 + 5 * k));
         list->DrawInstanced(3, 1, 0, 0);
         Barrier(list.Get(), finalTex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 

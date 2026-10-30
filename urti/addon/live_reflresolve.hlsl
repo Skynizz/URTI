@@ -3,6 +3,9 @@
 // blancs isolés), puis mélangée avec l'historique reprojeté par les vecteurs de mouvement du jeu ;
 // l'historique est borné par le voisinage de l'image courante (pas de traînées) et rejeté si la
 // profondeur ne correspond plus (point découvert).
+// Historique ancré (prioritaire) : la position précédente exacte du reflet, retrouvée par la géométrie
+// captée (live_reflect) ; gardé seulement si, à cet endroit, l'image précédente reflétait le même objet
+// dans le même miroir. Fiable même en mouvement : on y garde beaucoup d'historique.
 
 ByteAddressBuffer image : register(t0);       // image présentée (lignes alignées)
 ByteAddressBuffer reflection : register(t1);  // float4 par pixel de rendu : u, v, poids, lissé
@@ -11,6 +14,8 @@ ByteAddressBuffer motion : register(t3);      // vecteurs de mouvement du jeu (R
 ByteAddressBuffer depth : register(t4);       // profondeur de rendu (cette image)
 ByteAddressBuffer depthPrev : register(t5);   // profondeur de rendu (image précédente)
 ByteAddressBuffer sunBuf : register(t6);      // loi de profondeur (36 à 47), rotation de la caméra (576 à 627)
+ByteAddressBuffer anchorCur : register(t7);   // uint4 par pixel de rendu : position précédente du reflet, identités
+ByteAddressBuffer anchorPrev : register(t8);  // le même, de l'image précédente
 RWByteAddressBuffer resolved : register(u0);  // float4 par pixel de rendu : couleur linéaire, poids
 
 cbuffer Constants : register(b0)
@@ -25,12 +30,17 @@ cbuffer Constants : register(b0)
     uint motionConvention; // 255 : pas d'historique
     uint depthPitch;
     uint depth24;
-    float alpha;         // part de l'image courante
+    float alpha;         // part de l'image courante à l'arrêt
     float maxLuminance;  // plafond de la couleur reflétée (lumière linéaire, 1 = blanc de référence)
-    uint flags;          // 1 : historique valide ; 2 : image générée (pas de mise à jour) ; 4 : diagnostic, confiance
+    uint flags;          // 1 : historique valide ; 2 : image générée (pas de mise à jour) ; 4 : diagnostic, confiance ;
+                         // 8 : ancrages de cette image et de la précédente disponibles
     float p00;           // projection supposée (espace caméra de l'add-on)
     float p11;
-    uint pad2;
+    float alphaMax;      // part de l'image courante en mouvement rapide
+    float gamma;         // bornage : moyenne ± gamma écarts-types du voisinage
+    float depthTol;      // historique gardé si la profondeur diffère de moins de depthTol × profondeur
+    float anchorAlpha;   // historique ancré : part de l'image courante (0 : ancrage coupé)
+    float anchorGamma;   // historique ancré : bornage plus large (moyenne ± anchorGamma σ)
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -106,10 +116,47 @@ void main(uint2 id : SV_DispatchThreadID)
             m1 += n, m2 += n * n;
         }
     const float4 mean = m1 / 9.0, sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
-    const float4 lo = mean - 1.0 * sigma, hi = mean + 1.0 * sigma;
+    const float4 lo = mean - gamma * sigma, hi = mean + gamma * sigma;
 
     float4 result = cur;
-    if ((flags & 1) && motionConvention < 16)
+    bool done = false;
+    if ((flags & 8) && anchorAlpha > 0)
+    {
+        const uint4 a = anchorCur.Load4(dst);
+        const float2 pu = asfloat(a.xy);
+        if (a.z != 0 && a.w != 0 && all(isfinite(pu)) && all(pu > 0) && all(pu < 1))
+        {
+            // bilinéaire sur les quatre pixels voisins, chacun gardé seulement s'il reflétait le même objet
+            // dans le même miroir
+            const float2 q = pu * float2(renderWidth, renderHeight) - 0.5;
+            const int2 b = int2(floor(q));
+            const float2 f = q - b;
+            float4 hist = 0;
+            float hw = 0;
+            for (int j = 0; j < 4; j++)
+            {
+                const int2 s = clamp(b + int2(j & 1, j >> 1), int2(0, 0), int2(renderWidth - 1, renderHeight - 1));
+                const uint o = (uint(s.y) * renderWidth + uint(s.x)) * 16;
+                const uint4 pa = anchorPrev.Load4(o);
+                const float bw = ((j & 1) ? f.x : 1 - f.x) * ((j >> 1) ? f.y : 1 - f.y);
+                if (pa.z == a.z && pa.w == a.w)
+                    hist += asfloat(history.Load4(o)) * bw, hw += bw;
+            }
+            if (hw > 0.25)
+            {
+                hist /= hw;
+                const float4 alo = mean - anchorGamma * sigma, ahi = mean + anchorGamma * sigma;
+                result = lerp(clamp(hist, alo, ahi), cur, anchorAlpha);
+                done = true;
+                if (flags & 4)
+                {
+                    resolved.Store4(dst, asuint(float4(0, 1, 0, 1))); // diagnostic : vert = historique ancré
+                    return;
+                }
+            }
+        }
+    }
+    if (!done && (flags & 1) && motionConvention < 16)
     {
         const float3 law = asfloat(sunBuf.Load3(36));
         const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
@@ -145,13 +192,13 @@ void main(uint2 id : SV_DispatchThreadID)
         {
             const int2 p = int2(prevUv * float2(renderWidth, renderHeight));
             const float wp = ViewDepth(depthPrev, p, law.x, law.y);
-            if (wp > 0 && abs(wp - w) < 0.1 * w + 0.2)
+            if (wp > 0 && abs(wp - w) < depthTol * w + 0.2)
             {
                 const float4 hist = asfloat(history.Load4((uint(p.y) * renderWidth + uint(p.x)) * 16));
                 // historique borné par le voisinage courant (un reflet qui a bougé ne laisse pas de trace) ;
                 // mélange adaptatif : beaucoup d'historique à l'arrêt, peu en mouvement rapide
                 const float motionPx = length(mvVirtual * float2(renderWidth, renderHeight));
-                const float a = lerp(alpha * 0.5, 0.5, saturate(motionPx / 8.0));
+                const float a = lerp(alpha, alphaMax, saturate(motionPx / 8.0));
                 result = lerp(clamp(hist, lo, hi), cur, a);
                 if (flags & 4)
                 {

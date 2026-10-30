@@ -78,10 +78,13 @@ struct LiveMark
 };
 // en direct, chaque dessin a sa zone du flux et son compteur : aucune barrière entre dessins (le
 // compteur commun imposait une attente du GPU à chaque dessin, des milliers par image)
+// id : identité de l'objet dessiné, la même d'une image à l'autre (signature du dessin et rang parmi les
+// dessins de même signature : un moteur dessine souvent le même maillage à plusieurs endroits)
 struct LiveRegion
 {
-    uint32_t offset = 0, capacity = 0, counter = 0, pad = 0;
+    uint32_t offset = 0, capacity = 0, counter = 0, id = 0;
 };
+std::unordered_map<uint64_t, uint32_t> g_liveKeyRank; // dessins de l'écran de chaque signature dans cette image
 std::vector<LiveRegion> g_liveRegions[4]; // par emplacement (kSlots), dans l'ordre d'attribution
 uint32_t g_liveCursor[4] = {};            // octets attribués dans chaque emplacement
 uint32_t g_liveNextCounter = 4;           // compteurs par dessin après ceux des emplacements
@@ -711,7 +714,13 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 marked = g_liveMarks.size() < kLiveMaxMarks && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
             if (!capacity || uint64_t(g_liveCursor[slot]) + capacity > kSlotBytes || g_liveNextCounter >= kMaxDraws)
                 return; // emplacement plein : ce dessin n'est pas capté
-            region = { g_liveCursor[slot], capacity, g_liveNextCounter++, 0 };
+            uint32_t id = 0;
+            if (screen)
+            {
+                const uint64_t h = (key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[key]++;
+                id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
+            }
+            region = { g_liveCursor[slot], capacity, g_liveNextCounter++, id };
             g_liveCursor[slot] += (capacity + 15) & ~15u;
             if (screen)
                 g_liveRegions[slot].push_back(region);

@@ -687,3 +687,43 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   +0,16 %, 0,9 % de pixels qui sautent, concentrés sur les reflets lointains dans les flaques — le
   défaut vu dans RDR2 (`results/urti/bac_a_sable/`).
 - Test complet (deux lancements et mesures) : ~30 s.
+
+## v33 — URTI : suite de 7 tests, vérité terrain, essai de l'ancrage géométrique
+
+- Bac à sable plus proche d'un jeu : TAA (historique reprojeté, borné, mise à l'échelle) — l'image
+  native est stable d'une image à l'autre comme dans RDR2 ; rue mouillée réglable (`URTI_SANDBOX_WET`),
+  objets mobiles figés à la demande, mur pour l'occlusion, décalage sous-pixel coupable
+  (`URTI_SANDBOX_JITTER=0`).
+- **Vérité terrain** (`URTI_SANDBOX_TRUTH=1`, `--verite`) : le sol reflète la scène exacte (rendue en
+  miroir), mélangée avec la même règle qu'URTI (Fresnel f0 0,04, lissé > 0,35, plafond 4). On mesure
+  l'écart des reflets RT à l'image idéale ; un reflet qui bouge normalement ne compte plus comme un saut.
+- Nouvelle mesure : **pixels qui clignotent** (l'écart à la référence change de sens d'une image à la
+  suivante), distincte d'une erreur qui se déplace avec la scène.
+- `tools/reshade/urti_sandbox_suite.sh` : bâtiment immobile, arbre immobile, arbre au vent, personnage,
+  caméra fixe, caméra en mouvement, occlusion (~3 min 30). Référence (`results/urti/bac_a_sable/suite/`) :
+
+  | scène | écart | ajouté | sautent | clignotent |
+  |---|---|---|---|---|
+  | bâtiment | 3,31 % | +0,015 % | 0,012 % | 0,101 % |
+  | arbre immobile | 2,97 % | +0,036 % | 0,084 % | 0,163 % |
+  | arbre au vent | 2,94 % | +0,044 % | 0,086 % | 0,164 % |
+  | personnage | 2,75 % | +0,033 % | 0,191 % | 0,093 % |
+  | caméra fixe | 1,19 % | +0,049 % | 0,144 % | 0,118 % |
+  | caméra en mouvement | 1,15 % | +0,044 % | 1,257 % | 0,871 % |
+  | occlusion | 1,99 % | +0,024 % | 0,181 % | 0,093 % |
+
+- Diagnostic sur la marche (le seul cas mauvais) : sauts dus pour moitié aux ombres RT (0,59 % sans
+  elles), le reste aux reflets autour de l'horizon. Écartés par la mesure : le décalage sous-pixel (même
+  résultat sans), le bornage, la tolérance de profondeur et la part d'historique (0,59 % ± 0,03 quel que
+  soit le réglage), la synchronisation des deux lancements (vérifiée), la composition (test à vide :
+  0,000 %). La vérité terrain a son propre crénelage (0,49 % de clignotement contre le natif) : c'est le
+  plancher de la mesure.
+- **Ancrage géométrique** des reflets (`anchor_alpha=`) : identité stable par dessin (signature + rang),
+  sommets de l'image précédente gardés, miroir et point reflété retrouvés dans la géométrie captée (même
+  triangle, mêmes barycentriques, déformations comprises), point virtuel de l'image précédente → endroit
+  exact de l'historique, gardé seulement si le même objet se reflétait dans le même miroir. Fonctionne
+  (deux tiers des pixels reflétants, `ancrage_couverture.png`) mais **ne réduit pas le clignotement** :
+  0,909 % contre 0,871 % en marche, un peu moins bon caméra fixe (le passage d'un filtre à l'autre selon
+  les pixels en ajoute). Gardé, coupé par défaut, sans coût quand il est coupé.
+- Réglages d'essai dans urti.ini : `refl_alpha_min`, `refl_alpha_max`, `refl_gamma`, `refl_depth_tol`,
+  `anchor_alpha`, `anchor_gamma`.

@@ -47,6 +47,8 @@ struct LiveState
     uint32_t mvPitch = 0, mvWidth = 0, mvHeight = 0, mvConvention = 255, mvMovingFrames = 0;
     double mvErr[16] = {}, mvCount[16] = {};
     float temporalAlpha = 0.3f;
+    float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f; // reflets : part de l'image courante, à l'arrêt et en mouvement rapide
+    float reflGamma = 1.0f, reflDepthTol = 0.1f;    // reflets : largeur du bornage (écarts-types), tolérance de profondeur
     uint32_t debugView = 0;    // vue de diagnostic (menu UrtiDebug ou urti.ini debug_view=)
     int iniDebugView = -1;
     // reflets stabilisés : historique à la résolution de rendu (deux tampons alternés)
@@ -67,6 +69,19 @@ struct LiveState
     uint64_t frame = 0, lastFilled = 0;
     std::vector<ComPtr<ID3D12Resource>> retired[3]; // libérées trois images plus tard
     uint32_t photoIndex = 0;
+    // mémoire géométrique : sommets de l'image précédente (espace caméra de cette image-là) et, par
+    // identité d'objet, où commençait sa zone ; un point touché retrouve ainsi sa position précédente,
+    // déformations comprises (vent, animation : les sommets sont captés après le vertex shader)
+    ComPtr<ID3D12Resource> viewPrev, linkUpload[3], anchor[2];
+    std::unordered_map<uint32_t, uint32_t> prevStart, pendingStart;
+    bool prevValid = false;
+    int anchorOut = -1; // ancrage écrit à cette image (anchor[anchorOut]), l'autre est celui de la précédente
+    uint64_t anchorFrame = ~0ull;
+    bool anchorPrevOk = false; // l'autre tampon a bien été écrit à l'image précédente
+    uint64_t anchorBytes = 0;
+    // ancrage coupé par défaut : mesuré sur le bac à sable, il ne réduit pas le clignotement (le passage
+    // d'un filtre à l'autre selon les pixels en ajoute) ; anchor_alpha=0.1 dans urti.ini pour l'essayer
+    float anchorAlpha = 0.0f, anchorGamma = 2.5f;
     uint64_t boundFrame = 0;
 
     // suivi du soleil à chaque image
@@ -421,17 +436,22 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
 
 bool LiveCreatePipelines(ID3D12Device* device)
 {
-    auto make = [&](const void* code, size_t size, int srvCount, ComPtr<ID3D12RootSignature>& rs, ComPtr<ID3D12PipelineState>& pso, uint32_t constants) {
-        D3D12_ROOT_PARAMETER p[9] = {}; // jusqu'à 7 SRV, 1 UAV, constantes
+    auto make = [&](const void* code, size_t size, int srvCount, ComPtr<ID3D12RootSignature>& rs, ComPtr<ID3D12PipelineState>& pso, uint32_t constants,
+                    int uavCount = 1) {
+        D3D12_ROOT_PARAMETER p[16] = {}; // SRV (t0…), UAV (u0…), constantes
         for (int i = 0; i < srvCount; i++)
         {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
             p[i].Descriptor.ShaderRegister = i;
         }
-        p[srvCount].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        p[srvCount + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        p[srvCount + 1].Constants.Num32BitValues = constants;
-        D3D12_ROOT_SIGNATURE_DESC d = { UINT(srvCount + 2), p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        for (int i = 0; i < uavCount; i++)
+        {
+            p[srvCount + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            p[srvCount + i].Descriptor.ShaderRegister = i;
+        }
+        p[srvCount + uavCount].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p[srvCount + uavCount].Constants.Num32BitValues = constants;
+        D3D12_ROOT_SIGNATURE_DESC d = { UINT(srvCount + uavCount + 1), p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
         ComPtr<ID3DBlob> blob, err;
         if (FAILED(D3D12SerializeRootSignature(&d, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
             FAILED(g_createRootSignature(device, 0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs))))
@@ -448,8 +468,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
            make(g_live_composite, sizeof(g_live_composite), 5, live.compositeRs, live.compositePso, 12) &&
-           make(g_live_reflresolve, sizeof(g_live_reflresolve), 7, live.resolveRs, live.resolvePso, 16) &&
-           make(g_live_reflect, sizeof(g_live_reflect), 4, live.reflectRs, live.reflectPso, 16) &&
+           make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20) &&
+           make(g_live_reflect, sizeof(g_live_reflect), 8, live.reflectRs, live.reflectPso, 20, 2) &&
            make(g_live_depthfit, sizeof(g_live_depthfit), 3, live.depthfitRs, live.depthfitPso, 4);
 }
 
@@ -498,6 +518,9 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
     device->GetRaytracingAccelerationStructurePrebuildInfo(&in, &info);
     Retire(live.view), Retire(live.blas), Retire(live.blasScratch);
     live.view = UavBuffer(device, cap * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Retire(live.viewPrev);
+    live.viewPrev = UavBuffer(device, cap * 12, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    live.prevValid = false;
     live.blas = UavBuffer(device, info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
     live.blasScratch = UavBuffer(device, info.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.capacity = cap;
@@ -602,6 +625,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -616,6 +640,9 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect=", refl), value("reflect_channel=", channel), value("reflect_invert=", invert), value("smooth_min=", smoothMin);
                 value("reflect_f0=", f0), value("debug_reflect=", debugReflect), value("material_slot=", slot), value("reflect_everywhere=", everywhere);
                 value("shadow_rays=", rays), value("debug_view=", debugView);
+                value("refl_alpha_min=", reflAlphaMin), value("refl_alpha_max=", reflAlphaMax);
+                value("refl_gamma=", reflGamma), value("refl_depth_tol=", reflDepthTol);
+                value("anchor_alpha=", anchorAlpha), value("anchor_gamma=", anchorGamma); // anchor_alpha=0 : ancrage coupé
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -625,6 +652,8 @@ void LiveHotReload(ID3D12Device* device)
             live.f0 = f0, live.debugReflect = uint32_t(debugReflect), live.materialSlot = uint32_t(slot) & 7, live.reflEverywhere = everywhere != 0;
             live.shadowRays = std::clamp(uint32_t(rays), 1u, 4u);
             live.iniDebugView = int(debugView);
+            live.reflAlphaMin = std::clamp(reflAlphaMin, 0.01f, 1.0f), live.reflAlphaMax = std::clamp(reflAlphaMax, live.reflAlphaMin, 1.0f);
+            live.reflGamma = reflGamma, live.reflDepthTol = reflDepthTol, live.anchorAlpha = anchorAlpha, live.anchorGamma = anchorGamma;
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -852,6 +881,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             regionsNow.swap(g_liveRegions[slot]), cursorNow = g_liveCursor[slot];
         for (uint32_t s = 0; s < kSlots; s++)
             g_liveRegions[s].clear(), g_liveCursor[s] = 0;
+        g_liveKeyRank.clear();
         countersUsed = g_liveNextCounter;
         g_liveNextCounter = kSlots;
         if (!g_liveSunKeys.empty())
@@ -1036,6 +1066,36 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
     }
     if (!regionsBuf)
+        return;
+    // par zone : identité, début de la zone du même objet dans l'image précédente (+ 1 ; 0 : inconnue)
+    ID3D12Resource* linksBuf = nullptr;
+    {
+        live.pendingStart.clear();
+        std::vector<uint32_t> links(std::max<size_t>(regionsNow.size(), 1) * 2, 0);
+        for (size_t i = 0; i < regionsNow.size(); i++)
+        {
+            const LiveRegion& r = regionsNow[i];
+            links[i * 2] = r.id;
+            if (!r.id)
+                continue;
+            if (live.prevValid)
+                if (auto it = live.prevStart.find(r.id); it != live.prevStart.end())
+                    links[i * 2 + 1] = it->second + 1;
+            live.pendingStart.emplace(r.id, r.offset / 16);
+        }
+        ComPtr<ID3D12Resource>& up = live.linkUpload[live.frame % 3];
+        const uint64_t bytes = links.size() * 4;
+        if (!up || up->GetDesc().Width < bytes)
+            Retire(up), up = MakeBuffer(g.device, std::max<uint64_t>(bytes * 2, 65536), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* p = nullptr;
+        if (up && SUCCEEDED(up->Map(0, nullptr, &p)))
+        {
+            std::memcpy(p, links.data(), bytes);
+            up->Unmap(0, nullptr);
+            linksBuf = up.Get();
+        }
+    }
+    if (!linksBuf)
         return;
     list->SetComputeRootSignature(live.convertRs.Get());
     list->SetPipelineState(live.convertPso.Get());
@@ -1422,8 +1482,19 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         const bool material = live.materialBuf && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 2 &&
                               live.materialWidth == live.width && live.materialHeight == live.height;
-        if (live.reflectBuf && live.reflectPso)
+        if (live.anchorBytes < bytes)
         {
+            for (auto& a : live.anchor)
+                Retire(a), a = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.anchorBytes = bytes;
+            live.anchorOut = -1;
+        }
+        if (live.reflectBuf && live.reflectPso && live.anchor[0] && live.anchor[1])
+        {
+            // ancrage de cette image : l'autre tampon garde celui de la précédente
+            live.anchorOut = live.anchorOut < 0 ? 0 : 1 - live.anchorOut;
+            live.anchorPrevOk = live.anchorFrame != ~0ull && live.anchorFrame + 1 == live.frame;
+            live.anchorFrame = live.frame;
             if (live.materialBuf)
                 Transition(list.Get(), live.materialBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
@@ -1433,7 +1504,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(2, live.materialBuf ? live.materialBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(3, live.sunBuf->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(4, live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(4, regionsBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(5, linksBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(6, live.view->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(7, live.viewPrev ? live.viewPrev->GetGPUVirtualAddress() : live.view->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(8, live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(9, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
             const struct
             {
                 uint32_t width, height, depthPitch, materialPitch;
@@ -1442,11 +1518,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 float smoothMin, bias;
                 uint32_t flags;
                 float f0;
-                uint32_t reflectPitch;
+                uint32_t reflectPitch, regionCount, anchors, prevVertexCount, pad1;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
-                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u), live.f0, live.width * 16 };
-            list->SetComputeRoot32BitConstants(5, 16, &rc, 0);
+                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u), live.f0, live.width * 16,
+                     uint32_t(regionsNow.size()), live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity), 0 };
+            list->SetComputeRoot32BitConstants(10, 20, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (live.materialBuf)
@@ -1475,7 +1552,22 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     Transition(list.Get(), live.mask.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    Transition(list.Get(), live.view.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // sommets de cette image gardés pour la suivante (mémoire géométrique)
+    if (live.viewPrev && live.anchorAlpha > 0)
+    {
+        Transition(list.Get(), live.view.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(list.Get(), live.viewPrev.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(live.viewPrev.Get(), 0, live.view.Get(), 0, std::min<uint64_t>(cursorNow / 16, live.capacity) * 12);
+        Transition(list.Get(), live.viewPrev.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+        Transition(list.Get(), live.view.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.prevStart.swap(live.pendingStart);
+        live.prevValid = true;
+    }
+    else
+    {
+        Transition(list.Get(), live.view.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.prevValid = false;
+    }
     Transition(list.Get(), live.depthBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
 
     // 6. compteurs : lus plus tard, puis remis à zéro pour l'image suivante
@@ -1631,7 +1723,14 @@ void LiveComposite(effect_runtime* runtime)
                 list->SetComputeRootShaderResourceView(4, live.depthBuf->GetGPUVirtualAddress());
                 list->SetComputeRootShaderResourceView(5, live.depthPrevBuf ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
                 list->SetComputeRootShaderResourceView(6, live.sunBuf->GetGPUVirtualAddress());
-                list->SetComputeRootUnorderedAccessView(7, live.reflHist[cur]->GetGPUVirtualAddress());
+                // ancrage (point reflété retrouvé à l'image précédente, identités) : celui de cette image et le précédent
+                const bool anchored = live.anchorOut >= 0 && live.anchor[0] && live.anchor[1] && live.anchorFrame + 1 == live.frame; // écrit par les effets de cette image
+                if (anchored)
+                    for (auto& a : live.anchor)
+                        Transition(list.Get(), a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+                list->SetComputeRootShaderResourceView(7, anchored ? live.anchor[live.anchorOut]->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(8, anchored ? live.anchor[1 - live.anchorOut]->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(9, live.reflHist[cur]->GetGPUVirtualAddress());
                 const bool d24r = live.depthFormat == DXGI_FORMAT_R24G8_TYPELESS || live.depthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT;
                 const struct
                 {
@@ -1639,12 +1738,16 @@ void LiveComposite(effect_runtime* runtime)
                     float alpha, maxLuminance;
                     uint32_t flags;
                     float p00, p11;
-                    uint32_t pad2;
+                    float alphaMax, gamma, depthTol, anchorAlpha, anchorGamma;
                 } rc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.mvPitch,
-                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, 0.2f, 4.0f,
-                         (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u), live.p00, live.p11, 0 };
-                list->SetComputeRoot32BitConstants(8, 16, &rc, 0);
+                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, live.reflAlphaMin, 4.0f,
+                         (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u) | (anchored && live.anchorPrevOk ? 8u : 0u), live.p00, live.p11,
+                         live.reflAlphaMax, live.reflGamma, live.reflDepthTol, live.anchorAlpha, live.anchorGamma };
+                list->SetComputeRoot32BitConstants(10, 20, &rc, 0);
                 list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+                if (anchored)
+                    for (auto& a : live.anchor)
+                        Transition(list.Get(), a.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 if (prev >= 0)
                     Transition(list.Get(), live.reflHist[prev].Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

@@ -4,7 +4,7 @@
 #
 #   tools/reshade/urti_sandbox.sh [--frais] [--sans-urti] [--images N] [--camera marche|fixe|orbite]
 #                                 [--fg] [--sdr] [--debut S] [--vent F] [--montrer] [--ini "cle=valeur;..."]
-#                                 [--photos A-B [--sortie DOSSIER]]
+#                                 [--photos A-B [--sortie DOSSIER] [--verite]]
 #
 # --frais : efface l'étalonnage stocké (urti_calib.ini) : on teste un premier lancement.
 # --sans-urti : sans ReShade ni add-on (vitesse du bac à sable seul).
@@ -12,11 +12,14 @@
 # --photos A-B : deux lancements identiques, avec RT puis natif, photos des présentations A à B, puis
 #   comparaison (effet du RT, scintillement ajouté, carte des points qui sautent) dans --sortie
 #   (par défaut urti/build/sandbox/comparaison).
+# --verite : le second lancement n'est pas le natif mais la vérité terrain (sol qui reflète la scène
+#   exacte, même règle de mélange qu'URTI) : on mesure l'écart des reflets RT à l'image idéale et ce qui
+#   saute par rapport à elle (le mouvement normal d'un reflet ne compte plus comme un saut).
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD="$ROOT/urti/build"
 DIR="$BUILD/sandbox"
-FRAIS=0; SANS=0; INI=""; PHOTOS=""; SORTIE="$DIR/comparaison"
+FRAIS=0; SANS=0; VERITE=0; INI=""; PHOTOS=""; SORTIE="$DIR/comparaison"
 export URTI_FRAMES=${URTI_FRAMES:-300}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -32,6 +35,7 @@ while [ $# -gt 0 ]; do
         --ini) shift; INI=$1 ;;
         --photos) shift; PHOTOS=$1 ;;
         --sortie) shift; SORTIE=$1 ;;
+        --verite) VERITE=1 ;;
         *) echo "option inconnue : $1"; exit 2 ;;
     esac
     shift
@@ -69,8 +73,13 @@ run 1
 rm -rf "$DIR/photos_rt" "$DIR/photos_natif"
 mkdir -p "$DIR/photos_rt" "$DIR/photos_natif"
 mv "$DIR"/urti_photo_*.ppm "$DIR/photos_rt/" 2>/dev/null || true
-echo "=== natif ==="
-run 0
+if [ $VERITE = 1 ]; then
+    echo "=== vérité terrain ==="
+    URTI_SANDBOX_TRUTH=1 run 0
+else
+    echo "=== natif ==="
+    run 0
+fi
 mv "$DIR"/urti_photo_*.ppm "$DIR/photos_natif/" 2>/dev/null || true
 echo "=== comparaison ==="
 PYTHONIOENCODING=utf-8 python "$ROOT/tools/reshade/urti_sandbox_compare.py" "$DIR/photos_rt" "$DIR/photos_natif" "$SORTIE"

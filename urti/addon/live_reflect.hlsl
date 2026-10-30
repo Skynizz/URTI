@@ -3,12 +3,24 @@
 // touché est reprojeté à l'écran : s'il y est visible (même profondeur), sa couleur sera lue dans
 // l'image du jeu par la composition. Sortie par pixel : position à l'écran du point reflété (u, v),
 // poids (Fresnel × lissé), 0 si rien d'utilisable (le reflet du jeu reste alors).
+//
+// Ancrage (mémoire géométrique) : la surface-miroir et le point reflété sont retrouvés dans la géométrie
+// captée (même dessin, même triangle, mêmes coordonnées barycentriques) ; les sommets de l'image
+// précédente donnent leur position à ce moment-là, déformations comprises. Le point virtuel (le point
+// reflété symétrisé par le plan du miroir) de l'image précédente donne l'endroit exact où ce reflet se
+// trouvait : la stabilisation y lit son historique, si les identités (objet reflété, miroir) concordent.
 
 RaytracingAccelerationStructure scene : register(t0);
 ByteAddressBuffer depth : register(t1);    // profondeur du jeu (32 bits par texel, lignes alignées)
 ByteAddressBuffer material : register(t2); // copie de l'image de matériau du G-buffer (32 bits par texel)
 ByteAddressBuffer sunBuf : register(t3);   // octets 36 à 47 : loi de profondeur de cette image
+StructuredBuffer<uint4> regions : register(t4); // par dessin de l'écran : début (octets), taille, compteur, identité
+ByteAddressBuffer links : register(t5);    // par dessin : identité, début (sommets) du même objet dans l'image précédente + 1
+ByteAddressBuffer viewCur : register(t6);  // sommets de cette image (float3, espace caméra)
+ByteAddressBuffer viewPrev : register(t7); // sommets de l'image précédente (son espace caméra)
 RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé
+RWByteAddressBuffer anchor : register(u1);     // uint4 par pixel : position précédente du reflet (u, v ; NaN si
+                                               // inconnue), identité de l'objet reflété, identité du miroir
 
 cbuffer Constants : register(b0)
 {
@@ -30,7 +42,54 @@ cbuffer Constants : register(b0)
                        // (sinon la 4e composante est la distance de touche, 1e4 pour le ciel)
     float f0;          // réflectance à incidence normale (diélectrique ~0,04)
     uint reflectPitch;
+    uint regionCount;
+    uint anchors;      // 1 : sommets de l'image précédente disponibles
+    uint prevVertexCount; // sommets lisibles dans viewPrev (une lecture hors d'un tampon racine n'est pas bornée)
+    uint pad1;
 };
+
+// dessin qui contient ce triangle (zones triées par début)
+uint RegionIndex(uint prim)
+{
+    const uint byte = prim * 48;
+    uint lo = 0, hi = regionCount;
+    while (lo + 1 < hi)
+    {
+        const uint mid = (lo + hi) >> 1;
+        if (regions[mid].x <= byte)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+float3 Vertex(ByteAddressBuffer b, uint v) { return asfloat(b.Load3(v * 12)); }
+
+// identité de l'objet du triangle ; position et normale du même point à l'image précédente si connues
+bool Anchor(uint prim, float2 bary, out uint id, out float3 prevPos, out float3 prevNormal)
+{
+    prevPos = prevNormal = 0;
+    id = 0;
+    if (regionCount == 0 || anchors == 0)
+        return false;
+    const uint k = RegionIndex(prim);
+    const uint4 r = regions[k];
+    const uint byte = prim * 48;
+    id = r.w;
+    if (anchors == 0 || byte < r.x || byte - r.x >= r.y)
+        return false;
+    const uint start = links.Load(k * 8 + 4);
+    if (start == 0)
+        return false;
+    const uint v = start - 1 + (byte - r.x) / 16;
+    if (v + 2 >= prevVertexCount)
+        return false;
+    const float3 a = Vertex(viewPrev, v), b = Vertex(viewPrev, v + 1), c = Vertex(viewPrev, v + 2);
+    prevPos = a + bary.x * (b - a) + bary.y * (c - a);
+    prevNormal = normalize(cross(b - a, c - a));
+    return all(isfinite(prevPos)) && all(isfinite(prevNormal));
+}
 
 static float gA, gB, gClear;
 
@@ -85,8 +144,31 @@ void main(uint2 id : SV_DispatchThreadID)
     const float3 n = p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
     const float s = max(Smoothness(int2(id)), wet * saturate((n.y - 0.55) / 0.3));
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
+    const float nan = asfloat(0x7FC00000);
+    uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
     if (p.z > 0 && s >= sMin)
     {
+        // surface-miroir dans la géométrie captée : le premier triangle sur le rayon de la caméra, s'il est à
+        // la profondeur que l'image montre
+        bool mirrorKnown = false;
+        float3 prevMirror = 0, prevMirrorN = 0;
+        if (anchors != 0)
+        {
+            RayDesc eye;
+            eye.Origin = 0;
+            eye.Direction = normalize(p);
+            eye.TMin = 0.0;
+            eye.TMax = length(p) * 1.05 + 0.1;
+            RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qe;
+            qe.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, eye);
+            qe.Proceed();
+            if (qe.CommittedStatus() == COMMITTED_TRIANGLE_HIT && abs(qe.CommittedRayT() - length(p)) < 0.02 * length(p) + 0.05)
+            {
+                uint mirrorId;
+                mirrorKnown = Anchor(qe.CommittedPrimitiveIndex(), qe.CommittedTriangleBarycentrics(), mirrorId, prevMirror, prevMirrorN);
+                anchorOut.w = mirrorId;
+            }
+        }
         const float3 v = normalize(p);
         const float3 r = reflect(v, n);
         const float cosTheta = saturate(dot(-v, n));
@@ -126,6 +208,20 @@ void main(uint2 id : SV_DispatchThreadID)
                     const float3 seen = PointAt(int2(uv * float2(width, height)));
                     if (seen.z > 0 && abs(seen.z - h.z) < 0.03 * h.z + 0.05)
                     {
+                        // ancrage : point reflété à l'image précédente, symétrisé par le plan du miroir d'alors
+                        uint hitId;
+                        float3 prevHit, prevHitN;
+                        const bool hitKnown = Anchor(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
+                        anchorOut.z = hitId;
+                        if (hitKnown && mirrorKnown)
+                        {
+                            const float3 virt = prevHit - 2.0 * dot(prevHit - prevMirror, prevMirrorN) * prevMirrorN;
+                            if (virt.z > 1e-3)
+                            {
+                                const float2 pn = float2(virt.x * p00 / virt.z, virt.y * p11 / virt.z);
+                                anchorOut.xy = asuint(float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5));
+                            }
+                        }
                         // fondu vers les bords de l'écran (couleur inconnue au-delà)
                         const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
                         result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(q.CommittedRayT() / 50.0) : (flags & 16) ? s : q.CommittedRayT());
@@ -135,4 +231,5 @@ void main(uint2 id : SV_DispatchThreadID)
         }
     }
     reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(result));
+    anchor.Store4(id.y * reflectPitch + id.x * 16, anchorOut);
 }
