@@ -137,7 +137,8 @@ void main(uint2 id : SV_DispatchThreadID)
         }
         // face tournée à l'opposé du soleil : le jeu l'assombrit déjà par son éclairage ; une ombre RT en
         // plus y ferait des taches (le test de sa carte la voit éclairée, la surface étant son propre écran)
-        const bool facesSun = dot(NormalAt(int2(id), p), sun) > 0.08;
+        const float ndl = dot(NormalAt(int2(id), p), sun);
+        const bool facesSun = ndl > 0.08;
         if (!facesSun && (flags & 4))
             lit = 1.0;
         else if (flags & 1)
@@ -148,6 +149,15 @@ void main(uint2 id : SV_DispatchThreadID)
             else if (flags & 4)
                 lit = 1.0 - game * (1.0 - lit); // n'ajouter de l'ombre que là où le jeu éclaire
         }
+    }
+    // une ombre ne retire que la lumière directe du soleil, proportionnelle à l'angle de la surface face à lui
+    // (N·L) : une surface rasante perd peu, une surface face au soleil perd tout ; le reste (lumière du
+    // ciel, rebonds) demeure. Sans cela, l'ombre RT assombrit aussi l'éclairage indirect : trop noire.
+    if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
+    {
+        const float2 ndc2 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
+        const float3 p2 = float3(ndc2.x * w / p00, ndc2.y * w / p11, w);
+        lit = 1.0 - (1.0 - lit) * saturate(dot(NormalAt(int2(id), p2), sun) * 2.5);
     }
     // au loin, le jeu noie le paysage dans la brume : une ombre RT pleine y fait des taches noires ; elle
     // s'efface entre 120 et 300 unités (mètres dans RDR2)

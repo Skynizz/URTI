@@ -26,7 +26,8 @@ cbuffer Constants : register(b0)
     float smoothMin;   // en dessous : pas de reflet RT
     float bias;
     uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle),
-                       // 8 diagnostic : distance de touche à la place du lissé
+                       // 8 diagnostic : distance de touche normalisée ; 16 diagnostic : lissé
+                       // (sinon la 4e composante est la distance de touche, 1e4 pour le ciel)
     float f0;          // réflectance à incidence normale (diélectrique ~0,04)
     uint reflectPitch;
 };
@@ -83,7 +84,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
     const float3 n = p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
     const float s = max(Smoothness(int2(id)), wet * saturate((n.y - 0.55) / 0.3));
-    float4 result = float4(0, 0, 0, s);
+    float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     if (p.z > 0 && s >= sMin)
     {
         const float3 v = normalize(p);
@@ -109,7 +110,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (all(uv > 0.001) && all(uv < 0.999) && PointAt(int2(uv * float2(width, height))).z <= 0)
             {
                 const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
-                result = float4(uv, weight * edge.x * edge.y, s);
+                result = float4(uv, weight * edge.x * edge.y, (flags & 16) ? s : 1e4);
             }
         }
         else if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && r.z > -0.999)
@@ -127,7 +128,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     {
                         // fondu vers les bords de l'écran (couleur inconnue au-delà)
                         const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
-                        result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(q.CommittedRayT() / 50.0) : s);
+                        result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(q.CommittedRayT() / 50.0) : (flags & 16) ? s : q.CommittedRayT());
                     }
                 }
             }

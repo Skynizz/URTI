@@ -10,7 +10,7 @@ ByteAddressBuffer history : register(t2);     // float4 par pixel de rendu : cou
 ByteAddressBuffer motion : register(t3);      // vecteurs de mouvement du jeu (R16G16 flottants)
 ByteAddressBuffer depth : register(t4);       // profondeur de rendu (cette image)
 ByteAddressBuffer depthPrev : register(t5);   // profondeur de rendu (image précédente)
-ByteAddressBuffer sunBuf : register(t6);      // loi de profondeur (octets 36 à 47)
+ByteAddressBuffer sunBuf : register(t6);      // loi de profondeur (36 à 47), rotation de la caméra (576 à 627)
 RWByteAddressBuffer resolved : register(u0);  // float4 par pixel de rendu : couleur linéaire, poids
 
 cbuffer Constants : register(b0)
@@ -28,8 +28,8 @@ cbuffer Constants : register(b0)
     float alpha;         // part de l'image courante
     float maxLuminance;  // plafond de la couleur reflétée (lumière linéaire, 1 = blanc de référence)
     uint flags;          // 1 : historique valide ; 2 : image générée (pas de mise à jour) ; 4 : diagnostic, confiance
-    uint pad0;
-    uint pad1;
+    float p00;           // projection supposée (espace caméra de l'add-on)
+    float p11;
     uint pad2;
 };
 
@@ -96,16 +96,17 @@ void main(uint2 id : SV_DispatchThreadID)
     if (flags & 2)
         return; // image générée : le résultat de la dernière image réelle reste
 
-    // courant (couleur prémultipliée par le poids) et boîte du voisinage 3×3
+    // courant (couleur prémultipliée par le poids) et statistiques du voisinage 3×3 (moyenne ± γ σ)
     const float4 cur = Current(t);
-    float4 lo = cur, hi = cur;
+    float4 m1 = 0, m2 = 0;
     for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++)
-            if (dx != 0 || dy != 0)
-            {
-                const float4 n = Current(t + int2(dx, dy));
-                lo = min(lo, n), hi = max(hi, n);
-            }
+        {
+            const float4 n = (dx == 0 && dy == 0) ? cur : Current(t + int2(dx, dy));
+            m1 += n, m2 += n * n;
+        }
+    const float4 mean = m1 / 9.0, sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+    const float4 lo = mean - 1.0 * sigma, hi = mean + 1.0 * sigma;
 
     float4 result = cur;
     if ((flags & 1) && motionConvention < 16)
@@ -119,17 +120,39 @@ void main(uint2 id : SV_DispatchThreadID)
             mv = -mv;
         if (k & 8)
             mv.y = -mv.y;
-        const float2 prevUv = (float2(id) + 0.5) / float2(renderWidth, renderHeight) + mv;
+        const float2 uv = (float2(id) + 0.5) / float2(renderWidth, renderHeight);
         const float w = ViewDepth(depth, t, law.x, law.y);
-        if (law.z > 0 && all(isfinite(mv)) && all(prevUv > 0) && all(prevUv < 1) && w > 0)
+        // le reflet ne bouge pas comme la surface qui le porte : son point virtuel (derrière le miroir, à la
+        // distance du rayon) bouge comme un point immobile à cette profondeur. Mouvement = part due à la
+        // rotation de la caméra (mesurée par les cascades, la même à toute profondeur) + part due à la
+        // translation, qui décroît comme 1 / profondeur.
+        float2 mvRot = mv;
+        if (asfloat(sunBuf.Load(624)) > 0 && w > 0)
+        {
+            const float2 ndc = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+            const float3 pc = float3(ndc.x * w / p00, ndc.y * w / p11, w);
+            const float3 pr = float3(dot(asfloat(sunBuf.Load3(576)), pc), dot(asfloat(sunBuf.Load3(592)), pc), dot(asfloat(sunBuf.Load3(608)), pc));
+            if (pr.z > 1e-3)
+                mvRot = float2(pr.x * p00 / pr.z * 0.5 + 0.5, 0.5 - pr.y * p11 / pr.z * 0.5) - uv;
+        }
+        const float hitT = asfloat(reflection.Load((id.y * renderWidth + id.x) * 16 + 12));
+        const float2 ndc0 = float2(uv.x * 2 - 1, 1 - uv.y * 2);
+        const float dist = w > 0 ? length(float3(ndc0.x * w / p00, ndc0.y * w / p11, w)) : 1;
+        const float ratio = hitT >= 1e4 ? 0.0 : dist / (dist + max(hitT, 0.0));
+        const float2 mvVirtual = mvRot + (mv - mvRot) * ratio;
+        const float2 prevUv = uv + mvVirtual;
+        if (law.z > 0 && all(isfinite(mvVirtual)) && all(prevUv > 0) && all(prevUv < 1) && w > 0)
         {
             const int2 p = int2(prevUv * float2(renderWidth, renderHeight));
             const float wp = ViewDepth(depthPrev, p, law.x, law.y);
-            if (wp > 0 && abs(wp - w) < 0.04 * w + 0.05)
+            if (wp > 0 && abs(wp - w) < 0.1 * w + 0.2)
             {
                 const float4 hist = asfloat(history.Load4((uint(p.y) * renderWidth + uint(p.x)) * 16));
-                // historique borné par le voisinage courant : un reflet qui a bougé ne laisse pas de trace
-                result = lerp(clamp(hist, lo, hi), cur, alpha);
+                // historique borné par le voisinage courant (un reflet qui a bougé ne laisse pas de trace) ;
+                // mélange adaptatif : beaucoup d'historique à l'arrêt, peu en mouvement rapide
+                const float motionPx = length(mvVirtual * float2(renderWidth, renderHeight));
+                const float a = lerp(alpha * 0.5, 0.5, saturate(motionPx / 8.0));
+                result = lerp(clamp(hist, lo, hi), cur, a);
                 if (flags & 4)
                 {
                     // confiance : part de l'historique gardée après bornage (blanc : stable, noir : rejeté)

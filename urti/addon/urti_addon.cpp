@@ -677,7 +677,10 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         for (uint32_t p : params)
             key = key * 1315423911ull + p;
         // taille de la zone : sommets connus du dessin (listes de triangles) ; indirect : budget fixe
-        const uint64_t vertices = kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]);
+        // arrondie à trois sommets : la structure d'accélération forme les triangles par triplets depuis le
+        // début du flux ; une zone d'un autre multiple décalerait toutes les suivantes (triangles géants
+        // reliant des objets différents)
+        const uint64_t vertices = (kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]) + 2) / 3 * 3;
         const uint32_t capacity = uint32_t(std::min<uint64_t>(vertices * 16, kSlotBytes));
         LiveRegion region;
         {

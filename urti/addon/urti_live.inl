@@ -19,6 +19,7 @@
 #include "live_depthfit_cs.h"  // g_live_depthfit
 #include "live_mvcal_cs.h"     // g_live_mvcal
 #include "live_reflresolve_cs.h" // g_live_reflresolve
+#include "live_shadowtemporal_cs.h" // g_live_shadowtemporal
 
 struct LiveState
 {
@@ -35,6 +36,9 @@ struct LiveState
     ComPtr<ID3D12PipelineState> convertPso, shadowPso;
     ComPtr<ID3D12Resource> view, blas, blasScratch, tlas, tlasScratch, instances, depthBuf, shadowBuf, mask, counterReadback[3];
     ComPtr<ID3D12Resource> prevShadowBuf; // masque de l'image réelle précédente (images générées : mélange)
+    ComPtr<ID3D12Resource> shadowRawBuf;  // masque brut de cette image (avant débruitage)
+    ComPtr<ID3D12RootSignature> denoiseRs;
+    ComPtr<ID3D12PipelineState> denoisePso;
     // accumulation dans le temps : vecteurs de mouvement du jeu (G-buffer), profondeur précédente
     ComPtr<ID3D12Resource> mvBuf, depthPrevBuf, mvErrors, mvErrorsReadback[3];
     ComPtr<ID3D12RootSignature> mvcalRs;
@@ -110,9 +114,13 @@ struct LiveState
     uint32_t atlasPitch = 0;
     bool atlasD24 = false;
     uint64_t framesSinceSun = 0, sunFrames = 0, sunAccepted = 0, pairSum = 0;
+    uint32_t rotationValid = 0;
+    double rotationSum = 0;
 } live;
 constexpr uint32_t kLiveMaxPairs = 256;
-constexpr uint32_t kLiveSunBytes = 48 + 8 * 64 + 16; // soleil, bilan, cascades, puis un soleil en attente de confirmation
+// soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
+// l'image précédente (640)
+constexpr uint32_t kLiveSunBytes = 656 + 8 * 64;
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
@@ -436,6 +444,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
            make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 24) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
+           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 12) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
            make(g_live_composite, sizeof(g_live_composite), 5, live.compositeRs, live.compositePso, 12) &&
@@ -528,6 +537,8 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     live.shadowPitch = (live.width * 4 + 255) / 256 * 256;
     live.shadowBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.prevShadowBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_COPY_DEST);
+    Retire(live.shadowRawBuf);
+    live.shadowRawBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Retire(live.depthPrevBuf);
     live.depthPrevBuf = UavBuffer(device, total, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
@@ -558,7 +569,7 @@ bool LiveEnsureSun(ID3D12Device* device)
     for (auto& r : live.pairsUpload)
         r = MakeBuffer(device, kLiveMaxPairs * 48ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     for (auto& r : live.sunReadback)
-        r = MakeBuffer(device, 48, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        r = MakeBuffer(device, 640, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     live.pairDirs = UavBuffer(device, kLiveMaxPairs * 80ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.sunBuf = UavBuffer(device, kLiveSunBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.sunUpload = MakeBuffer(device, 48, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -854,6 +865,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         if (live.calibrated)
         {
             live.sunFrames++, live.pairSum += uint64_t(r[4]);
+            if (r[156] > 0) // rotation de la caméra mesurée (octet 624)
+            {
+                const double tr = r[144] + r[149] + r[154]; // trace de la matrice (lignes à 576, 592, 608)
+                live.rotationSum += std::acos(std::clamp((tr - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / 3.14159265;
+                live.rotationValid++;
+            }
             if (r[7] > 0)
             {
                 const float dot = r[0] * live.lastSun[0] + r[1] * live.lastSun[1] + r[2] * live.lastSun[2];
@@ -880,6 +897,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     Log("URTI direct : soleil d'une image à l'autre : %.3f° en moyenne, %.2f° au plus (caméra comprise)", live.sunJitterSum / live.sunJitterCount,
                         live.sunJitterMax);
                 live.sunJitterSum = live.sunJitterMax = 0, live.sunJitterCount = 0;
+                if (live.rotationValid)
+                    Log("URTI direct : rotation de la caméra mesurée sur %u images sur 300 (cascades), %.3f° par image en moyenne", live.rotationValid,
+                        live.rotationSum / live.rotationValid);
+                live.rotationValid = 0, live.rotationSum = 0;
                 live.sunFrames = live.sunAccepted = live.pairSum = 0;
             }
         }
@@ -1112,6 +1133,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             // aucune paire : bilan « non mesuré », le soleil précédent reste, plus de cascade connue
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 20); // pas la loi de profondeur (36 à 47)
+            list->CopyBufferRegion(live.sunBuf.Get(), 624, g.zeros.Get(), 0, 32); // rotation non mesurée, plus de cascades gardées
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
     }
@@ -1272,7 +1294,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(4, live.prevShadowBuf ? live.prevShadowBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(5, motionOk ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(6, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(7, live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(7, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     const bool sunNow = live.calibrated && live.framesSinceSun < 30;
@@ -1289,10 +1311,35 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t debugMode, frameIndex, pad4, pad5, pad6;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
-             live.mvPitch, motionOk && live.prevShadowBuf ? live.mvConvention : 255u, live.temporalAlpha,
-             live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u, uint32_t(live.frame), 0, 0, 0 };
+             live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
+             0u, uint32_t(live.frame), 0, 0, 0 };
     list->SetComputeRoot32BitConstants(8, 24, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+    // débruitage : flou guidé par la profondeur, historique reprojeté, bornage statistique, mélange adaptatif
+    if (live.shadowRawBuf && live.denoisePso)
+    {
+        Transition(list.Get(), live.shadowRawBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+        list->SetComputeRootSignature(live.denoiseRs.Get());
+        list->SetPipelineState(live.denoisePso.Get());
+        list->SetComputeRootShaderResourceView(0, live.shadowRawBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(1, live.prevShadowBuf ? live.prevShadowBuf->GetGPUVirtualAddress() : live.shadowRawBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(2, live.depthBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(3, motionOk ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(4, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(5, live.sunBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(6, live.shadowBuf->GetGPUVirtualAddress());
+        const struct
+        {
+            uint32_t width, height, depthPitch, shadowPitch, motionPitch, motionConvention, depth24, debugMode;
+            float alphaMin, alphaMax, gamma;
+            uint32_t pad;
+        } dn = { live.width, live.height, live.depthPitch, live.shadowPitch, live.mvPitch,
+                 motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
+                 0.1f, 0.5f, 1.5f, 0 };
+        list->SetComputeRoot32BitConstants(7, 12, &dn, 0);
+        list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+        Transition(list.Get(), live.shadowRawBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     // recherche de la convention des vecteurs de mouvement (tant qu'elle n'est pas trouvée)
     if (motionOk && live.mvConvention == 255 && live.mvcalPso)
     {
@@ -1332,7 +1379,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (atlasValid)
         Transition(list.Get(), live.atlasBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 48);
+    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 640);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     LiveTime(list.Get(), 4);
@@ -1397,7 +1444,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 float f0;
                 uint32_t reflectPitch;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
-                     d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u), live.f0, live.width * 16 };
+                     d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
+                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u), live.f0, live.width * 16 };
             list->SetComputeRoot32BitConstants(5, 16, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1589,10 +1637,12 @@ void LiveComposite(effect_runtime* runtime)
                 {
                     uint32_t width, height, pitch, format, renderWidth, renderHeight, motionPitch, motionConvention, depthPitch, depth24;
                     float alpha, maxLuminance;
-                    uint32_t flags, pad0, pad1, pad2;
+                    uint32_t flags;
+                    float p00, p11;
+                    uint32_t pad2;
                 } rc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.mvPitch,
                          motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, 0.2f, 4.0f,
-                         (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u), 0, 0, 0 };
+                         (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u), live.p00, live.p11, 0 };
                 list->SetComputeRoot32BitConstants(8, 16, &rc, 0);
                 list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
                 if (prev >= 0)

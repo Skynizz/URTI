@@ -5,7 +5,9 @@
 
 ByteAddressBuffer dirs : register(t0); // par paire : direction, poids
 RWByteAddressBuffer sun : register(u0); // float4 soleil (vers le soleil, espace caméra), float4 bilan, uint nombre de
-                                        // cascades (à 32), puis par cascade (à 48 + 64 k) : application (3 float4), viewport
+                                        // cascades (à 32), puis par cascade (à 48 + 64 k) : application (3 float4), viewport ;
+                                        // à 560 : soleil en attente ; à 576 : rotation de la caméra depuis l'image
+                                        // précédente (3 lignes, validité à 624) ; à 640 : cascades de l'image précédente
 
 cbuffer Constants : register(b0)
 {
@@ -132,4 +134,49 @@ void main(uint t : SV_GroupThreadID)
     }
     sun.Store4(16, asuint(float4(float(pairCount), sVote[0], total, accepted)));
     sun.Store(32, cascades);
+
+    // rotation de la caméra : la carte d'ombres a des axes fixes dans le monde ; la partie linéaire des
+    // applications caméra -> carte d'une même cascade, à deux images, donne c_préc = Lpréc⁻¹ Lcour c
+    // (la translation des cascades, qui suivent la caméra, ne touche pas cette partie)
+    const uint prevCount = sun.Load(640);
+    float valid = 0;
+    if (cascades > 0 && prevCount > 0)
+    {
+        const float4 vp = asfloat(sun.Load4(48 + 48));
+        for (uint pk = 0; pk < min(prevCount, 8u) && valid == 0; pk++)
+        {
+            if (any(asfloat(sun.Load4(656 + pk * 64 + 48)) != vp))
+                continue;
+            float Mc[12], Mp[12];
+            for (uint r2 = 0; r2 < 3; r2++)
+            {
+                const float4 a = asfloat(sun.Load4(48 + r2 * 16)), b = asfloat(sun.Load4(656 + pk * 64 + r2 * 16));
+                Mc[r2 * 4 + 0] = a.x, Mc[r2 * 4 + 1] = a.y, Mc[r2 * 4 + 2] = a.z, Mc[r2 * 4 + 3] = a.w;
+                Mp[r2 * 4 + 0] = b.x, Mp[r2 * 4 + 1] = b.y, Mp[r2 * 4 + 2] = b.z, Mp[r2 * 4 + 3] = b.w;
+            }
+            // M[a*3 + c] : composante c de la carte par coordonnée caméra a ; L[c][a] = M[a*3 + c]
+            float3x3 Lc, Lp;
+            for (uint c = 0; c < 3; c++)
+                for (uint a2 = 0; a2 < 3; a2++)
+                    Lc[c][a2] = Mc[a2 * 3 + c], Lp[c][a2] = Mp[a2 * 3 + c];
+            const float det = determinant(Lp);
+            if (abs(det) < 1e-12)
+                continue;
+            float3x3 inv;
+            inv[0] = cross(Lp[1], Lp[2]) / det;
+            inv[1] = cross(Lp[2], Lp[0]) / det;
+            inv[2] = cross(Lp[0], Lp[1]) / det;
+            const float3x3 R = mul(transpose(inv), Lc);
+            sun.Store4(576, asuint(float4(R[0], 0)));
+            sun.Store4(592, asuint(float4(R[1], 0)));
+            sun.Store4(608, asuint(float4(R[2], 0)));
+            valid = 1;
+        }
+    }
+    sun.Store(624, asuint(valid));
+    // cascades de cette image gardées pour la suivante
+    sun.Store(640, cascades);
+    for (uint c4 = 0; c4 < cascades; c4++)
+        for (uint r3 = 0; r3 < 4; r3++)
+            sun.Store4(656 + c4 * 64 + r3 * 16, sun.Load4(48 + c4 * 64 + r3 * 16));
 }

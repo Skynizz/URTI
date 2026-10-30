@@ -644,3 +644,23 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   mouillée).
 - GPU perdu dans RDR2 : la composition lisait le tampon des reflets coupés au-delà du tampon lié à sa
   place ; une lecture hors d'un tampon racine n'est pas bornée. Corrigé.
+
+## v31 — URTI : capture sans attente, stabilité temporelle (étapes 1 à 4)
+
+- Capture : une zone du flux et un compteur par dessin (plus de barrière par dessin) : de ~20 à ~50 i/s
+  dans RDR2. Zones arrondies à trois sommets (sinon les triangles se formaient à cheval sur deux objets :
+  grands triangles au sol qui apparaissaient et disparaissaient).
+- Démarrage instantané : étalonnage stocké (`urti_calib.ini` : convention et description de la carte
+  d'ombres, convention des vecteurs de mouvement), loi de profondeur mesurée à chaque image sur le GPU,
+  emplacement réservé à la carte d'ombres du soleil.
+- Soleil : vote affiné à 0,75°, saut faible rejeté, grand saut accepté seulement s'il se confirme.
+- Vecteurs de mouvement du jeu copiés depuis son G-buffer, convention trouvée seule (16 candidates, par
+  la profondeur de l'image précédente) : RDR2 = pixels, sens direct.
+- Ombres : passe de débruitage séparée (flou 3×3 guidé par la profondeur, historique reprojeté, bornage
+  moyenne ± 1,5 σ, mélange adaptatif 0,1 à 0,5 selon le mouvement), motif des rayons tournant d'une image
+  à l'autre, ombre pondérée par N·L (ne retire que la lumière directe), effacée au loin (brume).
+- Reflets : stabilisés (historique, bornage ± σ, mélange adaptatif, couleur plafonnée) et reprojetés sur
+  le point reflété : rotation de la caméra mesurée d'une image à l'autre par les cascades (partie linéaire
+  de L_préc⁻¹ L_cour, la translation des cascades ne la touche pas), translation déduite du vecteur de
+  mouvement de la surface et de la profondeur virtuelle (distance + distance de touche).
+- Neuf vues de diagnostic (menu ReShade et `debug_view`), images générées (DLSS-G) au choix.
