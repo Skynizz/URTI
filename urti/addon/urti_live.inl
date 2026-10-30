@@ -44,6 +44,13 @@ struct LiveState
     // suivi du soleil à chaque image
     bool forceCalibration = false, sunDirty = false;
     int iniCombine = -1; // urti.ini combine= : 0 ou 1 impose le mode ; -1 : menu de ReShade (UrtiMode)
+    std::atomic<bool> overlayOpen{ false }; // menu de ReShade ouvert : pas de passe RT (le menu doit rester visible)
+    uint32_t shadowRays = 4;                // urti.ini shadow_rays= (1 à 4)
+    // minutage GPU par étape (horodatages), moyenné sur 300 images
+    ComPtr<ID3D12QueryHeap> timeHeap;
+    ComPtr<ID3D12Resource> timeReadback[3];
+    double timeSum[8] = {};
+    uint32_t timeFrames = 0;
     uint32_t lastPresentDraws = 1; // dessins du jeu avant cette présentation (0 : image générée)
     // reflets : matériau du G-buffer copié à chaque image, rayons réfléchis
     ComPtr<ID3D12RootSignature> reflectRs, depthfitRs;
@@ -550,7 +557,7 @@ void LiveHotReload(ID3D12Device* device)
         {
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
-            float refl = 1.0f, channel = 0, invert = 0, smoothMin = 0.6f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0;
+            float refl = 1.0f, channel = 0, invert = 0, smoothMin = 0.6f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 4;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -564,6 +571,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("game_bias=", gameBias), value("ray_bias=", rayBias), value("sun_radius=", sunRadius);
                 value("reflect=", refl), value("reflect_channel=", channel), value("reflect_invert=", invert), value("smooth_min=", smoothMin);
                 value("reflect_f0=", f0), value("debug_reflect=", debugReflect), value("material_slot=", slot), value("reflect_everywhere=", everywhere);
+                value("shadow_rays=", rays);
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -571,6 +579,7 @@ void LiveHotReload(ID3D12Device* device)
             g_liveGameBias = gameBias, g_liveRayBias = rayBias, g_liveSunRadius = sunRadius;
             live.reflStrength = refl, live.reflChannel = uint32_t(channel) & 3, live.reflInvert = invert != 0, live.smoothMin = smoothMin;
             live.f0 = f0, live.debugReflect = uint32_t(debugReflect), live.materialSlot = uint32_t(slot) & 7, live.reflEverywhere = everywhere != 0;
+            live.shadowRays = std::clamp(uint32_t(rays), 1u, 4u);
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -664,6 +673,13 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
         live.materialFormat = uint32_t(d.Format), live.materialFrame = live.frame;
         return;
     }
+}
+
+// horodatage k (0 à 7) de l'image en cours
+void LiveTime(ID3D12GraphicsCommandList* list, uint32_t k)
+{
+    if (live.timeHeap)
+        list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * 8 + k);
 }
 
 int LiveMainSlot()
@@ -812,6 +828,37 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         return;
 
     const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (!live.timeHeap)
+    {
+        D3D12_QUERY_HEAP_DESC qd = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 24, 0 };
+        g.device->CreateQueryHeap(&qd, IID_PPV_ARGS(&live.timeHeap));
+        for (auto& r : live.timeReadback)
+            r = MakeBuffer(g.device, 8 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    // minutage lu trois images plus tard : structure, soleil, ombres, reflets, composition (ms)
+    if (const uint64_t* t = nullptr; live.timeReadback[live.frame % 3] && SUCCEEDED(live.timeReadback[live.frame % 3]->Map(0, nullptr, (void**)&t)) && t)
+    {
+        UINT64 freq = 0;
+        if (ID3D12CommandQueue* q = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native()); q && SUCCEEDED(q->GetTimestampFrequency(&freq)) && freq &&
+            t[5] > t[0] && t[5] - t[0] < freq)
+        {
+            for (int k = 0; k < 5; k++)
+                live.timeSum[k] += double(t[k + 1] - t[k]) * 1000.0 / double(freq);
+            if (t[7] > t[6] && t[7] - t[6] < freq)
+                live.timeSum[5] += double(t[7] - t[6]) * 1000.0 / double(freq);
+            if (++live.timeFrames == 300)
+            {
+                const double n = live.timeFrames;
+                Log("URTI direct : GPU par image : structure %.2f ms, soleil et profondeur %.2f, copie carte du jeu %.2f, ombres (%u rayons) %.2f, "
+                    "reflets %.2f, composition %.2f", live.timeSum[0] / n, live.timeSum[1] / n, live.timeSum[2] / n, live.shadowRays, live.timeSum[3] / n,
+                    live.timeSum[4] / n, live.timeSum[5] / n);
+                std::fill(std::begin(live.timeSum), std::end(live.timeSum), 0.0);
+                live.timeFrames = 0;
+            }
+        }
+        live.timeReadback[live.frame % 3]->Unmap(0, nullptr);
+    }
+    LiveTime(list.Get(), 0);
     // 1. sommets de l'écran vers l'espace caméra (NaN au-delà de ce qui a été rempli)
     Transition(list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
@@ -825,6 +872,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->Dispatch(UINT((live.capacity + 255) / 256), 1, 1);
     Transition(list.Get(), live.view.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
+    LiveTime(list.Get(), 1);
     // 1b. soleil de cette image : paires écran / carte d'ombres de même signature, ajustées puis votées
     if (live.sunDirty)
     {
@@ -983,6 +1031,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), depthCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, depthState);
     Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
 
+    LiveTime(list.Get(), 2);
     // 3b. carte d'ombres du jeu (son ombre est recalculée pixel par pixel : nos ombres ne s'ajoutent
     // que là où le jeu n'en met pas)
     bool atlasValid = false;
@@ -1026,6 +1075,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
     }
 
+    LiveTime(list.Get(), 3);
     // 4. un rayon par pixel vers le soleil
     list->SetComputeRootSignature(live.shadowRs.Get());
     list->SetPipelineState(live.shadowPso.Get());
@@ -1038,7 +1088,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     const bool sunNow = live.calibrated && live.framesSinceSun < 30;
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
-                           (sunNow ? 0u : 16u);
+                           (sunNow ? 0u : 16u) | (live.shadowRays << 8);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -1055,6 +1105,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 48);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    LiveTime(list.Get(), 4);
     // 4b. reflets : un rayon réfléchi par pixel lisse (matériau du G-buffer copié dans cette image)
     if (live.reflStrength > 0 || live.debugReflect)
     {
@@ -1102,6 +1153,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
     }
 
+    LiveTime(list.Get(), 5);
+    if (live.timeHeap && live.timeReadback[live.frame % 3])
+        list->ResolveQueryData(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * 8, 6, live.timeReadback[live.frame % 3].Get(), 0);
     // 5. image d'ombres pour l'effet
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(list.Get(), live.mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1158,6 +1212,8 @@ void LiveComposite(effect_runtime* runtime)
     // que des ombres figées qui ne suivent plus la caméra
     if (live.maskFrame == ~0ull || live.frame > live.maskFrame + 2)
         return;
+    if (live.overlayOpen)
+        return; // menu de ReShade ouvert : il doit rester lisible (la passe le recouvrirait)
     const effect_technique technique = runtime->find_technique("urti.fx", "URTI");
     const bool techniqueOn = runtime->get_effects_state() && (!technique.handle || runtime->get_technique_state(technique));
     if (techniqueOn != live.lastTechnique)
@@ -1214,6 +1270,9 @@ void LiveComposite(effect_runtime* runtime)
     tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     buf.PlacedFootprint = fp;
+    const uint32_t slotTime = uint32_t((live.frame + 2) % 3); // image dont les effets viennent d'être enregistrés
+    if (live.timeHeap)
+        list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slotTime * 8 + 6);
     Transition(list.Get(), bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
     buf.pResource = live.imageIn.Get();
     list->CopyTextureRegion(&buf, 0, 0, 0, &tex, nullptr);
@@ -1249,7 +1308,18 @@ void LiveComposite(effect_runtime* runtime)
     list->CopyTextureRegion(&tex, 0, 0, 0, &buf, nullptr);
     Transition(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
     Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (live.timeHeap && live.timeReadback[slotTime])
+    {
+        list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slotTime * 8 + 7);
+        list->ResolveQueryData(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slotTime * 8 + 6, 2, live.timeReadback[slotTime].Get(), 6 * 8);
+    }
     live.statComposited++;
+}
+
+bool OnOpenOverlay(effect_runtime*, bool open, input_source)
+{
+    live.overlayOpen = open;
+    return false;
 }
 
 // photo de l'écran après les effets (fichier déclencheur urti_photo)

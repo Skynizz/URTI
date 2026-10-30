@@ -1430,6 +1430,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
         reshade::register_event<reshade::addon_event::reshade_begin_effects>(OnBeginEffects);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnOpenOverlay);
         break;
     case DLL_PROCESS_DETACH:
         reshade::unregister_addon(module);

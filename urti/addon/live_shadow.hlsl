@@ -109,9 +109,10 @@ void main(uint2 id : SV_DispatchThreadID)
         const float3 t2 = cross(sun, t1);
         const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))));
         lit = 0.0;
-        for (uint k = 0; k < 4; k++)
+        const uint rays = clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
+        for (uint k = 0; k < rays; k++)
         {
-            const float u = (float(k & 1) + 0.5) * 0.5, v = (float(k >> 1) + 0.5) * 0.5;
+            const float u = rays == 1 ? 0.0 : (float(k & 1) + 0.5) * 0.5, v = (float(k >> 1) + 0.5) * 0.5;
             const float r = sunRadius * sqrt(u), a = 6.2831853 * v + rot;
             RayDesc ray;
             ray.Origin = p * (1.0 - bias) + sun * bias * dist;
@@ -121,7 +122,7 @@ void main(uint2 id : SV_DispatchThreadID)
             RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
             q.Proceed();
-            lit += q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 0.25;
+            lit += q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0 / rays;
         }
         // face tournée à l'opposé du soleil : le jeu l'assombrit déjà par son éclairage ; une ombre RT en
         // plus y ferait des taches (le test de sa carte la voit éclairée, la surface étant son propre écran)
