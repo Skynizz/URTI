@@ -1,0 +1,7 @@
+événements (pixel × image) : 43200000
+sauts, ombres + reflets : 1.168 %
+sauts, reflets seuls : 0.588 % ; ombres seules : 0.738 %
+sauts des deux expliqués par les ombres seules : 0.618 % ; par les reflets seuls : 0.512 %
+sauts qui n'existent que quand les deux sont actifs (superposition) : 0.037 % (3.2 % des sauts)
+sauts des ombres seules qui disparaissent avec les reflets : 0.120 %
+plancher (natif contre vérité terrain : reflets idéaux qui bougent) : 1.373 %

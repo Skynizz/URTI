@@ -151,6 +151,14 @@ void main(uint2 id : SV_DispatchThreadID)
         StoreLinear(px, rf.zzz);
         return;
     }
+    if (showMask != 0)
+    {
+        StoreLinear(px, lit.xxx);
+        return;
+    }
+    // l'ombre ne retire que la lumière directe qui éclaire la surface : elle s'applique avant le reflet, qui
+    // la remplace en partie (une flaque à l'ombre reflète toujours le ciel et les objets éclairés)
+    c *= 1.0 - strength * (1.0 - lit);
     if (reflStrength > 0 && (debugReflect & 0x200))
     {
         // reflet stabilisé, bilinéaire à la résolution de rendu (couleur prémultipliée par son poids)
@@ -181,11 +189,5 @@ void main(uint2 id : SV_DispatchThreadID)
         }
         c = lerp(c, reflected, saturate(rf.z * reflStrength));
     }
-
-    if (showMask != 0)
-    {
-        StoreLinear(px, lit.xxx);
-        return;
-    }
-    StoreLinear(px, c * (1.0 - strength * (1.0 - lit)));
+    StoreLinear(px, c);
 }

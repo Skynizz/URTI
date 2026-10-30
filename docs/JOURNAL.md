@@ -727,3 +727,18 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   les pixels en ajoute). Gardé, coupé par défaut, sans coût quand il est coupé.
 - Réglages d'essai dans urti.ini : `refl_alpha_min`, `refl_alpha_max`, `refl_gamma`, `refl_depth_tol`,
   `anchor_alpha`, `anchor_gamma`.
+
+## v34 — URTI : ombres et reflets, l'un ne s'applique plus sur l'autre
+
+- Question : les ombres RT tremblent-elles *à travers* les reflets ? La composition mélangeait le reflet
+  puis assombrissait le tout par le masque d'ombre : une flaque à l'ombre voyait son reflet assombri
+  (faux : l'ombre ne retire que la lumière directe de la surface) et le tremblement de l'ombre s'ajoutait
+  à celui du reflet.
+- Mesure par événement (pixel × image, `tools/reshade/urti_sandbox_overlap.sh` : cinq lancements, ombres
+  seules contre le natif, reflets seuls et les deux contre la vérité terrain ; les événements se
+  chevauchent, on ne soustrait pas des pourcentages) sur la marche :
+  sauts avec les deux 1,257 %, expliqués par les ombres 0,682 %, par les reflets 0,513 %, **dus à la
+  seule superposition 0,062 % (5 %)**. Les ombres seules sautent sur 0,738 % : le plus gros morceau.
+- Correction : l'ombre s'applique avant le reflet (qui la remplace en partie). Sauts 1,257 → 1,168 %,
+  superposition 0,062 → 0,037 % ; sur les 7 scènes, écart à la vérité et sauts en baisse partout
+  (`results/urti/bac_a_sable/suite/tableau_v34.txt`, `results/urti/bac_a_sable/superposition/`).
