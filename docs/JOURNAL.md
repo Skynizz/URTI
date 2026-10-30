@@ -625,3 +625,22 @@ dans ce qui entoure les caches (débruiteur, reflets), trois communes aux deux m
   rechargés à chaud dans le jeu en ~2 s ; lancement piloté par le journal (`urti_rdr2_rapide.ps1`).
 - Corrigés en route : `&` sur un `ComPtr` (le libère), paramètres de l'effet retirés par le
   compilateur de ReShade s'ils ne sont plus lus, barrières sans ressource, états ReShade -> D3D12.
+
+## v30 — URTI : corrections du direct, premiers reflets RT
+
+- Ombres figées à l'écran quand la caméra bouge : le masque était posé même quand il n'avait pas pu
+  être recalculé (étalonnage, profondeur absente, image du jeu prise pour une image générée). Le
+  masque n'est plus appliqué que s'il date de cette image ou de la précédente ; image générée =
+  présentation sans aucun dessin du jeu.
+- Menu de ReShade : l'effet URTI décoché ou les effets coupés suppriment les ombres RT (l'add-on les
+  posait lui-même sans en tenir compte) ; mode, force, écran partagé lus et journalisés.
+- Sans soleil (nuit, intérieur) : étalonnages espacés (1×, 2×, 4×… l'intervalle), loi de profondeur
+  gardée seule : les reflets marchent aussi la nuit.
+- **Reflets RT** : un rayon réfléchi par pixel lisse (normale tirée de la profondeur), point touché
+  reprojeté et vérifié visible, couleur lue dans l'image, Fresnel. Validé sur le banc (sol qui reflète
+  les cubes, `results/urti/banc_direct/reflets_rt.png`). Dans RDR2, le G-buffer est repéré et son
+  image de matériau copiée à la fin de son écriture à chaque image ; reste à savoir quel canal porte
+  le lissé (balayage des canaux par rechargement à chaud, à refaire devant de l'eau ou une rue
+  mouillée).
+- GPU perdu dans RDR2 : la composition lisait le tampon des reflets coupés au-delà du tampon lié à sa
+  place ; une lecture hors d'un tampon racine n'est pas bornée. Corrigé.
