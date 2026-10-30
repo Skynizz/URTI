@@ -5,6 +5,9 @@ RaytracingAccelerationStructure scene : register(t0);
 ByteAddressBuffer depth : register(t1);   // copie de la profondeur (32 bits par texel, lignes alignées)
 ByteAddressBuffer sunBuf : register(t2);  // soleil de cette image (live_sunvote), espace caméra, cascades
 ByteAddressBuffer atlas : register(t3);   // copie de la carte d'ombres du jeu (32 bits par texel, lignes alignées)
+ByteAddressBuffer prevShadow : register(t4); // masque de l'image précédente (accumulation)
+ByteAddressBuffer depthPrev : register(t5);  // profondeur de l'image précédente
+ByteAddressBuffer motion : register(t6);     // vecteurs de mouvement du jeu (R16G16 flottants)
 RWByteAddressBuffer shadow : register(u0); // 1 éclairé, 0 à l'ombre (float, lignes alignées)
 
 cbuffer Constants : register(b0)
@@ -25,6 +28,10 @@ cbuffer Constants : register(b0)
     uint depth24;      // 1 : D24S8 (24 bits de profondeur)
     uint atlasPitch;
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil
+    uint motionPitch;
+    uint motionConvention; // 0..15 (live_mvcal), 255 : pas d'accumulation
+    float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
+    uint pad3;
 };
 
 static float gA, gB, gClear;
@@ -142,5 +149,38 @@ void main(uint2 id : SV_DispatchThreadID)
     // s'efface entre 120 et 300 unités (mètres dans RDR2)
     if (w > 0)
         lit = lerp(lit, 1.0, saturate((w - 120.0) / 180.0));
+    // accumulation dans le temps : le masque de l'image précédente, lu là où le vecteur de mouvement du jeu
+    // dit que ce point se trouvait, si la profondeur y correspond (sinon : point découvert, rien à reprendre)
+    if (motionConvention < 16 && w > 0 && w < 1e5)
+    {
+        const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
+        float2 mv = float2(f16tof32(raw & 0xFFFF), f16tof32(raw >> 16));
+        const uint k = motionConvention;
+        mv = (k & 3) == 0 ? mv : (k & 3) == 1 ? mv * 0.5 : (k & 3) == 2 ? mv / float2(width, height) : mv * 2.0;
+        if (k & 4)
+            mv = -mv;
+        if (k & 8)
+            mv.y = -mv.y;
+        const float2 prevUv = (float2(id) + 0.5) / float2(width, height) + mv;
+        if (all(isfinite(mv)) && all(prevUv > 0) && all(prevUv < 1))
+        {
+            const float2 q = prevUv * float2(width, height) - 0.5;
+            const int2 b = int2(floor(q));
+            const float2 f = q - b;
+            float hist = 0, wsum = 0;
+            for (int j = 0; j < 4; j++)
+            {
+                const int2 t = clamp(b + int2(j & 1, j >> 1), int2(0, 0), int2(width - 1, height - 1));
+                const uint rawD = depthPrev.Load(t.y * depthPitch + t.x * 4);
+                const float dp = depth24 != 0 ? float(rawD & 0xFFFFFF) / 16777215.0 : asfloat(rawD);
+                const float wp = gB / (dp - gA);
+                const float bw = ((j & 1) ? f.x : 1 - f.x) * ((j >> 1) ? f.y : 1 - f.y);
+                if (wp > 0 && abs(wp - w) < 0.04 * w + 0.05)
+                    hist += asfloat(prevShadow.Load(t.y * shadowPitch + t.x * 4)) * bw, wsum += bw;
+            }
+            if (wsum > 0.25)
+                lit = lerp(hist / wsum, lit, temporalAlpha);
+        }
+    }
     shadow.Store(id.y * shadowPitch + id.x * 4, asuint(lit));
 }

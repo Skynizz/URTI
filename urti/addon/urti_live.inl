@@ -17,6 +17,7 @@
 #include "live_composite_cs.h" // g_live_composite
 #include "live_reflect_cs.h"   // g_live_reflect
 #include "live_depthfit_cs.h"  // g_live_depthfit
+#include "live_mvcal_cs.h"     // g_live_mvcal
 
 struct LiveState
 {
@@ -33,6 +34,14 @@ struct LiveState
     ComPtr<ID3D12PipelineState> convertPso, shadowPso;
     ComPtr<ID3D12Resource> view, blas, blasScratch, tlas, tlasScratch, instances, depthBuf, shadowBuf, mask, counterReadback[3];
     ComPtr<ID3D12Resource> prevShadowBuf; // masque de l'image réelle précédente (images générées : mélange)
+    // accumulation dans le temps : vecteurs de mouvement du jeu (G-buffer), profondeur précédente
+    ComPtr<ID3D12Resource> mvBuf, depthPrevBuf, mvErrors, mvErrorsReadback[3];
+    ComPtr<ID3D12RootSignature> mvcalRs;
+    ComPtr<ID3D12PipelineState> mvcalPso;
+    uint64_t mvBytes = 0, mvFrame = ~0ull;
+    uint32_t mvPitch = 0, mvWidth = 0, mvHeight = 0, mvConvention = 255, mvMovingFrames = 0;
+    double mvErr[16] = {}, mvCount[16] = {};
+    float temporalAlpha = 0.3f;
     uint32_t fgMode = 0;                  // images générées : 0 même masque, 1 sans RT, 2 mélange des deux dernières
     // stabilité du soleil : écart d'une image mesurée à la suivante
     float lastSun[3] = {};
@@ -94,7 +103,7 @@ struct LiveState
     uint64_t framesSinceSun = 0, sunFrames = 0, sunAccepted = 0, pairSum = 0;
 } live;
 constexpr uint32_t kLiveMaxPairs = 256;
-constexpr uint32_t kLiveSunBytes = 48 + 8 * 64; // soleil, bilan, nombre de cascades, 8 cascades (application, viewport)
+constexpr uint32_t kLiveSunBytes = 48 + 8 * 64 + 16; // soleil, bilan, cascades, puis un soleil en attente de confirmation
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
@@ -105,8 +114,8 @@ void LiveSaveCalibration()
     if (FILE* f = std::fopen((g_dir + "\\urti_calib.ini").c_str(), "w"))
     {
         std::fprintf(f, "; étalonnage URTI de ce jeu (relu au lancement ; F6 le refait)\n");
-        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\n", live.A, live.B, live.sunSign > 0 ? 1 : -1, live.sunMapWidth,
-                     live.sunMapHeight, live.sunMapFormat);
+        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\n", live.A, live.B, live.sunSign > 0 ? 1 : -1, live.sunMapWidth,
+                     live.sunMapHeight, live.sunMapFormat, live.mvConvention);
         std::fclose(f);
     }
 }
@@ -136,6 +145,9 @@ void LiveLoadCalibration()
     {
         std::sscanf(line, "depth_a=%lf", &a), std::sscanf(line, "depth_b=%lf", &b), std::sscanf(line, "sun_sign=%d", &sign);
         std::sscanf(line, "sun_map=%ux%u:%u", &w, &h, &fmt);
+        unsigned motionConvention = 255;
+        if (std::sscanf(line, "motion=%u", &motionConvention) == 1 && motionConvention < 16)
+            live.mvConvention = motionConvention;
     }
     std::fclose(f);
     if (b == 0 || !sign || !w)
@@ -393,7 +405,7 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
 bool LiveCreatePipelines(ID3D12Device* device)
 {
     auto make = [&](const void* code, size_t size, int srvCount, ComPtr<ID3D12RootSignature>& rs, ComPtr<ID3D12PipelineState>& pso, uint32_t constants) {
-        D3D12_ROOT_PARAMETER p[6] = {}; // jusqu'à 4 SRV, 1 UAV, constantes
+        D3D12_ROOT_PARAMETER p[9] = {}; // jusqu'à 7 SRV, 1 UAV, constantes
         for (int i = 0; i < srvCount; i++)
         {
             p[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -413,7 +425,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 4, live.shadowRs, live.shadowPso, 16) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 20) &&
+           make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
            make(g_live_composite, sizeof(g_live_composite), 4, live.compositeRs, live.compositePso, 12) &&
@@ -505,6 +518,8 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     live.shadowPitch = (live.width * 4 + 255) / 256 * 256;
     live.shadowBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.prevShadowBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_COPY_DEST);
+    Retire(live.depthPrevBuf);
+    live.depthPrevBuf = UavBuffer(device, total, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC td = {};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -632,13 +647,56 @@ void LiveHotReload(ID3D12Device* device)
 
 void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates)
 {
-    if (!g_liveCapture || !live.enabled || live.reflStrength <= 0 || !OurDevice(cmd->get_device()))
+    if (!g_liveCapture || !live.enabled || !OurDevice(cmd->get_device()))
         return;
-    uint64_t target = 0;
+    uint64_t target = 0, motionTarget = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (live.materialSlot < g_liveGbufferCount)
+        if (live.materialSlot < g_liveGbufferCount && live.reflStrength > 0)
             target = g_liveGbuffer[live.materialSlot];
+        // vecteurs de mouvement : la cible du G-buffer en deux flottants 16 bits
+        for (uint32_t k = 0; k < g_liveGbufferCount && !motionTarget; k++)
+            if (g_liveGbuffer[k])
+            {
+                const DXGI_FORMAT f = reinterpret_cast<ID3D12Resource*>(g_liveGbuffer[k])->GetDesc().Format;
+                if (f == DXGI_FORMAT_R16G16_FLOAT || f == DXGI_FORMAT_R16G16_TYPELESS)
+                    motionTarget = g_liveGbuffer[k];
+            }
+    }
+    for (uint32_t i = 0; i < count && motionTarget; i++)
+    {
+        if (resources[i].handle != motionTarget)
+            continue;
+        const uint32_t before = PassD3D12State(static_cast<uint32_t>(oldStates[i])), after = PassD3D12State(static_cast<uint32_t>(newStates[i]));
+        if (!(before & D3D12_RESOURCE_STATE_RENDER_TARGET) || (after & D3D12_RESOURCE_STATE_RENDER_TARGET))
+            continue;
+        ID3D12Resource* res = reinterpret_cast<ID3D12Resource*>(motionTarget);
+        const D3D12_RESOURCE_DESC d = res->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT64 total = 0;
+        g.device->GetCopyableFootprints(&d, 0, 1, 0, &fp, nullptr, nullptr, &total);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!live.mvBuf || live.mvBytes < total)
+        {
+            Retire(live.mvBuf);
+            live.mvBuf = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
+            live.mvBytes = total;
+            Log("URTI direct : vecteurs de mouvement du jeu %llux%u copiés à chaque image (accumulation dans le temps)", (unsigned long long)d.Width, d.Height);
+        }
+        if (!live.mvBuf)
+            break;
+        ID3D12GraphicsCommandList* l = Native(cmd);
+        Transition(l, res, D3D12_RESOURCE_STATES(after), D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+        dst.pResource = live.mvBuf.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = fp;
+        src.pResource = res;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Transition(l, res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATES(after));
+        live.mvPitch = fp.Footprint.RowPitch, live.mvWidth = uint32_t(d.Width), live.mvHeight = d.Height, live.mvFrame = live.frame;
+        break;
     }
     if (!target)
         return;
@@ -816,6 +874,44 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         live.sunReadback[live.frame % 3]->Unmap(0, nullptr);
     }
+    if (live.mvConvention == 255 && live.mvErrorsReadback[live.frame % 3])
+        if (const uint32_t* e = nullptr; SUCCEEDED(live.mvErrorsReadback[live.frame % 3]->Map(0, nullptr, (void**)&e)) && e)
+        {
+            const double meanMotion = e[33] ? e[32] / 1e6 / e[33] : 0;
+            if (meanMotion > 0.0008) // la caméra bouge : les candidates se départagent
+            {
+                for (int k = 0; k < 16; k++)
+                    live.mvErr[k] += e[k * 2] / 10000.0, live.mvCount[k] += e[k * 2 + 1];
+                if (++live.mvMovingFrames >= 90)
+                {
+                    int best = -1, second = -1;
+                    double bestErr = 1e30, secondErr = 1e30;
+                    for (int k = 0; k < 16; k++)
+                    {
+                        if (live.mvCount[k] < 500)
+                            continue;
+                        const double m = live.mvErr[k] / live.mvCount[k];
+                        if (m < bestErr)
+                            second = best, secondErr = bestErr, best = k, bestErr = m;
+                        else if (m < secondErr)
+                            second = k, secondErr = m;
+                    }
+                    if (best >= 0 && bestErr < 0.7 * secondErr)
+                    {
+                        live.mvConvention = uint32_t(best);
+                        Log("URTI direct : convention des vecteurs de mouvement trouvée (%d : erreur %.4f, suivante %.4f) : accumulation des ombres active", best,
+                            bestErr, secondErr);
+                        if (live.verified || live.fromStore)
+                            LiveSaveCalibration();
+                    }
+                    else
+                        Log("URTI direct : vecteurs de mouvement pas encore départagés (meilleure %.4f, suivante %.4f), on continue", bestErr, secondErr);
+                    std::fill(std::begin(live.mvErr), std::end(live.mvErr), 0.0), std::fill(std::begin(live.mvCount), std::end(live.mvCount), 0.0);
+                    live.mvMovingFrames = 0;
+                }
+            }
+            live.mvErrorsReadback[live.frame % 3]->Unmap(0, nullptr);
+        }
     if (live.lastPresentDraws == 0 && live.bound)
     {
         live.statNoDraw++;
@@ -1069,6 +1165,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     uav.UAV.pResource = live.tlas.Get();
     list->ResourceBarrier(1, &uav);
 
+    // 3a. profondeur de l'image précédente gardée (accumulation dans le temps)
+    if (live.depthPrevBuf)
+    {
+        Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyResource(live.depthPrevBuf.Get(), live.depthBuf.Get());
+        Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     // 3. profondeur du jeu (copie de ReShade) vers un tampon lisible par le shader
     const D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     Transition(list.Get(), depthCopy, depthState, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1146,7 +1249,19 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, live.sunBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(3, atlasValid ? live.atlasBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(4, live.shadowBuf->GetGPUVirtualAddress());
+    const bool motionOk = live.mvBuf && live.mvFrame != ~0ull && live.frame <= live.mvFrame + 1 && live.mvWidth == live.width &&
+                          live.mvHeight == live.height && live.depthPrevBuf;
+    if (motionOk)
+    {
+        Transition(list.Get(), live.mvBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+        Transition(list.Get(), live.depthPrevBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+    }
+    if (live.prevShadowBuf)
+        Transition(list.Get(), live.prevShadowBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+    list->SetComputeRootShaderResourceView(4, live.prevShadowBuf ? live.prevShadowBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(5, motionOk ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(6, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(7, live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     const bool sunNow = live.calibrated && live.framesSinceSun < 30;
@@ -1158,10 +1273,50 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t width, height, depthPitch, shadowPitch;
         float A, B, p00, p11, clearDepth;
         uint32_t d24, atlasPitch, flags;
+        uint32_t motionPitch, motionConvention;
+        float temporalAlpha;
+        uint32_t pad;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
-             live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags };
-    list->SetComputeRoot32BitConstants(5, 16, &sc, 0);
+             live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
+             live.mvPitch, motionOk && live.prevShadowBuf ? live.mvConvention : 255u, live.temporalAlpha, 0 };
+    list->SetComputeRoot32BitConstants(8, 20, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+    // recherche de la convention des vecteurs de mouvement (tant qu'elle n'est pas trouvée)
+    if (motionOk && live.mvConvention == 255 && live.mvcalPso)
+    {
+        if (!live.mvErrors)
+        {
+            live.mvErrors = UavBuffer(g.device, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            for (auto& r : live.mvErrorsReadback)
+                r = MakeBuffer(g.device, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        }
+        if (live.mvErrors)
+        {
+            Transition(list.Get(), live.mvErrors.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(live.mvErrors.Get(), 0, g.zeros.Get(), 0, 256);
+            Transition(list.Get(), live.mvErrors.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->SetComputeRootSignature(live.mvcalRs.Get());
+            list->SetPipelineState(live.mvcalPso.Get());
+            list->SetComputeRootShaderResourceView(0, live.depthBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, live.depthPrevBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, live.mvBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(3, live.sunBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(4, live.mvErrors->GetGPUVirtualAddress());
+            const uint32_t mc[8] = { live.width, live.height, live.depthPitch, live.mvPitch, d24 ? 1u : 0u, 0, 0, 0 };
+            list->SetComputeRoot32BitConstants(5, 8, mc, 0);
+            list->Dispatch(16, 1, 1); // 4096 échantillons
+            Transition(list.Get(), live.mvErrors.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(live.mvErrorsReadback[live.frame % 3].Get(), 0, live.mvErrors.Get(), 0, 256);
+            Transition(list.Get(), live.mvErrors.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+    }
+    if (motionOk)
+    {
+        Transition(list.Get(), live.mvBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+        Transition(list.Get(), live.depthPrevBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (live.prevShadowBuf)
+        Transition(list.Get(), live.prevShadowBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     if (atlasValid)
         Transition(list.Get(), live.atlasBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);

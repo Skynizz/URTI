@@ -73,7 +73,18 @@ void main(uint t : SV_GroupThreadID)
         // saut brusque soutenu par peu de paires : mesure rejetée (le soleil de l'image précédente reste)
         const float3 old = asfloat(sun.Load3(0));
         const bool jump = dot(old, old) > 0.5 && dot(normalize(sum) * sunSign, old) < 0.99863 && share < 0.6; // 3°
-        if (dot(sum, sum) > 0 && !jump)
+        // grand écart (> 3°) même bien soutenu : accepté seulement s'il se confirme à l'image suivante
+        // (une fausse mesure isolée ferait pivoter toutes les ombres pendant une image)
+        bool confirmed = true;
+        if (dot(sum, sum) > 0 && !jump && dot(old, old) > 0.5 && dot(normalize(sum) * sunSign, old) < 0.99863)
+        {
+            const float4 pending = asfloat(sun.Load4(560));
+            confirmed = pending.w > 0 && dot(pending.xyz, normalize(sum) * sunSign) > 0.99939; // 2°
+            sun.Store4(560, asuint(float4(normalize(sum) * sunSign, confirmed ? 0.0 : 1.0)));
+        }
+        else
+            sun.Store4(560, asuint(float4(0, 0, 0, 0)));
+        if (dot(sum, sum) > 0 && !jump && confirmed)
         {
             sun.Store4(0, asuint(float4(normalize(sum) * sunSign, 1)));
             accepted = 1;
