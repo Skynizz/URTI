@@ -692,8 +692,8 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
 
 - Bac à sable plus proche d'un jeu : TAA (historique reprojeté, borné, mise à l'échelle) — l'image
   native est stable d'une image à l'autre comme dans RDR2 ; rue mouillée réglable (`URTI_SANDBOX_WET`),
-  objets mobiles figés à la demande, mur pour l'occlusion, décalage sous-pixel coupable
-  (`URTI_SANDBOX_JITTER=0`).
+  objets mobiles figés à la demande, mur pour l'occlusion, décalage sous-pixel
+  désactivable (`URTI_SANDBOX_JITTER=0`).
 - **Vérité terrain** (`URTI_SANDBOX_TRUTH=1`, `--verite`) : le sol reflète la scène exacte (rendue en
   miroir), mélangée avec la même règle qu'URTI (Fresnel f0 0,04, lissé > 0,35, plafond 4). On mesure
   l'écart des reflets RT à l'image idéale ; un reflet qui bouge normalement ne compte plus comme un saut.
