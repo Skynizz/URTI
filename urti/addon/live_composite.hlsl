@@ -9,6 +9,7 @@ ByteAddressBuffer mask : register(t1);       // 1 éclairé, 0 ombre ajoutée (f
 ByteAddressBuffer reflection : register(t2); // float4 par pixel de rendu : u, v, poids, lissé
 ByteAddressBuffer prevMask : register(t3);   // masque de l'image réelle précédente (images générées, mélange)
 ByteAddressBuffer resolvedRefl : register(t4); // reflets stabilisés (live_reflresolve) : couleur × poids, poids
+ByteAddressBuffer preUi : register(t5);      // photo de l'écran avant l'interface du jeu (bit 10 de debugReflect)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 
 cbuffer Constants : register(b0)
@@ -25,7 +26,7 @@ cbuffer Constants : register(b0)
     uint showMask;      // 1 : masque d'ombres seul
     float reflStrength; // 0 : pas de reflets RT
     uint debugReflect;  // 1 lissé du matériau, 2 poids des reflets, 3 couleur reflétée seule ; bit 8 : mélanger avec prevMask ;
-                        // bit 9 : reflets stabilisés disponibles (resolvedRefl)
+                        // bit 9 : reflets stabilisés disponibles (resolvedRefl) ; bit 10 : photo avant l'interface (preUi)
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -43,6 +44,9 @@ float3 NitsToPq(float3 l)
 
 uint Address(int2 px) { return uint(px.y) * pitch + uint(px.x) * (format == 3 ? 8 : 4); }
 
+// couleurs lues dans la photo d'avant l'interface quand elle existe (les reflets n'y prennent pas les menus)
+static bool gPre = false;
+
 // lumière linéaire (HDR10 : nits / 203, blanc de référence à 1)
 float3 LoadLinear(int2 px)
 {
@@ -50,10 +54,10 @@ float3 LoadLinear(int2 px)
     const uint a = Address(px);
     if (format == 3)
     {
-        const uint2 raw = image.Load2(a);
+        const uint2 raw = gPre ? preUi.Load2(a) : image.Load2(a);
         return float3(f16tof32(raw.x & 0xFFFF), f16tof32(raw.x >> 16), f16tof32(raw.y & 0xFFFF));
     }
-    const uint raw = image.Load(a);
+    const uint raw = gPre ? preUi.Load(a) : image.Load(a);
     if (format == 2)
         return PqToNits(float3(raw & 1023, (raw >> 10) & 1023, (raw >> 20) & 1023) / 1023.0) / 203.0;
     const float3 c = float3(raw & 255, (raw >> 8) & 255, (raw >> 16) & 255) / 255.0;
@@ -106,6 +110,21 @@ void main(uint2 id : SV_DispatchThreadID)
     if (id.x >= width || id.y >= height)
         return;
     const int2 px = int2(id);
+    // interface du jeu (pixel différent de la photo d'avant l'interface) : laissée telle quelle, sans ombre
+    // ni reflet par-dessus
+    if (debugReflect & 0x400)
+    {
+        const uint a = Address(px);
+        if (format == 3 ? any(image.Load2(a) != preUi.Load2(a)) : image.Load(a) != preUi.Load(a))
+        {
+            if (format == 3)
+                output.Store2(a, image.Load2(a));
+            else
+                output.Store(a, image.Load(a));
+            return;
+        }
+        gPre = true;
+    }
     if (split != 0 && id.x == width / 2)
     {
         StoreLinear(px, float3(1, 1, 1));

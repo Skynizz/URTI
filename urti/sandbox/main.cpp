@@ -21,7 +21,8 @@
 // visible), URTI_SANDBOX_CAMERA=marche|fixe|orbite|batiment|arbre|rue|occlusion (les quatre derniers :
 // plans fixes des tests, voir tools/reshade/urti_sandbox_suite.sh), URTI_SANDBOX_FG=1 (génération d'images),
 // URTI_SANDBOX_SDR=1 (sortie sRGB au lieu de HDR10), URTI_SANDBOX_START=secondes (début du scénario),
-// URTI_SANDBOX_LEAVES=blocs (feuilles en petits blocs pleins au lieu de plaques découpées),
+// URTI_SANDBOX_UI=0 (sans interface : mini-carte, barres, menu qui s'ouvre 2 s toutes les 4 s, dessinés dans
+// l'image d'écran après la scène, comme un jeu), URTI_SANDBOX_LEAVES=blocs (feuilles en petits blocs pleins au lieu de plaques découpées),
 // URTI_SANDBOX_JITTER=0 (sans décalage sous-pixel), URTI_SANDBOX_WIND=facteur (0 : pas de vent), URTI_SANDBOX_MOVERS=0 (charrettes et passants immobiles),
 // URTI_SANDBOX_WET=0..1 (part du sol couverte d'eau ; défaut : flaques éparses), URTI_SANDBOX_TRUTH=1 (vérité
 // terrain : le sol reflète la scène exacte, rendue en miroir, mélangée avec la même règle qu'URTI ; un
@@ -226,7 +227,13 @@ cbuffer Object : register(b1)
     float4 color;  // albédo
     float4 params; // x : vent (multiplicateur), y : 1 sol à flaques, z : réservé, w : métal
 };
-cbuffer PassConstants : register(b2) { uint cascade; uint3 passPad; };
+cbuffer PassConstants : register(b2)
+{
+    uint cascade;
+    uint3 passPad;
+    float4 uiRect;  // interface : rectangle (NDC : gauche, haut, droite, bas)
+    float4 uiColor; // couleur déjà encodée pour l'écran, alpha
+};
 
 Texture2D<float4> gAlbedo : register(t0);
 Texture2D<float4> gNormal : register(t1);
@@ -501,6 +508,14 @@ float3 NitsToPq(float3 l)
     return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
 }
 float3 LinearToSrgb(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
+
+// interface du jeu : un rectangle plein, mélangé par son alpha, dessiné dans l'image d'écran
+float4 vsUi(uint id : SV_VertexID) : SV_Position
+{
+    const float2 c = float2((id & 1) ? uiRect.z : uiRect.x, (id & 2) ? uiRect.w : uiRect.y);
+    return float4(c, 0, 1);
+}
+float4 psUi() : SV_Target { return uiColor; }
 
 float4 psUpscale(FullOut i) : SV_Target
 {
@@ -952,6 +967,7 @@ int main()
     const float wet = float(std::atof(env("URTI_SANDBOX_WET", "-1").c_str()));
     const bool truth = env("URTI_SANDBOX_TRUTH", "0") != "0";
     const bool leafCards = env("URTI_SANDBOX_LEAVES", "cartes") != "blocs"; // feuillage en plaques découpées (défaut) ou en blocs
+    const bool ui = env("URTI_SANDBOX_UI", "1") != "0";
     const float jitter = float(std::atof(env("URTI_SANDBOX_JITTER", "1").c_str())); // 0 : sans décalage sous-pixel
     const double fpsCap = std::atof(env("URTI_SANDBOX_FPS", "90").c_str());
 
@@ -1023,7 +1039,7 @@ int main()
                                               D3D12_RESOURCE_STATE_COPY_SOURCE, &finalClear);
 
     // ---------------- descripteurs ----------------
-    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 10 };
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 10 + kBuffers };
     ComPtr<ID3D12Resource> mirror = Texture(device.Get(), kRenderW, kRenderH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &litClear);
     ComPtr<ID3D12Resource> mirrorDepth = Texture(device.Get(), kRenderW, kRenderH, DXGI_FORMAT_R32_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
@@ -1098,7 +1114,7 @@ int main()
         D3D12_ROOT_PARAMETER p[4] = {};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, p[0].Descriptor.ShaderRegister = 0;
         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV, p[1].Descriptor.ShaderRegister = 1;
-        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, p[2].Constants.ShaderRegister = 2, p[2].Constants.Num32BitValues = 4;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, p[2].Constants.ShaderRegister = 2, p[2].Constants.Num32BitValues = 12;
         p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, p[3].DescriptorTable.NumDescriptorRanges = 1, p[3].DescriptorTable.pDescriptorRanges = &range;
         p[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_STATIC_SAMPLER_DESC s[2] = {};
@@ -1184,6 +1200,30 @@ int main()
     ComPtr<ID3D12PipelineState> lightingPso = fullscreenPso("psLighting", DXGI_FORMAT_R16G16B16A16_FLOAT);
     ComPtr<ID3D12PipelineState> upscalePso = fullscreenPso("psUpscale", outFormat);
     ComPtr<ID3D12PipelineState> taaPso = fullscreenPso("psTaa", DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // interface : rectangles mélangés par leur alpha, dans l'image d'écran (une vue par image d'écran)
+    ComPtr<ID3D12PipelineState> uiPso;
+    {
+        ComPtr<ID3DBlob> v = Compile("vsUi", "vs_5_1", false), q = Compile("psUi", "ps_5_1", false);
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+        d.pRootSignature = rootSig.Get();
+        d.VS = { v->GetBufferPointer(), v->GetBufferSize() };
+        d.PS = { q->GetBufferPointer(), q->GetBufferSize() };
+        D3D12_RENDER_TARGET_BLEND_DESC& b = d.BlendState.RenderTarget[0];
+        b.BlendEnable = TRUE;
+        b.SrcBlend = D3D12_BLEND_SRC_ALPHA, b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA, b.BlendOp = D3D12_BLEND_OP_ADD;
+        b.SrcBlendAlpha = D3D12_BLEND_ONE, b.DestBlendAlpha = D3D12_BLEND_ZERO, b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+        d.SampleMask = UINT_MAX;
+        d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        d.NumRenderTargets = 1;
+        d.RTVFormats[0] = outFormat;
+        d.SampleDesc.Count = 1;
+        CHECK(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&uiPso)));
+    }
+    for (UINT i = 0; i < kBuffers; i++)
+        device->CreateRenderTargetView(backBuffers[i].Get(), nullptr, rtv(10 + i));
 
     // ---------------- maillages, tonneaux par ExecuteIndirect ----------------
     Geometry geo;
@@ -1488,7 +1528,37 @@ int main()
         ID3D12Resource* bb = backBuffers[swapchain->GetCurrentBackBufferIndex()].Get();
         Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(bb, finalTex.Get());
-        Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        if (ui)
+        {
+            // 7. interface du jeu, dessinée par-dessus la scène dans l'image d'écran
+            Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const D3D12_CPU_DESCRIPTOR_HANDLE bbv = rtv(10 + swapchain->GetCurrentBackBufferIndex());
+            list->OMSetRenderTargets(1, &bbv, FALSE, nullptr);
+            list->RSSetViewports(1, &dvp);
+            list->RSSetScissorRects(1, &dsr);
+            list->SetPipelineState(uiPso.Get());
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            auto rect = [&](float x0, float y0, float x1, float y1, float r, float g, float b, float a) {
+                const float c[8] = { x0, y0, x1, y1, r, g, b, a };
+                list->SetGraphicsRoot32BitConstants(2, 8, c, 4);
+                list->DrawInstanced(4, 1, 0, 0);
+            };
+            // valeurs déjà encodées pour l'écran (PQ en HDR10 : 0,58 ~ 200 nits)
+            rect(-0.95f, -0.55f, -0.65f, -0.95f, 0.25f, 0.22f, 0.18f, 0.85f); // mini-carte
+            rect(-0.92f, -0.6f, -0.68f, -0.62f, 0.62f, 0.6f, 0.55f, 1.0f);
+            rect(-0.95f, 0.92f, -0.55f, 0.89f, 0.6f, 0.15f, 0.12f, 1.0f); // barres de vie et d'endurance
+            rect(-0.95f, 0.87f, -0.62f, 0.84f, 0.55f, 0.55f, 0.55f, 1.0f);
+            if (std::fmod(t, 4.0f) > 2.0f) // menu ouvert
+            {
+                rect(-0.45f, 0.6f, 0.45f, -0.6f, 0.05f, 0.05f, 0.06f, 0.75f);
+                for (int k = 0; k < 6; k++)
+                    rect(-0.38f, 0.48f - k * 0.17f, 0.2f - 0.05f * k, 0.43f - k * 0.17f, 0.62f, 0.6f, 0.52f, 1.0f);
+            }
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        }
+        else
+            Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
         stamp(6);
         list->ResolveQueryData(stampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, kStamps, stampBuf.Get(), 0);
         CHECK(list->Close());

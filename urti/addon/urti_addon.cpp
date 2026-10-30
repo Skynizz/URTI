@@ -85,6 +85,28 @@ struct LiveRegion
     uint32_t offset = 0, capacity = 0, counter = 0, id = 0;
 };
 std::unordered_map<uint64_t, uint32_t> g_liveKeyRank; // dessins de l'écran de chaque signature dans cette image
+// budget de géométrie (urti_live.inl le met à jour à chaque image) : un objet déjà mesuré et peu important
+// (petit, lointain) n'entre pas dans la scène RT ; ceux à re-mesurer sont captés dans la zone de mesure, à
+// la fin de l'emplacement, hors de la structure d'accélération
+std::vector<LiveRegion> g_liveProbes[4];
+uint32_t g_liveProbeUsed[4] = {};
+std::unordered_set<uint32_t> g_liveKnown, g_liveAdmit, g_liveProbeWant;
+std::unordered_map<uint32_t, uint32_t> g_liveSeen; // identités de l'écran dans cette image -> sommets
+// ExecuteIndirect : nombre de sommets inconnu avant le dessin ; on réservait 65 536 sommets à chacun (place
+// vide prise dans l'emplacement et dans la structure). Taille apprise par identité (mesurée), marge comprise.
+std::unordered_map<uint32_t, uint32_t> g_liveLearned;
+uint64_t g_liveReserved = 0; // sommets réservés dans l'écran principal (bilan)
+// photos de l'écran au premier dessin de chaque liaison de l'image d'écran (urti_live.inl choisit celle
+// d'avant l'interface du jeu : les reflets n'y prennent pas les menus, la composition épargne l'interface)
+constexpr uint32_t kLiveSnaps = 4;
+std::unordered_set<uint64_t> g_liveBackBuffers;
+ID3D12Resource* g_liveSnap[kLiveSnaps] = {};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_liveSnapFp = {};
+uint32_t g_liveSnapCount = 0;
+bool g_liveBudget = false;
+uint64_t g_liveMainDepth = 0; // profondeur de l'écran principal (celle dont le flux fait la scène RT) : seule soumise au budget
+uint64_t g_liveSlotLimit = 0; // essai (urti.ini slot_limit=, sommets) : emplacement réduit, pour reproduire la saturation
+uint32_t g_liveOverflow = 0, g_liveOutOfBudget = 0;
 std::vector<LiveRegion> g_liveRegions[4]; // par emplacement (kSlots), dans l'ordre d'attribution
 uint32_t g_liveCursor[4] = {};            // octets attribués dans chaque emplacement
 uint32_t g_liveNextCounter = 4;           // compteurs par dessin après ceux des emplacements
@@ -395,6 +417,8 @@ struct CommandListState
 {
     uint64_t pipeline = 0;
     uint64_t depth = 0;
+    uint64_t backBuffer = 0; // image d'écran liée en cible (photo avant l'interface au premier dessin)
+    bool snapped = false;
     float viewport[4] = {}; // x, y, largeur, hauteur (le premier)
 };
 
@@ -529,8 +553,12 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
     if (g_liveCapture && depth && count >= 3)
         for (uint32_t i = 0; i < count && i < 8; i++)
             targets[i] = rtvs[i].handle ? cmd->get_device()->get_resource_from_view(rtvs[i]).handle : 0;
+    const uint64_t first = count && rtvs[0].handle && !g_liveBackBuffers.empty() ? cmd->get_device()->get_resource_from_view(rtvs[0]).handle : 0;
     std::lock_guard<std::mutex> lock(g_mutex);
-    g.lists[cmd->get_native()].depth = depth;
+    CommandListState& st = g.lists[cmd->get_native()];
+    st.depth = depth;
+    st.backBuffer = first && g_liveBackBuffers.count(first) ? first : 0;
+    st.snapped = false;
     if (targets[0])
         if (auto it = g.screenLike.find(depth); it != g.screenLike.end() && it->second == 1 && count >= g_liveGbufferCount)
         {
@@ -694,11 +722,42 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         // arrondie à trois sommets : la structure d'accélération forme les triangles par triplets depuis le
         // début du flux ; une zone d'un autre multiple décalerait toutes les suivantes (triangles géants
         // reliant des objets différents)
-        const uint64_t vertices = (kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]) + 2) / 3 * 3;
-        const uint32_t capacity = uint32_t(std::min<uint64_t>(vertices * 16, kSlotBytes));
+        uint64_t vertices = (kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]) + 2) / 3 * 3;
+        uint32_t capacity = uint32_t(std::min<uint64_t>(vertices * 16, kSlotBytes));
         LiveRegion region;
+        bool probe = false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            // identité, avant tout refus : le rang parmi les dessins de même signature ne doit pas dépendre
+            // des dessins refusés (sinon les identités glissent quand l'emplacement est plein)
+            uint32_t id = 0;
+            if (screen)
+            {
+                const uint64_t h = (key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[key]++;
+                id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
+                if (kind == 2)
+                    if (const auto it = g_liveLearned.find(id); it != g_liveLearned.end())
+                    {
+                        vertices = std::min<uint64_t>(65536, (uint64_t(it->second) * 5 / 4 + 64 + 2) / 3 * 3);
+                        capacity = uint32_t(vertices * 16);
+                    }
+                // tous les dessins comptent pour choisir l'écran principal, même hors budget (sinon une autre
+                // profondeur, moins chargée, finirait par passer devant)
+                g.slotDraws[slot]++;
+            }
+            if (screen && state.depth == g_liveMainDepth)
+            {
+                g_liveSeen[id] = uint32_t(vertices);
+                if (g_liveBudget && g_liveKnown.count(id) && !g_liveAdmit.count(id))
+                {
+                    if (!g_liveProbeWant.count(id))
+                    {
+                        g_liveOutOfBudget++;
+                        return; // hors budget, mesure récente : pas capté du tout
+                    }
+                    probe = true;
+                }
+            }
             bool marked = false;
             if (sunMap)
             {
@@ -711,25 +770,34 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                     return;
             }
             else
-                marked = g_liveMarks.size() < kLiveMaxMarks && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
-            if (!capacity || uint64_t(g_liveCursor[slot]) + capacity > kSlotBytes || g_liveNextCounter >= kMaxDraws)
-                return; // emplacement plein : ce dessin n'est pas capté
-            uint32_t id = 0;
-            if (screen)
+                marked = !probe && g_liveMarks.size() < kLiveMaxMarks && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
+            const uint64_t limit = g_liveSlotLimit ? std::min<uint64_t>(kSlotBytes, g_liveSlotLimit * 16) : kSlotBytes;
+            if (!capacity || uint64_t(g_liveCursor[slot]) + g_liveProbeUsed[slot] + capacity > limit || g_liveNextCounter >= kMaxDraws)
             {
-                const uint64_t h = (key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[key]++;
-                id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
+                if (screen && !probe)
+                    g_liveOverflow++;
+                return; // emplacement plein : ce dessin n'est pas capté
             }
-            region = { g_liveCursor[slot], capacity, g_liveNextCounter++, id };
-            g_liveCursor[slot] += (capacity + 15) & ~15u;
-            if (screen)
-                g_liveRegions[slot].push_back(region);
+            if (probe)
+            {
+                // zone de mesure : depuis la fin de l'emplacement, vers le début
+                g_liveProbeUsed[slot] += (capacity + 15) & ~15u;
+                region = { uint32_t(limit - g_liveProbeUsed[slot]), capacity, g_liveNextCounter++, id };
+                g_liveProbes[slot].push_back(region);
+            }
+            else
+            {
+                region = { g_liveCursor[slot], capacity, g_liveNextCounter++, id };
+                g_liveCursor[slot] += (capacity + 15) & ~15u;
+                if (screen)
+                    g_liveRegions[slot].push_back(region);
+                if (screen && state.depth == g_liveMainDepth)
+                    g_liveReserved += vertices;
+            }
             if (marked)
                 g_liveMarks.push_back({ key, uint32_t(slot), sunMap, { state.viewport[0], state.viewport[1], state.viewport[2], state.viewport[3] },
                                         region.offset, region.capacity, region.counter });
         }
-        if (screen)
-            g.slotDraws[slot]++;
         D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes + region.offset, region.capacity,
                                                  g.counters->GetGPUVirtualAddress() + region.counter * 8ull };
         list->SetPipelineState(shadow);
@@ -773,8 +841,46 @@ void CountDevice(command_list* cmd)
     g.drawsPerDevice[cmd->get_device()->get_native()]++;
 }
 
+// premier dessin dans l'image d'écran depuis sa liaison : photo de son contenu (avant ce dessin)
+void LiveUiSnapshot(command_list* cmd)
+{
+    ID3D12Resource *target = nullptr, *snap = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto it = g.lists.find(cmd->get_native());
+        if (it == g.lists.end() || !it->second.backBuffer || it->second.snapped)
+            return;
+        it->second.snapped = true;
+        if (g_liveSnapCount >= kLiveSnaps || !g_liveSnap[g_liveSnapCount])
+            return;
+        target = reinterpret_cast<ID3D12Resource*>(it->second.backBuffer);
+        snap = g_liveSnap[g_liveSnapCount++];
+        fp = g_liveSnapFp;
+    }
+    ID3D12GraphicsCommandList* list = Native(cmd);
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = target;
+    b.Transition.Subresource = 0;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; // en cible : l'état exigé pour dessiner
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &b);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = snap;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    src.pResource = target;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+}
+
 bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
+    if (g_liveCapture)
+        LiveUiSnapshot(cmd);
     g_presentDraws.fetch_add(1, std::memory_order_relaxed);
     PassDraw(cmd->get_native(), vertexCount <= 4 && instanceCount == 1);
     if (g.phase == Phase::Capturing)
@@ -788,6 +894,8 @@ bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uin
 
 bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
+    if (g_liveCapture)
+        LiveUiSnapshot(cmd);
     g_presentDraws.fetch_add(1, std::memory_order_relaxed);
     PassDraw(cmd->get_native(), false);
     if (g.phase == Phase::Capturing)

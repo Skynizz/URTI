@@ -788,3 +788,38 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   d'être reconstruite, avec une reconstruction au moins toutes les 8 images (`blas_refit=`, 0 : toujours
   reconstruire). Bac à sable : 0,65 → 0,35 ms, image identique ; le journal donne maintenant les sommets
   par image et le nombre de reconstructions et de mises à jour.
+
+## v37 — URTI : budget de géométrie, tailles apprises, interface du jeu épargnée
+
+- Le journal de RDR2 (v36) l'a montré : **8 388 605 sommets sur 8 388 608** — l'emplacement de capture
+  est plein à chaque image. Les dessins suivants sont refusés, mais des petits passent encore : les objets
+  présents dans la scène RT changent d'une image à l'autre (ombres et reflets qui sautent), la structure
+  couvre toute la capacité (pas de gain de vitesse) et la liste change toujours (0 mise à jour). Le bac à
+  sable (122 000 sommets) ne pouvait pas le voir.
+- **ExecuteIndirect** : chaque dessin réservait 65 536 sommets (nombre inconnu avant le dessin). Taille
+  maintenant apprise par identité (mesurée, + 25 % et 64 de marge). Bac à sable : la demande passe de
+  122 000 à 60 000 sommets — la moitié de l'emplacement était du vide.
+- **Budget de géométrie** (`vertex_budget=`, 4 millions par défaut ; 0 : sans) : chaque objet capté est
+  mesuré sur le GPU (`live_regionstats.hlsl` : distance minimale et taille dans l'espace caméra) ; seuls
+  les plus importants (taille apparente) entrent dans la scène RT, bonus de 30 % à ceux qui y sont déjà
+  (pas de va-et-vient) ; un objet trop gros pour la place restante est sauté. Les objets hors budget ne
+  sont pas captés du tout (moins de dessins rejoués) et sont re-mesurés par roulement dans une zone de
+  mesure en fin d'emplacement, hors de la structure (`probe_budget=`, 1 million de sommets par image) :
+  un objet dont on s'approche rentre. Le budget ne vaut que pour l'écran principal (une seconde passe de
+  profondeur, comme celle à mi-résolution du bac à sable, faisait changer d'écran principal) ; les
+  identités sont calculées avant tout refus (elles glissaient quand l'emplacement était plein).
+- Saturation reproduite (`slot_limit=` : emplacement réduit) : marche, sauts 1,133 → 1,402 % sans budget ;
+  avec budget, l'image est plus proche de l'idéale (écart 1,16 → 1,08 %, scintillement ajouté +0,067 →
+  +0,021 %). Dans le bac à sable les dessins refusés sont toujours les mêmes ; dans RDR2 ils changent, et
+  c'est cette instabilité que le budget supprime : à confirmer en jeu (le journal donne désormais
+  sommets réservés, objets dans la scène RT, hors budget, re-mesurés, refusés).
+- **Interface du jeu** (menus reflétés au sol) : les reflets lisaient leurs couleurs dans l'image finale,
+  interface comprise, et la composition dessinait ombres et reflets par-dessus les menus. URTI
+  photographie maintenant l'écran au premier dessin de chaque liaison de l'image d'écran (jusqu'à quatre
+  par image) ; `live_uicompare.hlsl` compte les pixels de chaque photo identiques à l'image finale ; la
+  première photo identique à plus de 60 % est l'image d'avant l'interface. Les reflets y lisent leurs
+  couleurs, et les pixels qui en diffèrent (l'interface) sont laissés tels quels. Bac à sable avec une
+  interface (mini-carte, barres, menu ouvert 2 s sur 4) : photo 0 trouvée seule (88,7 % identique) ; sans
+  elle, le menu se reflète au sol et la scène reflétée passe par-dessus ; avec, le menu est propre
+  (`results/urti/bac_a_sable/interface/`). `ui_photo=0` pour comparer.
+- 7 scènes égales ou meilleures (`suite/tableau_v37.txt`) ; pop / dépop 0,138 %.
