@@ -176,6 +176,11 @@ void main(uint2 id : SV_DispatchThreadID)
             StoreLinear(px, r.rgb);
             return;
         }
+        if ((debugReflect & 0xFF) == 4)
+        {
+            StoreLinear(px, saturate(r.a * reflStrength).xxx); // diagnostic : part du reflet RT réellement appliquée
+            return;
+        }
         const float a = saturate(r.a * reflStrength);
         c = c * (1.0 - a) + r.rgb * saturate(reflStrength);
     }

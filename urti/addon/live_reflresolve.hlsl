@@ -74,11 +74,13 @@ float3 SampleLinear(float2 uv)
     return lerp(lerp(LoadLinear(b), LoadLinear(b + int2(1, 0)), f.x), lerp(LoadLinear(b + int2(0, 1)), LoadLinear(b + int2(1, 1)), f.x), f.y);
 }
 
-// reflet courant d'un pixel de rendu : couleur plafonnée × poids, poids
-float4 Current(int2 t)
+// reflet courant d'un pixel de rendu : couleur plafonnée × poids, poids ; known = false si la surface
+// réfléchit mais que le point reflété est caché ou hors de l'écran (donnée manquante, pas un zéro)
+float4 Current(int2 t, out bool known)
 {
     t = clamp(t, int2(0, 0), int2(renderWidth - 1, renderHeight - 1));
     const float4 rf = asfloat(reflection.Load4((uint(t.y) * renderWidth + uint(t.x)) * 16));
+    known = rf.z >= 0;
     if (rf.z <= 0)
         return float4(0, 0, 0, 0);
     float3 c = SampleLinear(rf.xy);
@@ -87,6 +89,9 @@ float4 Current(int2 t)
         c *= maxLuminance / lum;
     return float4(c * rf.z, rf.z);
 }
+
+// reflet caché : part de l'historique gardée à chaque image (0,9 : la moitié après 7 images)
+static const float holdDecay = 0.9;
 
 float ViewDepth(ByteAddressBuffer b, int2 t, float A, float B)
 {
@@ -106,17 +111,24 @@ void main(uint2 id : SV_DispatchThreadID)
     if (flags & 2)
         return; // image générée : le résultat de la dernière image réelle reste
 
-    // courant (couleur prémultipliée par le poids) et statistiques du voisinage 3×3 (moyenne ± γ σ)
-    const float4 cur = Current(t);
+    // courant (couleur prémultipliée par le poids) et statistiques du voisinage 3×3 (moyenne ± γ σ), sur les
+    // pixels dont le reflet est connu. Reflet attendu mais point reflété caché (vitre, feuillage, bord de
+    // l'écran) : l'historique est gardé et s'estompe doucement au lieu de tomber à zéro d'une image à
+    // l'autre (c'était le « pop / dépop » : visible, caché, visible…)
+    bool known;
+    const float4 cur = Current(t, known);
     float4 m1 = 0, m2 = 0;
+    float count = 0;
     for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++)
         {
-            const float4 n = (dx == 0 && dy == 0) ? cur : Current(t + int2(dx, dy));
-            m1 += n, m2 += n * n;
+            bool nk = known;
+            const float4 n = (dx == 0 && dy == 0) ? cur : Current(t + int2(dx, dy), nk);
+            if (nk)
+                m1 += n, m2 += n * n, count += 1;
         }
-    const float4 mean = m1 / 9.0, sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
-    const float4 lo = mean - gamma * sigma, hi = mean + gamma * sigma;
+    const float4 mean = count > 0 ? m1 / count : 0, sigma = count > 0 ? sqrt(max(m2 / count - mean * mean, 0.0)) : 0;
+    const float4 lo = count > 0 ? mean - gamma * sigma : -1e9, hi = count > 0 ? mean + gamma * sigma : 1e9;
 
     float4 result = cur;
     bool done = false;
@@ -145,8 +157,8 @@ void main(uint2 id : SV_DispatchThreadID)
             if (hw > 0.25)
             {
                 hist /= hw;
-                const float4 alo = mean - anchorGamma * sigma, ahi = mean + anchorGamma * sigma;
-                result = lerp(clamp(hist, alo, ahi), cur, anchorAlpha);
+                const float4 alo = count > 0 ? mean - anchorGamma * sigma : -1e9, ahi = count > 0 ? mean + anchorGamma * sigma : 1e9;
+                result = known ? lerp(clamp(hist, alo, ahi), cur, anchorAlpha) : clamp(hist, alo, ahi) * holdDecay;
                 done = true;
                 if (flags & 4)
                 {
@@ -199,7 +211,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 // mélange adaptatif : beaucoup d'historique à l'arrêt, peu en mouvement rapide
                 const float motionPx = length(mvVirtual * float2(renderWidth, renderHeight));
                 const float a = lerp(alpha, alphaMax, saturate(motionPx / 8.0));
-                result = lerp(clamp(hist, lo, hi), cur, a);
+                result = known ? lerp(clamp(hist, lo, hi), cur, a) : clamp(hist, lo, hi) * holdDecay;
                 if (flags & 4)
                 {
                     // confiance : part de l'historique gardée après bornage (blanc : stable, noir : rejeté)

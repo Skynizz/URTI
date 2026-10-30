@@ -67,6 +67,11 @@ struct LiveState
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     resource_view maskSrv = {};
     uint64_t frame = 0, lastFilled = 0;
+    // structure d'accélération : mise à jour (refit, plusieurs fois moins chère) tant que la liste des
+    // dessins est la même qu'à la dernière construction, reconstruite au plus tous les blasRefit images
+    uint64_t blasLayout = 0;
+    uint32_t blasAge = ~0u, blasRefit = 8, statRebuilds = 0, statUpdates = 0;
+    uint64_t statVertices = 0;
     std::vector<ComPtr<ID3D12Resource>> retired[3]; // libérées trois images plus tard
     uint32_t photoIndex = 0;
     // mémoire géométrique : sommets de l'image précédente (espace caméra de cette image-là) et, par
@@ -511,12 +516,14 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
     geom.Triangles.VertexCount = UINT(cap);
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in = {};
     in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-    in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
     in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     in.NumDescs = 1;
     in.pGeometryDescs = &geom;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&in, &info);
+    info.ScratchDataSizeInBytes = std::max(info.ScratchDataSizeInBytes, info.UpdateScratchDataSizeInBytes);
+    live.blasAge = ~0u; // nouvelle structure : construction complète
     Retire(live.view), Retire(live.blas), Retire(live.blasScratch);
     live.view = UavBuffer(device, cap * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Retire(live.viewPrev);
@@ -626,7 +633,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -644,7 +651,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("refl_alpha_min=", reflAlphaMin), value("refl_alpha_max=", reflAlphaMax);
                 value("refl_gamma=", reflGamma), value("refl_depth_tol=", reflDepthTol);
                 value("anchor_alpha=", anchorAlpha), value("anchor_gamma=", anchorGamma); // anchor_alpha=0 : ancrage coupé
-                value("alpha_screen=", alphaScreen);
+                value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0 : toujours reconstruire
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -657,6 +664,7 @@ void LiveHotReload(ID3D12Device* device)
             live.reflAlphaMin = std::clamp(reflAlphaMin, 0.01f, 1.0f), live.reflAlphaMax = std::clamp(reflAlphaMax, live.reflAlphaMin, 1.0f);
             live.reflGamma = reflGamma, live.reflDepthTol = reflDepthTol, live.anchorAlpha = anchorAlpha, live.anchorGamma = anchorGamma;
             live.alphaScreen = alphaScreen != 0;
+            live.blasRefit = uint32_t(std::max(0.0f, blasRefit));
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1041,6 +1049,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 Log("URTI direct : GPU par image : structure %.2f ms, soleil et profondeur %.2f, copie carte du jeu %.2f, ombres (%u rayons) %.2f, "
                     "reflets %.2f, composition %.2f", live.timeSum[0] / n, live.timeSum[1] / n, live.timeSum[2] / n, live.shadowRays, live.timeSum[3] / n,
                     live.timeSum[4] / n, live.timeSum[5] / n);
+                const uint32_t builds = live.statRebuilds + live.statUpdates;
+                if (builds)
+                    Log("URTI direct : structure d'accélération : %.0f sommets en moyenne (capacité %llu), %u reconstructions et %u mises à jour",
+                        double(live.statVertices) / builds, (unsigned long long)live.capacity, live.statRebuilds, live.statUpdates);
+                live.statRebuilds = live.statUpdates = 0, live.statVertices = 0;
                 std::fill(std::begin(live.timeSum), std::end(live.timeSum), 0.0);
                 live.timeFrames = 0;
             }
@@ -1048,7 +1061,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.timeReadback[live.frame % 3]->Unmap(0, nullptr);
     }
     LiveTime(list.Get(), 0);
-    // 1. sommets de l'écran vers l'espace caméra (NaN au-delà de ce qui a été rempli)
+    // 1. sommets de l'écran vers l'espace caméra (NaN au-delà de ce qui a été rempli dans chaque zone) ;
+    // seulement la partie du flux attribuée à cette image : la structure ne couvre qu'elle
     Transition(list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
     ID3D12Resource* regionsBuf = nullptr;
@@ -1106,11 +1120,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, regionsBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, live.view->GetGPUVirtualAddress());
-    const uint32_t converted = uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity));
-    const struct { float p00, p11; uint32_t count, regionCount; } cc = { live.p00, live.p11, uint32_t(live.capacity), uint32_t(regionsNow.size()) };
+    const uint32_t converted = std::max(3u, uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity)) / 3 * 3);
+    const struct { float p00, p11; uint32_t count, regionCount; } cc = { live.p00, live.p11, converted, uint32_t(regionsNow.size()) };
     list->SetComputeRoot32BitConstants(4, 4, &cc, 0);
-    list->Dispatch(UINT((live.capacity + 255) / 256), 1, 1);
-    (void)converted;
+    list->Dispatch(UINT((converted + 255) / 256), 1, 1);
     Transition(list.Get(), live.view.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
     LiveTime(list.Get(), 1);
@@ -1224,10 +1237,22 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
     geom.Triangles.VertexBuffer = { live.view->GetGPUVirtualAddress(), 12 };
     geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    geom.Triangles.VertexCount = UINT(live.capacity);
+    geom.Triangles.VertexCount = converted;
+    // même liste de dessins (zones, tailles, identités) qu'à la dernière construction : les triangles sont
+    // les mêmes, seules leurs positions ont changé (caméra, vent, objets mobiles) : mise à jour
+    uint64_t layout = 1469598103934665603ull ^ converted;
+    for (const LiveRegion& r : regionsNow)
+        layout = (layout ^ (uint64_t(r.offset) << 32 ^ r.capacity ^ uint64_t(r.id) << 17)) * 1099511628211ull;
+    const bool refit = live.blasRefit > 0 && live.blasAge < live.blasRefit && layout == live.blasLayout;
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd = {};
     bd.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-    bd.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+    bd.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+                      (refit ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(0));
+    if (refit)
+        bd.SourceAccelerationStructureData = live.blas->GetGPUVirtualAddress(), live.blasAge++, live.statUpdates++;
+    else
+        live.blasLayout = layout, live.blasAge = 0, live.statRebuilds++;
+    live.statVertices += converted;
     bd.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     bd.Inputs.NumDescs = 1;
     bd.Inputs.pGeometryDescs = &geom;
@@ -1460,7 +1485,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         if (uint32_t(view) != live.debugView)
             Log("URTI direct : vue de diagnostic %d", view);
-        live.debugView = uint32_t(std::clamp(view, 0, 8));
+        live.debugView = uint32_t(std::clamp(view, 0, 9));
     }
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiGenerated"); v.handle)
     {
@@ -1683,7 +1708,7 @@ void LiveComposite(effect_runtime* runtime)
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     // vues 4 à 8 : lissé, poids, couleur reflétée, distance de touche (dans le canal du lissé), confiance
     const uint32_t reflectView = live.debugView == 4 ? 1u : live.debugView == 5 ? 2u : live.debugView == 6 ? 3u : live.debugView == 7 ? 1u :
-                                 live.debugView == 8 ? 3u : live.debugReflect;
+                                 live.debugView == 8 ? 3u : live.debugView == 9 ? 4u : live.debugReflect;
     const bool reflections = live.reflectBuf && (live.reflEffective > 0 || reflectView);
     if (reflections)
         Transition(list.Get(), live.reflectBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);

@@ -18,7 +18,9 @@ StructuredBuffer<uint4> regions : register(t4); // par dessin de l'écran : déb
 ByteAddressBuffer links : register(t5);    // par dessin : identité, début (sommets) du même objet dans l'image précédente + 1
 ByteAddressBuffer viewCur : register(t6);  // sommets de cette image (float3, espace caméra)
 ByteAddressBuffer viewPrev : register(t7); // sommets de l'image précédente (son espace caméra)
-RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé
+RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé ; poids < 0 : surface
+                                               // réfléchissante dont le point reflété est caché ou hors de
+                                               // l'écran (couleur inconnue : la stabilisation garde l'historique)
 RWByteAddressBuffer anchor : register(u1);     // uint4 par pixel : position précédente du reflet (u, v ; NaN si
                                                // inconnue), identité de l'objet reflété, identité du miroir
 
@@ -132,6 +134,20 @@ float3 NormalAt(int2 t, float3 p)
     return dot(n, p) > 0 ? -n : n;
 }
 
+// surface plane autour du pixel : les points à 4 pixels de part et d'autre, sur chaque axe, sont alignés
+// avec lui (vrai pour un sol, un toit, une flaque, quelle que soit la perspective ; faux pour un feuillage,
+// des branches, des câbles, où la profondeur saute). 1 : plane ; 0 : pas une surface continue.
+float Flatness(int2 t, float3 p)
+{
+    const float3 l = PointAt(t - int2(4, 0)), r = PointAt(t + int2(4, 0)), u = PointAt(t - int2(0, 4)), b = PointAt(t + int2(0, 4));
+    if (l.z <= 0 || r.z <= 0 || u.z <= 0 || b.z <= 0)
+        return 0;
+    const float3 h = r - l, v = b - u;
+    const float eh = length(cross(h, p - l)) / max(length(h), 1e-6);
+    const float ev = length(cross(v, p - u)) / max(length(v), 1e-6);
+    return saturate(1.0 - max(eh, ev) / (0.004 * p.z + 0.002));
+}
+
 float Smoothness(int2 t)
 {
     if (flags & 4) // contrôle : toutes les surfaces lisses
@@ -158,7 +174,9 @@ void main(uint2 id : SV_DispatchThreadID)
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
     const float3 n = p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
-    const float s = max(Smoothness(int2(id)), wet * saturate((n.y - 0.55) / 0.3));
+    // sol mouillé : seulement sur une surface plane tournée vers le haut (sur un feuillage, la normale tirée
+    // de la profondeur est du bruit : le reflet y apparaissait et disparaissait d'une image à l'autre)
+    const float s = max(Smoothness(int2(id)), (wet > 0 && p.z > 0) ? wet * saturate((n.y - 0.55) / 0.3) * Flatness(int2(id), p) : 0.0);
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
@@ -191,6 +209,9 @@ void main(uint2 id : SV_DispatchThreadID)
         // Fresnel (Schlick) ; le lissé au-dessus du seuil module le poids
         const float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
         const float weight = fresnel * saturate((s - sMin) / max(1e-3, 1.0 - sMin));
+        // par défaut : reflet attendu, couleur inconnue (remplacé ci-dessous si le point reflété est visible)
+        if (weight > 0)
+            result.z = -weight;
         RayDesc ray;
         ray.Origin = p + n * (bias * p.z);
         ray.Direction = r;

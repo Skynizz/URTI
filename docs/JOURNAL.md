@@ -764,3 +764,27 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
 - Mesures (avec les plaques) : marche, sauts 1,294 → 1,177 %, clignotement 0,952 → 0,853 %, écart à la
   vérité 1,14 → 1,01 % ; arbre, écart 2,67 → 2,46 %. Les 7 scènes : `suite/tableau_v35.txt` (le bac à
   sable a changé : feuillage et carte d'ombres, les tableaux précédents ne se comparent pas ligne à ligne).
+
+## v36 — URTI : fin du « pop / dépop » des reflets, structure d'accélération deux fois moins chère
+
+- Retour du jeu : les reflets ne partent plus dans tous les sens mais apparaissent et disparaissent en
+  boucle, très vite. Nouvelle vue de diagnostic 9 (part du reflet RT réellement appliquée) et mesure des
+  bascules (`tools/reshade/urti_sandbox_popping.sh` : la part change de plus de 0,3 d'une image à
+  l'autre ; aller-retour : dans un sens puis dans l'autre aussitôt). Marche : 0,404 % d'allers-retours
+  des pixels reflétants par image, concentrés dans le feuillage, les câbles et les vitres.
+- Cause 1 : le mode « sol mouillé » (actif par défaut dans RDR2) rendait lisse toute surface dont la
+  normale tirée de la profondeur pointe vers le haut ; dans un feuillage cette normale est du bruit, le
+  pixel devenait réfléchissant une image sur deux. Le mode mouillé ne vaut plus que sur une surface plane
+  (les points à 4 pixels de part et d'autre, sur chaque axe, alignés avec lui) : 0,404 → 0,276 %.
+- Cause 2 : une surface lisse dont le point reflété est caché ou hors de l'écran (vitre qui reflète
+  l'autre côté de la rue vu de biais, feuilles) passait à zéro, puis revenait dès qu'il redevenait
+  visible. C'est maintenant une donnée manquante (poids négatif) : la stabilisation garde l'historique,
+  qui s'estompe (× 0,9 par image), et le bornage ne compte que les voisins connus : 0,276 → 0,140 %
+  (−65 % en tout). Contre la vérité terrain, pas de traînée : marche, sauts 1,177 → 1,133 %, clignotement
+  0,853 → 0,802 %, écart 1,01 → 0,98 % ; les autres scènes égales ou meilleures (`suite/tableau_v36.txt`).
+- Vitesse : la structure d'accélération était construite sur toute la capacité réservée (8,4 millions de
+  sommets dans RDR2), partie vide comprise ; elle ne couvre plus que les sommets de l'image. Et tant que
+  la liste des dessins est la même qu'à la dernière construction, elle est mise à jour (refit) au lieu
+  d'être reconstruite, avec une reconstruction au moins toutes les 8 images (`blas_refit=`, 0 : toujours
+  reconstruire). Bac à sable : 0,65 → 0,35 ms, image identique ; le journal donne maintenant les sommets
+  par image et le nombre de reconstructions et de mises à jour.
