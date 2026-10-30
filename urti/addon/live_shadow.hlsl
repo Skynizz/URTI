@@ -27,6 +27,8 @@ cbuffer Constants : register(b0)
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil
 };
 
+static float gA, gB, gClear;
+
 // éclairement du point par le soleil selon la carte d'ombres du jeu (1 si aucune cascade ne le couvre)
 float GameLit(float3 p)
 {
@@ -66,8 +68,8 @@ float3 PointAt(int2 t)
         return float3(0, 0, -1);
     const uint raw = depth.Load(t.y * depthPitch + t.x * 4);
     const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
-    const float w = B / (d - A);
-    if (d == clearDepth || !(w > 0 && w < 1e6))
+    const float w = gB / (d - gA);
+    if (d == gClear || !(w > 0 && w < 1e6))
         return float3(0, 0, -1);
     const float2 ndc = float2((t.x + 0.5) / width * 2 - 1, 1 - (t.y + 0.5) / height * 2);
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
@@ -88,12 +90,16 @@ void main(uint2 id : SV_DispatchThreadID)
 {
     if (id.x >= width || id.y >= height)
         return;
+    // loi de profondeur mesurée dans cette image (live_depthfit), sinon celle des constantes
+    const float3 law = asfloat(sunBuf.Load3(36));
+    gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
+    gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
     const uint raw = depth.Load(id.y * depthPitch + id.x * 4);
     const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
     const float3 sun = asfloat(sunBuf.Load3(0));
     float lit = 1.0;
-    const float w = B / (d - A);
-    if ((flags & 16) == 0 && d != clearDepth && w > 0 && w < 1e6)
+    const float w = gB / (d - gA);
+    if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
         const float2 ndc = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p = float3(ndc.x * w / p00, ndc.y * w / p11, w);

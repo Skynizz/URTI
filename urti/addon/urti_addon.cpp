@@ -82,6 +82,8 @@ float g_liveSunRadius = 0.5f;    // urti.ini sun_radius= (degrés) : taille appa
 std::vector<LiveMark> g_liveMarks;
 std::unordered_set<uint64_t> g_liveSunKeys, g_livePrevSunKeys;
 uint64_t g_liveSunDepth = 0; // profondeur de la carte d'ombres du soleil (trouvée à l'étalonnage)
+uint32_t g_liveSunMapDesc[3] = {}; // largeur, hauteur, format de cette carte (étalonnage stocké)
+
 uint32_t g_liveSunMarked = 0;
 constexpr uint32_t kLiveMaxSunMarks = 1024, kLiveMaxMarks = 4096;
 bool g_liveShowMask = false;     // urti.ini show_mask=1 : l'effet montre les ombres RT seules      // le mode direct capte la profondeur de l'écran à chaque image
@@ -576,8 +578,18 @@ int SlotFor(uint64_t depth)
             }
         }
         it = g.screenLike.emplace(depth, kind).first;
+        // étalonnage stocké : la carte d'ombres du soleil est la profondeur de même description
+        if (!g_liveSunDepth && g_liveSunMapDesc[0] && kind == 0 && uint32_t(d.Width) == g_liveSunMapDesc[0] && d.Height == g_liveSunMapDesc[1] &&
+            uint32_t(d.Format) == g_liveSunMapDesc[2])
+        {
+            g_liveSunDepth = depth;
+            Log("URTI direct : carte d'ombres du soleil reconnue (%ux%u format %u)", g_liveSunMapDesc[0], g_liveSunMapDesc[1], g_liveSunMapDesc[2]);
+        }
     }
     if (it->second < 0)
+        return -1;
+    // en direct, les emplacements ne servent qu'à l'écran et à la carte d'ombres du soleil
+    if (g.phase != Phase::Capturing && it->second != 1 && depth != g_liveSunDepth)
         return -1;
     for (uint32_t s = 0; s < kSlots; s++)
     {
@@ -1202,6 +1214,8 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
 
     if (g_liveAtStart && g.frame == 0)
         live.enabled = true;
+    if (g.frame == 0)
+        LiveLoadCalibration(); // avant toute décision d'étalonnage
     // images par seconde, journalisées toutes les 300 présentations (avec ou sans ombres RT)
     {
         static LARGE_INTEGER last = {}, freq = {};
@@ -1243,7 +1257,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     {
         g.liveCalibration = true;
         g.nextCapture = g.frame + 1;
-        live.nextCalibration = g.frame + uint64_t(g_calibrationInterval) * (1ull << std::min<uint32_t>(live.missedCalibrations, 4));
+        live.nextCalibration = g.frame + uint64_t(g_calibrationInterval) * (1ull << std::min<uint32_t>(live.missedCalibrations, 2));
         live.forceCalibration = false;
     }
     const std::string photoTrigger = g_dir + "\\urti_f7";

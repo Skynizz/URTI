@@ -16,11 +16,15 @@
 #include "live_sunvote_cs.h" // g_live_sunvote
 #include "live_composite_cs.h" // g_live_composite
 #include "live_reflect_cs.h"   // g_live_reflect
+#include "live_depthfit_cs.h"  // g_live_depthfit
 
 struct LiveState
 {
     bool enabled = false, calibrated = false, bound = false;
     bool depthReady = false; // loi de profondeur connue (reflets) ; calibrated : soleil connu (ombres)
+    // étalonnage stocké (urti_calib.ini) : propre au jeu, relu au lancement -> ombres dès la première image
+    bool fromStore = false, verified = false, storeLoaded = false;
+    uint32_t sunMapWidth = 0, sunMapHeight = 0, sunMapFormat = 0;
     float sun[3] = { 0, 1, 0 }, A = 0, B = 0.1f, p00 = 1, p11 = 1;
     uint64_t nextCalibration = 0;
     uint32_t calibrationInterval = 180;
@@ -42,8 +46,8 @@ struct LiveState
     int iniCombine = -1; // urti.ini combine= : 0 ou 1 impose le mode ; -1 : menu de ReShade (UrtiMode)
     uint32_t lastPresentDraws = 1; // dessins du jeu avant cette présentation (0 : image générée)
     // reflets : matériau du G-buffer copié à chaque image, rayons réfléchis
-    ComPtr<ID3D12RootSignature> reflectRs;
-    ComPtr<ID3D12PipelineState> reflectPso;
+    ComPtr<ID3D12RootSignature> reflectRs, depthfitRs;
+    ComPtr<ID3D12PipelineState> reflectPso, depthfitPso;
     ComPtr<ID3D12Resource> materialBuf, reflectBuf;
     uint64_t materialBytes = 0, materialFrame = ~0ull, reflectBytes = 0;
     uint32_t materialPitch = 0, materialWidth = 0, materialHeight = 0, materialFormat = 0;
@@ -77,6 +81,60 @@ struct LiveState
 } live;
 constexpr uint32_t kLiveMaxPairs = 256;
 constexpr uint32_t kLiveSunBytes = 48 + 8 * 64; // soleil, bilan, nombre de cascades, 8 cascades (application, viewport)
+
+// ------------------------------------------------------------------------------------------------
+// étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
+// ------------------------------------------------------------------------------------------------
+
+void LiveSaveCalibration()
+{
+    if (FILE* f = std::fopen((g_dir + "\\urti_calib.ini").c_str(), "w"))
+    {
+        std::fprintf(f, "; étalonnage URTI de ce jeu (relu au lancement ; F6 le refait)\n");
+        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\n", live.A, live.B, live.sunSign > 0 ? 1 : -1, live.sunMapWidth,
+                     live.sunMapHeight, live.sunMapFormat);
+        std::fclose(f);
+    }
+}
+
+// projection supposée (champ de vision arbitraire, comme Calibrate) pour le rapport largeur / hauteur
+void LiveSetProjection(const D3D12_RESOURCE_DESC& depthDesc)
+{
+    const float fov = 50.0f * 3.14159265f / 180.0f;
+    const float aspect = depthDesc.Height ? float(depthDesc.Width) / float(depthDesc.Height) : 16.0f / 9.0f;
+    live.p11 = 1.0f / std::tan(fov * 0.5f), live.p00 = live.p11 / aspect;
+}
+
+// à la première présentation : étalonnage relu ; la carte d'ombres sera reconnue à sa description
+void LiveLoadCalibration()
+{
+    if (live.storeLoaded)
+        return;
+    live.storeLoaded = true;
+    FILE* f = std::fopen((g_dir + "\\urti_calib.ini").c_str(), "r");
+    if (!f)
+        return;
+    double a = 0, b = 0;
+    int sign = 0;
+    unsigned w = 0, h = 0, fmt = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f))
+    {
+        std::sscanf(line, "depth_a=%lf", &a), std::sscanf(line, "depth_b=%lf", &b), std::sscanf(line, "sun_sign=%d", &sign);
+        std::sscanf(line, "sun_map=%ux%u:%u", &w, &h, &fmt);
+    }
+    std::fclose(f);
+    if (b == 0 || !sign || !w)
+        return;
+    live.p00 = 0; // fixée à la première profondeur (rapport largeur / hauteur)
+    live.A = float(a), live.B = float(b), g.depthReversed = b > 0, live.sunSign = float(sign);
+    live.sunMapWidth = w, live.sunMapHeight = h, live.sunMapFormat = fmt;
+    live.depthReady = live.calibrated = live.fromStore = true;
+    live.framesSinceSun = 1000; // pas d'ombres avant la première mesure du soleil (quelques images)
+    g_liveSunMapDesc[0] = w, g_liveSunMapDesc[1] = h, g_liveSunMapDesc[2] = fmt;
+    Log("URTI direct : étalonnage stocké relu (profondeur = %.6f + %.6f / w, carte d'ombres %ux%u format %u) : ombres dès la première image",
+        a, b, w, h, fmt);
+}
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage : direction du soleil (cartes d'ombres) et loi de profondeur, sur le processeur
@@ -299,7 +357,19 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     live.A = float(A), live.B = float(B), live.p00 = p00, live.p11 = p11;
     g.depthReversed = B > 0; // profondeur inversée : d = B / w, le ciel (w infini) à 0
     live.calibrated = true;
+    live.verified = true;
     Log("URTI direct : soleil (%.3f, %.3f, %.3f), profondeur = %.6f + %.6f / w", bestSun[0], bestSun[1], bestSun[2], A, B);
+    if (ID3D12Resource* map = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth))
+    {
+        const D3D12_RESOURCE_DESC d = map->GetDesc();
+        const bool changed = live.fromStore && (std::fabs(live.A - float(A)) > 1e-4f * std::max(1.0f, std::fabs(float(A))) ||
+                                                std::fabs(live.B - float(B)) > 1e-3f * std::fabs(float(B)) || live.sunMapWidth != uint32_t(d.Width) ||
+                                                live.sunMapHeight != d.Height || live.sunMapFormat != uint32_t(d.Format));
+        live.sunMapWidth = uint32_t(d.Width), live.sunMapHeight = d.Height, live.sunMapFormat = uint32_t(d.Format);
+        LiveSaveCalibration();
+        if (changed)
+            Log("URTI direct : l'étalonnage stocké ne correspondait plus, il est remplacé");
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -333,7 +403,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
            make(g_live_composite, sizeof(g_live_composite), 3, live.compositeRs, live.compositePso, 12) &&
-           make(g_live_reflect, sizeof(g_live_reflect), 3, live.reflectRs, live.reflectPso, 16);
+           make(g_live_reflect, sizeof(g_live_reflect), 4, live.reflectRs, live.reflectPso, 16) &&
+           make(g_live_depthfit, sizeof(g_live_depthfit), 2, live.depthfitRs, live.depthfitPso, 4);
 }
 
 ComPtr<ID3D12Resource> UavBuffer(ID3D12Device* device, uint64_t size, D3D12_RESOURCE_STATES state)
@@ -683,9 +754,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             live.sunFrames++, live.pairSum += uint64_t(r[4]);
             if (r[7] > 0)
+            {
                 live.sunAccepted++, live.framesSinceSun = 0;
-            else if (++live.framesSinceSun == 600)
-                live.forceCalibration = true; // dix secondes sans soleil mesuré : étalonnage complet
+                if (!live.verified)
+                {
+                    live.verified = true;
+                    live.forceCalibration = true; // vérification discrète de l'étalonnage stocké
+                }
+            }
+            else
+                live.framesSinceSun++;
             if (live.sunFrames == 300)
             {
                 Log("URTI direct : soleil suivi (%.3f, %.3f, %.3f), mesuré sur %.0f %% des images, %.0f paires par image, %u cascades", r[0], r[1], r[2],
@@ -713,6 +791,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         runtime->get_texture_binding(var, &depthSrv, &depthSrgb);
     ID3D12Resource* depthCopy = depthSrv.handle ? reinterpret_cast<ID3D12Resource*>(runtime->get_device()->get_resource_from_view(depthSrv).handle) : nullptr;
     const effect_uniform_variable active = runtime->find_uniform_variable("urti.fx", "UrtiActive");
+    if (depthCopy && !live.depthReady)
+    {
+        // la loi de profondeur est mesurée à chaque image sur le GPU : seule la projection est supposée
+        LiveSetProjection(depthCopy->GetDesc());
+        live.depthReady = true;
+    }
     if (slot < 0 || !depthCopy || !live.depthReady)
     {
         if (active.handle)
@@ -721,6 +805,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         return;
     }
     const D3D12_RESOURCE_DESC depthDesc = depthCopy->GetDesc();
+    if (live.fromStore && live.p00 == 0)
+        LiveSetProjection(depthDesc);
     if (!LiveEnsureCapacity(device.Get(), std::max<uint64_t>(live.lastFilled, 300000)) || !LiveEnsureImages(runtime, g.device, depthDesc) ||
         !LiveEnsureSun(g.device))
         return;
@@ -745,7 +831,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         void* p = nullptr;
         if (SUCCEEDED(live.sunUpload->Map(0, nullptr, &p)))
         {
-            const float s[12] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+            const float s[12] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0, 0, live.A, live.B, live.B != 0 ? 1.0f : 0.0f };
             std::memcpy(p, s, sizeof(s));
             live.sunUpload->Unmap(0, nullptr);
         }
@@ -815,9 +901,24 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             // aucune paire : bilan « non mesuré », le soleil précédent reste, plus de cascade connue
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 32);
+            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 20); // pas la loi de profondeur (36 à 47)
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
+    }
+    // 1c. loi de profondeur de cette image, mesurée sur les sommets de l'écran
+    {
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = live.sunBuf.Get();
+        list->ResourceBarrier(1, &ub);
+        list->SetComputeRootSignature(live.depthfitRs.Get());
+        list->SetPipelineState(live.depthfitPso.Get());
+        list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(2, live.sunBuf->GetGPUVirtualAddress());
+        const uint32_t dc[4] = { uint32_t(slot * kSlotBytes), uint32_t(slot * 8), uint32_t(kSlotBytes), 0 };
+        list->SetComputeRoot32BitConstants(3, 4, dc, 0);
+        list->Dispatch(1, 1, 1);
     }
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
@@ -934,8 +1035,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(3, atlasValid ? live.atlasBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(4, live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
+    const bool sunNow = live.calibrated && live.framesSinceSun < 30;
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
-                           (live.calibrated ? 0u : 16u);
+                           (sunNow ? 0u : 16u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -968,12 +1071,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             if (live.materialBuf)
                 Transition(list.Get(), live.materialBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+            Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
             list->SetComputeRootSignature(live.reflectRs.Get());
             list->SetPipelineState(live.reflectPso.Get());
             list->SetComputeRootShaderResourceView(0, live.tlas->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(2, live.materialBuf ? live.materialBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(3, live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(3, live.sunBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(4, live.reflectBuf->GetGPUVirtualAddress());
             const struct
             {
                 uint32_t width, height, depthPitch, materialPitch;
@@ -985,8 +1090,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 uint32_t reflectPitch;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, live.smoothMin, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u), live.f0, live.width * 16 };
-            list->SetComputeRoot32BitConstants(4, 16, &rc, 0);
+            list->SetComputeRoot32BitConstants(5, 16, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+            Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (live.materialBuf)
                 Transition(list.Get(), live.materialBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
             D3D12_RESOURCE_BARRIER uavb = {};

@@ -7,7 +7,8 @@
 RaytracingAccelerationStructure scene : register(t0);
 ByteAddressBuffer depth : register(t1);    // profondeur du jeu (32 bits par texel, lignes alignées)
 ByteAddressBuffer material : register(t2); // copie de l'image de matériau du G-buffer (32 bits par texel)
-RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, distance
+ByteAddressBuffer sunBuf : register(t3);   // octets 36 à 47 : loi de profondeur de cette image
+RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé
 
 cbuffer Constants : register(b0)
 {
@@ -29,14 +30,16 @@ cbuffer Constants : register(b0)
     uint reflectPitch;
 };
 
+static float gA, gB, gClear;
+
 float3 PointAt(int2 t)
 {
     if (t.x < 0 || t.y < 0 || t.x >= int(width) || t.y >= int(height))
         return float3(0, 0, -1);
     const uint raw = depth.Load(t.y * depthPitch + t.x * 4);
     const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
-    const float w = B / (d - A);
-    if (d == clearDepth || !(w > 0 && w < 1e6))
+    const float w = gB / (d - gA);
+    if (d == gClear || !(w > 0 && w < 1e6))
         return float3(0, 0, -1);
     const float2 ndc = float2((t.x + 0.5) / width * 2 - 1, 1 - (t.y + 0.5) / height * 2);
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
@@ -67,6 +70,10 @@ void main(uint2 id : SV_DispatchThreadID)
 {
     if (id.x >= width || id.y >= height)
         return;
+    // loi de profondeur mesurée dans cette image (live_depthfit), sinon celle des constantes
+    const float3 law = asfloat(sunBuf.Load3(36));
+    gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
+    gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
     const float3 p = PointAt(int2(id));
     const float s = Smoothness(int2(id));
     float4 result = float4(0, 0, 0, s);
