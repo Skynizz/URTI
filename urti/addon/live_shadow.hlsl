@@ -24,7 +24,7 @@ cbuffer Constants : register(b0)
     float clearDepth;
     uint depth24;      // 1 : D24S8 (24 bits de profondeur)
     uint atlasPitch;
-    uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu
+    uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil
 };
 
 // éclairement du point par le soleil selon la carte d'ombres du jeu (1 si aucune cascade ne le couvre)
@@ -93,7 +93,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const float3 sun = asfloat(sunBuf.Load3(0));
     float lit = 1.0;
     const float w = B / (d - A);
-    if (d != clearDepth && w > 0 && w < 1e6)
+    if ((flags & 16) == 0 && d != clearDepth && w > 0 && w < 1e6)
     {
         const float2 ndc = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p = float3(ndc.x * w / p00, ndc.y * w / p11, w);

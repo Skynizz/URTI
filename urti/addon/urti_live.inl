@@ -20,6 +20,7 @@
 struct LiveState
 {
     bool enabled = false, calibrated = false, bound = false;
+    bool depthReady = false; // loi de profondeur connue (reflets) ; calibrated : soleil connu (ombres)
     float sun[3] = { 0, 1, 0 }, A = 0, B = 0.1f, p00 = 1, p11 = 1;
     uint64_t nextCalibration = 0;
     uint32_t calibrationInterval = 180;
@@ -149,6 +150,11 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
         return;
     }
     const double A = (n * swz - sw * sz) / (n * sww - sw * sw), B = (sz - A * sw) / n;
+    if (!live.depthReady)
+        Log("URTI direct : loi de profondeur = %.6f + %.6f / w (reflets possibles même sans soleil)", A, B);
+    live.A = float(A), live.B = float(B), live.p00 = p00, live.p11 = p11;
+    g.depthReversed = B > 0;
+    live.depthReady = true;
 
     // soleil : pour chaque carte d'ombres, une direction par paire de dessins, puis vote
     struct Dir { double d[3]; double w; };
@@ -707,7 +713,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         runtime->get_texture_binding(var, &depthSrv, &depthSrgb);
     ID3D12Resource* depthCopy = depthSrv.handle ? reinterpret_cast<ID3D12Resource*>(runtime->get_device()->get_resource_from_view(depthSrv).handle) : nullptr;
     const effect_uniform_variable active = runtime->find_uniform_variable("urti.fx", "UrtiActive");
-    if (slot < 0 || !depthCopy || !live.calibrated)
+    if (slot < 0 || !depthCopy || !live.depthReady)
     {
         if (active.handle)
             runtime->set_uniform_value_bool(active, false);
@@ -879,7 +885,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // 3b. carte d'ombres du jeu (son ombre est recalculée pixel par pixel : nos ombres ne s'ajoutent
     // que là où le jeu n'en met pas)
     bool atlasValid = false;
-    if (ID3D12Resource* atlas = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth); atlas && g_liveCombine)
+    if (ID3D12Resource* atlas = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth); atlas && g_liveCombine && live.calibrated)
     {
         uint32_t state = 0;
         bool known = false;
@@ -928,7 +934,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(3, atlasValid ? live.atlasBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(4, live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
-    const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u);
+    const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
+                           (live.calibrated ? 0u : 16u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -1039,7 +1046,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 // une image sur deux n'aurait pas les ombres RT.
 void LiveComposite(effect_runtime* runtime)
 {
-    if (!live.enabled || !live.calibrated || !live.bound || !live.shadowBuf || !live.compositePso)
+    if (!live.enabled || !live.depthReady || !live.bound || !live.shadowBuf || !live.compositePso)
         return;
     // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt
     // que des ombres figées qui ne suivent plus la caméra
