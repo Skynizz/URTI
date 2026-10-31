@@ -893,3 +893,15 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   immobile 0,124 → 0,054 %, arbre au vent 0,115 → 0,050 %, personnage 0,076 → 0,034 %, caméra fixe
   0,098 → 0,081 %, occlusion 0,126 → 0,081 %, marche 0,801 → 0,803 %.
 - `jitter_log=1` : décalage mesuré à chaque image dans le journal.
+
+## v41 — URTI : réserve de géométrie des ExecuteIndirect apprise par signature
+
+- Première session de la v40 dans RDR2 (lancée par URTI) : le jeu démarre, champ de vision mesuré 49,5° à
+  53,8° (il varie : visée, caméra), 49 à 53 i/s. Nouveau bilan des plus gros objets : **les ExecuteIndirect
+  réservent 65 535 sommets et en écrivent de 0 à 10 000** (86289/86289 65535/2787 65535/10242 65535/0…) :
+  sur 8,3 millions de sommets réservés, 1,3 à 1,5 million écrits — plus de 80 % de l'emplacement est du
+  vide, d'où sa saturation (50 à 230 dessins refusés par image) et le coût de la structure.
+- L'apprentissage par identité ne prenait pas : l'ordre des ExecuteIndirect change d'une image à l'autre
+  dans RDR2. Taille apprise maintenant **par signature de commande** : le plus grand nombre de sommets
+  écrits par ses dessins (décroît de 2 % par image) ; une zone remplie jusqu'au bout (tronquée) double la
+  taille apprise ; réserve = taille apprise × 1,25 + 64. Bac à sable inchangé ; à vérifier dans RDR2.

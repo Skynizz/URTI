@@ -108,6 +108,9 @@ std::unordered_map<uint32_t, uint32_t> g_liveSeen; // identités de l'écran dan
 // ExecuteIndirect : nombre de sommets inconnu avant le dessin ; on réservait 65 536 sommets à chacun (place
 // vide prise dans l'emplacement et dans la structure). Taille apprise par identité (mesurée), marge comprise.
 std::unordered_map<uint32_t, uint32_t> g_liveLearned;
+// dans RDR2 l'ordre des ExecuteIndirect change d'une image à l'autre (identité instable) : la taille est
+// aussi apprise par signature de commande (le plus grand nombre de sommets écrits par ses dessins)
+std::unordered_map<uint32_t, uint32_t> g_liveLearnedSig, g_liveIdSig; // signature -> sommets ; identité -> signature (cette image)
 uint64_t g_liveReserved = 0; // sommets réservés dans l'écran principal (bilan)
 uint64_t g_liveBudgetVertices = 0, g_liveProbeBudget = 0, g_liveProbeVerts = 0; // budget, zone de mesure (par image)
 // photos de l'écran au premier dessin de chaque liaison de l'image d'écran (urti_live.inl choisit celle
@@ -794,11 +797,19 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 const uint64_t h = (idKey ^ (idKey >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[idKey]++;
                 id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
                 if (kind == 2)
-                    if (const auto it = g_liveLearned.find(id); it != g_liveLearned.end())
+                {
+                    g_liveIdSig[id] = params[3];
+                    uint64_t learned = ~0ull;
+                    if (const auto it = g_liveLearnedSig.find(params[3]); it != g_liveLearnedSig.end())
+                        learned = it->second;
+                    else if (const auto jt = g_liveLearned.find(id); jt != g_liveLearned.end())
+                        learned = jt->second;
+                    if (learned != ~0ull)
                     {
-                        vertices = std::min<uint64_t>(65536, (uint64_t(it->second) * 5 / 4 + 64 + 2) / 3 * 3);
+                        vertices = std::min<uint64_t>(65536, (learned * 5 / 4 + 64 + 2) / 3 * 3);
                         capacity = uint32_t(vertices * 16);
                     }
+                }
                 // tous les dessins comptent pour choisir l'écran principal, même hors budget (sinon une autre
                 // profondeur, moins chargée, finirait par passer devant)
                 g.slotDraws[slot]++;

@@ -57,7 +57,9 @@ struct LiveState
     ComPtr<ID3D12PipelineState> statsPso;
     ComPtr<ID3D12Resource> statsBuf, statsUpload[3], statsReadback[3];
     uint64_t statsBytes = 0;
-    std::vector<uint32_t> statsIds[3];
+    std::vector<uint32_t> statsIds[3], statsCaps[3]; // identités mesurées et leur place réservée (sommets)
+    std::unordered_map<uint32_t, uint32_t> idSig;        // ExecuteIndirect : identité -> signature de commande
+    std::unordered_map<uint32_t, float> sigVertices;     // signature -> plus grand nombre de sommets écrits (décroît)
     struct ObjectStat
     {
         float importance;  // taille / distance (taille apparente)
@@ -954,6 +956,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         for (uint32_t s = 0; s < kSlots; s++)
             g_liveProbes[s].clear(), g_liveProbeUsed[s] = 0;
         live.seenNow.swap(g_liveSeen);
+        for (const auto& [id, sig] : g_liveIdSig)
+            live.idSig[id] = sig;
+        g_liveIdSig.clear();
+        if (live.idSig.size() > 50000)
+            live.idSig.clear();
         g_liveSeen.clear();
         live.statOverflow += g_liveOverflow, live.statOutOfBudget += g_liveOutOfBudget, live.statReserved += g_liveReserved;
         g_liveOverflow = g_liveOutOfBudget = 0, g_liveReserved = 0, g_liveProbeVerts = 0;
@@ -979,10 +986,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     const float minZ = v[i * 4], size = v[i * 4 + 1];
                     const float importance = (minZ < 1e8f && size > 0) ? size / std::max(minZ, 0.3f) : 0.0f;
                     live.objects[ids[i]] = { importance, live.frame, uint32_t(v[i * 4 + 2]) };
+                    // ExecuteIndirect : taille de sa signature ; une zone remplie jusqu'au bout a été tronquée : on double
+                    if (const auto it = live.idSig.find(ids[i]); it != live.idSig.end())
+                    {
+                        const std::vector<uint32_t>& caps = live.statsCaps[live.frame % 3];
+                        const float written = v[i * 4 + 2], cap = i < caps.size() ? float(caps[i]) : 0.0f;
+                        const float need = (cap > 0 && written >= cap) ? written * 2.0f : written;
+                        float& sig = live.sigVertices[it->second];
+                        sig = std::max(sig * 0.98f, need);
+                    }
                 }
                 live.statsReadback[live.frame % 3]->Unmap(0, nullptr);
             }
             ids.clear();
+            live.statsCaps[live.frame % 3].clear();
         }
         if (live.objects.size() > 200000)
             live.objects.clear();
@@ -1034,6 +1051,24 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 (known.count(id) ? knownVerts : unknownVerts) += vertices;
             Log("URTI direct : budget : %zu objets à l'écran (%llu sommets mesurés, %llu pas encore mesurés), %zu dans la scène RT, %zu mesures en mémoire", live.seenNow.size(),
                 (unsigned long long)knownVerts, (unsigned long long)unknownVerts, admit.size(), live.objects.size());
+            // les plus gros objets : sommets réservés (nombre d'indices × instances) et réellement écrits
+            std::vector<std::pair<uint32_t, uint32_t>> big;
+            for (const auto& [id, vertices] : live.seenNow)
+                big.push_back({ vertices, id });
+            std::sort(big.begin(), big.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            uint64_t admittedMeasured = 0;
+            for (uint32_t id : admit)
+                if (const auto it = live.objects.find(id); it != live.objects.end())
+                    admittedMeasured += it->second.vertices;
+            char top[256] = "";
+            for (size_t i = 0; i < big.size() && i < 5; i++)
+            {
+                const auto it = live.objects.find(big[i].second);
+                char item[48];
+                std::snprintf(item, sizeof(item), " %u/%u", big[i].first, it != live.objects.end() ? it->second.vertices : 0u);
+                std::strncat(top, item, sizeof(top) - std::strlen(top) - 1);
+            }
+            Log("URTI direct : budget : sommets écrits des objets admis %llu ; plus gros objets (réservés/écrits) :%s", (unsigned long long)admittedMeasured, top);
         }
         live.admitted = admit;
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1042,7 +1077,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.probeBudget;
         g_liveSlotLimit = live.slotLimit;
         g_liveMainDepth = slot >= 0 ? g.slotDepth[slot] : 0;
-        // tailles apprises des ExecuteIndirect (toutes les identités mesurées : la table reste petite)
+        // tailles apprises des ExecuteIndirect : par signature de commande (à chaque image), et par identité
+        g_liveLearnedSig.clear();
+        for (const auto& [sig, vertices] : live.sigVertices)
+            g_liveLearnedSig[sig] = uint32_t(vertices);
         if (live.frame % 30 == 0)
         {
             g_liveLearned.clear();
@@ -1330,11 +1368,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->CopyBufferRegion(live.statsReadback[live.frame % 3].Get(), 0, live.statsBuf.Get(), 0, bytes);
             Transition(list.Get(), live.statsBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             std::vector<uint32_t>& ids = live.statsIds[live.frame % 3];
-            ids.clear();
+            std::vector<uint32_t>& caps = live.statsCaps[live.frame % 3];
+            ids.clear(), caps.clear();
             for (const LiveRegion& r : regionsNow)
-                ids.push_back(r.id);
+                ids.push_back(r.id), caps.push_back(r.capacity / 16);
             for (const LiveRegion& r : probesNow)
-                ids.push_back(r.id);
+                ids.push_back(r.id), caps.push_back(r.capacity / 16);
         }
         live.statDraws += regionsNow.size(), live.statProbes += probesNow.size(), live.statBudgetFrames++;
     }
