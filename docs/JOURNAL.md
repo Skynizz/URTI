@@ -905,3 +905,21 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   dans RDR2. Taille apprise maintenant **par signature de commande** : le plus grand nombre de sommets
   écrits par ses dessins (décroît de 2 % par image) ; une zone remplie jusqu'au bout (tronquée) double la
   taille apprise ; réserve = taille apprise × 1,25 + 64. Bac à sable inchangé ; à vérifier dans RDR2.
+
+## v42 — URTI : sol mouillé retiré, champ de vision corrigé tout seul, ExecuteIndirect identifiés par leurs arguments
+
+- Retour de jeu : le sol mouillé ajouté par URTI fait des bugs (RDR2 n'a pas ce rendu) ; les reflets
+  semblent parfois « flotter au-dessus » des flaques. Sol mouillé coupé par défaut (`UrtiWet` = 0 dans
+  urti.fx ; le réglage reste pour essai).
+- **Projection d'URTI corrigée par le champ de vision mesuré** (`fov_auto=1` par défaut) : quand la mesure
+  est fiable (assez de rotation de la caméra) et s'écarte de plus de 3 %, p11 est corrigé de 80 % de
+  l'écart, la mesure repart de zéro et les 6 lectures suivantes (trois images de retard) sont ignorées.
+  Bac à sable : 50,0° → 54,1° → 54,9° (vrai : 55°), stable. Dans RDR2 le champ mesuré varie de 49,5° à
+  60,6° (visée, caméra). Avec des angles exacts, la normale du sol et la direction des reflets ne sont plus
+  faussées. Suite : marche, écart à la vérité 0,96 → 0,90 %, scintillement ajouté +0,054 → +0,025 % ;
+  les autres scènes égales ou meilleures (`suite/tableau_v42.txt`).
+- Journal de la session v41 : la réserve était encore pleine (« 65536/22176 65536/65535 65536/0 ») : une même
+  signature de commande sert à des ExecuteIndirect de toutes tailles, son maximum imposait 65 536 sommets à
+  tous. Identité d'un ExecuteIndirect : signature, tampon d'arguments et position dans ce tampon (plus de
+  rang) ; taille apprise par identité (0 compris : réserve de 66 sommets) ; une zone remplie jusqu'au bout
+  repart à la réserve maximale, la mesure suivante redonne la vraie taille.

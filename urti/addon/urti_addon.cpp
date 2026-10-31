@@ -784,10 +784,11 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 // identité stable d'une image à l'autre : le maillage (nombre d'indices ou de sommets, début dans
                 // ses tampons), pas le nombre d'instances ni la première instance (une végétation dessinée par
                 // instances en change à chaque image : dans RDR2, 120 000 identités pour 800 objets à l'écran) ;
-                // un ExecuteIndirect : sa signature de commande, et son rang
+                // un ExecuteIndirect : sa signature de commande, son tampon d'arguments et la position dans ce
+                // tampon (l'ordre des ExecuteIndirect change d'une image à l'autre dans RDR2 : pas le rang)
                 uint64_t idKey = kind * 1000003ull;
                 if (kind == 2)
-                    idKey = idKey * 1315423911ull + params[3];
+                    idKey = ((idKey * 1315423911ull + params[3]) * 1315423911ull + params[2]) * 1315423911ull + params[1];
                 else
                 {
                     idKey = (idKey * 1315423911ull + params[0]) * 1315423911ull + params[2];
@@ -799,10 +800,10 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 if (kind == 2)
                 {
                     g_liveIdSig[id] = params[3];
+                    // taille apprise de ce dessin (une même signature sert à des dessins de toutes tailles : son
+                    // maximum imposait 65 536 sommets à tous)
                     uint64_t learned = ~0ull;
-                    if (const auto it = g_liveLearnedSig.find(params[3]); it != g_liveLearnedSig.end())
-                        learned = it->second;
-                    else if (const auto jt = g_liveLearned.find(id); jt != g_liveLearned.end())
+                    if (const auto jt = g_liveLearned.find(id); jt != g_liveLearned.end())
                         learned = jt->second;
                     if (learned != ~0ull)
                     {

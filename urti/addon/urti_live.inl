@@ -127,6 +127,9 @@ struct LiveState
     float nrdDisocclusion = 0.01f, nrdFrames = 5.0f;
     bool jitterLog = false;
     float fovStretch = 0; // t² mesuré par live_sunvote (étirement de la projection supposée)
+    bool fovAuto = true;  // projection corrigée par le champ de vision mesuré (urti.ini fov_auto=0 : 50° supposés)
+    bool fovReset = false; // sommes de la mesure à remettre à zéro (projection changée)
+    uint32_t fovHold = 0;  // images à ignorer après une correction (mesures lues avec trois images de retard)
     uint32_t jitterMode = 2; // décalage sous-pixel du jeu compensé : 0 non, 1 écart d'une image à l'autre, 2 aussi l'absolu // SIGMA : seuil de disocclusion, images stabilisees
     uint64_t boundFrame = 0;
 
@@ -678,7 +681,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, fovAuto = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 4000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -700,7 +703,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0 : toujours reconstruire
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
-                value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter);
+                value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 float jl = 0;
                 value("jitter_log=", jl);
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -723,6 +726,7 @@ void LiveHotReload(ID3D12Device* device)
             live.uiPhoto = uiPhoto != 0;
             live.nrdShadows = nrdOn != 0, live.nrdDisocclusion = nrdDisocclusion, live.nrdFrames = nrdFrames;
             live.jitterMode = uint32_t(std::clamp(jitter, 0.0f, 2.0f));
+            live.fovAuto = fovAuto != 0;
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -986,14 +990,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     const float minZ = v[i * 4], size = v[i * 4 + 1];
                     const float importance = (minZ < 1e8f && size > 0) ? size / std::max(minZ, 0.3f) : 0.0f;
                     live.objects[ids[i]] = { importance, live.frame, uint32_t(v[i * 4 + 2]) };
-                    // ExecuteIndirect : taille de sa signature ; une zone remplie jusqu'au bout a été tronquée : on double
-                    if (const auto it = live.idSig.find(ids[i]); it != live.idSig.end())
+                    // ExecuteIndirect : une zone remplie jusqu'au bout a été tronquée : réserve maximale à l'image suivante
+                    if (live.idSig.count(ids[i]))
                     {
                         const std::vector<uint32_t>& caps = live.statsCaps[live.frame % 3];
                         const float written = v[i * 4 + 2], cap = i < caps.size() ? float(caps[i]) : 0.0f;
-                        const float need = (cap > 0 && written >= cap) ? written * 2.0f : written;
-                        float& sig = live.sigVertices[it->second];
-                        sig = std::max(sig * 0.98f, need);
+                        if (cap > 0 && written >= cap)
+                            live.objects[ids[i]].vertices = 65536; // la mesure suivante dira la vraie taille
                     }
                 }
                 live.statsReadback[live.frame % 3]->Unmap(0, nullptr);
@@ -1078,14 +1081,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         g_liveSlotLimit = live.slotLimit;
         g_liveMainDepth = slot >= 0 ? g.slotDepth[slot] : 0;
         // tailles apprises des ExecuteIndirect : par signature de commande (à chaque image), et par identité
-        g_liveLearnedSig.clear();
-        for (const auto& [sig, vertices] : live.sigVertices)
-            g_liveLearnedSig[sig] = uint32_t(vertices);
-        if (live.frame % 30 == 0)
+        if (live.frame % 10 == 0)
         {
             g_liveLearned.clear();
             for (const auto& [id, o] : live.objects)
-                if (o.vertices > 0 && live.frame - o.frame < 120)
+                if (live.frame - o.frame < 120) // 0 compris : un ExecuteIndirect qui ne dessine rien ne réserve presque rien
                     g_liveLearned[id] = o.vertices;
         }
     }
@@ -1123,6 +1123,25 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.framesSinceSun++;
             if (r[305] > 0)
                 live.fovStretch = r[305]; // t² : (tan du demi-champ supposé / tan du vrai)²
+            // champ de vision du jeu : la projection d'URTI est corrigée quand la mesure est fiable (assez de
+            // rotation de la caméra) et s'écarte de plus de 1,5 % ; les reflets ont alors des angles exacts (dans
+            // un espace caméra étiré, la normale du sol est fausse et le reflet décalé : il « flotte »)
+            if (live.fovHold)
+                live.fovHold--;
+            else if (live.fovAuto && r[304] > 0 && r[305] > 0 && r[300] + r[302] > 4e-4f)
+            {
+                const float k2 = (r[300] * r[304] + r[302] * r[305]) / (r[300] + r[302]);
+                if (std::fabs(k2 - 1.0f) > 0.03f)
+                {
+                    const float before = 2.0f * std::atan(1.0f / live.p11) * 57.2957795f;
+                    const float aspect = live.p11 / live.p00;
+                    live.p11 = std::clamp(live.p11 * std::pow(k2, 0.4f), // 80 % de l'écart : pas d'oscillation
+                                            1.0f / std::tan(55.0f / 57.2957795f), 1.0f / std::tan(10.0f / 57.2957795f));
+                    live.p00 = live.p11 / aspect;
+                    live.fovReset = true, live.fovHold = 6;
+                    Log("URTI direct : champ de vision corrigé : %.1f° -> %.1f°", before, 2.0f * std::atan(1.0f / live.p11) * 57.2957795f);
+                }
+            }
             if (live.sunFrames == 300)
             {
                 if (live.fovStretch > 0 && live.p11 > 0)
@@ -1381,6 +1400,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 
     LiveTime(list.Get(), 1);
     // 1b. soleil de cette image : paires écran / carte d'ombres de même signature, ajustées puis votées
+    if (live.fovReset)
+    {
+        // projection changée : la mesure de l'étirement repart de zéro
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(live.sunBuf.Get(), 1200, g.zeros.Get(), 0, 24);
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.fovReset = false;
+    }
     if (live.sunDirty)
     {
         void* p = nullptr;
