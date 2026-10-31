@@ -823,3 +823,27 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   elle, le menu se reflète au sol et la scène reflétée passe par-dessus ; avec, le menu est propre
   (`results/urti/bac_a_sable/interface/`). `ui_photo=0` pour comparer.
 - 7 scènes égales ou meilleures (`suite/tableau_v37.txt`) ; pop / dépop 0,138 %.
+
+## v38 — URTI : identités stables, budget respecté, sans OptiScaler
+
+- Journal de la session v37 dans RDR2 : budget sans effet (8,37 millions de sommets réservés, ~200
+  dessins refusés par image) car **120 000 identités pour ~800 objets à l'écran** : l'identité incluait
+  le nombre d'instances et la première instance, qui changent à chaque image (végétation par instances).
+  Elle ne garde plus que le maillage (nombre d'indices ou de sommets, début dans ses tampons) ; un
+  ExecuteIndirect, sa signature de commande ; plus le rang. Bac à sable : 381 mesures en mémoire.
+- Budget respecté : un objet inconnu n'entre dans la scène RT que tant que la place du budget le permet ;
+  au-delà il est mesuré dans la zone de mesure (dans sa limite par image). Saturation reproduite :
+  30 697 sommets pour un budget de 30 000, 0 dessin refusé.
+- Photo d'avant l'interface : dans RDR2 le rang de la bonne photo change d'une image à l'autre (le jeu
+  enregistre ses commandes sur plusieurs fils). Choix sur le GPU dans la même image
+  (`live_uiselect.hlsl`) : photo de cette image (identique à plus de 60 % à l'image finale et plus
+  proche d'elle que de l'image affichée précédente, sinon c'est une ancienne image), la moins identique
+  (la plus tôt, le moins d'interface) ; copiée dans un tampon que reflets et composition lisent.
+- « Une image sur deux » : OptiScaler avait la génération d'images active (`FGOutput = DLSSG`) ; URTI ne
+  s'appliquait qu'aux images réelles. L'utilisateur l'a retiré.
+- **Plantage au démarrage sans OptiScaler** (ucrtbase, 0xc0000409) : ReShade, chargé directement
+  (`dxgi.dll`), décharge et recharge les add-ons à chaque appareil que RDR2 crée au démarrage pour tester
+  la carte ; les entrées de tables de fonctions remplacées par URTI (`CreateRootSignature`,
+  `ExecuteIndirect`) pointaient alors vers le code d'un add-on déchargé. Elles sont maintenant remises à
+  l'origine au déchargement. Vérifié : le jeu démarre (`tools/reshade/rdr2_demarrage.ps1` : démarrage sans
+  clic, surveille processus et plantages).

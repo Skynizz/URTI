@@ -239,6 +239,18 @@ HRESULT STDMETHODCALLTYPE HookCreateRootSignature(ID3D12Device* self, UINT nodeM
     return g_createRootSignature(self, nodeMask, blob, size, riid, out);
 }
 
+// entrées de tables de fonctions remplacées, remises à l'origine quand l'add-on est déchargé : ReShade
+// décharge et recharge les add-ons à chaque appareil (RDR2 en crée plusieurs au démarrage pour tester la
+// carte graphique) ; une table qui pointerait encore vers le code d'un add-on déchargé ferait planter le
+// jeu au premier appel (ucrtbase, 0xc0000409, sans OptiScaler qui chargeait ReShade une seule fois)
+struct VtablePatch
+{
+    void** slot;
+    void* original;
+    void* hook;
+};
+std::vector<VtablePatch> g_vtablePatches;
+
 void PatchVtable(void* object, int index, void* hook, void** original, const char* name)
 {
     void** vtable = *reinterpret_cast<void***>(object);
@@ -248,9 +260,24 @@ void PatchVtable(void* object, int index, void* hook, void** original, const cha
     VirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
     if (!*original)
         *original = vtable[index];
+    g_vtablePatches.push_back({ &vtable[index], vtable[index], hook });
     vtable[index] = hook;
     VirtualProtect(&vtable[index], sizeof(void*), old, &old);
     Log("URTI : %s intercepté", name);
+}
+
+void UnpatchVtables()
+{
+    for (auto it = g_vtablePatches.rbegin(); it != g_vtablePatches.rend(); ++it)
+    {
+        if (*it->slot != it->hook)
+            continue;
+        DWORD old = 0;
+        VirtualProtect(it->slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+        *it->slot = it->original;
+        VirtualProtect(it->slot, sizeof(void*), old, &old);
+    }
+    g_vtablePatches.clear();
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1631,6 +1658,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnOpenOverlay);
         break;
     case DLL_PROCESS_DETACH:
+        UnpatchVtables();
         reshade::unregister_addon(module);
         break;
     }
