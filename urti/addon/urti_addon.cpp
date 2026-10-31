@@ -96,6 +96,7 @@ std::unordered_map<uint32_t, uint32_t> g_liveSeen; // identités de l'écran dan
 // vide prise dans l'emplacement et dans la structure). Taille apprise par identité (mesurée), marge comprise.
 std::unordered_map<uint32_t, uint32_t> g_liveLearned;
 uint64_t g_liveReserved = 0; // sommets réservés dans l'écran principal (bilan)
+uint64_t g_liveBudgetVertices = 0, g_liveProbeBudget = 0, g_liveProbeVerts = 0; // budget, zone de mesure (par image)
 // photos de l'écran au premier dessin de chaque liaison de l'image d'écran (urti_live.inl choisit celle
 // d'avant l'interface du jeu : les reflets n'y prennent pas les menus, la composition épargne l'interface)
 constexpr uint32_t kLiveSnaps = 4;
@@ -731,9 +732,23 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             // identité, avant tout refus : le rang parmi les dessins de même signature ne doit pas dépendre
             // des dessins refusés (sinon les identités glissent quand l'emplacement est plein)
             uint32_t id = 0;
+            const bool mainScreen = screen && state.depth == g_liveMainDepth;
             if (screen)
             {
-                const uint64_t h = (key ^ (key >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[key]++;
+                // identité stable d'une image à l'autre : le maillage (nombre d'indices ou de sommets, début dans
+                // ses tampons), pas le nombre d'instances ni la première instance (une végétation dessinée par
+                // instances en change à chaque image : dans RDR2, 120 000 identités pour 800 objets à l'écran) ;
+                // un ExecuteIndirect : sa signature de commande, et son rang
+                uint64_t idKey = kind * 1000003ull;
+                if (kind == 2)
+                    idKey = idKey * 1315423911ull + params[3];
+                else
+                {
+                    idKey = (idKey * 1315423911ull + params[0]) * 1315423911ull + params[2];
+                    if (kind == 1)
+                        idKey = idKey * 1315423911ull + params[3];
+                }
+                const uint64_t h = (idKey ^ (idKey >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[idKey]++;
                 id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
                 if (kind == 2)
                     if (const auto it = g_liveLearned.find(id); it != g_liveLearned.end())
@@ -745,17 +760,25 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 // profondeur, moins chargée, finirait par passer devant)
                 g.slotDraws[slot]++;
             }
-            if (screen && state.depth == g_liveMainDepth)
+            if (mainScreen)
             {
                 g_liveSeen[id] = uint32_t(vertices);
-                if (g_liveBudget && g_liveKnown.count(id) && !g_liveAdmit.count(id))
+                if (g_liveBudget && !g_liveAdmit.count(id))
                 {
-                    if (!g_liveProbeWant.count(id))
+                    // hors des objets choisis : un inconnu entre tant que la place du budget le permet ; sinon
+                    // (et pour un objet connu dont la mesure est à refaire) il est mesuré dans la zone de mesure,
+                    // dans sa limite par image ; le reste n'est pas capté du tout
+                    const bool known = g_liveKnown.count(id) != 0;
+                    if (known || g_liveReserved + vertices > g_liveBudgetVertices)
                     {
-                        g_liveOutOfBudget++;
-                        return; // hors budget, mesure récente : pas capté du tout
+                        if ((known && !g_liveProbeWant.count(id)) || g_liveProbeVerts + vertices > g_liveProbeBudget)
+                        {
+                            g_liveOutOfBudget++;
+                            return;
+                        }
+                        probe = true;
+                        g_liveProbeVerts += vertices;
                     }
-                    probe = true;
                 }
             }
             bool marked = false;
@@ -791,7 +814,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 g_liveCursor[slot] += (capacity + 15) & ~15u;
                 if (screen)
                     g_liveRegions[slot].push_back(region);
-                if (screen && state.depth == g_liveMainDepth)
+                if (mainScreen)
                     g_liveReserved += vertices;
             }
             if (marked)

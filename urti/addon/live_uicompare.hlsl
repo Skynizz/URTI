@@ -1,14 +1,17 @@
 // URTI en direct : quelle photo de l'écran est l'image sans l'interface du jeu ? URTI photographie l'écran
-// chaque fois que le jeu commence à y dessiner (jusqu'à quatre fois par image) ; on compte, sur un pixel
-// sur seize, ceux de chaque photo identiques à l'image finale. La première photo presque identique est
-// celle d'avant l'interface (menus, textes, mini-carte) : ses pixels différents sont l'interface.
+// au premier dessin de chaque liaison de l'image d'écran (jusqu'à quatre par image). On compte, sur un pixel
+// sur seize, ceux de chaque photo identiques à l'image finale de cette image, et ceux identiques à l'image
+// affichée précédente (une photo prise avant que le jeu écrive sa scène contient une ancienne image).
+// live_uiselect choisit ensuite, sur le GPU et dans la même image.
 
-ByteAddressBuffer finalImage : register(t0); // image présentée (lignes alignées)
+ByteAddressBuffer finalImage : register(t0); // image finale de cette image, avant la composition (lignes alignées)
 ByteAddressBuffer snap0 : register(t1);
 ByteAddressBuffer snap1 : register(t2);
 ByteAddressBuffer snap2 : register(t3);
 ByteAddressBuffer snap3 : register(t4);
-RWByteAddressBuffer counts : register(u0);   // uint par photo : pixels identiques ; à 16 : pixels comparés
+ByteAddressBuffer prevShown : register(t5);  // image affichée précédente (après composition)
+RWByteAddressBuffer counts : register(u0);   // uint : identiques à l'image finale par photo (0 à 12), à l'image
+                                             // affichée précédente (16 à 28), pixels comparés (32)
 
 cbuffer Constants : register(b0)
 {
@@ -22,9 +25,19 @@ cbuffer Constants : register(b0)
     uint pad2;
 };
 
-bool Same(ByteAddressBuffer b, uint a, uint2 f)
+uint2 Pixel(ByteAddressBuffer b, uint a) { return bytesPerPixel == 8 ? b.Load2(a) : uint2(b.Load(a), 0); }
+
+void Count(ByteAddressBuffer s, uint k, bool inside, uint a, uint2 f, uint2 p)
 {
-    return bytesPerPixel == 8 ? all(b.Load2(a) == f) : b.Load(a) == f.x;
+    const uint2 v = inside && k < count ? Pixel(s, a) : uint2(0, 0);
+    const uint same = WaveActiveCountBits(inside && k < count && all(v == f));
+    const uint old = WaveActiveCountBits(inside && k < count && all(v == p));
+    if (WaveIsFirstLane())
+    {
+        uint unused;
+        counts.InterlockedAdd(k * 4, same, unused);
+        counts.InterlockedAdd(16 + k * 4, old, unused);
+    }
 }
 
 [numthreads(8, 8, 1)]
@@ -33,23 +46,16 @@ void main(uint2 id : SV_DispatchThreadID)
     const uint2 px = id * 4;
     const bool inside = px.x < width && px.y < height;
     const uint a = px.y * pitch + px.x * bytesPerPixel;
-    uint2 f = 0;
-    if (inside)
-        f = bytesPerPixel == 8 ? finalImage.Load2(a) : uint2(finalImage.Load(a), 0);
-    const bool s0 = inside && count > 0 && Same(snap0, a, f);
-    const bool s1 = inside && count > 1 && Same(snap1, a, f);
-    const bool s2 = inside && count > 2 && Same(snap2, a, f);
-    const bool s3 = inside && count > 3 && Same(snap3, a, f);
-    // une addition par vague (pas une par pixel : le même compteur pour tous)
-    const uint n0 = WaveActiveCountBits(s0), n1 = WaveActiveCountBits(s1), n2 = WaveActiveCountBits(s2), n3 = WaveActiveCountBits(s3);
+    const uint2 f = inside ? Pixel(finalImage, a) : uint2(0, 0);
+    const uint2 p = inside ? Pixel(prevShown, a) : uint2(0, 0);
+    Count(snap0, 0, inside, a, f, p);
+    Count(snap1, 1, inside, a, f, p);
+    Count(snap2, 2, inside, a, f, p);
+    Count(snap3, 3, inside, a, f, p);
     const uint total = WaveActiveCountBits(inside);
     if (WaveIsFirstLane())
     {
         uint unused;
-        counts.InterlockedAdd(0, n0, unused);
-        counts.InterlockedAdd(4, n1, unused);
-        counts.InterlockedAdd(8, n2, unused);
-        counts.InterlockedAdd(12, n3, unused);
-        counts.InterlockedAdd(16, total, unused);
+        counts.InterlockedAdd(32, total, unused);
     }
 }

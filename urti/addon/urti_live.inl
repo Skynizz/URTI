@@ -22,6 +22,7 @@
 #include "live_shadowtemporal_cs.h" // g_live_shadowtemporal
 #include "live_regionstats_cs.h" // g_live_regionstats
 #include "live_uicompare_cs.h" // g_live_uicompare
+#include "live_uiselect_cs.h" // g_live_uiselect
 
 struct LiveState
 {
@@ -45,9 +46,9 @@ struct LiveState
     // entrent dans la scène RT, jusqu'à vertexBudget sommets ; les autres sont re-mesurés par roulement
     // (probeBudget sommets par image, hors de la structure)
     // photo d'avant l'interface : photos de l'écran (urti_addon.cpp), comparaison, choix
-    ComPtr<ID3D12Resource> snaps[kLiveSnaps], uiCounts, uiReadback[3];
-    ComPtr<ID3D12RootSignature> uiRs;
-    ComPtr<ID3D12PipelineState> uiPso;
+    ComPtr<ID3D12Resource> snaps[kLiveSnaps], uiCounts, uiReadback[3], preUiBuf;
+    ComPtr<ID3D12RootSignature> uiRs, uiSelRs;
+    ComPtr<ID3D12PipelineState> uiPso, uiSelPso;
     uint64_t snapBytes = 0, uiFrame = 0;
     uint32_t uiCountAt[3] = {};
     int uiChoice = -1; // rang de la photo d'avant l'interface (-1 : aucune sûre)
@@ -503,7 +504,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
            make(g_live_composite, sizeof(g_live_composite), 6, live.compositeRs, live.compositePso, 12) &&
-           make(g_live_uicompare, sizeof(g_live_uicompare), 5, live.uiRs, live.uiPso, 8) &&
+           make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
+           make(g_live_uiselect, sizeof(g_live_uiselect), 6, live.uiSelRs, live.uiSelPso, 8) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20) &&
            make(g_live_reflect, sizeof(g_live_reflect), 8, live.reflectRs, live.reflectPso, 20, 2) &&
            make(g_live_regionstats, sizeof(g_live_regionstats), 3, live.statsRs, live.statsPso, 4) &&
@@ -937,7 +939,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.seenNow.swap(g_liveSeen);
         g_liveSeen.clear();
         live.statOverflow += g_liveOverflow, live.statOutOfBudget += g_liveOutOfBudget, live.statReserved += g_liveReserved;
-        g_liveOverflow = g_liveOutOfBudget = 0, g_liveReserved = 0;
+        g_liveOverflow = g_liveOutOfBudget = 0, g_liveReserved = 0, g_liveProbeVerts = 0;
         countersUsed = g_liveNextCounter;
         g_liveNextCounter = kSlots;
         if (!g_liveSunKeys.empty())
@@ -1020,6 +1022,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         std::lock_guard<std::mutex> lock(g_mutex);
         g_liveKnown.swap(known), g_liveAdmit.swap(admit), g_liveProbeWant.swap(probe);
         g_liveBudget = live.vertexBudget > 0;
+        g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.probeBudget;
         g_liveSlotLimit = live.slotLimit;
         g_liveMainDepth = slot >= 0 ? g.slotDepth[slot] : 0;
         // tailles apprises des ExecuteIndirect (toutes les identités mesurées : la table reste petite)
@@ -1875,6 +1878,8 @@ void LiveComposite(effect_runtime* runtime)
             live.snaps[k] = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
             g_liveSnap[k] = live.snaps[k].Get();
         }
+        Retire(live.preUiBuf);
+        live.preUiBuf = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         g_liveSnapFp = fp;
         live.snapBytes = total;
         live.uiChoice = -1;
@@ -1893,18 +1898,17 @@ void LiveComposite(effect_runtime* runtime)
     const uint32_t uiSlot = uint32_t(live.uiFrame % 3);
     if (const uint32_t* c = nullptr; live.uiFrame >= 3 && live.uiCountAt[uiSlot] && SUCCEEDED(live.uiReadback[uiSlot]->Map(0, nullptr, (void**)&c)) && c)
     {
-        // la première photo presque identique à l'image finale : celle d'avant l'interface
+        // même règle que live_uiselect (qui choisit sur le GPU, dans la même image) : ici pour le journal
         int choice = -1;
-        float best = 0;
-        for (uint32_t k = 0; k < live.uiCountAt[uiSlot] && c[4]; k++)
+        float best = 2.0f;
+        for (uint32_t k = 0; k < live.uiCountAt[uiSlot] && c[8]; k++)
         {
-            const float same = float(c[k]) / float(c[4]);
-            if (same >= 0.6f)
-            {
+            const float same = float(c[k]) / float(c[8]), old = float(c[4 + k]) / float(c[8]);
+            if (same >= 0.6f && same > old && same < best)
                 choice = int(k), best = same;
-                break;
-            }
         }
+        if (choice < 0)
+            best = 0;
         if (choice != live.uiChoice)
             Log(choice >= 0 ? "URTI direct : image avant l'interface du jeu : photo %d (%.1f %% des pixels identiques à l'image finale)"
                             : "URTI direct : pas de photo avant l'interface du jeu (%d, %.1f)", choice, best * 100.0f);
@@ -1945,33 +1949,47 @@ void LiveComposite(effect_runtime* runtime)
     Transition(list.Get(), live.imageIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     for (uint32_t k = 0; k < snapCount; k++)
         Transition(list.Get(), live.snaps[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
-    // comparaison des photos de cette image à l'image finale (lue trois présentations plus tard)
+    // image d'avant l'interface : photos de cette image comparées à l'image finale et à l'image affichée
+    // précédente, choix et copie sur le GPU (live_uicompare puis live_uiselect), dans la même image
     live.uiCountAt[uiSlot] = 0;
-    if (snapCount && live.uiPso)
+    ID3D12Resource* preUi = nullptr;
+    if (snapCount && live.uiPhoto && live.uiPso && live.uiSelPso && live.preUiBuf)
     {
-        list->CopyBufferRegion(live.uiCounts.Get(), 0, g.zeros.Get(), 0, 32);
-        D3D12_RESOURCE_BARRIER cb = {};
-        cb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        cb.Transition.pResource = live.uiCounts.Get();
-        cb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // copie implicite (tampon) : état gardé
+        list->CopyBufferRegion(live.uiCounts.Get(), 0, g.zeros.Get(), 0, 64);
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = live.uiCounts.Get();
+        list->ResourceBarrier(1, &ub);
+        Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+        const uint32_t uc[8] = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format == 3 ? 8u : 4u, snapCount, 0, 0, 0 };
         list->SetComputeRootSignature(live.uiRs.Get());
         list->SetPipelineState(live.uiPso.Get());
         list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
         for (uint32_t k = 0; k < kLiveSnaps; k++)
             list->SetComputeRootShaderResourceView(1 + k, live.snaps[std::min(k, snapCount - 1)]->GetGPUVirtualAddress());
-        list->SetComputeRootUnorderedAccessView(5, live.uiCounts->GetGPUVirtualAddress());
-        const uint32_t uc[8] = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format == 3 ? 8u : 4u, snapCount, 0, 0, 0 };
-        list->SetComputeRoot32BitConstants(6, 8, uc, 0);
+        list->SetComputeRootShaderResourceView(5, live.imageOut->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(6, live.uiCounts->GetGPUVirtualAddress());
+        list->SetComputeRoot32BitConstants(7, 8, uc, 0);
         list->Dispatch((uint32_t(bd.Width) / 4 + 7) / 8, (bd.Height / 4 + 7) / 8, 1);
-        Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyBufferRegion(live.uiReadback[uiSlot].Get(), 0, live.uiCounts.Get(), 0, 32);
+        Transition(list.Get(), live.imageOut.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+        list->SetComputeRootSignature(live.uiSelRs.Get());
+        list->SetPipelineState(live.uiSelPso.Get());
+        list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
+        for (uint32_t k = 0; k < kLiveSnaps; k++)
+            list->SetComputeRootShaderResourceView(1 + k, live.snaps[std::min(k, snapCount - 1)]->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(5, live.uiCounts->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(6, live.preUiBuf->GetGPUVirtualAddress());
+        list->SetComputeRoot32BitConstants(7, 8, uc, 0);
+        list->Dispatch((uint32_t(bd.Width) + 7) / 8, (bd.Height + 7) / 8, 1);
+        Transition(list.Get(), live.uiCounts.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(live.uiReadback[uiSlot].Get(), 0, live.uiCounts.Get(), 0, 36);
         Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(list.Get(), live.preUiBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
         live.uiCountAt[uiSlot] = snapCount;
-        (void)cb;
+        preUi = live.preUiBuf.Get();
     }
     live.uiFrame++;
-    // photo d'avant l'interface de cette image, si le choix est sûr et qu'elle a été prise
-    ID3D12Resource* preUi = live.uiPhoto && live.uiChoice >= 0 && uint32_t(live.uiChoice) < snapCount ? live.snaps[live.uiChoice].Get() : nullptr;
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     // vues 4 à 8 : lissé, poids, couleur reflétée, distance de touche (dans le canal du lissé), confiance
     const uint32_t reflectView = live.debugView == 4 ? 1u : live.debugView == 5 ? 2u : live.debugView == 6 ? 3u : live.debugView == 7 ? 1u :
@@ -2098,6 +2116,8 @@ void LiveComposite(effect_runtime* runtime)
     Transition(list.Get(), live.imageIn.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     for (uint32_t k = 0; k < snapCount; k++)
         Transition(list.Get(), live.snaps[k].Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (preUi)
+        Transition(list.Get(), preUi, srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     buf.pResource = live.imageOut.Get();
