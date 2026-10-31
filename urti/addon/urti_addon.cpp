@@ -42,6 +42,19 @@
 #include <unordered_set>
 #include <vector>
 
+#if URTI_NRD
+// NRD et NRI (NVIDIA) : en-tetes au niveau global, le code d'integration est dans urti_nrd.inl
+#include <windows.h>
+#include <dbghelp.h>
+#include <NRD.h>
+#include <NRI.h>
+#include <Extensions/NRIHelper.h>
+#include <Extensions/NRIWrapperD3D12.h>
+// échecs internes de la couche d'intégration rendus visibles (muets en Release)
+#define NRD_INTEGRATION_ASSERT(expr, msg) do { if (!(expr)) { std::fprintf(stderr, "NRD : %s\n", msg); std::fflush(stderr); } } while (0)
+#include <NRDIntegration.hpp>
+#endif
+
 using Microsoft::WRL::ComPtr;
 using namespace reshade::api;
 
@@ -545,10 +558,13 @@ void OnInitDevice(device* dev)
                 reinterpret_cast<void**>(&g_createRootSignature), "CreateRootSignature");
 }
 
+void NrdDestroy(); // urti_nrd.inl
+
 void OnDestroyDevice(device* dev)
 {
     if (!OurDevice(dev))
         return;
+    NrdDestroy();
     g.phase = Phase::Idle;
     g.so.Reset(), g.counters.Reset(), g.zeros.Reset(), g.soReadback.Reset(), g.counterReadback.Reset(), g.depthReadback.Reset();
     g.list.Reset(), g.allocator.Reset(), g.fence.Reset();

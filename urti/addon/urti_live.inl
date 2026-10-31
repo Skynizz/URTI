@@ -118,6 +118,11 @@ struct LiveState
     // d'un filtre à l'autre selon les pixels en ajoute) ; anchor_alpha=0.1 dans urti.ini pour l'essayer
     float anchorAlpha = 0.0f, anchorGamma = 2.5f;
     bool alphaScreen = true; // trous des plaques découpées reconnus à l'écran (urti.ini alpha_screen=0 : coupé)
+    // ombres débruitées par SIGMA de NVIDIA (urti.ini nrd=1) si l'add-on a NRD ; coupé par défaut tant qu'il ne bat pas
+    // le débruitage d'URTI sur le bac à sable (il lui manque le décalage sous-pixel du jeu, inconnu pour l'instant)
+    bool nrdShadows = false;
+    uint32_t statNrd = 0;
+    float nrdDisocclusion = 0.01f, nrdFrames = 5.0f; // SIGMA : seuil de disocclusion, images stabilisees
     uint64_t boundFrame = 0;
 
     // suivi du soleil à chaque image
@@ -498,7 +503,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 24) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 24, 2) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 12) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
@@ -650,6 +655,8 @@ FILETIME FileTime(const std::string& path)
 
 bool Newer(const FILETIME& a, const FILETIME& b) { return CompareFileTime(&a, &b) > 0; }
 
+#include "urti_nrd.inl" // débruiteurs de NVIDIA (si l'add-on est compilé avec NRD)
+
 // toutes les 30 images : urti.ini modifié -> réglages relus ; shader recompilé dans urti_shaders -> pipeline
 // recréé (l'ancien est libéré trois images plus tard)
 void LiveHotReload(ID3D12Device* device)
@@ -666,7 +673,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 4000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -688,6 +695,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0 : toujours reconstruire
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
+                value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames);
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -704,6 +712,7 @@ void LiveHotReload(ID3D12Device* device)
             live.vertexBudget = uint64_t(std::max(0.0f, vertexBudget)), live.probeBudget = uint64_t(std::max(0.0f, probeBudget));
             live.slotLimit = uint64_t(std::max(0.0f, slotLimit));
             live.uiPhoto = uiPhoto != 0;
+            live.nrdShadows = nrdOn != 0, live.nrdDisocclusion = nrdDisocclusion, live.nrdFrames = nrdFrames;
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1574,10 +1583,18 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(6, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(7, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+    // SIGMA (NVIDIA) : un rayon par pixel, pénombre et poids des corrections ; débruitage ensuite
+#if URTI_NRD
+    const bool nrdActive = live.nrdShadows && motionOk && live.mvConvention < 16 && live.shadowRawBuf && NrdEnsure(runtime);
+    list->SetComputeRootUnorderedAccessView(8, nrdActive ? g_nrd.penumbraBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+#else
+    const bool nrdActive = false;
+    list->SetComputeRootUnorderedAccessView(8, live.shadowBuf->GetGPUVirtualAddress());
+#endif
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     const bool sunNow = live.calibrated && live.framesSinceSun < 30;
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
-                           (sunNow ? 0u : 16u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u);
+                           (sunNow ? 0u : 16u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) | (nrdActive ? 4096u : 0u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -1591,10 +1608,23 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), 0, 0, 0 };
-    list->SetComputeRoot32BitConstants(8, 24, &sc, 0);
+    list->SetComputeRoot32BitConstants(9, 24, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
-    // débruitage : flou guidé par la profondeur, historique reprojeté, bornage statistique, mélange adaptatif
-    if (live.shadowRawBuf && live.denoisePso)
+    // débruitage : SIGMA de NVIDIA ; sinon celui d'URTI (flou guidé par la profondeur, historique reprojeté,
+    // bornage statistique, mélange adaptatif)
+    bool nrdDone = false;
+#if URTI_NRD
+    if (nrdActive)
+    {
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = nullptr; // les deux sorties du tracé d'ombres
+        list->ResourceBarrier(1, &ub);
+        nrdDone = NrdShadows(runtime, list.Get(), d24, motionOk);
+        live.statNrd += nrdDone ? 1 : 0;
+    }
+#endif
+    if (!nrdDone && live.shadowRawBuf && live.denoisePso)
     {
         Transition(list.Get(), live.shadowRawBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
         list->SetComputeRootSignature(live.denoiseRs.Get());

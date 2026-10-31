@@ -28,7 +28,9 @@ cbuffer Constants : register(b0)
     uint depth24;      // 1 : D24S8 (24 bits de profondeur)
     uint atlasPitch;
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
-                       // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil
+                       // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
+                       // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
+                       // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après
     uint motionPitch;
     uint motionConvention; // 0..15 (live_mvcal), 255 : pas d'accumulation
     float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
@@ -40,6 +42,15 @@ cbuffer Constants : register(b0)
 };
 
 static float gA, gB, gClear;
+
+// SIGMA : rayon de la pénombre au point (distance à l'obstacle × tangente du rayon apparent du soleil) ;
+// NRD_FP16_MAX : rien ne bloque (même formule que SIGMA_FrontEnd_PackPenumbra de NRD)
+static const float kFp16Max = 65504.0;
+float PackPenumbra(float distanceToOccluder, float tanOfLightAngularRadius)
+{
+    return distanceToOccluder >= kFp16Max ? kFp16Max : min(distanceToOccluder * tanOfLightAngularRadius * 0.5, 32768.0);
+}
+RWByteAddressBuffer penumbra : register(u1); // float par pixel (pas : shadowPitch), mode SIGMA
 
 // éclairement du point par le soleil selon la carte d'ombres du jeu (1 si aucune cascade ne le couvre)
 float GameLit(float3 p)
@@ -167,6 +178,8 @@ void main(uint2 id : SV_DispatchThreadID)
     const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
     const float3 sun = asfloat(sunBuf.Load3(0));
     float lit = 1.0;
+    float hitDistance = kFp16Max; // mode SIGMA : distance de l'obstacle du premier rayon
+    float weight = 0.0;           // mode SIGMA : part de l'ombre gardée par les corrections (0 : aucune ombre RT)
     const float w = gB / (d - gA);
     if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
@@ -177,8 +190,10 @@ void main(uint2 id : SV_DispatchThreadID)
         const float3 t1 = normalize(abs(sun.y) < 0.99 ? cross(sun, float3(0, 1, 0)) : cross(sun, float3(1, 0, 0)));
         const float3 t2 = cross(sun, t1);
         const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))) + 0.61803399 * float(frameIndex & 1023));
+        hitDistance = kFp16Max;
         lit = 0.0;
-        const uint rays = clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
+        // SIGMA veut un rayon par pixel (il débruite lui-même) et la distance de l'obstacle
+        const uint rays = (flags & 4096) ? 1u : clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
         for (uint k = 0; k < rays; k++)
         {
             const float u = rays == 1 ? 0.0 : (float(k & 1) + 0.5) * 0.5, v = (float(k >> 1) + 0.5) * 0.5;
@@ -197,6 +212,8 @@ void main(uint2 id : SV_DispatchThreadID)
                     ((flags & 2048) == 0 || !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p)))
                 {
                     blocked = true;
+                    if (k == 0)
+                        hitDistance = q.CandidateTriangleRayT();
                     q.Abort();
                 }
             lit += blocked ? 0.0 : 1.0 / rays;
@@ -205,16 +222,19 @@ void main(uint2 id : SV_DispatchThreadID)
         // plus y ferait des taches (le test de sa carte la voit éclairée, la surface étant son propre écran)
         const float ndl = dot(NormalAt(int2(id), p), sun);
         const bool facesSun = ndl > 0.08;
+        weight = 1.0;
         if (!facesSun && (flags & 4))
-            lit = 1.0;
+            lit = 1.0, weight = 0.0;
         else if (flags & 1)
         {
             const float game = GameLit(p);
             if (flags & 8)
                 lit = game; // contrôle : l'ombre du jeu telle que recalculée
             else if (flags & 4)
-                lit = 1.0 - game * (1.0 - lit); // n'ajouter de l'ombre que là où le jeu éclaire
+                lit = 1.0 - game * (1.0 - lit), weight *= game; // n'ajouter de l'ombre que là où le jeu éclaire
         }
+        if (ndl <= 0)
+            hitDistance = 0; // SIGMA : surface dos au soleil, à l'ombre d'elle-même
     }
     // une ombre ne retire que la lumière directe du soleil, proportionnelle à l'angle de la surface face à lui
     // (N·L) : une surface rasante perd peu, une surface face au soleil perd tout ; le reste (lumière du
@@ -223,12 +243,21 @@ void main(uint2 id : SV_DispatchThreadID)
     {
         const float2 ndc2 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p2 = float3(ndc2.x * w / p00, ndc2.y * w / p11, w);
-        lit = 1.0 - (1.0 - lit) * saturate(dot(NormalAt(int2(id), p2), sun) * 2.5);
+        const float ndlWeight = saturate(dot(NormalAt(int2(id), p2), sun) * 2.5);
+        lit = 1.0 - (1.0 - lit) * ndlWeight;
+        weight *= ndlWeight;
     }
     // au loin, le jeu noie le paysage dans la brume : une ombre RT pleine y fait des taches noires ; elle
     // s'efface entre 120 et 300 unités (mètres dans RDR2)
     if (w > 0)
-        lit = lerp(lit, 1.0, saturate((w - 120.0) / 180.0));
+        lit = lerp(lit, 1.0, saturate((w - 120.0) / 180.0)), weight *= 1.0 - saturate((w - 120.0) / 180.0);
+    if (flags & 4096)
+    {
+        // SIGMA débruite la visibilité seule ; les corrections s'appliquent après (live_nrdpost)
+        penumbra.Store(id.y * shadowPitch + id.x * 4, asuint(PackPenumbra(hitDistance, tan(sunRadius))));
+        shadow.Store(id.y * shadowPitch + id.x * 4, asuint(weight));
+        return;
+    }
     const float rawLit = lit;
     float motionPixels = 0;
     bool historyUsed = false;

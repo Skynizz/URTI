@@ -847,3 +847,28 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   `ExecuteIndirect`) pointaient alors vers le code d'un add-on déchargé. Elles sont maintenant remises à
   l'origine au déchargement. Vérifié : le jeu démarre (`tools/reshade/rdr2_demarrage.ps1` : démarrage sans
   clic, surveille processus et plantages).
+
+## v39 — URTI : débruiteurs de NVIDIA (NRD / SIGMA) intégrés ; le jitter, cause du tremblement restant
+
+- **NRD 4.17.3** (NVIDIA, licence RTX SDK, autorisée pour l'intégration dans une application ; source et
+  bibliothèques hors du dépôt, dans `urti/third_party/NRD`, compilées avec NRI en statique, shaders DXIL
+  seulement, **sans le support Agility SDK** : sinon NRI appelle `ID3D12Device15::TryCreate…View`, absent
+  du DirectX 12 du système (`ID3D12Device14`) → écriture n'importe où, plantage dans D3D12Core). CMake
+  l'inclut s'il est compilé (`URTI_NRD`).
+- Intégration (`urti_nrd.inl`, réglage `nrd=1`) : SIGMA (ombres) via la couche NRDIntegration sur NRI, qui
+  enveloppe l'appareil D3D12 du jeu, sa file de commandes et nos textures (barrières classiques). Entrées :
+  `live_shadow` en mode SIGMA (un rayon par pixel, pénombre = distance de l'obstacle × tan du rayon du
+  soleil, et le poids des corrections d'URTI), `live_nrdprep` (profondeur linéaire, normales encodées par
+  `NRD_FrontEnd_PackNormalAndRoughness`), vecteurs de mouvement du jeu tels quels (échelle selon leur
+  convention). NRD tourne sur sa propre liste de commandes (il installe ses tables de descripteurs : rien ne
+  fuit dans l'état de ReShade), soumise entre nos passes ; `live_nrdpost` recompose le masque. Un
+  plantage dans NRD est rattrapé (pile d'appels symbolisée dans le journal) et URTI repasse à son
+  débruitage ; symboles de débogage générés en Release.
+- Mesures (bac à sable) : SIGMA **moins bon** que le débruitage d'URTI (arbre au vent, clignotement 0,115 →
+  0,301 % ; marche 0,801 → 0,929 %) ; seuil de disocclusion, nombre d'images, taille du soleil : sans effet.
+  **Sans décalage sous-pixel** (`URTI_SANDBOX_JITTER=0`), l'arbre au vent devient presque parfait avec les
+  deux (URTI 0,000 %, SIGMA 0,010 %) : le tremblement restant d'une scène fixe vient du **jitter** du jeu
+  (DLSS / TAA). URTI calcule sur la profondeur décalée et compose sur l'image déjà stabilisée ; NRD exige
+  ce décalage (`cameraJitter`), qu'URTI ne connaît pas. SIGMA coupé par défaut en attendant.
+- Piste : le jitter apparaît dans le passage d'une image à l'autre mesuré par les cascades (live_sunvote)
+  comme un cisaillement, séparable de la rotation (`A[0][2] + A[2][0]`, `A[1][2] + A[2][1]`).

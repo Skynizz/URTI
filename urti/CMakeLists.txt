@@ -32,6 +32,27 @@ add_library(urti_addon SHARED addon/urti_addon.cpp addon/urti_live.inl ${CMAKE_C
 target_include_directories(urti_addon PRIVATE third_party/reshade/include third_party/imgui ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(urti_addon d3d12)
 set_target_properties(urti_addon PROPERTIES OUTPUT_NAME urti SUFFIX ".addon64")
+# symboles de débogage aussi en Release (piles d'appels lisibles en cas de plantage)
+target_compile_options(urti_addon PRIVATE /Zi)
+target_link_options(urti_addon PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+
+# débruiteurs de NVIDIA (NRD 4.17.3 avec NRI : SIGMA pour les ombres), s'ils ont été compilés dans
+# third_party/NRD (licence NVIDIA RTX SDK, hors du dépôt ; voir JOURNAL v39)
+set(URTI_NRD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/NRD)
+if(EXISTS ${URTI_NRD_DIR}/_Bin/Release/NRD.lib)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/live_nrdprep_cs.h ${CMAKE_CURRENT_BINARY_DIR}/live_nrdpost_cs.h
+        COMMAND ${URTI_DXC} -nologo -T cs_6_0 -E main -Vn g_live_nrdprep -I ${URTI_NRD_DIR}/Shaders -Fh ${CMAKE_CURRENT_BINARY_DIR}/live_nrdprep_cs.h ${CMAKE_CURRENT_SOURCE_DIR}/addon/live_nrdprep.hlsl
+        COMMAND ${URTI_DXC} -nologo -T cs_6_0 -E main -Vn g_live_nrdpost -Fh ${CMAKE_CURRENT_BINARY_DIR}/live_nrdpost_cs.h ${CMAKE_CURRENT_SOURCE_DIR}/addon/live_nrdpost.hlsl
+        DEPENDS addon/live_nrdprep.hlsl addon/live_nrdpost.hlsl)
+    target_sources(urti_addon PRIVATE addon/urti_nrd.inl ${CMAKE_CURRENT_BINARY_DIR}/live_nrdprep_cs.h ${CMAKE_CURRENT_BINARY_DIR}/live_nrdpost_cs.h)
+    target_compile_definitions(urti_addon PRIVATE URTI_NRD=1)
+    target_include_directories(urti_addon PRIVATE ${URTI_NRD_DIR}/Include ${URTI_NRD_DIR}/Integration ${URTI_NRD_DIR}/_Build/_deps/nri-src/Include)
+    file(GLOB URTI_NRI_LIBS ${URTI_NRD_DIR}/_Build/_deps/nri-build/Release/*.lib)
+    target_link_libraries(urti_addon ${URTI_NRD_DIR}/_Bin/Release/NRD.lib ${URTI_NRD_DIR}/_Bin/Release/NRI.lib ${URTI_NRI_LIBS}
+        ${URTI_NRD_DIR}/_Build/_deps/shadermake-build/Release/ShaderMakeBlob.lib dxgi dxguid dbghelp)
+    message(STATUS "URTI : débruiteurs NRD de NVIDIA inclus")
+endif()
 
 # ombres du soleil en ray tracing sur une capture (outil hors ligne, DXR 1.1)
 add_custom_command(
