@@ -26,7 +26,15 @@ cbuffer Constants : register(b0)
     float alphaMax;        // en mouvement rapide
     float gamma;           // largeur du bornage (écarts-types)
     uint pad;
+    float p00;             // projection supposée (décalage sous-pixel en pixels)
+    float p11;
 };
+
+// décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
+// (cisaillement x' = x + a w, y' = y + b w) : en pixels de rendu, le contenu d'un pixel est celui du point
+// situé à « pixel - jitter » ; écart d'une image à l'autre (précédente - courante) à 628, absolu à 1184
+float2 JitterPixels(float2 ab, float p00_, float p11_, float2 size) { return float2(ab.x * p00_, -ab.y * p11_) * 0.5 * size; }
+
 
 static float gA, gB;
 
@@ -87,7 +95,8 @@ void main(uint2 id : SV_DispatchThreadID)
             if (k & 8)
                 mv.y = -mv.y;
             motionPixels = length(mv * float2(width, height));
-            const float2 prevUv = (float2(id) + 0.5) / float2(width, height) + mv;
+            const float2 jitterStep = JitterPixels(asfloat(sunBuf.Load2(628)), p00, p11, float2(width, height));
+            const float2 prevUv = (float2(id) + 0.5 + jitterStep) / float2(width, height) + mv;
             if (all(isfinite(mv)) && all(prevUv > 0) && all(prevUv < 1))
             {
                 const float2 q = prevUv * float2(width, height) - 0.5;

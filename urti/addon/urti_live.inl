@@ -122,7 +122,10 @@ struct LiveState
     // le débruitage d'URTI sur le bac à sable (il lui manque le décalage sous-pixel du jeu, inconnu pour l'instant)
     bool nrdShadows = false;
     uint32_t statNrd = 0;
-    float nrdDisocclusion = 0.01f, nrdFrames = 5.0f; // SIGMA : seuil de disocclusion, images stabilisees
+    float nrdDisocclusion = 0.01f, nrdFrames = 5.0f;
+    bool jitterLog = false;
+    float fovStretch = 0; // t² mesuré par live_sunvote (étirement de la projection supposée)
+    uint32_t jitterMode = 2; // décalage sous-pixel du jeu compensé : 0 non, 1 écart d'une image à l'autre, 2 aussi l'absolu // SIGMA : seuil de disocclusion, images stabilisees
     uint64_t boundFrame = 0;
 
     // suivi du soleil à chaque image
@@ -176,7 +179,7 @@ struct LiveState
 constexpr uint32_t kLiveMaxPairs = 256;
 // soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
 // l'image précédente (640)
-constexpr uint32_t kLiveSunBytes = 656 + 8 * 64;
+constexpr uint32_t kLiveSunBytes = 656 + 8 * 64 + 64; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223)
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
@@ -505,10 +508,10 @@ bool LiveCreatePipelines(ID3D12Device* device)
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
            make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 24, 2) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
-           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 12) &&
+           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
-           make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 4) &&
-           make(g_live_composite, sizeof(g_live_composite), 6, live.compositeRs, live.compositePso, 12) &&
+           make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
+           make(g_live_composite, sizeof(g_live_composite), 7, live.compositeRs, live.compositePso, 14) &&
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
            make(g_live_uiselect, sizeof(g_live_uiselect), 6, live.uiSelRs, live.uiSelPso, 8) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20) &&
@@ -638,7 +641,7 @@ bool LiveEnsureSun(ID3D12Device* device)
     for (auto& r : live.pairsUpload)
         r = MakeBuffer(device, kLiveMaxPairs * 48ull, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     for (auto& r : live.sunReadback)
-        r = MakeBuffer(device, 640, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        r = MakeBuffer(device, kLiveSunBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     live.pairDirs = UavBuffer(device, kLiveMaxPairs * 80ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.sunBuf = UavBuffer(device, kLiveSunBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.sunUpload = MakeBuffer(device, 48, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -673,7 +676,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 4000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -695,7 +698,11 @@ void LiveHotReload(ID3D12Device* device)
                 value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0 : toujours reconstruire
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
-                value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames);
+                value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter);
+                float jl = 0;
+                value("jitter_log=", jl);
+                if (l.rfind("jitter_log=", 0) == 0)
+                    live.jitterLog = jl != 0;
             }
             std::fclose(f);
             live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
@@ -713,6 +720,7 @@ void LiveHotReload(ID3D12Device* device)
             live.slotLimit = uint64_t(std::max(0.0f, slotLimit));
             live.uiPhoto = uiPhoto != 0;
             live.nrdShadows = nrdOn != 0, live.nrdDisocclusion = nrdDisocclusion, live.nrdFrames = nrdFrames;
+            live.jitterMode = uint32_t(std::clamp(jitter, 0.0f, 2.0f));
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1049,6 +1057,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         if (live.calibrated)
         {
             live.sunFrames++, live.pairSum += uint64_t(r[4]);
+            if (live.jitterLog) // urti.ini jitter_log=1 : décalage sous-pixel mesuré à chaque image (celle d'il y a trois)
+                Log("JITTER %llu valide %.0f ecart %.6f %.6f absolu %.6f %.6f s2 %.3f t2 %.3f", (unsigned long long)live.frame, r[156], r[157], r[158], r[296], r[297], r[304], r[305]);
             if (r[156] > 0) // rotation de la caméra mesurée (octet 624)
             {
                 const double tr = r[144] + r[149] + r[154]; // trace de la matrice (lignes à 576, 592, 608)
@@ -1073,8 +1083,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             }
             else
                 live.framesSinceSun++;
+            if (r[305] > 0)
+                live.fovStretch = r[305]; // t² : (tan du demi-champ supposé / tan du vrai)²
             if (live.sunFrames == 300)
             {
+                if (live.fovStretch > 0 && live.p11 > 0)
+                    Log("URTI direct : champ de vision vertical du jeu mesuré : %.1f° (URTI suppose %.1f°)",
+                        2.0 * std::atan(1.0 / (live.p11 * std::sqrt(double(live.fovStretch)))) * 180.0 / 3.14159265,
+                        2.0 * std::atan(1.0 / double(live.p11)) * 180.0 / 3.14159265);
                 Log("URTI direct : soleil suivi (%.3f, %.3f, %.3f), mesuré sur %.0f %% des images, %.0f paires par image, %u cascades", r[0], r[1], r[2],
                     100.0 * live.sunAccepted / live.sunFrames, double(live.pairSum) / live.sunFrames, reinterpret_cast<const uint32_t*>(r)[8]);
                 if (live.sunJitterCount)
@@ -1397,8 +1413,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetPipelineState(live.votePso.Get());
             list->SetComputeRootShaderResourceView(0, live.pairDirs->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(1, live.sunBuf->GetGPUVirtualAddress());
-            const struct { uint32_t count; float cosTol, minShare, sunSign; } vc = { uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.35f, live.sunSign };
-            list->SetComputeRoot32BitConstants(2, 4, &vc, 0);
+            const struct { uint32_t count; float cosTol, minShare, sunSign, jitterDelta, jitterAbsolute, pad0, pad1; } vc = {
+                uint32_t(pairs.size()), std::cos(2.0f * 3.14159265f / 180.0f), 0.35f, live.sunSign, live.jitterMode >= 1 ? 1.0f : 0.0f,
+                live.jitterMode >= 2 ? 1.0f : 0.0f, 0, 0 };
+            list->SetComputeRoot32BitConstants(2, 8, &vc, 0);
             list->Dispatch(1, 1, 1);
             Transition(list.Get(), live.pairDirs.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
@@ -1641,10 +1659,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             uint32_t width, height, depthPitch, shadowPitch, motionPitch, motionConvention, depth24, debugMode;
             float alphaMin, alphaMax, gamma;
             uint32_t pad;
+            float p00, p11;
         } dn = { live.width, live.height, live.depthPitch, live.shadowPitch, live.mvPitch,
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
-                 0.1f, 0.5f, 1.5f, 0 };
-        list->SetComputeRoot32BitConstants(7, 12, &dn, 0);
+                 0.1f, 0.5f, 1.5f, 0, live.p00, live.p11 };
+        list->SetComputeRoot32BitConstants(7, 14, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
         Transition(list.Get(), live.shadowRawBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
@@ -1687,7 +1706,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (atlasValid)
         Transition(list.Get(), live.atlasBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, 640);
+    list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, kLiveSunBytes);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     LiveTime(list.Get(), 4);
@@ -2123,7 +2142,9 @@ void LiveComposite(effect_runtime* runtime)
     list->SetComputeRootShaderResourceView(3, blend ? live.prevShadowBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(4, reflHistOut >= 0 ? live.reflHist[reflHistOut]->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(5, preUi ? preUi->GetGPUVirtualAddress() : live.imageIn->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(6, live.imageOut->GetGPUVirtualAddress());
+    Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    list->SetComputeRootShaderResourceView(6, live.sunBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(7, live.imageOut->GetGPUVirtualAddress());
     const struct
     {
         uint32_t width, height, pitch, format, maskWidth, maskHeight, maskPitch;
@@ -2131,11 +2152,13 @@ void LiveComposite(effect_runtime* runtime)
         uint32_t split, showMask;
         float reflStrength;
         uint32_t debugReflect;
+        float p00, p11;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u, (reflections && !(generated && live.fgMode == 2)) ? std::max(live.reflEffective, reflectView ? 1.0f : 0.0f) : 0.0f,
-             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u) };
-    list->SetComputeRoot32BitConstants(7, 12, &cc, 0);
+             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u), live.p00, live.p11 };
+    list->SetComputeRoot32BitConstants(8, 14, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
+    Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (blend)
         Transition(list.Get(), live.prevShadowBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);

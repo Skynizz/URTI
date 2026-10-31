@@ -15,6 +15,8 @@ cbuffer Constants : register(b0)
     float cosTol;
     float minShare; // part minimale du poids total pour la direction gagnante
     float sunSign; // +1 ou -1 : direction de profondeur décroissante de la carte -> vers le soleil
+    float2 jitterMode; // x : écart de décalage sous-pixel utilisé (1) ou non (0) ; y : décalage absolu
+    float2 pad;
 };
 
 #define T 256
@@ -174,6 +176,36 @@ void main(uint t : SV_GroupThreadID)
         }
     }
     sun.Store(624, asuint(valid));
+    // décalage sous-pixel du jeu (jitter) : la projection décalée ajoute à l'espace caméra un cisaillement
+    // (x' = x + a w, y' = y + b w), qui n'est pas une rotation ; A = K_préc R K_cour⁻¹ donne au premier ordre
+    // a_préc - a_cour = A[0][2] + A[2][0] et b_préc - b_cour = A[1][2] + A[2][1]. Suivi en absolu : somme
+    // des écarts moins sa moyenne glissante (la suite des décalages d'un jeu est centrée)
+    //
+    // La projection supposée par URTI (champ de 50°) n'est pas celle du jeu : l'espace caméra d'URTI est
+    // l'espace vrai étiré de s (en x) et t (en y), et une rotation y devient S R S⁻¹ : A[0][2] = s r02,
+    // A[2][0] = -r02 / s. D'où a_préc - a_cour = A[0][2] + s² A[2][0] (et b avec t²). s² et t² sont mesurés
+    // par régression sur les images où la caméra tourne (la rotation fuyait sinon dans le décalage : dérive
+    // de plusieurs pixels en marchant). s = tan(champ vrai / 2) / tan(champ supposé / 2).
+    float2 jitterDelta = 0;
+    float4 fit = asfloat(sun.Load4(1200)); // sommes décroissantes : A20², A02 A20, A21², A12 A21
+    if (valid > 0)
+    {
+        const float3 a0 = asfloat(sun.Load3(576)), a1 = asfloat(sun.Load3(592)), a2 = asfloat(sun.Load3(608));
+        fit = fit * 0.995 + float4(a2.x * a2.x, a0.z * a2.x, a2.y * a2.y, a1.z * a2.y);
+        const float s2 = fit.x > 1e-6 ? clamp(-fit.y / fit.x, 0.25, 4.0) : 1.0;
+        const float t2 = fit.z > 1e-6 ? clamp(-fit.w / fit.z, 0.25, 4.0) : 1.0;
+        sun.Store4(1200, asuint(fit));
+        sun.Store2(1216, asuint(float2(s2, t2)));
+        jitterDelta = float2(a0.z + s2 * a2.x, a1.z + t2 * a2.y);
+        if (any(abs(jitterDelta) > 0.01))
+            jitterDelta = 0; // pas un décalage sous-pixel (mesure aberrante)
+    }
+    sun.Store2(628, asuint(jitterDelta * jitterMode.x));
+    float4 track = asfloat(sun.Load4(1168)); // somme (xy), moyenne glissante (zw)
+    track.xy -= jitterDelta;
+    track.zw = lerp(track.zw, track.xy, 1.0 / 32.0);
+    sun.Store4(1168, asuint(track));
+    sun.Store2(1184, asuint((track.xy - track.zw) * jitterMode.y));
     // cascades de cette image gardées pour la suivante
     sun.Store(640, cascades);
     for (uint c4 = 0; c4 < cascades; c4++)

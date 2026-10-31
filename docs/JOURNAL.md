@@ -872,3 +872,24 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   ce décalage (`cameraJitter`), qu'URTI ne connaît pas. SIGMA coupé par défaut en attendant.
 - Piste : le jitter apparaît dans le passage d'une image à l'autre mesuré par les cascades (live_sunvote)
   comme un cisaillement, séparable de la rotation (`A[0][2] + A[2][0]`, `A[1][2] + A[2][1]`).
+
+## v40 — URTI : décalage sous-pixel (jitter) et champ de vision du jeu mesurés et compensés
+
+- Le décalage sous-pixel du jeu (DLSS / TAA) est mesuré à chaque image sans rien savoir du jeu : la
+  projection décalée ajoute à l'espace caméra un cisaillement x' = x + a w, y' = y + b w ; le passage d'une
+  image à l'autre mesuré par les cascades vaut A = K_préc S R S⁻¹ K_cour⁻¹. Au premier ordre
+  a_préc - a_cour = A[0][2] + s² A[2][0] (b avec t²), où s, t sont l'étirement de l'espace caméra d'URTI
+  (champ de vision supposé) par rapport au vrai. s² et t² sont mesurés par régression (sommes
+  décroissantes) sur les images où la caméra tourne : sans eux, la rotation fuyait dans la mesure (dérive
+  de ~16 pixels en marchant). Décalage absolu : somme des écarts moins sa moyenne glissante (la suite
+  d'un jeu est centrée) ; bac à sable : ±0,4 pixel, le cycle de Halton à 8 images retrouvé.
+- **Champ de vision du jeu mesuré** (s = tan(champ vrai / 2) / tan(champ supposé / 2)) : bac à sable
+  54,9° à 55,1° pour 55° (URTI supposait 50°). Journalisé ; pas encore réinjecté dans la projection.
+- Compensation (`jitter=2` par défaut ; 1 : seulement l'écart, 0 : rien) : la composition lit masque et
+  reflets à l'endroit non décalé (l'image présentée est stabilisée par le TAA), les reflets prennent leur
+  couleur à l'endroit non décalé, les historiques sont reprojetés avec l'écart de décalage. Recaler
+  seulement l'historique est pire (il suit alors le décalage au lieu de le moyenner).
+- 7 scènes, toutes meilleures (`suite/tableau_v40.txt`) : clignotement bâtiment 0,077 → 0,003 %, arbre
+  immobile 0,124 → 0,054 %, arbre au vent 0,115 → 0,050 %, personnage 0,076 → 0,034 %, caméra fixe
+  0,098 → 0,081 %, occlusion 0,126 → 0,081 %, marche 0,801 → 0,803 %.
+- `jitter_log=1` : décalage mesuré à chaque image dans le journal.

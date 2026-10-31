@@ -74,6 +74,12 @@ float3 SampleLinear(float2 uv)
     return lerp(lerp(LoadLinear(b), LoadLinear(b + int2(1, 0)), f.x), lerp(LoadLinear(b + int2(0, 1)), LoadLinear(b + int2(1, 1)), f.x), f.y);
 }
 
+// décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
+// (cisaillement x' = x + a w, y' = y + b w) : en pixels de rendu, le contenu d'un pixel est celui du point
+// situé à « pixel - jitter » ; écart d'une image à l'autre (précédente - courante) à 628, absolu à 1184
+float2 JitterPixels(float2 ab, float p00_, float p11_, float2 size) { return float2(ab.x * p00_, -ab.y * p11_) * 0.5 * size; }
+static float2 gJitterUv; // décalage absolu de cette image, en uv (le point reflété projeté dans l'espace décalé)
+
 // reflet courant d'un pixel de rendu : couleur plafonnée × poids, poids ; known = false si la surface
 // réfléchit mais que le point reflété est caché ou hors de l'écran (donnée manquante, pas un zéro)
 float4 Current(int2 t, out bool known)
@@ -83,7 +89,7 @@ float4 Current(int2 t, out bool known)
     known = rf.z >= 0;
     if (rf.z <= 0)
         return float4(0, 0, 0, 0);
-    float3 c = SampleLinear(rf.xy);
+    float3 c = SampleLinear(rf.xy - gJitterUv); // l'image présentée n'est pas décalée (TAA)
     const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     if (lum > maxLuminance)
         c *= maxLuminance / lum;
@@ -108,6 +114,7 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     const int2 t = int2(id);
     const uint dst = (id.y * renderWidth + id.x) * 16;
+    gJitterUv = JitterPixels(asfloat(sunBuf.Load2(1184)), p00, p11, float2(renderWidth, renderHeight)) / float2(renderWidth, renderHeight);
     if (flags & 2)
         return; // image générée : le résultat de la dernière image réelle reste
 
@@ -199,7 +206,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const float dist = w > 0 ? length(float3(ndc0.x * w / p00, ndc0.y * w / p11, w)) : 1;
         const float ratio = hitT >= 1e4 ? 0.0 : dist / (dist + max(hitT, 0.0));
         const float2 mvVirtual = mvRot + (mv - mvRot) * ratio;
-        const float2 prevUv = uv + mvVirtual;
+        const float2 prevUv = uv + mvVirtual + JitterPixels(asfloat(sunBuf.Load2(628)), p00, p11, float2(renderWidth, renderHeight)) / float2(renderWidth, renderHeight);
         if (law.z > 0 && all(isfinite(mvVirtual)) && all(prevUv > 0) && all(prevUv < 1) && w > 0)
         {
             const int2 p = int2(prevUv * float2(renderWidth, renderHeight));
