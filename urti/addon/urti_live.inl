@@ -75,6 +75,7 @@ struct LiveState
     std::string burstFolder;
     uint64_t statChurn = 0; // objets entrés ou sortis de la scène RT (bilan par 300 images)
     bool composedNow = false;           // la composition d'URTI a eu lieu à cette présentation
+    std::atomic<bool> showGameOnly{ false }; // F4 : image du jeu seule (comparaison avant / après en plein écran)
     uint64_t vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0;
     uint64_t statDraws = 0, statOverflow = 0, statOutOfBudget = 0, statProbes = 0, statBudgetFrames = 0, statReserved = 0;
     // accumulation dans le temps : vecteurs de mouvement du jeu (G-buffer), profondeur précédente
@@ -2034,6 +2035,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 void LiveComposite(effect_runtime* runtime)
 {
     live.composedNow = false;
+    if (live.showGameOnly)
+        return; // F4 : avant (le calcul RT continue : le retour à « après » est immédiat)
     if (!live.enabled || !live.depthReady || !live.bound || !live.shadowBuf || !live.compositePso)
         return;
     // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt

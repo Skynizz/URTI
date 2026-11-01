@@ -1522,6 +1522,12 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.forceCalibration = true;
     if (GetAsyncKeyState(VK_F5) & 1)
         live.toggleSplit = true;
+    // F4 : avant / après en plein écran, instantané (seule la pose sur l'image est sautée, le calcul continue)
+    if (GetAsyncKeyState(VK_F4) & 1)
+    {
+        live.showGameOnly = !live.showGameOnly;
+        Log("URTI direct : F4, %s", live.showGameOnly ? "image du jeu seule (avant)" : "image avec URTI (après)");
+    }
     if (const std::string f5 = g_dir + "\\urti_f5"; g.frame % 30 == 0 && GetFileAttributesA(f5.c_str()) != INVALID_FILE_ATTRIBUTES)
         DeleteFileA(f5.c_str()), live.toggleSplit = true; // F5 par fichier (tests automatiques)
     // rafale (touche F8, ou fichier déclencheur urti_rafale) : 30 images consécutives, chacune sans et avec URTI
