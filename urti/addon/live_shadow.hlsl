@@ -28,7 +28,8 @@ cbuffer Constants : register(b0)
     uint depth24;      // 1 : D24S8 (24 bits de profondeur)
     uint atlasPitch;
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
-                       // 32 carte en 16 bits (R16, RDR2),
+                       // 32 carte en 16 bits (R16, RDR2), 64 pas de rayons d'ombre du soleil (le soleil reste connu :
+                       // l'occultation ambiante s'en sert),
                        // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
                        // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
                        // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après
@@ -40,7 +41,15 @@ cbuffer Constants : register(b0)
     float sunSky;          // rapport soleil / ciel mesuré dans l'image du jeu (live_sunlight) ; 0 : non mesuré
     uint gameDilate;       // voisinage lu dans la carte du jeu (rayon en texels)
     uint gameMin;          // 1 : part éclairée filtrée, visibilité la plus faible des deux ; 0 : ombre du jeu élargie, produit
+    float aoAmount;        // occultation ambiante RT : part de la lumière du ciel retirée par un obstacle tout proche (0 : coupée)
+    float aoRadius;        // portée des rayons d'occultation (mètres)
 };
+
+uint AoHash(uint x)
+{
+    x ^= x >> 16, x *= 0x7feb352d, x ^= x >> 15, x *= 0x846ca68b, x ^= x >> 16;
+    return x;
+}
 
 static float gA, gB, gClear;
 
@@ -171,6 +180,19 @@ bool Hole(float3 h, float3 receiver)
     return screen >= 0 ? screen == 1 : SunSeesThrough(h, receiver);
 }
 
+// surface plane autour du pixel (comme live_reflect) : les points à 2 pixels de part et d'autre sont alignés
+// avec lui sur au moins un axe ; faux pour l'herbe, le feuillage, une grille (la profondeur saute)
+float Flatness(int2 t, float3 p)
+{
+    const float3 l = PointAt(t - int2(2, 0)), r = PointAt(t + int2(2, 0)), u = PointAt(t - int2(0, 2)), b = PointAt(t + int2(0, 2));
+    if (l.z <= 0 || r.z <= 0 || u.z <= 0 || b.z <= 0)
+        return 0;
+    const float3 h = r - l, v = b - u;
+    const float eh = length(cross(h, p - l)) / max(length(h), 1e-6);
+    const float ev = length(cross(v, p - u)) / max(length(v), 1e-6);
+    return saturate(1.0 - min(eh, ev) / (0.004 * p.z + 0.002));
+}
+
 float3 NormalAt(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
@@ -196,6 +218,7 @@ void main(uint2 id : SV_DispatchThreadID)
     float hitDistance = kFp16Max; // mode SIGMA : distance de l'obstacle du premier rayon
     float weight = 0.0;           // mode SIGMA : part de l'ombre gardée par les corrections (0 : aucune ombre RT)
     const float w = gB / (d - gA);
+    float gameVis = 1.0; // soleil reçu selon la carte du jeu (occultation ambiante : part du ciel dans la lumière)
     if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
         const float2 ndc = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
@@ -206,9 +229,9 @@ void main(uint2 id : SV_DispatchThreadID)
         const float3 t2 = cross(sun, t1);
         const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))) + 0.61803399 * float(frameIndex & 1023));
         hitDistance = kFp16Max;
-        lit = 0.0;
+        lit = (flags & 64) ? 1.0 : 0.0;
         // SIGMA veut un rayon par pixel (il débruite lui-même) et la distance de l'obstacle
-        const uint rays = (flags & 4096) ? 1u : clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
+        const uint rays = (flags & 64) ? 0u : (flags & 4096) ? 1u : clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
         for (uint k = 0; k < rays; k++)
         {
             const float u = rays == 1 ? 0.0 : (float(k & 1) + 0.5) * 0.5, v = (float(k >> 1) + 0.5) * 0.5;
@@ -243,6 +266,7 @@ void main(uint2 id : SV_DispatchThreadID)
         else if (flags & 1)
         {
             const float game = GameLit(p);
+            gameVis = facesSun ? game : 0.0;
             if (flags & 8)
                 lit = game; // contrôle : l'ombre du jeu telle que recalculée
             else if (flags & 4)
@@ -268,6 +292,45 @@ void main(uint2 id : SV_DispatchThreadID)
         const float ndlWeight = sunSky > 0 ? sunSky * ndl2 / (1.0 + sunSky * ndl2) : saturate(ndl2 * 2.5);
         lit = 1.0 - (1.0 - lit) * ndlWeight;
         weight *= ndlWeight;
+    }
+    // occultation ambiante RT : un rayon court par pixel et par image (hémisphère pondéré par le cosinus, motif
+    // qui tourne d'une image à l'autre, moyenné par le débruitage), dans la vraie géométrie de la scène (hors
+    // de l'écran comprise) ; obstacle à la distance t : occultation 1 - t / portée. Elle ne retire que la
+    // lumière du ciel : toute celle d'un point à l'ombre, 1 / (1 + x N·L) de celle d'un point au soleil.
+    // Seulement sur les surfaces planes (sol, murs, routes) : l'herbe et le feuillage, où chaque brin est de la
+    // géométrie, s'assombrissaient en entier (le jeu y a déjà son occultation) et tremblaient au vent
+    const float2 ndc3 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
+    const float3 p3 = float3(ndc3.x * w / p00, ndc3.y * w / p11, w);
+    if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5)
+    {
+        const float3 n = NormalAt(int2(id), p3);
+        const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
+        const float3 b2 = cross(n, b1);
+        // deux rayons (strates opposées en azimut) : moitié moins de bruit qu'un seul
+        uint h = AoHash(id.x * 1973u + id.y * 9277u + frameIndex * 26699u);
+        float occlusion = 0;
+        for (uint k = 0; k < 2; k++, h = AoHash(h))
+        {
+            const float u1 = float(h & 0xFFFF) / 65536.0, u2 = (float(h >> 16) / 65536.0 + float(k)) * 0.5;
+            const float r = sqrt(u1), phi = 6.2831853 * u2;
+            RayDesc ray;
+            ray.Origin = p3 + n * max(0.01, 0.002 * length(p3));
+            ray.Direction = normalize(b1 * (r * cos(phi)) + b2 * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+            ray.TMin = 0.0;
+            ray.TMax = aoRadius;
+            RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+            q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+            while (q.Proceed())
+                if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
+                    ((flags & 2048) == 0 || !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p3)))
+                    q.CommitNonOpaqueTriangleHit(); // le plus proche reste (les candidats plus loin sont écartés)
+            // obstacle proche : occultation forte ; vers la portée, elle s'éteint en douceur
+            const float t = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() / aoRadius : 1.0;
+            occlusion += 0.5 * (1.0 - t) * (1.0 - t);
+        }
+        const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;
+        const float skyShare = sunSky > 0 ? 1.0 / (1.0 + sunSky * ndlSky) : 1.0 - 0.6 * ndlSky;
+        lit = max(0.0, lit - aoAmount * occlusion * skyShare);
     }
     // au loin, le jeu noie le paysage dans la brume : une ombre RT pleine y fait des taches noires ; elle
     // s'efface entre 120 et 300 unités (mètres dans RDR2)

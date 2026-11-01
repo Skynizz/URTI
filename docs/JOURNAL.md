@@ -1073,3 +1073,46 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   la lumière directe revient (la mesure continue).
 - Suite des reflets inchangée (`suite/tableau_v49.txt`). Non vérifié dans le jeu : à mesurer (rafales F8
   sur le sol mouillé, et une avec un menu ouvert).
+
+## v50–v52 — URTI : une seule case, occultation ambiante RT, ombres du soleil coupées (mesuré : invisibles)
+
+- Retour du joueur : « 0 différence » et beaucoup d'images par seconde perdues ; trop d'options ; demande un
+  RT « à la NVIDIA » (une case, tout automatique), l'occultation ambiante, voire du path tracing et la Ray
+  Reconstruction ; une option de beau temps ; plantage en ouvrant le Social Club (touche Home, « erreur
+  mémoire »).
+- Analyse de sa partie : **force des reflets à 0 dans son menu** (`UrtiReflect=0`) et ombres suspendues
+  (ciel couvert) : URTI ne pouvait rien changer, en coûtant 4 à 5 ms (structure, suivi du soleil).
+- Recherches : le « ray tracing » vu sur RDR2 est fait de shaders ReShade en espace écran (RTGI / PTGI de
+  Pascal Gilcher, sans direction du soleil) ; la Ray Reconstruction ne s'injecte (forks expérimentaux
+  d'OptiScaler) que dans des jeux qui ont déjà du path tracing ; beau temps à la demande : ScriptHookRDR2 et
+  un trainer (fichiers tiers, non installés sans accord).
+- Plantage Social Club : pas reproduit (touche Home envoyée : pas de menu, pas de plantage) ; aucun
+  plantage dans le journal de Windows depuis le 31/10 ; ReShade s'ouvre sur Page suivante (pas de
+  conflit) ; mémoire vidéo 7,0 / 12 Go. À revoir avec le texte exact de l'erreur.
+- **Menu réduit à « URTI activé »** : les autres réglages sont cachés et ignorés (l'ancien `UrtiReflect=0`
+  du préréglage n'éteint plus rien) : reflets à 1, ombres « seulement celles que le jeu n'a pas », pas de
+  sol mouillé ; urti.ini garde la main pour les essais.
+- **Occultation ambiante RT** (`live_shadow`, ao=0,8, ao_radius=1,5 m) : deux rayons courts par pixel
+  (hémisphère pondéré par le cosinus, motif tournant), obstacle à t : occultation (1 - t / portée)² ; trous
+  du feuillage reconnus ; ne retire que la lumière du ciel (toute à l'ombre, 1 / (1 + x N·L) au soleil, x
+  soleil / ciel mesuré) ; débruitée avec le masque. **Seulement sur les surfaces planes** (sol, murs,
+  routes) et à moins de 50 m : sur l'herbe et les grilles, chaque brin est de la géométrie, tout
+  s'assombrissait (le jeu y a déjà son occultation) et tremblait.
+- **Ombres du soleil RT coupées par défaut** (`shadows=1` pour les rallumer ; drapeau 64 : le soleil reste
+  connu pour l'occultation) : rafale au soleil sans occultation : **0,0 % de l'image changé pour 3,2 ms**.
+  Les ombres de RDR2 n'en laissent presque aucune à ajouter.
+- Débruitage du masque quand il ne porte que l'occultation : plus d'images accumulées (part courante
+  0,05 à 0,3) et bornage plus large (2 écarts-types).
+- Mesures dans RDR2 (rafales, `results/urti/jeu/rafales/`) :
+  - v50 (occultation partout) : 32,5 % de l'image changé, pixels qui sautent 0,21 %, ombres + occultation
+    6,1 ms ;
+  - v50 occultation plane : 20,2 %, 0,12 %, 5,1 ms ;
+  - v51 (sans ombres du soleil, brouillard) : 8,2 %, 0,08 %, 1,2 ms, 56-58 i/s ;
+  - v52 (bayou au soleil) : 9,4 %, 0,05 %, zone assombrie tremble 1,2 % (4,1 % en v51), 2,3 ms, 44 i/s.
+- Restent :
+  - des flashs d'une image quand des objets entrent ou sortent de la scène RT (images 6, 11-12, 15 de la
+    rafale v52 : 4 à 10 objets ; le jeu ne dessine pas certains objets une image) ;
+  - les reflets sur l'eau qui tremblent (zone de reflets : 17 % tremblent) ;
+  - la reconstruction de la structure à chaque image (3,8 à 5,7 ms) ;
+  - la photo d'avant l'interface encore perdue par moments dans RDR2 (ressemblance des photos maintenant
+    journalisée).

@@ -24,7 +24,7 @@ public static class KrcInput {
 "@
 
 $codes = @{ Enter = @(0x1C, $false); Escape = @(0x01, $false); Space = @(0x39, $false); F9 = @(0x43, $false);
-            Up = @(0x48, $true); Down = @(0x50, $true); Left = @(0x4B, $true); Right = @(0x4D, $true); W = @(0x11, $false) }
+            Up = @(0x48, $true); Down = @(0x50, $true); Left = @(0x4B, $true); Right = @(0x4D, $true); W = @(0x11, $false); Home = @(0x47, $true); F4 = @(0x3E, $false); F7 = @(0x41, $false); F8 = @(0x42, $false) }
 $p = Get-Process -Name $Process -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 # Windows refuse le premier plan à un processus d'arrière-plan : un appui sur Alt le débloque
 if ([KrcInput]::GetForegroundWindow() -ne $p.MainWindowHandle) {

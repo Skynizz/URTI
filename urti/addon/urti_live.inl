@@ -144,7 +144,11 @@ struct LiveState
     // luminance), lissé ; les ombres RT ne retirent que cette part (urti.ini sun_measure=0 : pente fixe)
     bool sunMeasure = true;
     uint32_t gameDilate = 1; // urti.ini game_dilate= : voisinage lu dans la carte du jeu (rayon en texels)
-    bool gameMin = true;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
+    bool gameMin = true;
+    float aoAmount = 0.8f, aoRadius = 1.5f; // occultation ambiante RT (urti.ini ao=, ao_radius= ; ao=0 : coupée)
+    // ombres du soleil RT : coupées par défaut (urti.ini shadows=1) : dans RDR2, ses ombres déjà excellentes n'en
+    // laissent presque aucune à ajouter (rafale au soleil : 0,0 % de l'image changé pour 3,2 ms par image)
+    bool sunShadows = false;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
     float sunSky[4] = { 2.2f, 2.2f, 2.2f, 2.2f };
     uint32_t sunSkyFrames = 0, sunSkyLogged = 0;
     bool sunWeakLogged = false;
@@ -535,7 +539,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 24, 2) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 26, 2) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
@@ -706,7 +710,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -729,7 +733,8 @@ void LiveHotReload(ID3D12Device* device)
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
-                value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin);
+                value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
+                value("shadows=", sunShadows);
                 float jl = 0;
                 value("jitter_log=", jl);
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -756,6 +761,8 @@ void LiveHotReload(ID3D12Device* device)
             live.sunMeasure = sunMeasure != 0;
             live.gameDilate = uint32_t(std::clamp(gameDilate, 0.0f, 3.0f));
             live.gameMin = gameMin != 0;
+            live.aoAmount = std::clamp(ao, 0.0f, 1.0f), live.aoRadius = std::clamp(aoRadius, 0.1f, 10.0f);
+            live.sunShadows = sunShadows != 0;
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -953,15 +960,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     LiveHotReload(g.device);
     if (live.iniCombine >= 0)
         g_liveCombine = live.iniCombine != 0;
-    else if (const effect_uniform_variable mode = runtime->find_uniform_variable("urti.fx", "UrtiMode"); mode.handle)
-    {
-        int32_t m = 0;
-        runtime->get_uniform_value_int(mode, &m, 1);
-        g_liveCombine = m == 1;
-        if (m != live.lastMode)
-            Log("URTI direct : mode %s (menu de ReShade)", m == 1 ? "seulement les ombres que le jeu n'a pas" : "ombres RT complètes");
-        live.lastMode = m;
-    }
+    else
+        g_liveCombine = true; // seulement les ombres que le jeu n'a pas (le menu n'a plus que « URTI activé »)
 
     // ce que le flux a reçu il y a trois images (lecture sans attente)
     if (const uint64_t* c = nullptr; live.counterReadback[live.frame % 3] && SUCCEEDED(live.counterReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
@@ -1782,8 +1782,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         Log("URTI direct : ombres RT %s (soleil / ciel mesuré %.2f)", sunWeak ? "suspendues : lumière directe trop faible pour se voir" : "reprises", live.sunSky[3]);
     live.sunWeakLogged = sunWeak;
     const bool sunNow = live.calibrated && live.framesSinceSun < 30 && !sunWeak;
+    // (sans soleil, la passe garde l'occultation ambiante : flags 16 ne coupe que les rayons du soleil)
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (live.atlas16 ? 32u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
-                           (sunNow ? 0u : 16u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) | (nrdActive ? 4096u : 0u);
+                           (sunNow ? 0u : 16u) | (live.sunShadows ? 0u : 64u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) |
+                           (nrdActive ? 4096u : 0u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -1795,11 +1797,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t debugMode, frameIndex;
         float sunSky;
         uint32_t gameDilate, gameMin;
+        float aoAmount, aoRadius;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
-             0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u };
-    list->SetComputeRoot32BitConstants(9, 24, &sc, 0);
+             0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
+             live.aoAmount, live.aoRadius };
+    list->SetComputeRoot32BitConstants(9, 26, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     // débruitage : SIGMA de NVIDIA ; sinon celui d'URTI (flou guidé par la profondeur, historique reprojeté,
     // bornage statistique, mélange adaptatif)
@@ -1835,7 +1839,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             float p00, p11;
         } dn = { live.width, live.height, live.depthPitch, live.shadowPitch, live.mvPitch,
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
-                 0.1f, 0.5f, 1.5f, 0, live.p00, live.p11 };
+                 // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
+                 // accumulées et un bornage plus large (moins de grain qui tremble)
+                 live.sunShadows ? 0.1f : 0.05f, live.sunShadows ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f, 0, live.p00, live.p11 };
         list->SetComputeRoot32BitConstants(7, 14, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
         Transition(list.Get(), live.shadowRawBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1883,9 +1889,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     LiveTime(list.Get(), 4);
-    // réglages des reflets dans le menu de ReShade : force, sol mouillé (urti.ini garde la main s'il impose
-    // un lissé négatif, c'est-à-dire un sol mouillé)
-    float menuReflect = 1.0f, menuWet = 0.0f;
+    // reflets : plus de réglage dans le menu (force 1, pas de sol mouillé) ; urti.ini garde la main pour les essais
     {
         int32_t view = live.iniDebugView;
         if (view < 0)
@@ -1904,12 +1908,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         runtime->get_uniform_value_int(v, &m, 1);
         live.fgMode = uint32_t(std::clamp(m, 0, 2));
     }
-    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiReflect"); v.handle)
-        runtime->get_uniform_value_float(v, &menuReflect, 1);
-    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiWet"); v.handle)
-        runtime->get_uniform_value_float(v, &menuWet, 1);
-    live.reflEffective = live.reflStrength * menuReflect;
-    const float smoothMinEffective = live.smoothMin < 0 ? live.smoothMin : (menuWet > 0.01f ? -menuWet : live.smoothMin);
+    live.reflEffective = live.reflStrength;
+    const float smoothMinEffective = live.smoothMin;
     // 4b. reflets : un rayon réfléchi par pixel lisse (matériau du G-buffer copié dans cette image)
     if (live.reflEffective > 0 || live.debugReflect)
     {
@@ -2128,8 +2128,14 @@ void LiveComposite(effect_runtime* runtime)
         const int choice = int(c[16 + live.uiParity[uiSlot]]) - 1;
         const float best = choice >= 0 && choice < 4 && c[8] ? float(c[choice]) / float(c[8]) : 0.0f;
         if (choice != live.uiChoice)
-            Log(choice >= 0 ? "URTI direct : image avant l'interface du jeu : photo %d (%.1f %% des pixels identiques à l'image finale)"
-                            : "URTI direct : pas de photo avant l'interface du jeu (%d, %.1f)", choice, best * 100.0f);
+        {
+            char detail[160] = "";
+            for (uint32_t k = 0, n = 0; k < live.uiCountAt[uiSlot] && k < 4 && c[8]; k++)
+                n += std::snprintf(detail + n, sizeof(detail) - n, " ; photo %u : %.1f %% / %.1f %%", k, 100.0 * c[k] / c[8], 100.0 * c[4 + k] / c[8]);
+            Log(choice >= 0 ? "URTI direct : image avant l'interface du jeu : photo %d (%.1f %% des pixels identiques à l'image finale)%s"
+                            : "URTI direct : pas de photo avant l'interface du jeu (%d, %.1f)%s (identiques à l'image finale / à la précédente)",
+                choice, best * 100.0f, detail);
+        }
         live.uiChoice = choice;
         live.uiReadback[uiSlot]->Unmap(0, nullptr);
     }
@@ -2138,11 +2144,10 @@ void LiveComposite(effect_runtime* runtime)
         std::lock_guard<std::mutex> lock(g_mutex);
         snapCount = std::min(g_liveSnapCount, kLiveSnaps);
     }
-    // réglages de l'effet (menu de ReShade) : force, écran partagé, masque seul
-    float strength = 1.0f; // 1 : la lumière du soleil retirée entièrement, comme dans les ombres du jeu
+    // réglages de l'effet : écran partagé (F5), masque seul (contrôle) ; plus de force dans le menu : la
+    // lumière du soleil est retirée entièrement, comme dans les ombres du jeu
+    const float strength = 1.0f;
     bool split = false, showMask = false;
-    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiStrength"); v.handle)
-        runtime->get_uniform_value_float(v, &strength, 1);
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiSplit"); v.handle)
         runtime->get_uniform_value_bool(v, &split, 1);
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiShowMask"); v.handle)
