@@ -998,3 +998,37 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
 - Bug de l'outil de contrôle : `show_mask=1` dans urti.ini cochait « masque seul » dans l'effet, sans
   jamais la décocher : écran blanc (masque sans ombre) après le contrôle. Décochée maintenant quand la
   ligne est retirée. Le jeu, lancé par URTI pour ce contrôle, a été fermé (aucune progression jouée).
+
+## v45–v46 — URTI : mesure dans le jeu (rafales) ; la scène RT de RDR2 était tirée au hasard à chaque image
+
+- Demande : « les reflets sautent, tu dis que c'est corrigé mais ça ne l'est jamais ». Les mesures du bac
+  à sable ne suffisent pas : il faut mesurer dans RDR2.
+- **Rafale** (touche F8 ou fichier déclencheur `urti_rafale`) : 30 images consécutives enregistrées sans
+  URTI (copie de l'image avant la composition) et avec, dans `urti_rafale_N\`. `tools/reshade/urti_rafale.py`
+  : contribution d'URTI C = après - avant, ce qui saute = variation de C d'une image à la suivante
+  (indépendante de la scène) ; zones ombres / reflets ; objets entrés / sortis de la scène RT par image
+  (lignes RAFALE du journal) ; carte des sauts et gros plan de la pire zone. Résultats dans
+  `results/urti/jeu/rafales/`.
+- Réglages de RDR2 relus (system.xml) : RTX 4070, DX12, DLSS, HDR, flou de mouvement coupé, netteté au
+  maximum, reflets de l'eau en espace écran actifs (le jeu garde ses reflets là où URTI n'en met pas),
+  plusieurs sources d'ombres (cascades, lointaines, relief, espace écran, longues). Rien qui fausse URTI.
+- Séance dans RDR2 lancée par URTI (Saint-Denis la nuit, pavés mouillés) : URTI changeait 0,2 % des pixels ;
+  au plus fort saut, le reflet orange d'un lampadaire apparaissait deux ou trois images puis disparaissait.
+  Journal : **0 objet connu dans la scène RT, 6,1 M sommets jamais mesurés, 183 499 mesures en mémoire
+  pour ~930 objets à l'écran**. Cause : l'identité d'un ExecuteIndirect (v42) comprenait l'adresse et la
+  position de ses arguments, qui tournent dans RDR2 : nouvelle identité à chaque image, jamais mesurée,
+  réserve maximale ; les inconnus remplissaient le budget dans l'ordre d'enregistrement (variable) : la
+  scène RT était un tirage différent à chaque image. Le bac à sable (arguments fixes) ne pouvait pas le voir.
+- **Identité stable** : signature de commande, pipeline, tampons d'indices et de sommets liés (événements
+  `bind_index_buffer` / `bind_vertex_buffers` suivis par liste de commandes), nombre maximal de commandes.
+  Dans RDR2 : 671 objets à l'écran, **671 dans la scène RT, 0 jamais mesuré, 785 mesures en mémoire,
+  0 hors budget**, 0,4 objet entré ou sorti par image. Rafale caméra fixe, zone des reflets d'URTI :
+  tremblent 8,2 → 1,5 %, sautent 0,88 → 0,12 %. Budget porté à 6 M sommets (place d'un emplacement : 8 M).
+  Bac à sable inchangé au chiffre près.
+- Coût : la scène RT contient maintenant de vrais triangles (4,5 M sommets) : construction de la structure
+  2,6 → 4,1 ms, reflets 0,2 → 1,0 ms ; ~51 i/s dans cette scène de nuit (64 avant, avec une scène RT
+  vide de sens). La structure est reconstruite à chaque image (300 sur 300) : la mise à jour exige la même
+  disposition, or la place de chaque objet dans le flux suit l'ordre d'enregistrement des dessins, qui
+  change d'une image à l'autre (RDR2 enregistre sur plusieurs fils). À faire : une place fixe par objet.
+- Non vérifiable cette nuit-là : reflets de jour, ombres (pas de soleil). La rafale caméra en mouvement
+  mêle le déplacement normal du reflet aux sauts : à affiner.

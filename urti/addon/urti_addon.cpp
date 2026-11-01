@@ -461,6 +461,7 @@ struct CommandListState
 {
     uint64_t pipeline = 0;
     uint64_t depth = 0;
+    uint64_t indexBuffer = 0, vertexBuffer = 0; // tampons liés (ressource et position mêlées) : identité des ExecuteIndirect
     uint64_t backBuffer = 0; // image d'écran liée en cible (photo avant l'interface au premier dessin)
     bool snapped = false;
     float viewport[4] = {}; // x, y, largeur, hauteur (le premier)
@@ -585,6 +586,22 @@ void OnBindPipeline(command_list* cmd, pipeline_stage stages, pipeline pipe)
         return;
     std::lock_guard<std::mutex> lock(g_mutex);
     g.lists[cmd->get_native()].pipeline = pipe.handle;
+}
+
+// tampons d'indices et de sommets liés : ce qui reste stable d'une image à l'autre pour un ExecuteIndirect (le
+// tampon de ses arguments tourne dans RDR2 : une identité qui en dépend change à chaque image)
+void OnBindIndexBuffer(command_list* cmd, resource buffer, uint64_t offset, uint32_t)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g.lists[cmd->get_native()].indexBuffer = buffer.handle ^ (offset * 0x9E3779B97F4A7C15ull);
+}
+
+void OnBindVertexBuffers(command_list* cmd, uint32_t first, uint32_t count, const resource* buffers, const uint64_t* offsets, const uint32_t*)
+{
+    if (first != 0 || count == 0 || !buffers)
+        return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g.lists[cmd->get_native()].vertexBuffer = buffers[0].handle ^ ((offsets ? offsets[0] : 0) * 0x9E3779B97F4A7C15ull);
 }
 
 // relevé des passes (urti_passes.inl)
@@ -784,11 +801,14 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 // identité stable d'une image à l'autre : le maillage (nombre d'indices ou de sommets, début dans
                 // ses tampons), pas le nombre d'instances ni la première instance (une végétation dessinée par
                 // instances en change à chaque image : dans RDR2, 120 000 identités pour 800 objets à l'écran) ;
-                // un ExecuteIndirect : sa signature de commande, son tampon d'arguments et la position dans ce
-                // tampon (l'ordre des ExecuteIndirect change d'une image à l'autre dans RDR2 : pas le rang)
+                // un ExecuteIndirect : sa signature de commande, son pipeline, les tampons d'indices et de sommets
+                // liés, son nombre maximal de commandes ; pas son tampon d'arguments, qui tourne dans RDR2 (une
+                // identité par image : 107 000 mesures en mémoire pour 900 objets, jamais connus, la scène RT
+                // tirée au hasard parmi eux à chaque image)
                 uint64_t idKey = kind * 1000003ull;
                 if (kind == 2)
-                    idKey = ((idKey * 1315423911ull + params[3]) * 1315423911ull + params[2]) * 1315423911ull + params[1];
+                    idKey = ((((idKey * 1315423911ull + params[3]) * 1315423911ull + state.pipeline) * 1315423911ull + state.indexBuffer) * 1315423911ull +
+                             state.vertexBuffer) * 1315423911ull + params[0];
                 else
                 {
                     idKey = (idKey * 1315423911ull + params[0]) * 1315423911ull + params[2];
@@ -1692,6 +1712,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
         reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
         reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+        reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
+        reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);
         reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
         reshade::register_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
         reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
