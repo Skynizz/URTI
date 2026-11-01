@@ -1050,3 +1050,26 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   de carte d'ombres du soleil). La nuit, URTI ne fait pas d'ombres (seulement celles du soleil) et ses
   reflets, limités aux surfaces planes, reflètent une scène sombre : 0,2 % des pixels changés (rafale).
   Les reflets visibles sur les pavés mouillés la nuit sont ceux du jeu.
+
+## v49 — URTI : plus de menus dans les reflets ; plus d'ombres invisibles qui coûtent 4 ms
+
+- Retour de jeu (Saint-Denis, jour de pluie, sol mouillé par le jeu) : les reflets tremblent, **les menus
+  s'affichent dans les reflets au sol**, des reflets se décollent du sol, aucune différence pour les
+  ombres ; 20 à 27 i/s. Journal : soleil suivi, carte d'ombres concordante (éclairés 3,2 fois plus clairs
+  que les points à l'ombre), mais soleil / ciel mesuré 0,06 (ciel couvert : 6 % de la lumière retirée) ;
+  GPU : ombres 3,8 ms, reflets 3,1 ms, soleil et structure 3,9 ms. « Pas de photo avant l'interface »
+  27 fois dans la partie.
+- **Menus dans les reflets** : la photo d'avant l'interface (couleurs des reflets) n'était gardée que si
+  elle ressemblait plus à l'image courante qu'à la précédente. Image immobile (le joueur regarde le sol,
+  un menu est ouvert) : égalité, aucune photo, couleurs lues dans l'image finale, menus compris. Le GPU
+  garde maintenant son choix d'une image à l'autre (`live_uiselect`, octets 64 / 68 de ses comptes) : la
+  photo précédente reste si elle ressemble encore à au moins 30 % à l'image finale (un grand menu en
+  couvre une part) et n'est pas une copie de l'image affichée précédente (photo prise trop tôt). Si
+  aucune photo n'est sûre, les reflets RT s'effacent en douceur (-15 % par image) et reviennent avec elle.
+  Bac à sable, plan fixe sans décalage sous-pixel, menu ouvert 2 s toutes les 4 s : photo perdue 2 fois
+  sur 600 images → 0.
+- **Ombres invisibles** : soleil / ciel mesuré sous 0,15 (moins de 13 % de la lumière retirée : ciel
+  couvert, crépuscule) : plus de rayons d'ombre (3,8 ms gagnées dans cette scène) ; ils reprennent quand
+  la lumière directe revient (la mesure continue).
+- Suite des reflets inchangée (`suite/tableau_v49.txt`). Non vérifié dans le jeu : à mesurer (rafales F8
+  sur le sol mouillé, et une avec un menu ouvert).

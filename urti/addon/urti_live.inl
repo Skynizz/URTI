@@ -52,7 +52,9 @@ struct LiveState
     ComPtr<ID3D12PipelineState> uiPso, uiSelPso;
     uint64_t snapBytes = 0, uiFrame = 0;
     uint32_t uiCountAt[3] = {};
-    int uiChoice = -1; // rang de la photo d'avant l'interface (-1 : aucune sûre)
+    int uiChoice = -1; // rang de la photo d'avant l'interface (-1 : aucune sûre), lu trois images plus tard
+    uint32_t uiParity[3] = {};
+    float uiReflGate = 1.0f; // reflets RT effacés en douceur quand aucune photo sûre (sinon l'interface s'y reflète)
     bool uiPhoto = true; // urti.ini ui_photo=0 : sans la photo d'avant l'interface (contrôle)
     ComPtr<ID3D12RootSignature> statsRs;
     ComPtr<ID3D12PipelineState> statsPso;
@@ -145,6 +147,7 @@ struct LiveState
     bool gameMin = true;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
     float sunSky[4] = { 2.2f, 2.2f, 2.2f, 2.2f };
     uint32_t sunSkyFrames = 0, sunSkyLogged = 0;
+    bool sunWeakLogged = false;
     uint64_t sunSkyPairs = 0, atlasFrame = ~0ull;
     uint64_t mapCheck[6] = {}; // contrôle de la carte du jeu : points éclairés, à l'ombre, au bord, hors des cascades ; luminances (× 1024)
     uint64_t depthHist[16] = {}, gapHist[16] = {}; // profondeur des points dans la cascade, écart carte - point
@@ -540,7 +543,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_composite, sizeof(g_live_composite), 7, live.compositeRs, live.compositePso, 17) &&
            make(g_live_sunlight, sizeof(g_live_sunlight), 3, live.sunlightRs, live.sunlightPso, 20) &&
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
-           make(g_live_uiselect, sizeof(g_live_uiselect), 6, live.uiSelRs, live.uiSelPso, 8) &&
+           make(g_live_uiselect, sizeof(g_live_uiselect), 5, live.uiSelRs, live.uiSelPso, 8, 2) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20) &&
            make(g_live_reflect, sizeof(g_live_reflect), 8, live.reflectRs, live.reflectPso, 20, 2) &&
            make(g_live_regionstats, sizeof(g_live_regionstats), 3, live.statsRs, live.statsPso, 4) &&
@@ -1772,7 +1775,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootUnorderedAccessView(8, live.shadowBuf->GetGPUVirtualAddress());
 #endif
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
-    const bool sunNow = live.calibrated && live.framesSinceSun < 30;
+    // ciel couvert, crépuscule : la part du soleil mesurée dans l'image est si faible qu'une ombre RT ne se
+    // verrait pas (moins de 13 % de la lumière retirée) : pas de rayons d'ombre (plusieurs ms gagnées)
+    const bool sunWeak = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] < 0.15f;
+    if (sunWeak != live.sunWeakLogged)
+        Log("URTI direct : ombres RT %s (soleil / ciel mesuré %.2f)", sunWeak ? "suspendues : lumière directe trop faible pour se voir" : "reprises", live.sunSky[3]);
+    live.sunWeakLogged = sunWeak;
+    const bool sunNow = live.calibrated && live.framesSinceSun < 30 && !sunWeak;
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (live.atlas16 ? 32u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
                            (sunNow ? 0u : 16u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) | (nrdActive ? 4096u : 0u);
     const struct
@@ -2115,17 +2124,9 @@ void LiveComposite(effect_runtime* runtime)
     const uint32_t uiSlot = uint32_t(live.uiFrame % 3);
     if (const uint32_t* c = nullptr; live.uiFrame >= 3 && live.uiCountAt[uiSlot] && SUCCEEDED(live.uiReadback[uiSlot]->Map(0, nullptr, (void**)&c)) && c)
     {
-        // même règle que live_uiselect (qui choisit sur le GPU, dans la même image) : ici pour le journal
-        int choice = -1;
-        float best = 2.0f;
-        for (uint32_t k = 0; k < live.uiCountAt[uiSlot] && c[8]; k++)
-        {
-            const float same = float(c[k]) / float(c[8]), old = float(c[4 + k]) / float(c[8]);
-            if (same >= 0.6f && same > old && same < best)
-                choice = int(k), best = same;
-        }
-        if (choice < 0)
-            best = 0;
+        // choix fait par live_uiselect sur le GPU, dans la même image (octets 64 et 68 selon la parité)
+        const int choice = int(c[16 + live.uiParity[uiSlot]]) - 1;
+        const float best = choice >= 0 && choice < 4 && c[8] ? float(c[choice]) / float(c[8]) : 0.0f;
         if (choice != live.uiChoice)
             Log(choice >= 0 ? "URTI direct : image avant l'interface du jeu : photo %d (%.1f %% des pixels identiques à l'image finale)"
                             : "URTI direct : pas de photo avant l'interface du jeu (%d, %.1f)", choice, best * 100.0f);
@@ -2178,7 +2179,9 @@ void LiveComposite(effect_runtime* runtime)
         ub.UAV.pResource = live.uiCounts.Get();
         list->ResourceBarrier(1, &ub);
         Transition(list.Get(), live.imageOut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-        const uint32_t uc[8] = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format == 3 ? 8u : 4u, snapCount, 0, 0, 0 };
+        const uint32_t parity = uint32_t(live.uiFrame & 1);
+        live.uiParity[uiSlot] = parity;
+        const uint32_t uc[8] = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format == 3 ? 8u : 4u, snapCount, parity, 0, 0 };
         list->SetComputeRootSignature(live.uiRs.Get());
         list->SetPipelineState(live.uiPso.Get());
         list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
@@ -2189,24 +2192,29 @@ void LiveComposite(effect_runtime* runtime)
         list->SetComputeRoot32BitConstants(7, 8, uc, 0);
         list->Dispatch((uint32_t(bd.Width) / 4 + 7) / 8, (bd.Height / 4 + 7) / 8, 1);
         Transition(list.Get(), live.imageOut.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+        list->ResourceBarrier(1, &ub); // comptes écrits, lus (et choix gardé) par live_uiselect
         list->SetComputeRootSignature(live.uiSelRs.Get());
         list->SetPipelineState(live.uiSelPso.Get());
         list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
         for (uint32_t k = 0; k < kLiveSnaps; k++)
             list->SetComputeRootShaderResourceView(1 + k, live.snaps[std::min(k, snapCount - 1)]->GetGPUVirtualAddress());
-        list->SetComputeRootShaderResourceView(5, live.uiCounts->GetGPUVirtualAddress());
-        list->SetComputeRootUnorderedAccessView(6, live.preUiBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(5, live.preUiBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(6, live.uiCounts->GetGPUVirtualAddress());
         list->SetComputeRoot32BitConstants(7, 8, uc, 0);
         list->Dispatch((uint32_t(bd.Width) + 7) / 8, (bd.Height + 7) / 8, 1);
-        Transition(list.Get(), live.uiCounts.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyBufferRegion(live.uiReadback[uiSlot].Get(), 0, live.uiCounts.Get(), 0, 36);
+        Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(live.uiReadback[uiSlot].Get(), 0, live.uiCounts.Get(), 0, 72);
         Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Transition(list.Get(), live.preUiBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
         live.uiCountAt[uiSlot] = snapCount;
         preUi = live.preUiBuf.Get();
     }
     live.uiFrame++;
+    // pas de photo sûre d'avant l'interface (lu trois images plus tard) : les couleurs des reflets viendraient de
+    // l'image finale, menus compris ; les reflets RT s'effacent en douceur (le jeu garde les siens) et reviennent
+    // avec la photo
+    const bool uiUnsafe = preUi && live.uiChoice < 0;
+    live.uiReflGate = uiUnsafe ? std::max(0.0f, live.uiReflGate - 0.15f) : std::min(1.0f, live.uiReflGate + 0.1f);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     // vues 4 à 8 : lissé, poids, couleur reflétée, distance de touche (dans le canal du lissé), confiance
     const uint32_t reflectView = live.debugView == 4 ? 1u : live.debugView == 5 ? 2u : live.debugView == 6 ? 3u : live.debugView == 7 ? 1u :
@@ -2356,7 +2364,8 @@ void LiveComposite(effect_runtime* runtime)
         float p00, p11;
         float tint[3];
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
-             split ? 1u : 0u, showMask ? 1u : 0u, (reflections && !(generated && live.fgMode == 2)) ? std::max(live.reflEffective, reflectView ? 1.0f : 0.0f) : 0.0f,
+             split ? 1u : 0u, showMask ? 1u : 0u,
+             (reflections && !(generated && live.fgMode == 2)) ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
              (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u), live.p00, live.p11,
              { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f } };
     list->SetComputeRoot32BitConstants(8, 17, &cc, 0);
