@@ -28,6 +28,7 @@ cbuffer Constants : register(b0)
     uint depth24;      // 1 : D24S8 (24 bits de profondeur)
     uint atlasPitch;
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
+                       // 32 carte en 16 bits (R16, RDR2),
                        // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
                        // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
                        // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après
@@ -36,9 +37,9 @@ cbuffer Constants : register(b0)
     float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
     uint debugMode;        // 1 ombre brute (sans accumulation), 2 vecteurs de mouvement, 3 historique gardé
     uint frameIndex;       // fait tourner le motif des rayons d'une image à l'autre (l'accumulation le moyenne)
-    uint pad4;
-    uint pad5;
-    uint pad6;
+    float sunSky;          // rapport soleil / ciel mesuré dans l'image du jeu (live_sunlight) ; 0 : non mesuré
+    uint gameDilate;       // voisinage lu dans la carte du jeu (rayon en texels)
+    uint gameMin;          // 1 : part éclairée filtrée, visibilité la plus faible des deux ; 0 : ombre du jeu élargie, produit
 };
 
 static float gA, gB, gClear;
@@ -51,6 +52,20 @@ float PackPenumbra(float distanceToOccluder, float tanOfLightAngularRadius)
     return distanceToOccluder >= kFp16Max ? kFp16Max : min(distanceToOccluder * tanOfLightAngularRadius * 0.5, 32768.0);
 }
 RWByteAddressBuffer penumbra : register(u1); // float par pixel (pas : shadowPitch), mode SIGMA
+
+// profondeur d'un texel de la carte d'ombres du jeu : 32 bits flottants, D24 (bit 2 de flags) ou 16 bits
+// normalisés (bit 32 : RDR2, deux octets par texel)
+float AtlasDepth(uint2 t)
+{
+    if (flags & 32)
+    {
+        const uint a = t.y * atlasPitch + t.x * 2;
+        const uint raw = atlas.Load(a & ~3u);
+        return float((a & 2) ? raw >> 16 : raw & 0xFFFF) / 65535.0;
+    }
+    const uint raw = atlas.Load(t.y * atlasPitch + t.x * 4);
+    return (flags & 2) ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
+}
 
 // éclairement du point par le soleil selon la carte d'ombres du jeu (1 si aucune cascade ne le couvre)
 float GameLit(float3 p)
@@ -68,18 +83,20 @@ float GameLit(float3 p)
         if (abs(s.x) > 0.98 || abs(s.y) > 0.98 || s.z <= 0 || s.z >= 1)
             continue;
         const float2 texel = vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw;
-        // éclairé seulement si tout le voisinage 5×5 l'est : l'ombre du jeu est élargie de deux texels,
-        // ce qui absorbe le flou de ses bords (sinon un liseré d'ombre RT double chaque contour)
-        for (int dy = -2; dy <= 2; dy++)
-            for (int dx = -2; dx <= 2; dx++)
+        // gameMin : part éclairée du voisinage (comme le filtrage du jeu : sa pénombre comprise) ; sinon
+        // éclairé seulement si tout le voisinage l'est (ombre du jeu élargie de gameDilate texels)
+        const int r = int(gameDilate);
+        float litCount = 0;
+        for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++)
             {
-                const uint2 t = uint2(int2(texel) + int2(dx, dy));
-                const uint raw = atlas.Load(t.y * atlasPitch + t.x * 4);
-                const float stored = (flags & 2) ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
-                if (!(sunSign > 0 ? s.z <= stored + gameBias : s.z >= stored - gameBias))
+                const float stored = AtlasDepth(uint2(int2(texel) + int2(dx, dy)));
+                const bool texelLit = sunSign > 0 ? s.z <= stored + gameBias : s.z >= stored - gameBias;
+                if (!texelLit && gameMin == 0)
                     return 0.0;
+                litCount += texelLit ? 1.0 : 0.0;
             }
-        return 1.0;
+        return litCount / float((2 * r + 1) * (2 * r + 1));
     }
     return 1.0;
 }
@@ -111,9 +128,7 @@ bool SunSeesThrough(float3 h, float3 receiver)
         const float gap = sunSign * (r.z - s.z); // > 0 : h entre le soleil et le récepteur
         if (gap <= 2.0 * gameBias)
             return false;
-        const uint2 t = uint2(vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw);
-        const uint raw = atlas.Load(t.y * atlasPitch + t.x * 4);
-        const float stored = (flags & 2) ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
+        const float stored = AtlasDepth(uint2(vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw));
         return sunSign * (stored - s.z) > 0.5 * gap;
     }
     return false;
@@ -231,19 +246,26 @@ void main(uint2 id : SV_DispatchThreadID)
             if (flags & 8)
                 lit = game; // contrôle : l'ombre du jeu telle que recalculée
             else if (flags & 4)
-                lit = 1.0 - game * (1.0 - lit), weight *= game; // n'ajouter de l'ombre que là où le jeu éclaire
+            {
+                // n'ajouter de l'ombre que là où le jeu éclaire : le soleil restant est sa visibilité « game » ;
+                // la visibilité voulue est la plus faible des deux, URTI retire la différence
+                lit = gameMin ? 1.0 - max(0.0, game - lit) : 1.0 - game * (1.0 - lit);
+                weight *= game;
+            }
         }
         if (ndl <= 0)
             hitDistance = 0; // SIGMA : surface dos au soleil, à l'ombre d'elle-même
     }
     // une ombre ne retire que la lumière directe du soleil, proportionnelle à l'angle de la surface face à lui
-    // (N·L) : une surface rasante perd peu, une surface face au soleil perd tout ; le reste (lumière du
-    // ciel, rebonds) demeure. Sans cela, l'ombre RT assombrit aussi l'éclairage indirect : trop noire.
+    // (N·L) ; le reste (lumière du ciel, rebonds) demeure. Le point éclairé reçoit ciel + soleil × N·L : la
+    // part du soleil y est x N·L / (1 + x N·L), x = soleil / ciel mesuré dans l'image (live_sunlight) ;
+    // midi : ombres franches, temps couvert : presque rien. Non mesuré : pente fixe (ancienne règle).
     if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
         const float2 ndc2 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p2 = float3(ndc2.x * w / p00, ndc2.y * w / p11, w);
-        const float ndlWeight = saturate(dot(NormalAt(int2(id), p2), sun) * 2.5);
+        const float ndl2 = saturate(dot(NormalAt(int2(id), p2), sun));
+        const float ndlWeight = sunSky > 0 ? sunSky * ndl2 / (1.0 + sunSky * ndl2) : saturate(ndl2 * 2.5);
         lit = 1.0 - (1.0 - lit) * ndlWeight;
         weight *= ndlWeight;
     }

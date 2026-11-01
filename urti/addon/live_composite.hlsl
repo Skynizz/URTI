@@ -30,6 +30,9 @@ cbuffer Constants : register(b0)
                         // bit 9 : reflets stabilisés disponibles (resolvedRefl) ; bit 10 : photo avant l'interface (preUi)
     float p00;          // projection supposée (décalage sous-pixel en pixels de rendu)
     float p11;
+    float tintR;        // rapport soleil / ciel de chaque canal sur celui de la luminance (live_sunlight) : 1 sans mesure
+    float tintG;        // (trois nombres : un float3 ici serait déplacé à la frontière de 16 octets suivante)
+    float tintB;
 };
 
 // décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
@@ -188,8 +191,12 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     }
     // l'ombre ne retire que la lumière directe qui éclaire la surface : elle s'applique avant le reflet, qui
-    // la remplace en partie (une flaque à l'ombre reflète toujours le ciel et les objets éclairés)
-    c *= 1.0 - strength * (1.0 - lit);
+    // la remplace en partie (une flaque à l'ombre reflète toujours le ciel et les objets éclairés). Le masque
+    // donne la part a de la luminance qui vient du soleil (a = x / (1 + x), x = soleil / ciel × N·L) ; par
+    // canal, x est multiplié par la teinte mesurée : le soleil est plus chaud que le ciel, l'ombre bleuit
+    const float sunPart = min(strength * (1.0 - lit), 0.98);
+    const float3 x = sunPart / (1.0 - sunPart) * float3(tintR, tintG, tintB);
+    c *= 1.0 - x / (1.0 + x);
     if (reflStrength > 0 && (debugReflect & 0x200))
     {
         // reflet stabilisé, bilinéaire à la résolution de rendu (couleur prémultipliée par son poids)

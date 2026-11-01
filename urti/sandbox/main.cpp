@@ -28,7 +28,9 @@
 // terrain : le sol reflète la scène exacte, rendue en miroir, mélangée avec la même règle qu'URTI ; un
 // lancement sans URTI dans ce mode est l'image que les reflets RT devraient donner), URTI_SANDBOX_FPS=cadence maximale (défaut 90, 0 : sans limite ;
 // un lancement natif et un lancement avec RT atteignent ainsi la même image au même moment, après que
-// ReShade a retiré son bandeau d'accueil).
+// ReShade a retiré son bandeau d'accueil), URTI_SANDBOX_GAMESHADOW=partiel (la carte d'ombres du « jeu » oublie
+// les poteaux, piquets, le mur, les charrettes et les passants : URTI doit rendre ces ombres comme le jeu les
+// aurait faites ; tools/reshade/urti_sandbox_ombres.sh).
 
 #include <windows.h>
 #include <d3d12.h>
@@ -653,6 +655,7 @@ struct Object
     float params[4]; // vent (multiplicateur), sol à flaques, réservé, métal
     int mover = -1;  // objet animé (charrette, passant)
     float moverPhase = 0;
+    bool optionalShadow = false; // absent de la carte d'ombres en mode URTI_SANDBOX_GAMESHADOW=partiel
 };
 
 struct ObjectConstants
@@ -719,7 +722,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             geo.Box(Mul(Scale(0.25f, 8, 0.25f), Translate(x, 4, z)), 0.3f, 0.22f, 0.15f, 0.1f);
             geo.Box(Mul(Scale(0.15f, 0.15f, 1.6f), Translate(x, 7.6f, z)), 0.3f, 0.22f, 0.15f, 0.1f);
             geo.End(pole);
-            add(pole);
+            add(pole).optionalShadow = true;
             if (i == 7)
                 continue;
             const int span = geo.Begin();
@@ -810,7 +813,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             const int post = geo.Begin();
             geo.Box(Mul(Scale(0.1f, 1.1f, 0.1f), Translate(-55 + i * 1.5f, 0.55f, z)), 0.5f, 0.4f, 0.3f, 0.2f);
             geo.End(post);
-            add(post);
+            add(post).optionalShadow = true;
         }
     }
     // un mur au milieu de la rue : deux passants passent derrière (test d'occlusion)
@@ -818,7 +821,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
         const int m = geo.Begin();
         geo.Box(Mul(Scale(4, 2.2f, 0.3f), Translate(1, 1.1f, 4)), 0.55f, 0.5f, 0.45f, 0.15f);
         geo.End(m);
-        add(m);
+        add(m).optionalShadow = true;
     }
     // charrettes (caisse, roues, brancards) et passants : ils avancent (vecteurs de mouvement d'objets)
     for (int c = 0; c < 3; c++)
@@ -831,7 +834,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             geo.Box(Mul(Scale(2.0f, 0.08f, 0.08f), Translate(2.2f, 0.9f, s ? 0.5f : -0.5f)), 0.35f, 0.25f, 0.15f, 0.2f);
         geo.End(m);
         Object& cart = add(m);
-        cart.mover = 0, cart.moverPhase = c * 2.1f;
+        cart.mover = 0, cart.moverPhase = c * 2.1f, cart.optionalShadow = true;
     }
     for (int p = 0; p < 5; p++)
     {
@@ -841,7 +844,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
         geo.Box(Mul(Scale(0.5f, 0.08f, 0.5f), Translate(0, 1.72f, 0)), 0.15f, 0.12f, 0.1f, 0.2f); // chapeau
         geo.End(m);
         Object& walker = add(m);
-        walker.mover = 1, walker.moverPhase = p * 1.3f;
+        walker.mover = 1, walker.moverPhase = p * 1.3f, walker.optionalShadow = true;
     }
     return o;
 }
@@ -966,6 +969,7 @@ int main()
     const bool movers = env("URTI_SANDBOX_MOVERS", "1") != "0";
     const float wet = float(std::atof(env("URTI_SANDBOX_WET", "-1").c_str()));
     const bool truth = env("URTI_SANDBOX_TRUTH", "0") != "0";
+    const bool partialShadows = env("URTI_SANDBOX_GAMESHADOW", "complet") == "partiel";
     const bool leafCards = env("URTI_SANDBOX_LEAVES", "cartes") != "blocs"; // feuillage en plaques découpées (défaut) ou en blocs
     const bool ui = env("URTI_SANDBOX_UI", "1") != "0";
     const float jitter = float(std::atof(env("URTI_SANDBOX_JITTER", "1").c_str())); // 0 : sans décalage sous-pixel
@@ -1401,11 +1405,13 @@ int main()
         list->SetGraphicsRootConstantBufferView(0, frameBuf->GetGPUVirtualAddress());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->IASetIndexBuffer(&ibv);
-        auto drawScene = [&](ID3D12PipelineState* plain, ID3D12PipelineState* instanced) {
+        auto drawScene = [&](ID3D12PipelineState* plain, ID3D12PipelineState* instanced, bool shadowPass = false) {
             list->SetPipelineState(plain);
             list->IASetVertexBuffers(0, 1, &vbv);
             for (size_t i = 0; i < scene.size(); i++)
             {
+                if (shadowPass && partialShadows && scene[i].optionalShadow)
+                    continue;
                 list->SetGraphicsRootConstantBufferView(1, objectBuf->GetGPUVirtualAddress() + i * sizeof(ObjectConstants));
                 list->DrawIndexedInstanced(geo.meshes[scene[i].mesh].indexCount, 1, geo.meshes[scene[i].mesh].firstIndex, 0, 0);
             }
@@ -1429,7 +1435,7 @@ int main()
             list->RSSetScissorRects(1, &sr);
             const UINT pass[4] = { k, 0, 0, 0 };
             list->SetGraphicsRoot32BitConstants(2, 4, pass, 0);
-            drawScene(shadowPso.Get(), shadowInstPso.Get());
+            drawScene(shadowPso.Get(), shadowInstPso.Get(), true);
         }
         Barrier(list.Get(), atlas.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 

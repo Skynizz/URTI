@@ -923,3 +923,45 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   tous. Identité d'un ExecuteIndirect : signature, tampon d'arguments et position dans ce tampon (plus de
   rang) ; taille apprise par identité (0 compris : réserve de 66 sommets) ; une zone remplie jusqu'au bout
   repart à la réserve maximale, la mesure suivante redonne la vraie taille.
+
+## v43 — URTI : les ombres ne retirent que la lumière du soleil ; carte d'ombres du jeu enfin bien lue
+
+- Demande : une ombre est une visibilité du soleil, elle ne doit retirer que la lumière directe, pas
+  assombrir toute la couleur (`c *= 1 - force × (1 - masque)`, même proportion partout, même par temps
+  couvert).
+- **Part du soleil mesurée dans l'image du jeu** (`live_sunlight.hlsl`, à chaque présentation, avant la
+  composition) : un point tiré par bloc de 4×4 pixels de rendu, face au soleil (N·L > 0,2), à moins de
+  100 m, nettement éclairé ou nettement à l'ombre dans la carte du jeu (voisinage 5×5 dans le même état) ;
+  partenaire à 10 pixels sur le même plan, dans l'autre état. Rapport des couleurs de l'image :
+  ombré / éclairé = ciel / (ciel + soleil × N·L), d'où x = soleil / ciel par canal et en luminance,
+  accumulé dans des histogrammes (log2, quarts d'octave) dans le tampon du soleil (octets 1232 à 1887),
+  médiane lue sur le processeur, lissée en log (5 % par image). Moins de 32 paires : valeur gardée.
+- **Ombre physique** : le masque retire x N·L / (1 + x N·L) de la luminance (au lieu de la pente fixe
+  min(1, 2,5 N·L)) ; la composition l'applique par canal avec la teinte mesurée (le soleil est plus chaud
+  que le ciel : l'ombre bleuit comme celles du jeu). `UrtiStrength` = 1 par défaut : aussi sombre que les
+  ombres du jeu. `sun_measure=0` : ancienne règle.
+- **Bug trouvé : la carte d'ombres du jeu était mal lue depuis le début.** RDR2 (et le bac à sable) l'ont
+  en R16 (format 53, deux octets par texel) ; URTI lisait quatre octets comme un flottant : valeurs
+  absurdes, lectures hors des lignes. Touchés : le mode « seulement les ombres que le jeu n'a pas »
+  (décidé au hasard pixel par pixel, qui bouge avec les cascades : une cause probable des ombres qui
+  gigotent dans le jeu, où ce mode est choisi) et le test des trous du feuillage hors de l'écran. Lecture
+  16 bits ajoutée (bit 32 des drapeaux de `live_shadow`).
+- **Combinaison avec l'ombre du jeu** : part éclairée filtrée sur 3×3 texels (sa pénombre comprise) et
+  visibilité finale = la plus faible des deux (URTI retire max(0, jeu - RT)), au lieu d'une ombre du jeu
+  élargie de deux texels (tout ou rien) multipliée. Mode par défaut : « seulement les ombres que le jeu
+  n'a pas » (`UrtiMode` = 1) : le mode « complet » retire deux fois le soleil là où le jeu ombre déjà.
+  `game_min=0`, `game_dilate=` : ancienne combinaison, pour essai.
+- Bug évité : un `float3` dans les constantes de la composition, déplacé à la frontière de 16 octets
+  suivante, ne recevait que le rouge : trois nombres séparés.
+- **Nouveau test** `tools/reshade/urti_sandbox_ombres.sh` : la carte du « jeu » oublie poteaux, piquets,
+  mur, charrettes et passants (`URTI_SANDBOX_GAMESHADOW=partiel`) ; on compare au lancement où le jeu les
+  ombre (sol sec, reflets coupés). Ombre oubliée rattrapée, avant → après :
+  rue 56 → 90 %, occlusion 57 → 91 %, marche 55 → 68 % ; noirceur dans la rue (lumière RT / jeu, rouge
+  vert bleu) 2,5 1,9 1,6 → 1,08 1,12 1,11 (teinte juste) ; écart hors de la zone 1,9 / 1,3 / 0,5 → 0,15 /
+  0,11 / 0,19 % (plus de double ombre) ; scintillement dans la zone en marche 6,4 → 5,2 %
+  (`ombres/tableau_avant.txt`, `ombres/tableau_v43.txt`). Soleil / ciel mesuré dans le bac à sable : 4,5
+  (rouge 5,8, vert 4,3, bleu 3,0).
+- Suite des reflets (vérité terrain = ombres du jeu seules) : écart bâtiment 2,13 → 0,08 %, passants
+  1,60 → 0,47 %, marche 0,90 → 0,60 % (sautent 1,10 → 0,50 %, clignotent 0,81 → 0,57 %), occlusion
+  1,32 → 0,36 % (`suite/tableau_v43.txt`).
+- Reste : en marche, les ombres fines et lointaines (poteaux, câbles) sont trop lissées (68 %).

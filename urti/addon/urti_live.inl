@@ -23,6 +23,7 @@
 #include "live_regionstats_cs.h" // g_live_regionstats
 #include "live_uicompare_cs.h" // g_live_uicompare
 #include "live_uiselect_cs.h" // g_live_uiselect
+#include "live_sunlight_cs.h" // g_live_sunlight
 
 struct LiveState
 {
@@ -130,6 +131,16 @@ struct LiveState
     bool fovAuto = true;  // projection corrigée par le champ de vision mesuré (urti.ini fov_auto=0 : 50° supposés)
     bool fovReset = false; // sommes de la mesure à remettre à zéro (projection changée)
     uint32_t fovHold = 0;  // images à ignorer après une correction (mesures lues avec trois images de retard)
+    // part du soleil dans l'image du jeu (live_sunlight) : rapport soleil / ciel par canal (rouge, vert, bleu,
+    // luminance), lissé ; les ombres RT ne retirent que cette part (urti.ini sun_measure=0 : pente fixe)
+    bool sunMeasure = true;
+    uint32_t gameDilate = 1; // urti.ini game_dilate= : voisinage lu dans la carte du jeu (rayon en texels)
+    bool gameMin = true;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
+    float sunSky[4] = { 2.2f, 2.2f, 2.2f, 2.2f };
+    uint32_t sunSkyFrames = 0, sunSkyLogged = 0;
+    uint64_t sunSkyPairs = 0, atlasFrame = ~0ull;
+    ComPtr<ID3D12RootSignature> sunlightRs;
+    ComPtr<ID3D12PipelineState> sunlightPso;
     uint32_t jitterMode = 2; // décalage sous-pixel du jeu compensé : 0 non, 1 écart d'une image à l'autre, 2 aussi l'absolu // SIGMA : seuil de disocclusion, images stabilisees
     uint64_t boundFrame = 0;
 
@@ -176,7 +187,7 @@ struct LiveState
     std::vector<ComPtr<ID3D12PipelineState>> retiredPso[3];
     uint64_t atlasBytes = 0;
     uint32_t atlasPitch = 0;
-    bool atlasD24 = false;
+    bool atlasD24 = false, atlas16 = false; // carte d'ombres du jeu en D24, en 16 bits (RDR2 : R16, deux octets par texel)
     uint64_t framesSinceSun = 0, sunFrames = 0, sunAccepted = 0, pairSum = 0;
     uint32_t rotationValid = 0;
     double rotationSum = 0;
@@ -184,7 +195,8 @@ struct LiveState
 constexpr uint32_t kLiveMaxPairs = 256;
 // soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
 // l'image précédente (640)
-constexpr uint32_t kLiveSunBytes = 656 + 8 * 64 + 64; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223)
+constexpr uint32_t kLiveSunBytes = 656 + 8 * 64 + 64 + 656; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
+                                                             // part du soleil dans l'image (1232 : paires, 1248 : histogrammes, live_sunlight)
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
@@ -516,7 +528,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
-           make(g_live_composite, sizeof(g_live_composite), 7, live.compositeRs, live.compositePso, 14) &&
+           make(g_live_composite, sizeof(g_live_composite), 7, live.compositeRs, live.compositePso, 17) &&
+           make(g_live_sunlight, sizeof(g_live_sunlight), 3, live.sunlightRs, live.sunlightPso, 20) &&
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
            make(g_live_uiselect, sizeof(g_live_uiselect), 6, live.uiSelRs, live.uiSelPso, 8) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20) &&
@@ -681,7 +694,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, fovAuto = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 4000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -704,6 +717,7 @@ void LiveHotReload(ID3D12Device* device)
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
+                value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin);
                 float jl = 0;
                 value("jitter_log=", jl);
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -727,6 +741,9 @@ void LiveHotReload(ID3D12Device* device)
             live.nrdShadows = nrdOn != 0, live.nrdDisocclusion = nrdDisocclusion, live.nrdFrames = nrdFrames;
             live.jitterMode = uint32_t(std::clamp(jitter, 0.0f, 2.0f));
             live.fovAuto = fovAuto != 0;
+            live.sunMeasure = sunMeasure != 0;
+            live.gameDilate = uint32_t(std::clamp(gameDilate, 0.0f, 3.0f));
+            live.gameMin = gameMin != 0;
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1123,6 +1140,30 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.framesSinceSun++;
             if (r[305] > 0)
                 live.fovStretch = r[305]; // t² : (tan du demi-champ supposé / tan du vrai)²
+            // part du soleil dans l'image du jeu : médiane de chaque histogramme (live_sunlight), lissée en log
+            // (une demi-seconde environ) ; trop peu de paires (pas d'ombre du jeu à l'écran) : valeur gardée
+            if (const uint32_t* u = reinterpret_cast<const uint32_t*>(r); live.sunMeasure && u[308] >= 32)
+            {
+                float measured[4] = {};
+                for (int c = 0; c < 4; c++)
+                {
+                    const uint32_t* h = u + 312 + c * 40;
+                    uint32_t total = 0, below = 0;
+                    for (int b = 0; b < 40; b++)
+                        total += h[b];
+                    int b = 0;
+                    while (b < 39 && below + h[b] < total / 2)
+                        below += h[b++];
+                    const float f = h[b] ? std::clamp((total * 0.5f - below) / h[b], 0.0f, 1.0f) : 0.5f;
+                    measured[c] = std::exp2((b + f) / 4.0f - 5.0f);
+                }
+                for (int c = 0; c < 4; c++)
+                {
+                    const float old = std::log2(live.sunSky[c]), now = std::log2(measured[c]);
+                    live.sunSky[c] = std::exp2(live.sunSkyFrames ? old + (now - old) * 0.05f : now);
+                }
+                live.sunSkyFrames++, live.sunSkyPairs += u[308];
+            }
             // champ de vision du jeu : la projection d'URTI est corrigée quand la mesure est fiable (assez de
             // rotation de la caméra) et s'écarte de plus de 1,5 % ; les reflets ont alors des angles exacts (dans
             // un espace caméra étiré, la normale du sol est fausse et le reflet décalé : il « flotte »)
@@ -1159,6 +1200,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                         live.rotationSum / live.rotationValid);
                 live.rotationValid = 0, live.rotationSum = 0;
                 live.sunFrames = live.sunAccepted = live.pairSum = 0;
+                if (live.sunSkyFrames > live.sunSkyLogged)
+                    Log("URTI direct : lumière du jeu mesurée : soleil / ciel %.2f (rouge %.2f, vert %.2f, bleu %.2f) ; ombre RT face au soleil : "
+                        "%.0f %% de la lumière retirée ; %u images mesurées sur 300, %.0f paires par image", live.sunSky[3], live.sunSky[0], live.sunSky[1],
+                        live.sunSky[2], 100.0f * live.sunSky[3] / (1.0f + live.sunSky[3]), live.sunSkyFrames - live.sunSkyLogged,
+                        double(live.sunSkyPairs) / std::max(1u, live.sunSkyFrames - live.sunSkyLogged));
+                else if (live.sunMeasure)
+                    Log("URTI direct : lumière du jeu non mesurée (pas d'ombre du jeu à l'écran) : soleil / ciel gardé à %.2f", live.sunSky[3]);
+                live.sunSkyLogged = live.sunSkyFrames, live.sunSkyPairs = 0;
             }
         }
         live.sunReadback[live.frame % 3]->Unmap(0, nullptr);
@@ -1624,6 +1673,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             live.atlasPitch = afp.Footprint.RowPitch;
             live.atlasD24 = ad.Format == DXGI_FORMAT_R24G8_TYPELESS || ad.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+            live.atlas16 = ad.Format == DXGI_FORMAT_R16_TYPELESS || ad.Format == DXGI_FORMAT_D16_UNORM || ad.Format == DXGI_FORMAT_R16_UNORM;
             Transition(list.Get(), atlas, D3D12_RESOURCE_STATES(state), D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
             dst.pResource = live.atlasBuf.Get();
@@ -1635,6 +1685,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             Transition(list.Get(), atlas, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATES(state));
             Transition(list.Get(), live.atlasBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
             atlasValid = true;
+            live.atlasFrame = live.frame;
         }
     }
 
@@ -1677,7 +1728,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 #endif
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     const bool sunNow = live.calibrated && live.framesSinceSun < 30;
-    const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
+    const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (live.atlas16 ? 32u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
                            (sunNow ? 0u : 16u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) | (nrdActive ? 4096u : 0u);
     const struct
     {
@@ -1687,11 +1738,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t d24, atlasPitch, flags;
         uint32_t motionPitch, motionConvention;
         float temporalAlpha;
-        uint32_t debugMode, frameIndex, pad4, pad5, pad6;
+        uint32_t debugMode, frameIndex;
+        float sunSky;
+        uint32_t gameDilate, gameMin;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
-             0u, uint32_t(live.frame), 0, 0, 0 };
+             0u, uint32_t(live.frame), live.sunMeasure && live.sunSkyFrames ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u };
     list->SetComputeRoot32BitConstants(9, 24, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     // débruitage : SIGMA de NVIDIA ; sinon celui d'URTI (flou guidé par la profondeur, historique reprojeté,
@@ -2036,7 +2089,7 @@ void LiveComposite(effect_runtime* runtime)
         snapCount = std::min(g_liveSnapCount, kLiveSnaps);
     }
     // réglages de l'effet (menu de ReShade) : force, écran partagé, masque seul
-    float strength = 0.55f;
+    float strength = 1.0f; // 1 : la lumière du soleil retirée entièrement, comme dans les ombres du jeu
     bool split = false, showMask = false;
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiStrength"); v.handle)
         runtime->get_uniform_value_float(v, &strength, 1);
@@ -2196,6 +2249,38 @@ void LiveComposite(effect_runtime* runtime)
         if (reflHistOut >= 0)
             Transition(list.Get(), live.reflHist[reflHistOut].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     }
+    // part du soleil dans l'image du jeu (live_sunlight) : points d'une même surface que le jeu éclaire et ombre
+    if (live.sunMeasure && !isGenerated && live.sunlightPso && live.atlasBuf && live.atlasFrame + 1 == live.frame && live.depthBuf && // copiée par les effets de cette image
+        live.calibrated && live.framesSinceSun < 30)
+    {
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, 656);
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+        Transition(list.Get(), live.atlasBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+        list->SetComputeRootSignature(live.sunlightRs.Get());
+        list->SetPipelineState(live.sunlightPso.Get());
+        list->SetComputeRootShaderResourceView(0, live.depthBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(1, live.atlasBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(2, preUi ? preUi->GetGPUVirtualAddress() : live.imageIn->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(3, live.sunBuf->GetGPUVirtualAddress());
+        const bool d24s = live.depthFormat == DXGI_FORMAT_R24G8_TYPELESS || live.depthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT;
+        const struct
+        {
+            uint32_t width, height, depthPitch, depth24;
+            float A, B, p00, p11, sunSign, gameBias;
+            uint32_t atlasPitch, atlasFormat, imageWidth, imageHeight, imagePitch, format, frameIndex, pad0, pad1, pad2;
+        } lc = { live.width, live.height, live.depthPitch, d24s ? 1u : 0u, live.A, live.B, live.p00, live.p11, live.sunSign, g_liveGameBias,
+                 live.atlasPitch, live.atlas16 ? 2u : live.atlasD24 ? 1u : 0u, uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, uint32_t(live.frame), 0, 0, 0 };
+        list->SetComputeRoot32BitConstants(4, 20, &lc, 0);
+        list->Dispatch((live.width / 4 + 7) / 8, (live.height / 4 + 7) / 8, 1);
+        Transition(list.Get(), live.atlasBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+        Transition(list.Get(), live.depthBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = live.sunBuf.Get();
+        list->ResourceBarrier(1, &ub);
+    }
     list->SetComputeRootSignature(live.compositeRs.Get());
     list->SetPipelineState(live.compositePso.Get());
     list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
@@ -2211,6 +2296,7 @@ void LiveComposite(effect_runtime* runtime)
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(6, live.sunBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(7, live.imageOut->GetGPUVirtualAddress());
+    const bool tinted = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] > 0.01f; // teinte des ombres mesurée
     const struct
     {
         uint32_t width, height, pitch, format, maskWidth, maskHeight, maskPitch;
@@ -2219,10 +2305,12 @@ void LiveComposite(effect_runtime* runtime)
         float reflStrength;
         uint32_t debugReflect;
         float p00, p11;
+        float tint[3];
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u, (reflections && !(generated && live.fgMode == 2)) ? std::max(live.reflEffective, reflectView ? 1.0f : 0.0f) : 0.0f,
-             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u), live.p00, live.p11 };
-    list->SetComputeRoot32BitConstants(8, 14, &cc, 0);
+             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u), live.p00, live.p11,
+             { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f } };
+    list->SetComputeRoot32BitConstants(8, 17, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
