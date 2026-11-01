@@ -1039,3 +1039,14 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   et l'image avec URTI, en plein écran et sans délai : seule la pose sur l'image est sautée, le calcul RT
   continue (les images par seconde ne changent donc pas : pour elles, F7 coupe tout). F5 reste l'écran
   partagé (gauche sans, droite avec).
+
+## v48 — URTI : case « URTI activé » dans le menu (tout le calcul coupé), F7 synchronisée
+
+- Demande : un bouton qui coupe complètement le ray tracing (plus aucun calcul) et le relance. Case
+  `UrtiOn` dans le menu de ReShade : décochée, plus de capture de géométrie, de structure, d'ombres, de
+  reflets ni de pose ; recochée, tout reprend. F7 fait la même chose et la case suit. Sans effet si
+  urti.ini n'a pas `live=1` (les lancements natifs du bac à sable restent natifs ; suite inchangée).
+- « Aucune différence » avec F4 : la partie du joueur était de nuit (soleil suivi sur 0 % des images, pas
+  de carte d'ombres du soleil). La nuit, URTI ne fait pas d'ombres (seulement celles du soleil) et ses
+  reflets, limités aux surfaces planes, reflètent une scène sombre : 0,2 % des pixels changés (rafale).
+  Les reflets visibles sur les pavés mouillés la nuit sont ceux du jeu.

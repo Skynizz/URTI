@@ -76,6 +76,7 @@ struct LiveState
     uint64_t statChurn = 0; // objets entrés ou sortis de la scène RT (bilan par 300 images)
     bool composedNow = false;           // la composition d'URTI a eu lieu à cette présentation
     std::atomic<bool> showGameOnly{ false }; // F4 : image du jeu seule (comparaison avant / après en plein écran)
+    int menuOn = -1; // case « URTI activé » du menu (UrtiOn) telle que lue à la dernière présentation ; -1 : pas encore lue
     uint64_t vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0;
     uint64_t statDraws = 0, statOverflow = 0, statOutOfBudget = 0, statProbes = 0, statBudgetFrames = 0, statReserved = 0;
     // accumulation dans le temps : vecteurs de mouvement du jeu (G-buffer), profondeur précédente
@@ -2400,6 +2401,21 @@ void OnReshadePresent(effect_runtime* runtime)
 {
     if (!OurDevice(runtime->get_device()))
         return;
+    // case « URTI activé » du menu : décochée, plus aucun calcul RT (capture, structure, ombres, reflets, pose) ;
+    // F7 fait la même chose et la case suit
+    if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiOn"); v.handle && g_liveAtStart)
+    {
+        bool on = true;
+        runtime->get_uniform_value_bool(v, &on, 1);
+        if (int(on) != live.menuOn)
+        {
+            if (live.menuOn >= 0 && live.enabled != on)
+                Log("URTI : %s (menu)", on ? "activé, le calcul ray tracing reprend" : "coupé, plus aucun calcul ray tracing");
+            live.menuOn = int(on), live.enabled = on;
+        }
+        else if (live.enabled != on)
+            runtime->set_uniform_value_bool(v, live.enabled), live.menuOn = int(live.enabled); // F7
+    }
     LiveComposite(runtime);
     // rafale : l'image sans URTI (sa copie, imageIn) et avec, à chaque image réelle composée
     if (live.burst > 0 && live.composedNow && live.lastPresentDraws > 0 && live.imageIn)
