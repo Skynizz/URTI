@@ -137,15 +137,17 @@ float3 NormalAt(int2 t, float3 p)
 // surface plane autour du pixel : les points à 4 pixels de part et d'autre, sur chaque axe, sont alignés
 // avec lui (vrai pour un sol, un toit, une flaque, quelle que soit la perspective ; faux pour un feuillage,
 // des branches, des câbles, où la profondeur saute). 1 : plane ; 0 : pas une surface continue.
-float Flatness(int2 t, float3 p)
+float Flatness(int2 t, float3 p, int k = 4)
 {
-    const float3 l = PointAt(t - int2(4, 0)), r = PointAt(t + int2(4, 0)), u = PointAt(t - int2(0, 4)), b = PointAt(t + int2(0, 4));
+    const float3 l = PointAt(t - int2(k, 0)), r = PointAt(t + int2(k, 0)), u = PointAt(t - int2(0, k)), b = PointAt(t + int2(0, k));
     if (l.z <= 0 || r.z <= 0 || u.z <= 0 || b.z <= 0)
         return 0;
     const float3 h = r - l, v = b - u;
     const float eh = length(cross(h, p - l)) / max(length(h), 1e-6);
     const float ev = length(cross(v, p - u)) / max(length(v), 1e-6);
-    return saturate(1.0 - max(eh, ev) / (0.004 * p.z + 0.002));
+    // relief dans les deux directions (feuillage, cheveux) ; sur une seule (bord d'une flaque contre un mur, objet
+    // au loin dans l'axe vertical), la surface reste plane
+    return saturate(1.0 - (k == 4 ? max(eh, ev) : min(eh, ev)) / (0.004 * p.z + 0.002));
 }
 
 float Smoothness(int2 t)
@@ -174,9 +176,11 @@ void main(uint2 id : SV_DispatchThreadID)
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
     const float3 n = p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
-    // sol mouillé : seulement sur une surface plane tournée vers le haut (sur un feuillage, la normale tirée
-    // de la profondeur est du bruit : le reflet y apparaissait et disparaissait d'une image à l'autre)
-    const float s = max(Smoothness(int2(id)), (wet > 0 && p.z > 0) ? wet * saturate((n.y - 0.55) / 0.3) * Flatness(int2(id), p) : 0.0);
+    // reflets RT seulement sur une surface plane (sol, flaque, vitre, eau) : sur un feuillage, des cheveux, un
+    // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
+    // gris) ; le jeu y garde ses propres reflets. Sol mouillé : en plus, tourné vers le haut
+    const float flat = p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
+    const float s = max(Smoothness(int2(id)) * ((flags & 4) ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);

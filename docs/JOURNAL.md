@@ -965,3 +965,36 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   1,60 → 0,47 %, marche 0,90 → 0,60 % (sautent 1,10 → 0,50 %, clignotent 0,81 → 0,57 %), occlusion
   1,32 → 0,36 % (`suite/tableau_v43.txt`).
 - Reste : en marche, les ombres fines et lointaines (poteaux, câbles) sont trop lissées (68 %).
+
+## v44 — URTI : reflets RT seulement sur les surfaces planes ; la carte d'ombres de RDR2 ne concorde pas
+
+- Retour de jeu (v43, jardin de Saint-Denis au soleil) : les reflets tremblent encore, des choses sautent,
+  **les arbres ont des points gris flous qui tremblent**, et les ombres ne font **aucune différence**
+  activées ou non. Journal : soleil / ciel mesuré 0,06 à 0,16 (6 à 13 % de la lumière retirée : ombres
+  invisibles) alors que la scène a des ombres franches ; 50 à 115 objets sur ~800 dans la scène RT ;
+  48 i/s, ~7 ms d'URTI par image. Préréglage du joueur à la fin : mode « ombres RT complètes », force 1.
+- **Points gris** : les reflets RT se posaient sur toute surface que le jeu déclare lisse (cheveux,
+  feuilles, peau) ; la normale tirée de la profondeur y est du bruit, le reflet partait au hasard et
+  clignotait (vu sur la nuque du personnage dans une capture). Le contrôle de planéité (jusqu'ici réservé
+  au sol mouillé) s'applique maintenant à tous les reflets : voisins à 2 pixels (à 4, au loin ils
+  tombaient sur un autre objet : sauts en marche 0,50 → 0,91 %), et une surface n'est refusée que si elle
+  a du relief dans les deux directions (le bord d'une flaque contre un mur reste plan). Bac à sable
+  (reproductible à l'identique : contrôle coupé = v43 au chiffre près) : sautent / clignotent, marche
+  0,501 / 0,565 → 0,484 / 0,557 %, arbres au vent 0,019 / 0,041 → 0,016 / 0,036 %, rue fixe
+  0,066 / 0,075 → 0,057 / 0,063 %. Le jeu garde ses propres reflets sur les surfaces refusées.
+- **La carte d'ombres de RDR2 ne concorde pas** avec ce qu'URTI en attend (session lancée par URTI dans le
+  bayou, temps couvert) : contrôle ajouté dans `live_sunlight` (points face au soleil que la carte dit
+  éclairés / à l'ombre / au bord / hors des cascades, luminance moyenne des deux premiers) : **100 % au
+  bord** ; la vue « ombre du jeu recalculée » est blanche partout. Dans le bac à sable : 65 % éclairés,
+  31 % à l'ombre, rapport de luminance 5,9. Le test de profondeur dans la carte de RDR2 n'avait jamais pu
+  être vérifié (lecture fausse jusqu'à la v43) : la profondeur que la projection d'URTI donne au point
+  n'est probablement pas celle que le jeu écrit (plage de profondeur du viewport, décalage…). Ajouté au
+  journal toutes les 300 images : histogramme de la profondeur des points dans la cascade et de l'écart
+  carte - point (bac à sable : points dans 0,375 à 0,625 ; écart nul pour les points éclairés, très
+  négatif pour ceux à l'ombre). À relever dans RDR2 **au soleil** pour corriger.
+- **Garde-fou** : la mesure soleil / ciel n'est prise que si la carte concorde avec l'image (points
+  éclairés au moins 1,3 fois plus clairs que ceux à l'ombre) ; sinon la valeur par défaut reste (2,2 :
+  69 % de la lumière retirée face au soleil, l'ancien rendu) au lieu d'effacer les ombres.
+- Bug de l'outil de contrôle : `show_mask=1` dans urti.ini cochait « masque seul » dans l'effet, sans
+  jamais la décocher : écran blanc (masque sans ombre) après le contrôle. Décochée maintenant quand la
+  ligne est retirée. Le jeu, lancé par URTI pour ce contrôle, a été fermé (aucune progression jouée).

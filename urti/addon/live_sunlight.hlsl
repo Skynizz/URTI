@@ -39,6 +39,9 @@ cbuffer Constants : register(b0)
 static const uint kCount = 1232;  // nombre de paires mesurées
 static const uint kHist = 1248;   // 4 × 40 cases : rouge, vert, bleu, luminance
 static const uint kBins = 40;
+static const uint kStats = 1888; // contrôle : points éclairés, à l'ombre, au bord, hors des cascades ; luminance × 1024 des deux premiers
+static const uint kDepthHist = 1920; // profondeur du point dans la première cascade qui le couvre en x, y : 16 cases de -0,5 à 1,5
+static const uint kGapHist = 1984;   // carte - point (profondeur), points couverts : 16 cases de -0,02 à 0,02
 
 static float gA, gB, gClear;
 
@@ -109,6 +112,7 @@ float AtlasDepth(uint2 t)
 int GameState(float3 p)
 {
     const uint count = min(sunBuf.Load(32), 8u);
+    bool record = true;
     for (uint k = 0; k < count; k++)
     {
         const uint base = 48 + k * 64;
@@ -118,9 +122,17 @@ int GameState(float3 p)
         float3 s;
         for (uint c = 0; c < 3; c++)
             s[c] = M[9 + c] + p.x * M[c] + p.y * M[3 + c] + p.z * M[6 + c];
-        if (abs(s.x) > 0.95 || abs(s.y) > 0.95 || s.z <= 0 || s.z >= 1)
+        if (abs(s.x) > 0.95 || abs(s.y) > 0.95)
+            continue;
+        // contrôle : où tombe la profondeur du point dans la cascade, et l'écart à la carte (pour un point
+        // éclairé, la carte note le point lui-même : écart nul au décalage du jeu près)
+        if (record)
+            sunBuf.InterlockedAdd(kDepthHist + uint(clamp(floor((s.z + 0.5) * 8.0), 0.0, 15.0)) * 4, 1), record = false;
+        if (s.z <= 0 || s.z >= 1)
             continue;
         const float2 texel = vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw;
+        if (count > 0)
+            sunBuf.InterlockedAdd(kGapHist + uint(clamp(floor((AtlasDepth(uint2(texel)) - s.z + 0.02) * 400.0), 0.0, 15.0)) * 4, 1);
         uint lit = 0;
         for (int dy = -2; dy <= 2; dy++)
             for (int dx = -2; dx <= 2; dx++)
@@ -130,7 +142,7 @@ int GameState(float3 p)
             }
         return lit == 25 ? 1 : lit == 0 ? 0 : -1;
     }
-    return -1;
+    return -2; // hors des cascades
 }
 
 uint Hash(uint x)
@@ -176,6 +188,15 @@ void main(uint2 id : SV_DispatchThreadID)
     if (ndl < 0.2)
         return; // surface rasante ou dos au soleil : le rapport y dit peu de chose
     const int state = GameState(p);
+    // contrôle de la carte lue : si elle est bien celle du soleil, les points qu'elle éclaire sont nettement
+    // plus clairs dans l'image que ceux qu'elle ombre
+    sunBuf.InterlockedAdd(kStats + (state == 1 ? 0 : state == 0 ? 4 : state == -1 ? 8 : 12), 1);
+    if (state >= 0)
+    {
+        const float2 jit = JitterPixels(asfloat(sunBuf.Load2(1184)), float2(width, height));
+        const float y = min(dot(ColorAt(t, jit), float3(0.2126, 0.7152, 0.0722)), 4.0);
+        sunBuf.InterlockedAdd(kStats + (state == 1 ? 16 : 20), uint(y * 1024.0));
+    }
     if (state < 0)
         return;
     // partenaire : à 10 pixels, sur le même plan (même normale, à la même distance du plan), dans l'autre état

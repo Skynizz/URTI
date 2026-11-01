@@ -139,6 +139,8 @@ struct LiveState
     float sunSky[4] = { 2.2f, 2.2f, 2.2f, 2.2f };
     uint32_t sunSkyFrames = 0, sunSkyLogged = 0;
     uint64_t sunSkyPairs = 0, atlasFrame = ~0ull;
+    uint64_t mapCheck[6] = {}; // contrôle de la carte du jeu : points éclairés, à l'ombre, au bord, hors des cascades ; luminances (× 1024)
+    uint64_t depthHist[16] = {}, gapHist[16] = {}; // profondeur des points dans la cascade, écart carte - point
     ComPtr<ID3D12RootSignature> sunlightRs;
     ComPtr<ID3D12PipelineState> sunlightPso;
     uint32_t jitterMode = 2; // décalage sous-pixel du jeu compensé : 0 non, 1 écart d'une image à l'autre, 2 aussi l'absolu // SIGMA : seuil de disocclusion, images stabilisees
@@ -166,7 +168,7 @@ struct LiveState
     uint64_t maskFrame = ~0ull;    // image où le masque d'ombres a été calculé (sinon il ne suit plus la caméra)
     int lastMode = -1;
     float lastStrength = -1;
-    bool lastSplit = false, lastShowMask = false, lastTechnique = true;
+    bool lastSplit = false, lastShowMask = false, lastTechnique = true, iniMaskSet = false;
     std::atomic<bool> toggleSplit{ false }; // F5 : écran partagé (gauche jeu seul, droite avec ombres RT)
     float sunSign = 1; // sens du soleil par rapport à la profondeur des cartes (convention du jeu)
     uint32_t missedCalibrations = 0;
@@ -195,8 +197,8 @@ struct LiveState
 constexpr uint32_t kLiveMaxPairs = 256;
 // soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
 // l'image précédente (640)
-constexpr uint32_t kLiveSunBytes = 656 + 8 * 64 + 64 + 656; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
-                                                             // part du soleil dans l'image (1232 : paires, 1248 : histogrammes, live_sunlight)
+constexpr uint32_t kLiveSunBytes = 2048; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
+                                                             // part du soleil dans l'image (1232 : paires, 1248 : histogrammes, 1888 à 2047 : contrôle, live_sunlight)
 
 // ------------------------------------------------------------------------------------------------
 // étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
@@ -1142,7 +1144,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.fovStretch = r[305]; // t² : (tan du demi-champ supposé / tan du vrai)²
             // part du soleil dans l'image du jeu : médiane de chaque histogramme (live_sunlight), lissée en log
             // (une demi-seconde environ) ; trop peu de paires (pas d'ombre du jeu à l'écran) : valeur gardée
-            if (const uint32_t* u = reinterpret_cast<const uint32_t*>(r); live.sunMeasure && u[308] >= 32)
+            const uint32_t* check = reinterpret_cast<const uint32_t*>(r) + 472; // octet 1888
+            for (int k = 0; k < 6; k++)
+                live.mapCheck[k] += check[k];
+            for (int k = 0; k < 16; k++)
+                live.depthHist[k] += check[8 + k], live.gapHist[k] += check[24 + k];
+            // mesure acceptée seulement si la carte lue concorde avec l'image : les points qu'elle éclaire sont
+            // nettement plus clairs que ceux qu'elle ombre (sinon elle est mal lue : la valeur d'avant reste)
+            const bool mapAgrees = check[0] >= 32 && check[1] >= 32 && check[5] > 0 &&
+                                   (double(check[4]) / check[0]) > 1.3 * (double(check[5]) / check[1]);
+            if (const uint32_t* u = reinterpret_cast<const uint32_t*>(r); live.sunMeasure && mapAgrees && u[308] >= 32)
             {
                 float measured[4] = {};
                 for (int c = 0; c < 4; c++)
@@ -1208,6 +1219,26 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 else if (live.sunMeasure)
                     Log("URTI direct : lumière du jeu non mesurée (pas d'ombre du jeu à l'écran) : soleil / ciel gardé à %.2f", live.sunSky[3]);
                 live.sunSkyLogged = live.sunSkyFrames, live.sunSkyPairs = 0;
+                if (const uint64_t n = live.mapCheck[0] + live.mapCheck[1] + live.mapCheck[2] + live.mapCheck[3])
+                {
+                    Log("URTI direct : carte d'ombres du jeu au point vu (face au soleil) : %.0f %% éclairés, %.0f %% à l'ombre, %.0f %% au bord, "
+                        "%.0f %% hors des cascades ; luminance moyenne éclairés %.3f, à l'ombre %.3f (rapport %.2f : bien plus que 1 si la carte lue est la bonne)",
+                        100.0 * live.mapCheck[0] / n, 100.0 * live.mapCheck[1] / n, 100.0 * live.mapCheck[2] / n, 100.0 * live.mapCheck[3] / n,
+                        live.mapCheck[0] ? live.mapCheck[4] / 1024.0 / live.mapCheck[0] : 0.0, live.mapCheck[1] ? live.mapCheck[5] / 1024.0 / live.mapCheck[1] : 0.0,
+                        live.mapCheck[0] && live.mapCheck[1] && live.mapCheck[5] ? (double(live.mapCheck[4]) / live.mapCheck[0]) / (double(live.mapCheck[5]) / live.mapCheck[1]) : 0.0);
+                    char depthText[160] = {}, gapText[160] = {};
+                    for (int k = 0, a = 0, b = 0; k < 16; k++)
+                    {
+                        a += std::snprintf(depthText + a, sizeof(depthText) - a, "%s%llu", k ? " " : "", (unsigned long long)live.depthHist[k]);
+                        b += std::snprintf(gapText + b, sizeof(gapText) - b, "%s%llu", k ? " " : "", (unsigned long long)live.gapHist[k]);
+                    }
+                    Log("URTI direct : profondeur des points dans la cascade (-0,5 à 1,5 par 0,125) : %s ; carte - point (-0,02 à 0,02 par 0,0025) : %s",
+                        depthText, gapText);
+                }
+                for (uint64_t& v : live.mapCheck)
+                    v = 0;
+                for (int k = 0; k < 16; k++)
+                    live.depthHist[k] = live.gapHist[k] = 0;
             }
         }
         live.sunReadback[live.frame % 3]->Unmap(0, nullptr);
@@ -1744,7 +1775,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
-             0u, uint32_t(live.frame), live.sunMeasure && live.sunSkyFrames ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u };
+             0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u };
     list->SetComputeRoot32BitConstants(9, 24, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     // débruitage : SIGMA de NVIDIA ; sinon celui d'URTI (flou guidé par la profondeur, historique reprojeté,
@@ -1970,8 +2001,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (active.handle)
         runtime->set_uniform_value_bool(active, true);
     const effect_uniform_variable showMask = runtime->find_uniform_variable("urti.fx", "UrtiShowMask");
-    if (showMask.handle && g_liveShowMask)
-        runtime->set_uniform_value_bool(showMask, true);
+    // urti.ini show_mask=1 coche « masque seul » dans l'effet ; retiré, il la décoche (sinon la vue reste)
+    if (showMask.handle && g_liveShowMask != live.iniMaskSet)
+        runtime->set_uniform_value_bool(showMask, g_liveShowMask), live.iniMaskSet = g_liveShowMask;
     if (!live.bound && active.handle)
     {
         live.bound = true;
@@ -2254,7 +2286,7 @@ void LiveComposite(effect_runtime* runtime)
         live.calibrated && live.framesSinceSun < 30)
     {
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, 656);
+        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, kLiveSunBytes - 1232);
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
         Transition(list.Get(), live.atlasBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
