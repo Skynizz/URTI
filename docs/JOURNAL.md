@@ -1032,3 +1032,10 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   change d'une image à l'autre (RDR2 enregistre sur plusieurs fils). À faire : une place fixe par objet.
 - Non vérifiable cette nuit-là : reflets de jour, ombres (pas de soleil). La rafale caméra en mouvement
   mêle le déplacement normal du reflet aux sauts : à affiner.
+
+## v47 — URTI : F4, avant / après en plein écran
+
+- Demande du joueur : un bouton pour voir la différence en direct. **F4** bascule entre l'image du jeu seule
+  et l'image avec URTI, en plein écran et sans délai : seule la pose sur l'image est sautée, le calcul RT
+  continue (les images par seconde ne changent donc pas : pour elles, F7 coupe tout). F5 reste l'écran
+  partagé (gauche sans, droite avec).
