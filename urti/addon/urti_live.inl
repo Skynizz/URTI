@@ -70,7 +70,12 @@ struct LiveState
     std::unordered_map<uint32_t, ObjectStat> objects;
     std::unordered_map<uint32_t, uint32_t> seenNow;
     std::unordered_set<uint32_t> admitted;
-    uint64_t vertexBudget = 4000000, probeBudget = 1000000, slotLimit = 0;
+    uint32_t churnIn = 0, churnOut = 0; // objets entrés dans la scène RT / sortis, à cette image
+    uint32_t burst = 0, burstIndex = 0, burstCount = 0; // rafale d'images avant / après URTI en cours (images restantes)
+    std::string burstFolder;
+    uint64_t statChurn = 0; // objets entrés ou sortis de la scène RT (bilan par 300 images)
+    bool composedNow = false;           // la composition d'URTI a eu lieu à cette présentation
+    uint64_t vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0;
     uint64_t statDraws = 0, statOverflow = 0, statOutOfBudget = 0, statProbes = 0, statBudgetFrames = 0, statReserved = 0;
     // accumulation dans le temps : vecteurs de mouvement du jeu (G-buffer), profondeur précédente
     ComPtr<ID3D12Resource> mvBuf, depthPrevBuf, mvErrors, mvErrorsReadback[3];
@@ -697,7 +702,7 @@ void LiveHotReload(ID3D12Device* device)
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
             float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
-            float vertexBudget = 4000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1;
+            float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1092,6 +1097,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             }
             Log("URTI direct : budget : sommets écrits des objets admis %llu ; plus gros objets (réservés/écrits) :%s", (unsigned long long)admittedMeasured, top);
         }
+        live.churnIn = live.churnOut = 0;
+        for (const uint32_t id : admit)
+            live.churnIn += live.admitted.count(id) ? 0 : 1;
+        for (const uint32_t id : live.admitted)
+            live.churnOut += admit.count(id) ? 0 : 1;
+        live.statChurn += live.churnIn + live.churnOut;
         live.admitted = admit;
         std::lock_guard<std::mutex> lock(g_mutex);
         g_liveKnown.swap(known), g_liveAdmit.swap(admit), g_liveProbeWant.swap(probe);
@@ -1354,9 +1365,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 {
                     const double f = double(live.statBudgetFrames);
                     Log("URTI direct : budget de géométrie %llu sommets : %.0f dessins dans la scène RT (%.0f sommets réservés), %.0f hors budget, "
-                        "%.0f re-mesurés, %.1f refusés (emplacement plein) par image", (unsigned long long)live.vertexBudget, live.statDraws / f,
-                        live.statReserved / f, live.statOutOfBudget / f, live.statProbes / f, live.statOverflow / f);
+                        "%.0f re-mesurés, %.1f refusés (emplacement plein), %.1f entrés ou sortis de la scène RT par image", (unsigned long long)live.vertexBudget,
+                        live.statDraws / f, live.statReserved / f, live.statOutOfBudget / f, live.statProbes / f, live.statOverflow / f, live.statChurn / f);
                 }
+                live.statChurn = 0;
                 live.statDraws = live.statOutOfBudget = live.statProbes = live.statOverflow = live.statBudgetFrames = live.statReserved = 0;
                 std::fill(std::begin(live.timeSum), std::end(live.timeSum), 0.0);
                 live.timeFrames = 0;
@@ -2021,6 +2033,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 // une image sur deux n'aurait pas les ombres RT.
 void LiveComposite(effect_runtime* runtime)
 {
+    live.composedNow = false;
     if (!live.enabled || !live.depthReady || !live.bound || !live.shadowBuf || !live.compositePso)
         return;
     // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt
@@ -2369,6 +2382,7 @@ void LiveComposite(effect_runtime* runtime)
         list->ResolveQueryData(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slotTime * 8 + 6, 2, live.timeReadback[slotTime].Get(), 6 * 8);
     }
     live.statComposited++;
+    live.composedNow = true;
 }
 
 bool OnOpenOverlay(effect_runtime*, bool open, input_source)
@@ -2384,6 +2398,21 @@ void OnReshadePresent(effect_runtime* runtime)
     if (!OurDevice(runtime->get_device()))
         return;
     LiveComposite(runtime);
+    // rafale : l'image sans URTI (sa copie, imageIn) et avec, à chaque image réelle composée
+    if (live.burst > 0 && live.composedNow && live.lastPresentDraws > 0 && live.imageIn)
+        if (const resource back = runtime->get_current_back_buffer(); back.handle)
+        {
+            runtime->get_command_queue()->flush_immediate_command_list();
+            ID3D12CommandQueue* queue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
+            const std::string base = live.burstFolder + "\\";
+            SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "apres_" + std::to_string(live.burstIndex) + ".ppm", 2);
+            SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "avant_" + std::to_string(live.burstIndex) + ".ppm", 2, live.imageIn.Get());
+            Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
+                live.churnOut);
+            live.burstIndex++;
+            if (--live.burst == 0)
+                Log("URTI direct : rafale %u terminée (%u paires d'images)", live.burstCount, live.burstIndex);
+        }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_liveSnapCount = 0; // photos de la prochaine image

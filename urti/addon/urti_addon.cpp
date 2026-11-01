@@ -1122,7 +1122,8 @@ void BeginList()
 // image de la frame (pour savoir ce qui a été capturé)
 // ------------------------------------------------------------------------------------------------
 
-void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path, uint32_t step = 2)
+// copyOf : un tampon de même disposition (copie de l'image, état COPY_DEST) enregistré à la place de l'image
+void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path, uint32_t step = 2, ID3D12Resource* copyOf = nullptr)
 {
     const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -1139,7 +1140,14 @@ void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const
     dst.PlacedFootprint = fp;
     src.pResource = backBuffer;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (copyOf)
+    {
+        Transition(g.list.Get(), copyOf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g.list->CopyBufferRegion(readback.Get(), 0, copyOf, 0, total);
+        Transition(g.list.Get(), copyOf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    else
+        g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     Transition(g.list.Get(), backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
     Submit(queue);
 
@@ -1496,6 +1504,19 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.toggleSplit = true;
     if (const std::string f5 = g_dir + "\\urti_f5"; g.frame % 30 == 0 && GetFileAttributesA(f5.c_str()) != INVALID_FILE_ATTRIBUTES)
         DeleteFileA(f5.c_str()), live.toggleSplit = true; // F5 par fichier (tests automatiques)
+    // rafale (touche F8, ou fichier déclencheur urti_rafale) : 30 images consécutives, chacune sans et avec URTI
+    // (urti_rafale_N\avant_i.ppm, apres_i.ppm), pour mesurer dans le jeu ce qu'URTI ajoute comme tremblement
+    // (tools/reshade/urti_rafale.py)
+    const bool burstKey = (GetAsyncKeyState(VK_F8) & 1) != 0;
+    if (const std::string burst = g_dir + "\\urti_rafale"; live.burst == 0 &&
+        (burstKey || (g.frame % 30 == 0 && GetFileAttributesA(burst.c_str()) != INVALID_FILE_ATTRIBUTES)))
+    {
+        DeleteFileA(burst.c_str());
+        live.burstFolder = g_dir + "\\urti_rafale_" + std::to_string(++live.burstCount);
+        CreateDirectoryA(live.burstFolder.c_str(), nullptr);
+        live.burst = 30, live.burstIndex = 0;
+        Log("URTI direct : rafale %u demandée (30 images avant / après URTI)", live.burstCount);
+    }
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
     // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil
     // image par image est perdu ; sinon le soleil est suivi sur le GPU
