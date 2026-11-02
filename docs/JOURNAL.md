@@ -1116,3 +1116,31 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
   - la reconstruction de la structure à chaque image (3,8 à 5,7 ms) ;
   - la photo d'avant l'interface encore perdue par moments dans RDR2 (ressemblance des photos maintenant
     journalisée).
+
+## v53–v55 — URTI : une place fixe par objet : plus de flashs, structure mise à jour au lieu de reconstruite
+
+- Avis du joueur : laisser les ombres au jeu (les siennes sont trop bonnes) ; étape 1 : stabilité et vitesse.
+- Cause des flashs d'une image (rafale v52) : 8 à 9 objets par image entraient ou sortaient de la scène RT,
+  sans refus ni dépassement de budget : le jeu ne dessine pas tout à chaque image (végétation, niveaux de
+  détail, masquage). Et la place de chaque objet dans le flux suivait l'ordre d'enregistrement des dessins,
+  variable : la structure était reconstruite 300 fois sur 300 (3,8 à 5,7 ms).
+- **Places fixes** (`g_livePlaces`, urti.ini `persist=0` pour l'ancienne règle) : chaque objet de l'écran
+  principal garde sa place d'une image à l'autre (premier espace libre assez grand, un quart de marge,
+  espaces libres fusionnés) ; un objet que le jeu ne dessine pas pendant au plus 3 images garde sa dernière
+  géométrie dans la scène RT ; au-delà, sa place est rendue. Les comptes de sommets écrits sont recopiés
+  dans une case par place (`live_counts.hlsl`), que la conversion lit ; la conversion couvre toutes les
+  places tenues (table triée par début). Une place refusée ou plus de 70 % de l'emplacement occupé : tout est
+  redistribué à l'image suivante.
+- Triangles absents : plats (sommets à l'origine) au lieu de NaN : une mise à jour de la structure ne peut
+  pas changer l'état actif / inactif d'un triangle. **Mise à jour tant que la partie convertie garde sa
+  taille** (reconstruction complète au plus toutes les 8 images).
+- v53 : la partie occupée remplissait tout l'emplacement (82 dessins refusés par image, 406 objets dans la
+  scène RT) : d'où la marge, la fusion et la redistribution de v54.
+- Mesures dans RDR2 (v54, Saint-Denis au soleil) : 871 places tenues (71 Mo), partie occupée 81 Mo sur
+  128, 0 nouvelle place par image, 0 redistribution ; **33 reconstructions et 267 mises à jour sur 300** ;
+  étape « soleil et profondeur » 1,3 ms (3,8 à 5,7) ; **0 objet entré ou sorti sur les 30 images de la
+  rafale**, 0,015 % des pixels qui sautent ; 65 i/s. Bac à sable : suite identique au chiffre près avec ou
+  sans places fixes.
+- Occultation ambiante en mouvement (bac à sable, marche) : sautent 0,47 % sans elle, 0,78 % avec ; débruitage
+  du mode occultation seule élargi (flou 5×5 guidé par la profondeur, part de l'image courante en mouvement
+  0,2) : 0,69 % (clignotent 0,84 → 0,71 %). Reste à réduire.

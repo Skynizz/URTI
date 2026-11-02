@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -127,6 +128,38 @@ uint32_t g_liveOverflow = 0, g_liveOutOfBudget = 0;
 std::vector<LiveRegion> g_liveRegions[4]; // par emplacement (kSlots), dans l'ordre d'attribution
 uint32_t g_liveCursor[4] = {};            // octets attribués dans chaque emplacement
 uint32_t g_liveNextCounter = 4;           // compteurs par dessin après ceux des emplacements
+// place fixe de chaque objet de l'écran principal dans son emplacement, d'une image à l'autre : un objet que le
+// jeu ne dessine pas pendant quelques images garde sa dernière géométrie dans la scène RT (plus de flash), et
+// la disposition stable permet de mettre à jour la structure au lieu de la reconstruire (urti.ini persist=0 :
+// zones attribuées à la suite à chaque image, comme avant)
+struct LivePlace
+{
+    uint32_t offset = 0, capacity = 0, countIndex = 0, frameCounter = 0;
+    uint64_t lastFrame = 0;
+};
+bool g_livePersist = true;
+std::unordered_map<uint32_t, LivePlace> g_livePlaces; // identité -> place
+std::map<uint32_t, uint32_t> g_liveFreeSpace;         // début -> taille (octets, multiples de 48 : trois sommets)
+std::vector<uint32_t> g_liveFreeCounts;               // cases de compte rendues
+uint32_t g_livePlaceHigh = 0, g_liveNextCount = 0;    // fin de la partie occupée (octets) ; cases de compte attribuées
+uint64_t g_livePlaceFrame = 1;                         // image de capture (avancée par urti_live.inl)
+uint32_t g_livePlaceNew = 0, g_livePlaceFailed = 0;    // places attribuées, refusées (emplacement plein) dans cette image
+
+// rend la place : son espace (fusionné avec ses voisins libres) et sa case de compte
+void LiveFreePlace(const LivePlace& p)
+{
+    uint32_t start = p.offset, size = p.capacity;
+    if (auto next = g_liveFreeSpace.find(start + size); next != g_liveFreeSpace.end())
+        size += next->second, g_liveFreeSpace.erase(next);
+    if (auto prev = g_liveFreeSpace.lower_bound(start); prev != g_liveFreeSpace.begin())
+        if (--prev; prev->first + prev->second == start)
+            start = prev->first, size += prev->second, g_liveFreeSpace.erase(prev);
+    if (start + size == g_livePlaceHigh)
+        g_livePlaceHigh = start; // en haut de la partie occupée : elle rétrécit
+    else
+        g_liveFreeSpace[start] = size;
+    g_liveFreeCounts.push_back(p.countIndex);
+}
 bool g_liveCombine = true;       // urti.ini combine=0 : ombres RT seules, sans tenir compte de celles du jeu
 uint32_t g_liveDebugGame = 0;    // urti.ini debug_game_shadow=1 : affiche l'ombre du jeu recalculée
 float g_liveGameBias = 0.0015f;  // urti.ini game_bias= : tolérance du test de la carte d'ombres du jeu
@@ -870,7 +903,9 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             else
                 marked = !probe && g_liveMarks.size() < kLiveMaxMarks && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
             const uint64_t limit = g_liveSlotLimit ? std::min<uint64_t>(kSlotBytes, g_liveSlotLimit * 16) : kSlotBytes;
-            if (!capacity || uint64_t(g_liveCursor[slot]) + g_liveProbeUsed[slot] + capacity > limit || g_liveNextCounter >= kMaxDraws)
+            const bool persist = mainScreen && g_livePersist && !probe;
+            const uint32_t used = mainScreen && g_livePersist ? std::max(g_liveCursor[slot], g_livePlaceHigh) : g_liveCursor[slot];
+            if (!capacity || uint64_t(used) + g_liveProbeUsed[slot] + (persist ? 0 : capacity) > limit || g_liveNextCounter >= kMaxDraws)
             {
                 if (screen && !probe)
                     g_liveOverflow++;
@@ -882,6 +917,53 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 g_liveProbeUsed[slot] += (capacity + 15) & ~15u;
                 region = { uint32_t(limit - g_liveProbeUsed[slot]), capacity, g_liveNextCounter++, id };
                 g_liveProbes[slot].push_back(region);
+            }
+            else if (persist)
+            {
+                // sa place s'il en a une assez grande (et pas déjà prise dans cette image), sinon une nouvelle :
+                // le premier espace libre qui convient, sinon au bout de la partie occupée
+                auto it = g_livePlaces.find(id);
+                if (it != g_livePlaces.end() && it->second.lastFrame == g_livePlaceFrame)
+                    return; // même identité deux fois dans l'image : la seconde n'est pas captée
+                if (it != g_livePlaces.end() && it->second.capacity < capacity)
+                    LiveFreePlace(it->second), g_livePlaces.erase(it), it = g_livePlaces.end();
+                if (it == g_livePlaces.end())
+                {
+                    // un quart de marge : un objet qui grossit un peu (taille apprise) garde sa place
+                    const uint32_t size = uint32_t(std::min<uint64_t>(kSlotBytes, (uint64_t(capacity) * 5 / 4 + 47) / 48 * 48));
+                    uint32_t offset = ~0u;
+                    for (auto f = g_liveFreeSpace.begin(); f != g_liveFreeSpace.end(); ++f)
+                        if (f->second >= size)
+                        {
+                            offset = f->first;
+                            const uint32_t rest = f->second - size, at = f->first + size;
+                            g_liveFreeSpace.erase(f);
+                            if (rest)
+                                g_liveFreeSpace[at] = rest;
+                            break;
+                        }
+                    if (offset == ~0u)
+                    {
+                        if (uint64_t(g_livePlaceHigh) + size + g_liveProbeUsed[slot] > limit)
+                        {
+                            g_liveOverflow++, g_livePlaceFailed++;
+                            return; // emplacement plein : ce dessin n'est pas capté (les places sont redistribuées ensuite)
+                        }
+                        offset = g_livePlaceHigh, g_livePlaceHigh += size;
+                    }
+                    LivePlace p;
+                    p.offset = offset, p.capacity = size;
+                    if (!g_liveFreeCounts.empty())
+                        p.countIndex = g_liveFreeCounts.back(), g_liveFreeCounts.pop_back();
+                    else
+                        p.countIndex = g_liveNextCount++;
+                    it = g_livePlaces.emplace(id, p).first;
+                    g_livePlaceNew++;
+                }
+                region = { it->second.offset, it->second.capacity, g_liveNextCounter++, id };
+                it->second.lastFrame = g_livePlaceFrame, it->second.frameCounter = region.counter;
+                g_liveRegions[slot].push_back(region);
+                g_liveReserved += vertices;
             }
             else
             {

@@ -1,9 +1,11 @@
 // URTI en direct : sommets captés (espace de découpage) vers l'espace caméra pour la structure
 // d'accélération. Chaque dessin a sa zone du flux et son compteur (pas de barrière entre dessins) ; un
-// sommet n'est valide que s'il tombe dans la partie remplie de sa zone, sinon NaN (triangle inactif).
+// sommet n'est valide que s'il tombe dans la partie remplie de sa zone, sinon il est à l'origine : triangle
+// plat, jamais touché, mais actif (une mise à jour de la structure ne peut pas changer l'état actif / inactif
+// d'un triangle, et les places fixes en changent le contenu d'une image à l'autre).
 
 StructuredBuffer<float4> clip : register(t0);   // flux de l'écran (début de son emplacement)
-ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
+ByteAddressBuffer counters : register(t1);      // octets écrits par dessin (places fixes : par place, gardés)
 StructuredBuffer<uint4> regions : register(t2); // par dessin, dans l'ordre : début (octets), taille, compteur
 RWByteAddressBuffer view : register(u0);        // float3 par sommet
 
@@ -35,7 +37,7 @@ void main(uint id : SV_DispatchThreadID)
 {
     if (id >= vertexCount)
         return;
-    float3 v = asfloat(0x7FC00000).xxx; // NaN
+    float3 v = 0; // triangle plat
     if (regionCount > 0)
     {
         const uint byte = id * 16;

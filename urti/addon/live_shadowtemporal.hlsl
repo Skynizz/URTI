@@ -25,7 +25,7 @@ cbuffer Constants : register(b0)
     float alphaMin;        // part de l'image courante à l'arrêt
     float alphaMax;        // en mouvement rapide
     float gamma;           // largeur du bornage (écarts-types)
-    uint pad;
+    uint blurRadius;       // 1 : flou 3×3 (ombres du soleil, bords nets) ; 2 : 5×5 (occultation ambiante seule, douce)
     float p00;             // projection supposée (décalage sous-pixel en pixels)
     float p11;
 };
@@ -66,21 +66,23 @@ void main(uint2 id : SV_DispatchThreadID)
     float outValue = center;
     if (w > 0)
     {
-        // flou 3×3 guidé par la profondeur, et statistiques du voisinage
+        // flou guidé par la profondeur (3×3, ou 5×5 pour l'occultation seule), et statistiques du voisinage
         float sum = 0, wsum = 0, m1 = 0, m2 = 0;
-        for (int dy = -1; dy <= 1; dy++)
-            for (int dx = -1; dx <= 1; dx++)
+        const int r = int(clamp(blurRadius, 1u, 2u));
+        for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++)
             {
                 const int2 n = t + int2(dx, dy);
                 const float v = Raw(n);
                 const float wn = ViewDepth(depth, n);
-                const float g = (dx == 0 && dy == 0) ? 1.0 : (abs(dx) + abs(dy) == 1 ? 0.6 : 0.36);
+                const float g = r == 1 ? ((dx == 0 && dy == 0) ? 1.0 : (abs(dx) + abs(dy) == 1 ? 0.6 : 0.36)) : exp(-float(dx * dx + dy * dy) / 4.0);
                 const float k = wn > 0 ? g * exp(-abs(wn - w) / (0.02 * w + 0.02)) : 0;
                 sum += v * k, wsum += k;
                 m1 += v, m2 += v * v;
             }
         const float cur = wsum > 0 ? sum / wsum : center;
-        const float mean = m1 / 9.0, sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+        const float taps = float((2 * r + 1) * (2 * r + 1));
+        const float mean = m1 / taps, sigma = sqrt(max(m2 / taps - mean * mean, 0.0));
         outValue = cur;
         float motionPixels = 0;
         bool used = false;
