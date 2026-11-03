@@ -46,8 +46,17 @@ void main(uint id : SV_DispatchThreadID)
         const uint4 r = RegionOf(byte);
         const bool written = byte >= r.x && byte - r.x < min(counters.Load(r.z * 8), r.y);
         const float4 c = written ? clip[id] : clip[r.x / 16];
-        if (written || all(isfinite(c)))
-            v = float3(c.x / p00, c.y / p11, c.w);
+        const float3 cv = float3(c.x / p00, c.y / p11, c.w);
+        // sommet aberrant (non fini, ou à plus de 20 km) : replié sur le premier sommet de sa zone, sinon à
+        // l'origine. Un seul suffit à étirer la boîte de toute la scène : les boîtes intérieures, rangées avec
+        // une précision relative à elle, ne valent plus rien et plus aucun rayon ne touche (v66-v67, places
+        // fixes et reconstruction à chaque image)
+        const float4 c0 = clip[r.x / 16];
+        const float3 v0 = float3(c0.x / p00, c0.y / p11, c0.w);
+        if (all(isfinite(cv)) && all(abs(cv) < 20000.0))
+            v = cv;
+        else if (all(isfinite(v0)) && all(abs(v0) < 20000.0))
+            v = v0;
     }
     view.Store3(id * 12, asuint(v));
 }

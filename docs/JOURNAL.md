@@ -1220,3 +1220,16 @@ l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celle
   (`urti_rafale_decalage.py`).
 - À vérifier dans RDR2 par le joueur : images par seconde, coût par étape (journal), objets manquants quand le
   budget baisse.
+
+## v68 — URTI : optimisation validée dans RDR2 ; sommets aberrants (scène RT invisible depuis v66)
+
+- v67 dans RDR2 : occultation et reflets sans aucun effet (0,0 % de l'image, masque blanc, passe à 0,13 ms).
+  Les rayons ne touchaient rien. Coupable : la combinaison places fixes + reconstruction à chaque image
+  (v66) ; places fixes coupées, ou mises à jour permises : tout revient. Cause : des sommets aberrants (non
+  finis ou immenses, places gardées ou jamais écrites) ; une reconstruction complète étire la boîte de
+  toute la scène et les boîtes intérieures, rangées avec une précision relative à elle, ne valent plus rien.
+  La conversion replie maintenant tout sommet non fini ou à plus de 20 km sur le premier sommet de sa zone.
+  La v66 jugée « parfaite » par le joueur tournait donc sans occultation RT dans certaines scènes.
+- Optimisation mesurée dans le jeu (même partie, Saint-Denis, deux fois de suite) : occultation complète 3,75
+  / 3,88 ms, 54,8 / 52,9 i/s ; **au quart 1,99 / 2,16 ms, 59,1 / 57,3 i/s**. Rafale : 0,001 % des pixels
+  sautent. Reconstruction 2,25 ms (sous la cible de 2,5 ms : budget inchangé ici).
