@@ -1269,3 +1269,38 @@ l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celle
   cours, reconnaît le menu sans capture d'étalonnage, ne clique pas quand quelqu'un se sert du PC.
 - À vérifier dans RDR2 : réglage des rayons d'occultation et gain d'images par seconde sous les arcades ; coût
   du cache avec la table en mémoire vidéo.
+
+## v70 — URTI : rebond de lumière (éclairage indirect) ; cache de surfaces enfin actif dans RDR2 ; mini-carte protégée
+
+- **Correction de v69** : dans RDR2, le cache de surfaces n'était jamais lu. Le test « le cache couvre la scène »
+  (triangles × 3 ≥ capacité) échouait de 2 sommets : la capacité (8 388 608) n'est pas un multiple de 3 (dans
+  le bac à sable, si). L'écart mesuré en v69 (0,4 % de pixels) était du bruit. Maintenant : triangles ≥
+  capacité / 3.
+- **Cache par groupes de huit triangles** : dans RDR2, la plupart des triangles sont plus petits qu'un pixel ;
+  un pixel échantillonné par bloc 4×4 ne tombait presque jamais sur le triangle qu'un rayon touche ensuite
+  (un rayon d'occultation sur quatre trouvait une entrée, presque aucune du bon objet). Une entrée couvre huit
+  triangles consécutifs (voisins dans le maillage) ; entrée vide ou d'un autre objet : les entrées voisines
+  du même objet.
+- **Rebond de lumière** (`gi=`, 1 par défaut) : les rayons d'occultation qui touchent un obstacle y prennent la
+  couleur retenue par le cache (la lumière que la surface renvoie), avec le même poids que l'occultation
+  (la lumière du ciel retirée dans cette direction est remplacée par celle de l'obstacle). Trois plans R, G, B
+  au quart, débruités par le même filtre que l'occultation (étendu à trois plans, mêmes poids), reçus selon
+  la couleur propre de la surface (albedo du G-buffer, copiée à chaque image). Pas de rayon de plus.
+  Bac à sable : sable éclairé qui renvoie une lumière chaude au pied des murs et sous les tonneaux,
+  scintillement inchangé ; +0,4 ms. RDR2 : +0,85 ms (61 → 58 i/s sur le quai).
+- **Personnages exclus du rebond** : alpha de la normale du G-buffer (cible 1, copiée) = repère des
+  personnages (0,41 sur Arthur, 0 sur le plancher). Ils bougent, leur historique est rejeté à chaque image et
+  le rebond, plus bruité que l'occultation, y tremblait (rafale : 0,20 % de pixels qui tremblent, tous sur
+  le personnage).
+- **Mini-carte jamais protégée depuis la zone d'interface fixe** : dans la composition, `float4 uiZone` après
+  18 nombres était placé par HLSL à la frontière de 16 octets suivante, 8 octets plus loin que ce que
+  l'add-on écrit (les deux derniers nombres hors des constantes). Même défaut dans le cache de surfaces.
+  Quatre nombres séparés ; vérifié sur tous les shaders (aucun autre).
+- Rechargement à chaud aussi pour le cache de surfaces et le débruitage.
+- **Mesures RDR2** (quai mouillé de Saint-Denis, rafales en régime établi) : sans rebond, effet 10,2 % des
+  pixels (reflets RT du ciel sur le quai : 9,7 %), tremble 0,01 %, saute 0,000 % ; avec rebond, effet 10,8 %,
+  tremble 0,01 %, saute 0,001 %.
+- Pièges de mesure : une rafale prise quelques secondes après un rechargement de `urti.ini` montre les reflets
+  absents par moments (état remis à zéro, à examiner) : attendre 20 s. Un shader de diagnostic rechargé à
+  chaud reste actif après l'effacement de son `.cso` (jusqu'au prochain rechargement ou relancement) : une
+  première rafale « parfaite » avait été prise avec un rebond gris de diagnostic.

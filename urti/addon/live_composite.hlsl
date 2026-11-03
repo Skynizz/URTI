@@ -12,6 +12,9 @@ ByteAddressBuffer resolvedRefl : register(t4); // reflets stabilisés (live_refl
 ByteAddressBuffer preUi : register(t5);      // photo de l'écran avant l'interface du jeu (bit 10 de debugReflect)
 ByteAddressBuffer sunBuf : register(t6);     // décalage sous-pixel du jeu mesuré (octets 1184 à 1191)
 ByteAddressBuffer uiCounts : register(t7);   // live_uiselect : choix de la photo + 1 (octets 64, 68 selon la parité ; 0 : aucune)
+ByteAddressBuffer bounceBuf : register(t8);  // rebond de lumière débruité : plans R, G, B (float, pas maskPitch, résolution de rendu)
+ByteAddressBuffer albedo : register(t9);     // couleur propre des surfaces (G-buffer du jeu, RGBA8 sRGB, résolution de rendu)
+ByteAddressBuffer gNormal : register(t10);   // normale du G-buffer (RGBA8) ; alpha : repère des personnages (RDR2)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 RWByteAddressBuffer uiMask : register(u1);   // 1 par pixel d'interface, retenu de la dernière photo sûre
 
@@ -36,7 +39,15 @@ cbuffer Constants : register(b0)
     float tintG;        // (trois nombres : un float3 ici serait déplacé à la frontière de 16 octets suivante)
     float tintB;
     uint uiParity;      // parité de l'image (case du choix de live_uiselect)
-    float4 uiZone;      // zone d'interface fixe (fractions de l'écran : x0, y0, x1, y1 ; vide si x1 <= x0), jamais retouchée
+    // zone d'interface fixe (fractions de l'écran ; vide si x1 <= x0), jamais retouchée. Quatre nombres : un float4
+    // ici serait déplacé à la frontière de 16 octets suivante, plus loin que ce que l'add-on écrit
+    float uiX0;
+    float uiY0;
+    float uiX1;
+    float uiY1;
+    float giStrength;   // rebond de lumière ajouté (0 : coupé)
+    uint albedoPitch;
+    uint normalPitch;   // 0 : normale du G-buffer absente
 };
 
 // décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
@@ -146,7 +157,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const int2 px = int2(id);
     // zone d'interface fixe (urti.ini ui_zone=, ex. la mini-carte de RDR2, dont l'écran ne reçoit jamais d'image
     // sans interface) : laissée telle quelle
-    if (uiZone.z > uiZone.x && all(float2(id) >= uiZone.xy * float2(width, height)) && all(float2(id) < uiZone.zw * float2(width, height)))
+    if (uiX1 > uiX0 && all(float2(id) >= float2(uiX0, uiY0) * float2(width, height)) && all(float2(id) < float2(uiX1, uiY1) * float2(width, height)))
     {
         const uint a = Address(px);
         if (format == 3)
@@ -251,6 +262,32 @@ void main(uint2 id : SV_DispatchThreadID)
     const float sunPart = min(strength * (1.0 - lit), 0.98);
     const float3 x = sunPart / (1.0 - sunPart) * float3(tintR, tintG, tintB);
     c *= 1.0 - x / (1.0 + x);
+    // rebond de lumière : la lumière que renvoient les surfaces proches (live_shadow, débruitée), reçue par ce point
+    // selon sa couleur propre (diffus : albedo × lumière moyenne reçue)
+    if (giStrength > 0)
+    {
+        const uint plane = maskPitch * maskHeight;
+        float3 gi = 0;
+        for (int j = 0; j < 4; j++)
+        {
+            const int2 t = clamp(b + int2(j & 1, j >> 1), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+            const uint a = t.y * maskPitch + t.x * 4;
+            gi += float3(asfloat(bounceBuf.Load(a)), asfloat(bounceBuf.Load(plane + a)), asfloat(bounceBuf.Load(2 * plane + a))) *
+                  (((j & 1) ? f.x : 1 - f.x) * ((j >> 1) ? f.y : 1 - f.y));
+        }
+        const int2 ta = clamp(int2(round(m)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+        const uint ra = albedo.Load(ta.y * albedoPitch + ta.x * 4);
+        const float3 alb = SrgbToLinear(float3(ra & 255, (ra >> 8) & 255, (ra >> 16) & 255) / 255.0);
+        // personnages (alpha de la normale du G-buffer) : pas de rebond, il y tremblait (ils bougent : historique rejeté)
+        const float person = normalPitch ? float(gNormal.Load(ta.y * normalPitch + ta.x * 4) >> 24) / 255.0 : 0.0;
+        const float3 added = alb * max(gi, 0.0) * giStrength * (1.0 - saturate(person * 4.0));
+        if ((debugReflect & 0xFF) == 5)
+        {
+            StoreLinear(px, added * 4.0); // diagnostic : rebond seul, éclairci
+            return;
+        }
+        c += added;
+    }
     if (reflStrength > 0 && (debugReflect & 0x200))
     {
         // reflet stabilisé, bilinéaire à la résolution de rendu (couleur prémultipliée par son poids)

@@ -72,18 +72,31 @@ uint RegionIndex(uint prim)
 
 float3 Vertex(ByteAddressBuffer b, uint v) { return asfloat(b.Load3(v * 12)); }
 
-// couleur retenue pour ce triangle par le cache de surfaces, si elle est à son objet actuel
+// couleur retenue pour ce triangle par le cache de surfaces, si elle est à son objet actuel.
+// Une entrée pour huit triangles consécutifs (voisins dans le maillage) : dans RDR2, la plupart des triangles
+// sont plus petits qu'un pixel et une entrée par triangle n'était presque jamais remplie (un rayon d'occultation
+// sur quatre trouvait sa couleur). Entrée vide ou d'un autre objet : les entrées voisines du même objet
 bool Cached(uint prim, out float3 c)
 {
     c = 0;
     if ((flags & 64) == 0 || prim >= cacheTriangles || regionCount == 0)
         return false;
-    const uint4 r = regions[RegionIndex(prim)];
-    const uint2 e = surfCache.Load2(prim * 8);
-    if ((e.y & 255) == 0 || (e.y >> 8) != (r.w & 0xFFFFFF))
-        return false;
-    c = float3(e.x & 511, (e.x >> 9) & 511, (e.x >> 18) & 511) * exp2(float(int(e.x >> 27) - 24));
-    return all(isfinite(c));
+    const uint ident = regions[RegionIndex(prim)].w & 0xFFFFFF;
+    const int g = int(prim >> 3), last = int((cacheTriangles - 1) >> 3);
+    static const int kNear[5] = { 0, -1, 1, -2, 2 };
+    for (uint k = 0; k < 5; k++)
+    {
+        const int e = g + kNear[k];
+        if (e < 0 || e > last)
+            continue;
+        const uint2 v = surfCache.Load2(uint(e) * 8);
+        if ((v.y & 255) != 0 && (v.y >> 8) == ident)
+        {
+            c = float3(v.x & 511, (v.x >> 9) & 511, (v.x >> 18) & 511) * exp2(float(int(v.x >> 27) - 24));
+            return all(isfinite(c));
+        }
+    }
+    return false;
 }
 
 // identité de l'objet du triangle ; position et normale du même point à l'image précédente si connues

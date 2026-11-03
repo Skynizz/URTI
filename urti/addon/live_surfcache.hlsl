@@ -3,8 +3,9 @@
 // caméra, gardé s'il tombe à la profondeur de l'image) et la couleur que l'image montre à cet endroit y est
 // retenue (moyenne glissante). Un reflet qui touche ce triangle alors qu'il est caché ou hors de l'écran
 // prend cette couleur (live_reflect) au lieu de rester inconnu.
-// Par triangle, 8 octets : couleur linéaire (RGB9E5) ; identité de son objet (24 bits) et nombre de mesures
-// (8 bits). Les places fixes gardent un objet au même endroit du flux : ses triangles gardent leur numéro.
+// Par groupe de huit triangles consécutifs (voisins dans le maillage ; dans RDR2 la plupart des triangles sont
+// plus petits qu'un pixel), 8 octets : couleur linéaire (RGB9E5) ; identité de son objet (24 bits) et nombre de
+// mesures (8 bits). Les places fixes gardent un objet au même endroit du flux : ses triangles gardent leur numéro.
 
 RaytracingAccelerationStructure scene : register(t0);
 ByteAddressBuffer image : register(t1);         // image présentée (lignes alignées)
@@ -29,7 +30,10 @@ cbuffer Constants : register(b0)
     uint frameIndex;
     uint triangles;    // triangles que le cache peut tenir
     uint pad0;
-    float4 uiZone;     // zone d'interface fixe (uv : x0, y0, x1, y1), sautée
+    float uiX0;        // zone d'interface fixe (uv), sautée ; quatre nombres : un float4 ici serait déplacé à la
+    float uiY0;        // frontière de 16 octets suivante, plus loin que ce que l'add-on écrit
+    float uiX1;
+    float uiY1;
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -138,7 +142,7 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     const float2 jitterUv = JitterPixels(asfloat(sunBuf.Load2(1184)), float2(renderWidth, renderHeight)) / float2(renderWidth, renderHeight);
     const float2 uv = (float2(t) + 0.5) / float2(renderWidth, renderHeight) - jitterUv;
-    if (all(uv >= uiZone.xy) && all(uv <= uiZone.zw))
+    if (all(uv >= float2(uiX0, uiY0)) && all(uv <= float2(uiX1, uiY1)))
         return;
     RayDesc eye;
     eye.Origin = 0;
@@ -161,9 +165,10 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     // moyenne des premières mesures, puis glissante (0,2 : suit un changement de lumière en une dizaine de mesures)
     const uint ident = r.w & 0xFFFFFF;
-    const uint2 old = cache.Load2(prim * 8);
+    const uint entry = prim >> 3;
+    const uint2 old = cache.Load2(entry * 8);
     const uint n = (old.y >> 8) == ident ? (old.y & 255) : 0;
     if (n > 0)
         c = lerp(UnpackRgb9e5(old.x), c, max(1.0 / float(n + 1), 0.2));
-    cache.Store2(prim * 8, uint2(PackRgb9e5(c), (ident << 8) | min(n + 1, 255u)));
+    cache.Store2(entry * 8, uint2(PackRgb9e5(c), (ident << 8) | min(n + 1, 255u)));
 }

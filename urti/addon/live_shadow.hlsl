@@ -34,7 +34,8 @@ cbuffer Constants : register(b0)
                        // par pixel calculé à l'arrêt (0 : règle fixe ; l'add-on les règle sur le temps de la passe),
                        // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
                        // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
-                       // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après
+                       // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après ;
+                       // 1 << 20 : rebond de lumière (bounce)
     uint motionPitch;
     uint motionConvention; // 0..15 (live_mvcal), 255 : pas d'accumulation
     float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
@@ -46,6 +47,8 @@ cbuffer Constants : register(b0)
     float aoAmount;        // occultation ambiante RT : part de la lumière du ciel retirée par un obstacle tout proche (0 : coupée)
     float aoRadius;        // portée des rayons d'occultation (mètres)
     uint aoMotion;         // convention des vecteurs de mouvement (live_mvcal) pour l'occultation ; 255 : inconnue
+    uint cacheTriangles;   // triangles tenus par le cache de surfaces (rebond de lumière)
+    uint regionCount;      // zones de la scène RT (regions)
 };
 
 uint AoHash(uint x)
@@ -64,6 +67,55 @@ float PackPenumbra(float distanceToOccluder, float tanOfLightAngularRadius)
     return distanceToOccluder >= kFp16Max ? kFp16Max : min(distanceToOccluder * tanOfLightAngularRadius * 0.5, 32768.0);
 }
 RWByteAddressBuffer penumbra : register(u1); // float par pixel (pas : shadowPitch), mode SIGMA
+
+// rebond de lumière (éclairage indirect, bit 20 de flags) : les rayons d'occultation qui touchent un triangle y
+// prennent la couleur que le cache de surfaces a retenue (live_surfcache) : la lumière que cette surface renvoie.
+// Sortie : trois plans R, G, B (float, pas shadowPitch, l'un après l'autre), -1 aux pixels non calculés (au quart)
+ByteAddressBuffer surfCache : register(t7);     // par triangle : couleur (RGB9E5), identité de l'objet et mesures
+StructuredBuffer<uint4> regions : register(t8); // zones de la scène RT : début (octets), taille, compteur, identité
+RWByteAddressBuffer bounce : register(u2);
+
+uint RegionIndex(uint prim)
+{
+    const uint byte = prim * 48;
+    uint lo = 0, hi = regionCount;
+    while (lo + 1 < hi)
+    {
+        const uint mid = (lo + hi) >> 1;
+        if (regions[mid].x <= byte)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// couleur retenue pour ce triangle, si elle est à son objet actuel.
+// Une entrée pour huit triangles consécutifs (voisins dans le maillage) : dans RDR2, la plupart des triangles
+// sont plus petits qu'un pixel et une entrée par triangle n'était presque jamais remplie (un rayon d'occultation
+// sur quatre trouvait sa couleur). Entrée vide ou d'un autre objet : les entrées voisines du même objet
+bool Cached(uint prim, out float3 c)
+{
+    c = 0;
+    if (prim >= cacheTriangles || regionCount == 0)
+        return false;
+    const uint ident = regions[RegionIndex(prim)].w & 0xFFFFFF;
+    const int g = int(prim >> 3), last = int((cacheTriangles - 1) >> 3);
+    static const int kNear[5] = { 0, -1, 1, -2, 2 };
+    for (uint k = 0; k < 5; k++)
+    {
+        const int e = g + kNear[k];
+        if (e < 0 || e > last)
+            continue;
+        const uint2 v = surfCache.Load2(uint(e) * 8);
+        if ((v.y & 255) != 0 && (v.y >> 8) == ident)
+        {
+            c = float3(v.x & 511, (v.x >> 9) & 511, (v.x >> 18) & 511) * exp2(float(int(v.x >> 27) - 24));
+            return all(isfinite(c));
+        }
+    }
+    return false;
+}
 
 // profondeur d'un texel de la carte d'ombres du jeu : 32 bits flottants, D24 (bit 2 de flags) ou 16 bits
 // normalisés (bit 32 : RDR2, deux octets par texel)
@@ -319,6 +371,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const float2 ndc3 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
     const float3 p3 = float3(ndc3.x * w / p00, ndc3.y * w / p11, w);
     bool aoSkipped = false; // occultation au quart : ce pixel n'est pas calculé à cette image
+    float3 bounceSum = 0;   // rebond de lumière : couleur des surfaces touchées, pondérée comme l'occultation
     if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5 && !SeesThroughAround(int2(id), p3))
     {
         // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
@@ -369,6 +422,11 @@ void main(uint2 id : SV_DispatchThreadID)
             // obstacle proche : occultation forte ; vers la portée, elle s'éteint en douceur
             const float t = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() / aoRadius : 1.0;
             occlusion += (1.0 - t) * (1.0 - t) / float(aoRays);
+            // la lumière du ciel retirée dans cette direction est remplacée par celle que renvoie l'obstacle (même
+            // poids) ; obstacle jamais vu à l'écran : rien (le jeu garde son propre éclairage d'ambiance au loin)
+            float3 hc;
+            if ((flags & (1u << 20)) && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && Cached(q.CommittedPrimitiveIndex(), hc))
+                bounceSum += hc * ((1.0 - t) * (1.0 - t) / float(aoRays));
         }
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;
         const float skyShare = sunSky > 0 ? 1.0 / (1.0 + sunSky * ndlSky) : 1.0 - 0.6 * ndlSky;
@@ -430,4 +488,10 @@ void main(uint2 id : SV_DispatchThreadID)
     else if (debugMode == 3)
         lit = historyUsed ? 1.0 : 0.0;       // noir : historique rejeté (point découvert, profondeur changée)
     shadow.Store(id.y * shadowPitch + id.x * 4, asuint(aoSkipped && debugMode == 0 ? -1.0 : lit));
+    if (flags & (1u << 20))
+    {
+        const uint plane = shadowPitch * height, a = id.y * shadowPitch + id.x * 4;
+        const float3 b = aoSkipped ? float3(-1, -1, -1) : bounceSum;
+        bounce.Store(a, asuint(b.r)), bounce.Store(plane + a, asuint(b.g)), bounce.Store(2 * plane + a, asuint(b.b));
+    }
 }
