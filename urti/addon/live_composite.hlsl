@@ -203,14 +203,22 @@ void main(uint2 id : SV_DispatchThreadID)
     const int2 b = int2(floor(m));
     const float2 f = m - b;
     float lit = 0, wsum = 0;
-    for (int dy = -1; dy <= 2; dy++)
-        for (int dx = -1; dx <= 2; dx++)
-        {
-            const float wx = max(0.0, 1.5 - abs(dx - f.x)), wy = max(0.0, 1.5 - abs(dy - f.y));
-            lit += MaskAt(b + int2(dx, dy)) * wx * wy;
-            wsum += wx * wy;
-        }
-    lit /= wsum;
+    if (debugReflect & 0x800)
+    {
+        // occultation seule (douce) : bilinéaire, quatre lectures au lieu de seize
+        lit = lerp(lerp(MaskAt(b), MaskAt(b + int2(1, 0)), f.x), lerp(MaskAt(b + int2(0, 1)), MaskAt(b + int2(1, 1)), f.x), f.y);
+    }
+    else
+    {
+        for (int dy = -1; dy <= 2; dy++)
+            for (int dx = -1; dx <= 2; dx++)
+            {
+                const float wx = max(0.0, 1.5 - abs(dx - f.x)), wy = max(0.0, 1.5 - abs(dy - f.y));
+                lit += MaskAt(b + int2(dx, dy)) * wx * wy;
+                wsum += wx * wy;
+            }
+        lit /= wsum;
+    }
 
     // reflet : pixel de rendu correspondant
     // (lu seulement si les reflets sont actifs : sinon le tampon lié n'a pas cette taille, et une lecture

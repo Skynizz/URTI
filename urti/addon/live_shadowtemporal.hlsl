@@ -67,22 +67,25 @@ void main(uint2 id : SV_DispatchThreadID)
     if (w > 0)
     {
         // flou guidé par la profondeur (3×3, ou 5×5 pour l'occultation seule), et statistiques du voisinage
-        float sum = 0, wsum = 0, m1 = 0, m2 = 0;
+        float sum = 0, wsum = 0, m1 = 0, m2 = 0, taps = 0;
         const int r = int(clamp(blurRadius, 1u, 2u));
         for (int dy = -r; dy <= r; dy++)
             for (int dx = -r; dx <= r; dx++)
             {
                 const int2 n = t + int2(dx, dy);
                 const float v = Raw(n);
+                if (v < 0)
+                    continue; // pas calculé à cette image (occultation au quart)
                 const float wn = ViewDepth(depth, n);
                 const float g = r == 1 ? ((dx == 0 && dy == 0) ? 1.0 : (abs(dx) + abs(dy) == 1 ? 0.6 : 0.36)) : exp(-float(dx * dx + dy * dy) / 4.0);
                 const float k = wn > 0 ? g * exp(-abs(wn - w) / (0.02 * w + 0.02)) : 0;
                 sum += v * k, wsum += k;
-                m1 += v, m2 += v * v;
+                m1 += v, m2 += v * v, taps += 1;
             }
-        const float cur = wsum > 0 ? sum / wsum : center;
-        const float taps = float((2 * r + 1) * (2 * r + 1));
-        const float mean = m1 / taps, sigma = sqrt(max(m2 / taps - mean * mean, 0.0));
+        const bool hasCur = wsum > 0;
+        const float cur = hasCur ? sum / wsum : (center >= 0 ? center : 1.0);
+        taps = max(taps, 1.0);
+        const float mean = hasCur ? m1 / taps : cur, sigma = hasCur ? sqrt(max(m2 / taps - mean * mean, 0.0)) : 1.0;
         outValue = cur;
         float motionPixels = 0;
         bool used = false;
@@ -116,7 +119,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 if (hw > 0.25)
                 {
                     hist = clamp(hist / hw, mean - gamma * sigma - 0.02, mean + gamma * sigma + 0.02);
-                    const float alpha = lerp(alphaMin, alphaMax, saturate(motionPixels / 8.0));
+                    const float alpha = hasCur ? lerp(alphaMin, alphaMax, saturate(motionPixels / 8.0)) : 0.0;
                     outValue = lerp(hist, cur, alpha);
                     used = true;
                 }
@@ -129,5 +132,5 @@ void main(uint2 id : SV_DispatchThreadID)
         else if (debugMode == 3)
             outValue = used ? 1.0 : 0.0;
     }
-    result.Store(id.y * shadowPitch + id.x * 4, asuint(outValue));
+    result.Store(id.y * shadowPitch + id.x * 4, asuint(outValue < 0 ? 1.0 : outValue)); // jamais un pixel « non calculé »
 }

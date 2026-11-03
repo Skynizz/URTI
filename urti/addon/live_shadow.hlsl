@@ -29,7 +29,8 @@ cbuffer Constants : register(b0)
     uint atlasPitch;
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
                        // 32 carte en 16 bits (R16, RDR2), 64 pas de rayons d'ombre du soleil (le soleil reste connu :
-                       // l'occultation ambiante s'en sert),
+                       // l'occultation ambiante s'en sert), 128 occultation au quart (un pixel sur quatre par image,
+                       // les autres écrits -1 : live_shadowtemporal les reconstruit),
                        // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
                        // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
                        // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après
@@ -316,21 +317,31 @@ void main(uint2 id : SV_DispatchThreadID)
     // géométrie, s'assombrissaient en entier (le jeu y a déjà son occultation) et tremblaient au vent
     const float2 ndc3 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
     const float3 p3 = float3(ndc3.x * w / p00, ndc3.y * w / p11, w);
+    bool aoSkipped = false; // occultation au quart : ce pixel n'est pas calculé à cette image
     if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5 && !SeesThroughAround(int2(id), p3))
+    {
+        // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
+        static const uint2 kQuarter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
+        aoSkipped = (flags & 128) && any((id & 1u) != kQuarter[frameIndex & 3]);
+    }
+    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5 &&
+        !SeesThroughAround(int2(id), p3))
     {
         const float3 n = NormalAt(int2(id), p3);
         const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
         const float3 b2 = cross(n, b1);
         // deux rayons (strates en azimut) ; quatre là où l'image bouge de plus d'un pixel et demi : l'historique y
-        // est rejeté ou à peine gardé, le bruit de deux rayons tremblerait
-        uint aoRays = 2;
+        // est rejeté ou à peine gardé, le bruit de deux rayons tremblerait. Au quart : deux fois plus (quatre fois
+        // moins de pixels : moitié moins de rayons au total)
+        const uint aoBase = (flags & 128) ? 2u : 1u;
+        uint aoRays = 2 * aoBase;
         if (aoMotion < 16)
         {
             const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
             float2 mv = float2(f16tof32(raw & 0xFFFF), f16tof32(raw >> 16));
             mv = (aoMotion & 3) == 0 ? mv : (aoMotion & 3) == 1 ? mv * 0.5 : (aoMotion & 3) == 2 ? mv / float2(width, height) : mv * 2.0;
             if (all(isfinite(mv)) && length(mv * float2(width, height)) > 1.5)
-                aoRays = 4;
+                aoRays = (flags & 128) ? 6u : 4u;
         }
         uint h = AoHash(id.x * 1973u + id.y * 9277u + frameIndex * 26699u);
         float occlusion = 0;
@@ -414,5 +425,5 @@ void main(uint2 id : SV_DispatchThreadID)
         lit = saturate(motionPixels / 20.0); // blanc : 20 pixels de mouvement ou plus
     else if (debugMode == 3)
         lit = historyUsed ? 1.0 : 0.0;       // noir : historique rejeté (point découvert, profondeur changée)
-    shadow.Store(id.y * shadowPitch + id.x * 4, asuint(lit));
+    shadow.Store(id.y * shadowPitch + id.x * 4, asuint(aoSkipped && debugMode == 0 ? -1.0 : lit));
 }

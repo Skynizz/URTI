@@ -1197,3 +1197,26 @@ l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celle
   - **caméra en mouvement moins bonne** : sautent 0,63 → 1,24 % (clignotent 0,68 → 0,55 %), écarts à la vérité
     plus grands partout. À comprendre : changements des reflets (seuil de poids, portée minimale, normale
     centrée) ou de la photo d'avant l'interface (photo après le premier dessin, tolérance).
+
+## v67 — URTI : optimisation (budget de géométrie au coût mesuré, occultation au quart, composition allégée)
+
+- Demande : les images par seconde. Coûts mesurés dans RDR2 (v65-v66) : la reconstruction de la scène RT
+  domine (1,8 ms dans la gare de triage, 5,7 à 8,8 ms dans une rue sous la pluie) ; occultation ~1 ms,
+  reflets 0,2-0,5 ms, composition 0,8 ms.
+- **Budget de géométrie réglé sur le coût mesuré de la reconstruction** (`build_ms=2.5`, 0 : budget fixe) :
+  toutes les 30 images, -15 % si la reconstruction dépasse la cible de 10 %, +8 % sous 75 % de la cible,
+  entre 1,5 M sommets et `vertex_budget` (6 M). Les objets de plus petite taille apparente (boîte / distance)
+  sortent d'abord.
+- **Occultation au quart** (`ao_quarter=1`) : un pixel de chaque bloc 2×2 lance ses rayons à chaque image (les
+  quatre en quatre images), deux fois plus de rayons par pixel (4 au repos, 6 en mouvement) ; les autres sont
+  écrits -1 et reconstruits par le débruitage (flou 5×5 sur les seuls pixels calculés, historique seul sans
+  voisin calculé). Bac à sable : passe d'occultation 0,86 → 0,39 ms, mesures de qualité inchangées.
+- **Composition** : masque lu en bilinéaire (4 lectures au lieu de 16) quand il ne porte que l'occultation :
+  0,51 → 0,46 ms (bac à sable).
+- **Recul du bac à sable en caméra mouvante expliqué** (sautent 0,63 → 1,25 % depuis v62) : occultation coupée,
+  0,48 % (le niveau d'avant). La vérité terrain n'a pas d'occultation : un assombrissement qui suit le décor
+  y compte comme des sauts. Avant v62, la comparaison à l'identique de l'interface empêchait l'occultation
+  sur une grande part des pixels (effet plus faible). Dans le jeu, l'effet suit le mouvement à 98 %
+  (`urti_rafale_decalage.py`).
+- À vérifier dans RDR2 par le joueur : images par seconde, coût par étape (journal), objets manquants quand le
+  budget baisse.

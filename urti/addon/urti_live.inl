@@ -155,7 +155,13 @@ struct LiveState
     float aoAmount = 0.8f, aoRadius = 1.5f; // occultation ambiante RT (urti.ini ao=, ao_radius= ; ao=0 : coupée)
     // ombres du soleil RT : coupées par défaut (urti.ini shadows=1) : dans RDR2, ses ombres déjà excellentes n'en
     // laissent presque aucune à ajouter (rafale au soleil : 0,0 % de l'image changé pour 3,2 ms par image)
-    bool sunShadows = false;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
+    bool sunShadows = false;
+    bool aoQuarter = true; // urti.ini ao_quarter=0 : occultation calculée sur chaque pixel à chaque image
+    // budget de géométrie réglé sur le coût mesuré de la reconstruction (urti.ini build_ms=, 0 : budget fixe) :
+    // au-dessus de la cible, il baisse (les objets de plus petite taille apparente sortent d'abord), en dessous
+    // il remonte jusqu'à vertex_budget
+    float buildTarget = 2.5f;
+    uint64_t budgetMax = 6000000;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
     float sunSky[4] = { 2.2f, 2.2f, 2.2f, 2.2f };
     uint32_t sunSkyFrames = 0, sunSkyLogged = 0;
     bool sunWeakLogged = false;
@@ -736,7 +742,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
@@ -764,7 +770,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
                 if (l.rfind("ui_zone=", 0) == 0)
                     std::sscanf(l.c_str() + 8, "%f,%f,%f,%f", &zone[0], &zone[1], &zone[2], &zone[3]);
-                value("shadows=", sunShadows);
+                value("shadows=", sunShadows), value("ao_quarter=", aoQuarter), value("build_ms=", buildMs);
                 float jl = 0;
                 value("jitter_log=", jl);
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -788,7 +794,9 @@ void LiveHotReload(ID3D12Device* device)
                 g_livePersist = persist != 0;
                 g_livePlaces.clear(), g_liveFreeSpace.clear(), g_liveFreeCounts.clear(), g_livePlaceHigh = 0, g_liveNextCount = 0;
             }
-            live.vertexBudget = uint64_t(std::max(0.0f, vertexBudget)), live.probeBudget = uint64_t(std::max(0.0f, probeBudget));
+            live.budgetMax = uint64_t(std::max(0.0f, vertexBudget)), live.probeBudget = uint64_t(std::max(0.0f, probeBudget));
+            if (live.budgetMax == 0 || live.buildTarget <= 0 || live.vertexBudget == 0 || live.vertexBudget > live.budgetMax)
+                live.vertexBudget = live.budgetMax;
             live.slotLimit = uint64_t(std::max(0.0f, slotLimit));
             live.uiPhoto = uiPhoto != 0;
             live.nrdShadows = nrdOn != 0, live.nrdDisocclusion = nrdDisocclusion, live.nrdFrames = nrdFrames;
@@ -800,6 +808,7 @@ void LiveHotReload(ID3D12Device* device)
             live.gameMin = gameMin != 0;
             live.aoAmount = std::clamp(ao, 0.0f, 1.0f), live.aoRadius = std::clamp(aoRadius, 0.1f, 10.0f);
             live.sunShadows = sunShadows != 0;
+            live.aoQuarter = aoQuarter != 0, live.buildTarget = std::max(0.0f, buildMs);
         }
         if (!first)
             Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
@@ -1438,6 +1447,15 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (!live.slotRefit[s])
                 {
                     live.rebuildMs += (build - live.rebuildMs) * 0.2;
+                    // budget de géométrie : toutes les 30 images, -15 % au-dessus de la cible (+10 %), +8 % bien en dessous
+                    if (live.buildTarget > 0 && live.budgetMax > 0 && live.frame % 30 == 0)
+                    {
+                        constexpr uint64_t kBudgetMin = 1500000;
+                        if (live.rebuildMs > live.buildTarget * 1.1)
+                            live.vertexBudget = std::max<uint64_t>(std::min(kBudgetMin, live.budgetMax), live.vertexBudget * 85 / 100);
+                        else if (live.rebuildMs < live.buildTarget * 0.75)
+                            live.vertexBudget = std::min<uint64_t>(live.budgetMax, live.vertexBudget * 108 / 100);
+                    }
                     // le coût de la mise à jour revient lentement vers une valeur plausible : une seule mesure
                     // aberrante (image chargée, autre programme) ne bloque pas les mises à jour pour toujours
                     live.refitMs += (0.3 * live.rebuildMs - live.refitMs) * 0.05;
@@ -1947,7 +1965,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // (sans soleil, la passe garde l'occultation ambiante : flags 16 ne coupe que les rayons du soleil)
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (live.atlas16 ? 32u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
                            (sunNow ? 0u : 16u) | (live.sunShadows ? 0u : 64u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) |
-                           (nrdActive ? 4096u : 0u);
+                           (nrdActive ? 4096u : 0u) |
+                           (live.aoQuarter && !live.sunShadows && !nrdActive && live.shadowRawBuf && live.denoisePso ? 128u : 0u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -2546,7 +2565,8 @@ void LiveComposite(effect_runtime* runtime)
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u,
              (reflections && !(generated && live.fgMode == 2)) ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
-             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u), live.p00, live.p11,
+             (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u) |
+             (live.sunShadows ? 0u : 0x800u), live.p00, live.p11,
              { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f },
              uint32_t((live.uiFrame - 1) & 1), { live.uiZone[0], live.uiZone[1], live.uiZone[2], live.uiZone[3] } };
     list->SetComputeRoot32BitConstants(10, 22, &cc, 0);
