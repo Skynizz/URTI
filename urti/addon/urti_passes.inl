@@ -232,6 +232,16 @@ bool PassSave(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STA
     if (FAILED(readback->Map(0, nullptr, (void**)&data)))
         return false;
     const uint32_t w = uint32_t(desc.Width) / 2, h = desc.Height / 2, texel = PassTexelBytes(uint32_t(desc.Format));
+    // texels bruts à côté (même demi-résolution, tous les canaux, alpha compris) : étude du G-buffer
+    // (tools/reshade/urti_gbuffer.py)
+    if (FILE* raw = std::fopen((path.substr(0, path.size() - 4) + ".raw").c_str(), "wb"))
+    {
+        std::fprintf(raw, "URTIRAW %u %u %u %u\n", uint32_t(desc.Format), w, h, texel);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++)
+                std::fwrite(data + fp.Offset + size_t(y * 2) * fp.Footprint.RowPitch + size_t(x * 2) * texel, 1, texel, raw);
+        std::fclose(raw);
+    }
     std::vector<float> img(size_t(w) * h * 3);
     float peak[3] = { 1e-6f, 1e-6f, 1e-6f };
     int channels = 1;
@@ -326,5 +336,9 @@ void PassPresent(ID3D12CommandQueue* queue)
         Log("URTI : instantané %s : %ux%u format %u%s", name, snap.width, snap.height, snap.format, ok ? "" : " (non écrit)");
     }
     g_pass.snapshots.clear();
+    // cibles du G-buffer repéré (liées ensemble avec la profondeur de l'écran)
+    for (uint32_t k = 0; k < g_liveGbufferCount; k++)
+        if (auto it = g_pass.targets.find(g_liveGbuffer[k]); g_liveGbuffer[k] && it != g_pass.targets.end())
+            Log("URTI : G-buffer cible %u = passe %03u (%ux%u format %u)", k, it->second.order, it->second.width, it->second.height, it->second.format);
     Log("URTI : relevé des passes fini, %u images copiées, %u instantanés", saved, index);
 }

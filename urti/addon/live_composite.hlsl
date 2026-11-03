@@ -278,7 +278,7 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     else if (reflStrength > 0 && rf.z > 0)
     {
-        const float3 reflected = SampleLinear(rf.xy);
+        const float3 reflected = rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy); // u < -0,5 : cache de surfaces
         if ((debugReflect & 0xFF) == 3)
         {
             StoreLinear(px, reflected * rf.z);

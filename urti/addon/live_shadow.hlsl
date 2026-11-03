@@ -30,7 +30,8 @@ cbuffer Constants : register(b0)
     uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
                        // 32 carte en 16 bits (R16, RDR2), 64 pas de rayons d'ombre du soleil (le soleil reste connu :
                        // l'occultation ambiante s'en sert), 128 occultation au quart (un pixel sur quatre par image,
-                       // les autres écrits -1 : live_shadowtemporal les reconstruit),
+                       // les autres écrits -1 : live_shadowtemporal les reconstruit), bits 16 à 18 : rayons d'occultation
+                       // par pixel calculé à l'arrêt (0 : règle fixe ; l'add-on les règle sur le temps de la passe),
                        // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
                        // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
                        // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après
@@ -334,14 +335,17 @@ void main(uint2 id : SV_DispatchThreadID)
         // est rejeté ou à peine gardé, le bruit de deux rayons tremblerait. Au quart : deux fois plus (quatre fois
         // moins de pixels : moitié moins de rayons au total)
         const uint aoBase = (flags & 128) ? 2u : 1u;
-        uint aoRays = 2 * aoBase;
+        // nombre réglé par l'add-on (bits 16 à 18) : sous des arcades, presque tout l'écran reçoit de l'occultation
+        // et le coût de la passe, proportionnel aux rayons, triplait (5,5 ms dans RDR2)
+        const uint aoRest = (flags >> 16) & 7;
+        uint aoRays = aoRest ? aoRest : 2 * aoBase;
         if (aoMotion < 16)
         {
             const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
             float2 mv = float2(f16tof32(raw & 0xFFFF), f16tof32(raw >> 16));
             mv = (aoMotion & 3) == 0 ? mv : (aoMotion & 3) == 1 ? mv * 0.5 : (aoMotion & 3) == 2 ? mv / float2(width, height) : mv * 2.0;
             if (all(isfinite(mv)) && length(mv * float2(width, height)) > 1.5)
-                aoRays = (flags & 128) ? 6u : 4u;
+                aoRays = aoRest ? aoRest + max(1u, aoRest / 2) : (flags & 128) ? 6u : 4u;
         }
         uint h = AoHash(id.x * 1973u + id.y * 9277u + frameIndex * 26699u);
         float occlusion = 0;

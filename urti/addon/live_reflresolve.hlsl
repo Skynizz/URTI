@@ -89,7 +89,8 @@ float4 Current(int2 t, out bool known)
     known = rf.z >= 0;
     if (rf.z <= 0)
         return float4(0, 0, 0, 0);
-    float3 c = SampleLinear(rf.xy - gJitterUv); // l'image présentée n'est pas décalée (TAA)
+    // u < -0,5 : couleur du cache de surfaces (point reflété caché ou hors de l'écran) ; sinon lue dans l'image
+    float3 c = rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy - gJitterUv); // l'image présentée n'est pas décalée (TAA)
     const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     if (lum > maxLuminance)
         c *= maxLuminance / lum;

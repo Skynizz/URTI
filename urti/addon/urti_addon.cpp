@@ -76,9 +76,18 @@ bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès l
 uint32_t g_calibrationInterval = 180;
 bool g_liveCapture = false;
 std::atomic<uint32_t> g_presentDraws{ 0 }; // dessins du jeu depuis la dernière présentation (0 : image générée)
-// G-buffer du jeu : cibles de rendu liées avec la profondeur de l'écran (au moins trois)
+// G-buffer du jeu : cibles de rendu liées avec la profondeur de l'écran (au moins trois). Parmi ces jeux de
+// cibles, celui où le jeu dessine le plus : dans RDR2, une passe plus tardive (transparents) lie aussi cinq
+// cibles, dont deux du G-buffer ; la dernière liaison vue la prenait une partie du temps (lissé perdu)
 uint64_t g_liveGbuffer[8] = {};
 uint32_t g_liveGbufferCount = 0;
+struct GbufferSet
+{
+    uint64_t targets[8] = {};
+    uint32_t count = 0;
+    uint64_t draws = 0;
+};
+std::unordered_map<uint64_t, GbufferSet> g_gbufferSets; // clé : la première cible
 void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resources, const resource_usage* oldStates, const resource_usage* newStates);
 // mode direct : dessins marqués de l'image en cours. La carte d'ombres du soleil et l'écran voient les
 // mêmes maillages : les paires de même signature donnent la direction du soleil à chaque image (GPU)
@@ -497,6 +506,7 @@ struct CommandListState
     uint64_t indexBuffer = 0, vertexBuffer = 0; // tampons liés (ressource et position mêlées) : identité des ExecuteIndirect
     uint64_t backBuffer = 0; // image d'écran liée en cible (photos avant l'interface à ses premiers dessins)
     uint32_t backBufferDraws = 0; // dessins dans l'image d'écran depuis sa liaison
+    uint64_t gbufferSet = 0; // jeu de cibles candidat au G-buffer lié (sa première cible), 0 : aucun
     float viewport[4] = {}; // x, y, largeur, hauteur (le premier)
 };
 
@@ -656,11 +666,19 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
     st.depth = depth;
     st.backBuffer = first && g_liveBackBuffers.count(first) ? first : 0;
     st.backBufferDraws = 0;
+    st.gbufferSet = 0;
     if (targets[0])
-        if (auto it = g.screenLike.find(depth); it != g.screenLike.end() && it->second == 1 && count >= g_liveGbufferCount)
+        if (auto it = g.screenLike.find(depth); it != g.screenLike.end() && it->second == 1)
         {
-            std::memcpy(g_liveGbuffer, targets, sizeof(targets));
-            g_liveGbufferCount = std::min<uint32_t>(count, 8);
+            // une même première cible liée avec moins de cibles (dans RDR2, trois au lieu de cinq pour une partie
+            // des objets) : la liaison la plus large est gardée (sinon les vecteurs de mouvement, cinquièmes, partaient)
+            GbufferSet& set = g_gbufferSets[targets[0]];
+            if (std::min<uint32_t>(count, 8) >= set.count)
+            {
+                std::memcpy(set.targets, targets, sizeof(targets));
+                set.count = std::min<uint32_t>(count, 8);
+            }
+            st.gbufferSet = targets[0];
         }
 }
 
@@ -789,6 +807,9 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         state = g.lists[(uint64_t)list];
+        if (state.gbufferSet)
+            if (auto set = g_gbufferSets.find(state.gbufferSet); set != g_gbufferSets.end())
+                set->second.draws++;
         slot = SlotFor(state.depth);
         auto it = g_pipelines.find(state.pipeline);
         if (slot >= 0 && it != g_pipelines.end() && it->second.usable)
@@ -1611,6 +1632,29 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         Log("URTI : ombres RT en direct %s", live.enabled ? "actives" : "coupées");
     }
     live.lastPresentDraws = g_presentDraws.exchange(0);
+    // G-buffer : le jeu de cibles le plus dessiné, revu toutes les 30 images (tout de suite s'il n'y en a pas)
+    if (g.frame % 30 == 0 || !g_liveGbufferCount)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const GbufferSet* best = nullptr;
+        for (const auto& [key, set] : g_gbufferSets)
+            if (set.draws && (!best || set.draws > best->draws))
+                best = &set;
+        if (best && (best->targets[0] != g_liveGbuffer[0] || best->count != g_liveGbufferCount))
+        {
+            char formats[64] = {};
+            for (uint32_t k = 0, n = 0; k < best->count; k++)
+                n += std::snprintf(formats + n, sizeof(formats) - n, k ? " %d" : "%d",
+                                   best->targets[k] ? int(reinterpret_cast<ID3D12Resource*>(best->targets[k])->GetDesc().Format) : 0);
+            Log("URTI direct : G-buffer : %u cibles (formats %s), %llu dessins (%zu jeux de cibles candidats)", best->count, formats,
+                (unsigned long long)best->draws, g_gbufferSets.size());
+            std::memcpy(g_liveGbuffer, best->targets, sizeof(g_liveGbuffer));
+            g_liveGbufferCount = best->count;
+        }
+        if (best || g.frame % 30 == 0)
+            for (auto it = g_gbufferSets.begin(); it != g_gbufferSets.end();)
+                it = it->second.draws ? (it->second.draws = 0, ++it) : g_gbufferSets.erase(it); // plus dessiné : ressources peut-être détruites
+    }
     if (GetAsyncKeyState(VK_F6) & 1)
         live.forceCalibration = true;
     if (GetAsyncKeyState(VK_F5) & 1)

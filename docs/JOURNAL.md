@@ -1233,3 +1233,39 @@ l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celle
 - Optimisation mesurée dans le jeu (même partie, Saint-Denis, deux fois de suite) : occultation complète 3,75
   / 3,88 ms, 54,8 / 52,9 i/s ; **au quart 1,99 / 2,16 ms, 59,1 / 57,3 i/s**. Rafale : 0,001 % des pixels
   sautent. Reconstruction 2,25 ms (sous la cible de 2,5 ms : budget inchangé ici).
+
+## v69 — URTI : G-buffer de RDR2 décodé, choix du G-buffer corrigé, cache de surfaces, occultation réglée sur son temps
+
+- **G-buffer de RDR2** (relevé des passes, texels bruts `.raw` de tous les canaux, `tools/reshade/urti_gbuffer.py`) :
+  cible 0 = couleur (albedo, RGBA8 sRGB ; alpha : 8 valeurs, un repère de matériau) ; cible 1 = normale du monde
+  (z vers le haut, codée 0..1, longueur 1,00), alpha = repère des personnages ; cible 2 = matériau : r type
+  (0,5 commun, 0,2 feuillage, 0,31 peau), **g lissé** (flaque 0,60, laiton 0,49, peau 0,53, chemise 0,03),
+  **b métal** (boules en laiton 0,80, poteaux de fer 0,57, grilles 0,44, ailleurs 0), a occultation ou
+  humidité (réécrit plus tard dans l'image par une autre passe) ; cible 3 = r presque 1 partout, b
+  diffusion sous la peau (peau 0,53) ; cible 4 = vecteurs de mouvement (RG16F).
+- **Défaut trouvé** : le G-buffer était la dernière liaison de trois cibles ou plus sur la profondeur de
+  l'écran. Une passe plus tardive (transparents : 087, 088, 089 + deux du G-buffer) le remplaçait par
+  moments, et le G-buffer lui-même est lié avec 3 cibles pour une partie des objets (couleur, normale,
+  mouvement) : la « cible 2 » était alors les vecteurs de mouvement, lus comme lissé. Maintenant : le jeu de
+  cibles où le jeu dessine le plus, revu toutes les 30 images, en gardant pour une même première cible la
+  liaison la plus large. Vérifié dans RDR2 : `5 cibles (formats 29 28 28 28 34)`, stable.
+- **Cache de surfaces** (`live_surfcache.hlsl`) : un pixel par bloc 4×4 et par image (tout l'écran en 16
+  images), rayon depuis la caméra jusqu'au triangle vu, couleur de l'image retenue par triangle (RGB9E5 +
+  identité de l'objet, 8 octets, 21 Mo pour 2,8 millions de triangles). Un reflet dont le point touché est
+  caché ou hors de l'écran prend cette couleur au lieu de rester inconnu. Bac à sable : reflets des
+  fenêtres prolongés au bord de l'écran, écart à la vérité inchangé (2,59 %, presque tout y est visible à
+  l'écran). RDR2 : marche, +0,7 ms, gain visible faible dans les scènes vues (reflets RT sur 2 % de l'image).
+- **Constat RDR2** : sol des arcades de Saint-Denis lissé 0,36 (pierre polie, reflet flou), sous le seuil des
+  reflets RT (0,5) : les reflets RT ne couvrent que 2 % de l'image. Des reflets flous (rayons tirés selon la
+  rugosité + débruitage) sont une étape à part.
+- **Occultation : 5,5 ms sous les arcades** (68 i/s sans elle, 48 avec). Le coût ne dépend ni de la portée
+  (0,2 m comme 1,5 m), ni des rayons opaques ou du test des trous, ni de la taille de la scène (3 fois moins
+  de sommets : pareil) ; il double avec le nombre de rayons. Sous des arcades, presque tout l'écran est une
+  surface plane proche (dehors, ciel et lointain sont sautés). Nombre de rayons par pixel calculé maintenant
+  réglé toutes les 30 images sur le temps de la passe (cible 2,5 ms, `ao_ms=`, de 4 à 2 rayons).
+- Table des zones de la scène RT copiée en mémoire vidéo à chaque image (conversion, reflets et cache y
+  cherchaient leur zone à travers le bus PCIe).
+- Outils : `urti_rdr2_rapide.ps1` ne prend plus l'ancien journal ni « première image » pour une partie en
+  cours, reconnaît le menu sans capture d'étalonnage, ne clique pas quand quelqu'un se sert du PC.
+- À vérifier dans RDR2 : réglage des rayons d'occultation et gain d'images par seconde sous les arcades ; coût
+  du cache avec la table en mémoire vidéo.

@@ -18,9 +18,11 @@ StructuredBuffer<uint4> regions : register(t4); // par dessin de l'écran : déb
 ByteAddressBuffer links : register(t5);    // par dessin : identité, début (sommets) du même objet dans l'image précédente + 1
 ByteAddressBuffer viewCur : register(t6);  // sommets de cette image (float3, espace caméra)
 ByteAddressBuffer viewPrev : register(t7); // sommets de l'image précédente (son espace caméra)
+ByteAddressBuffer surfCache : register(t8); // par triangle : couleur vue à l'écran (RGB9E5), identité et mesures (live_surfcache)
 RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé ; poids < 0 : surface
                                                // réfléchissante dont le point reflété est caché ou hors de
-                                               // l'écran (couleur inconnue : la stabilisation garde l'historique)
+                                               // l'écran (couleur inconnue : la stabilisation garde l'historique) ;
+                                               // u < -0,5 : couleur tirée du cache de surfaces (-1 - r, g, poids, b)
 RWByteAddressBuffer anchor : register(u1);     // uint4 par pixel : position précédente du reflet (u, v ; NaN si
                                                // inconnue), identité de l'objet reflété, identité du miroir
 
@@ -41,14 +43,15 @@ cbuffer Constants : register(b0)
     float bias;
     uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle),
                        // 8 diagnostic : distance de touche normalisée ; 16 diagnostic : lissé ;
-                       // 32 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le rayon
+                       // 32 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le rayon ;
+                       // 64 : cache de surfaces lisible
                        // (sinon la 4e composante est la distance de touche, 1e4 pour le ciel)
     float f0;          // réflectance à incidence normale (diélectrique ~0,04)
     uint reflectPitch;
     uint regionCount;
     uint anchors;      // 1 : sommets de l'image précédente disponibles
     uint prevVertexCount; // sommets lisibles dans viewPrev (une lecture hors d'un tampon racine n'est pas bornée)
-    uint pad1;
+    uint cacheTriangles;  // triangles tenus par le cache de surfaces
 };
 
 // dessin qui contient ce triangle (zones triées par début)
@@ -68,6 +71,20 @@ uint RegionIndex(uint prim)
 }
 
 float3 Vertex(ByteAddressBuffer b, uint v) { return asfloat(b.Load3(v * 12)); }
+
+// couleur retenue pour ce triangle par le cache de surfaces, si elle est à son objet actuel
+bool Cached(uint prim, out float3 c)
+{
+    c = 0;
+    if ((flags & 64) == 0 || prim >= cacheTriangles || regionCount == 0)
+        return false;
+    const uint4 r = regions[RegionIndex(prim)];
+    const uint2 e = surfCache.Load2(prim * 8);
+    if ((e.y & 255) == 0 || (e.y >> 8) != (r.w & 0xFFFFFF))
+        return false;
+    c = float3(e.x & 511, (e.x >> 9) & 511, (e.x >> 18) & 511) * exp2(float(int(e.x >> 27) - 24));
+    return all(isfinite(c));
+}
 
 // identité de l'objet du triangle ; position et normale du même point à l'image précédente si connues
 bool Anchor(uint prim, float2 bary, out uint id, out float3 prevPos, out float3 prevNormal)
@@ -256,6 +273,7 @@ void main(uint2 id : SV_DispatchThreadID)
         else if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && r.z > -0.999)
         {
             const float3 h = ray.Origin + r * q.CommittedRayT();
+            bool onScreen = false;
             if (h.z > 1e-3)
             {
                 const float2 ndc = float2(h.x * p00 / h.z, h.y * p11 / h.z);
@@ -283,8 +301,29 @@ void main(uint2 id : SV_DispatchThreadID)
                         // fondu vers les bords de l'écran (couleur inconnue au-delà)
                         const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
                         result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(q.CommittedRayT() / 50.0) : (flags & 16) ? s : q.CommittedRayT());
+                        onScreen = true;
                     }
                 }
+            }
+            // caché ou hors de l'écran : la couleur que le cache de surfaces a retenue pour ce triangle (pas dans
+            // les vues de diagnostic, qui lisent la 4e composante)
+            float3 cached;
+            if (!onScreen && (flags & 24) == 0 && Cached(q.CommittedPrimitiveIndex(), cached))
+            {
+                uint hitId;
+                float3 prevHit, prevHitN;
+                const bool hitKnown = Anchor(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
+                anchorOut.z = hitId;
+                if (hitKnown && mirrorKnown)
+                {
+                    const float3 virt = prevHit - 2.0 * dot(prevHit - prevMirror, prevMirrorN) * prevMirrorN;
+                    if (virt.z > 1e-3)
+                    {
+                        const float2 pn = float2(virt.x * p00 / virt.z, virt.y * p11 / virt.z);
+                        anchorOut.xy = asuint(float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5));
+                    }
+                }
+                result = float4(-1.0 - cached.r, cached.g, weight, cached.b);
             }
         }
     }
