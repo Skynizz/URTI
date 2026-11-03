@@ -3,8 +3,9 @@
 // cette image : identique à plus de 60 % à l'image finale, et plus proche d'elle que de l'image affichée
 // précédente. Parmi elles, la moins identique : la plus tôt, celle qui a le moins d'interface. Image
 // immobile (joueur qui regarde, menu ouvert) : chaque photo est aussi proche de l'image précédente que de la
-// courante, la règle ne tranche plus ; la photo choisie à l'image d'avant est alors gardée. Aucune :
-// l'image finale elle-même (l'interface n'est alors ni reconnue ni épargnée ; l'add-on efface ses reflets).
+// courante, la règle ne tranche plus ; la photo choisie à l'image d'avant est alors gardée. Aucune (dans
+// RDR2 : photo prise avant que le jeu écrive son image, une fois sur deux environ) : preUi garde la dernière
+// photo sûre (live_composite reprend alors l'interface retenue de cette photo-là).
 
 ByteAddressBuffer finalImage : register(t0);
 ByteAddressBuffer snap0 : register(t1);
@@ -61,6 +62,8 @@ void main(uint2 id : SV_DispatchThreadID)
     const int k = Choose();
     if (id.x == 0 && id.y == 0)
         counts.Store(64 + parity * 4, uint(k + 1));
+    // aucune photo sûre : l'image finale elle-même (garder la dernière photo sûre donnait des couleurs de reflets
+    // prises dans une image ancienne, v58-v62)
     const uint2 v = k == 0 ? Pixel(snap0, a) : k == 1 ? Pixel(snap1, a) : k == 2 ? Pixel(snap2, a) : k == 3 ? Pixel(snap3, a) : Pixel(finalImage, a);
     if (bytesPerPixel == 8)
         preUi.Store2(a, v);

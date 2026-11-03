@@ -43,6 +43,7 @@ cbuffer Constants : register(b0)
     uint gameMin;          // 1 : part éclairée filtrée, visibilité la plus faible des deux ; 0 : ombre du jeu élargie, produit
     float aoAmount;        // occultation ambiante RT : part de la lumière du ciel retirée par un obstacle tout proche (0 : coupée)
     float aoRadius;        // portée des rayons d'occultation (mètres)
+    uint aoMotion;         // convention des vecteurs de mouvement (live_mvcal) pour l'occultation ; 255 : inconnue
 };
 
 uint AoHash(uint x)
@@ -193,6 +194,20 @@ float Flatness(int2 t, float3 p)
     return saturate(1.0 - min(eh, ev) / (0.004 * p.z + 0.002));
 }
 
+// feuillage (plaques découpées, planes donc acceptées par Flatness) : autour du pixel, à 6 pixels, la caméra
+// voit nettement plus loin (le fond à travers les trous des feuilles)
+bool SeesThroughAround(int2 t, float3 p)
+{
+    static const int2 kAround[8] = { int2(6, 0), int2(-6, 0), int2(0, 6), int2(0, -6), int2(4, 4), int2(-4, 4), int2(4, -4), int2(-4, -4) };
+    for (uint k = 0; k < 8; k++)
+    {
+        const float3 q = PointAt(t + kAround[k]);
+        if (q.z <= 0 || q.z > p.z * 1.3 + 0.5)
+            return true;
+    }
+    return false;
+}
+
 float3 NormalAt(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
@@ -301,22 +316,34 @@ void main(uint2 id : SV_DispatchThreadID)
     // géométrie, s'assombrissaient en entier (le jeu y a déjà son occultation) et tremblaient au vent
     const float2 ndc3 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
     const float3 p3 = float3(ndc3.x * w / p00, ndc3.y * w / p11, w);
-    if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5)
+    if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5 && !SeesThroughAround(int2(id), p3))
     {
         const float3 n = NormalAt(int2(id), p3);
         const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
         const float3 b2 = cross(n, b1);
-        // deux rayons (strates opposées en azimut) : moitié moins de bruit qu'un seul
+        // deux rayons (strates en azimut) ; quatre là où l'image bouge de plus d'un pixel et demi : l'historique y
+        // est rejeté ou à peine gardé, le bruit de deux rayons tremblerait
+        uint aoRays = 2;
+        if (aoMotion < 16)
+        {
+            const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
+            float2 mv = float2(f16tof32(raw & 0xFFFF), f16tof32(raw >> 16));
+            mv = (aoMotion & 3) == 0 ? mv : (aoMotion & 3) == 1 ? mv * 0.5 : (aoMotion & 3) == 2 ? mv / float2(width, height) : mv * 2.0;
+            if (all(isfinite(mv)) && length(mv * float2(width, height)) > 1.5)
+                aoRays = 4;
+        }
         uint h = AoHash(id.x * 1973u + id.y * 9277u + frameIndex * 26699u);
         float occlusion = 0;
-        for (uint k = 0; k < 2; k++, h = AoHash(h))
+        for (uint k = 0; k < aoRays; k++, h = AoHash(h))
         {
-            const float u1 = float(h & 0xFFFF) / 65536.0, u2 = (float(h >> 16) / 65536.0 + float(k)) * 0.5;
+            const float u1 = float(h & 0xFFFF) / 65536.0, u2 = (float(h >> 16) / 65536.0 + float(k)) / float(aoRays);
             const float r = sqrt(u1), phi = 6.2831853 * u2;
             RayDesc ray;
             ray.Origin = p3 + n * max(0.01, 0.002 * length(p3));
             ray.Direction = normalize(b1 * (r * cos(phi)) + b2 * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
-            ray.TMin = 0.0;
+            // obstacles à moins de 6 cm ignorés : les décalques du jeu (boue, marques, flaques), posés juste au-dessus
+            // du sol sans écrire la profondeur, faisaient des taches sombres à leur forme exacte
+            ray.TMin = 0.06;
             ray.TMax = aoRadius;
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
@@ -326,7 +353,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     q.CommitNonOpaqueTriangleHit(); // le plus proche reste (les candidats plus loin sont écartés)
             // obstacle proche : occultation forte ; vers la portée, elle s'éteint en douceur
             const float t = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() / aoRadius : 1.0;
-            occlusion += 0.5 * (1.0 - t) * (1.0 - t);
+            occlusion += (1.0 - t) * (1.0 - t) / float(aoRays);
         }
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;
         const float skyShare = sunSky > 0 ? 1.0 / (1.0 + sunSky * ndlSky) : 1.0 - 0.6 * ndlSky;

@@ -1144,3 +1144,56 @@ de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`)
 - Occultation ambiante en mouvement (bac à sable, marche) : sautent 0,47 % sans elle, 0,78 % avec ; débruitage
   du mode occultation seule élargi (flou 5×5 guidé par la profondeur, part de l'image courante en mouvement
   0,2) : 0,69 % (clignotent 0,84 → 0,71 %). Reste à réduire.
+
+## v56–v66 — URTI : décalques, photo d'avant l'interface impossible dans RDR2, mises à jour de la structure abandonnées
+
+Toutes les mesures ci-dessous sont prises dans RDR2, lancé par URTI ; scènes différentes d'un lancement à
+l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celles d'un même lancement.
+
+- **Occultation en mouvement** : 4 rayons au lieu de 2 là où l'image bouge de plus d'un pixel et demi
+  (vecteurs de mouvement) ; feuillage exclu des surfaces qui la reçoivent (points voisins à 6 pixels vus
+  nettement plus loin : le fond à travers les feuilles).
+- **Reflets sur l'eau** : normale par différence centrée sur 4 pixels de part et d'autre quand les deux côtés
+  sont sur la même surface (vaguelettes lissées) ; pas de rayon de reflet sous 3 % de poids (Fresnel de
+  face), portée 500 m.
+- **v56 : photos supplémentaires de l'écran (1er, 2e, 8e, 32e dessins) : RDR2 plante dès son menu**
+  (erreur fatale « mémoire »), retirées (v57).
+- **Taches sombres au sol à bords droits** (vues par le joueur) : les décalques du jeu (boue, marques,
+  flaques), posés juste au-dessus de la route sans écrire la profondeur, arrêtaient les rayons
+  d'occultation à quelques centimètres. Obstacles à moins de 6 cm ignorés (5 cm pour les reflets) : tache
+  disparue (assombrissement moyen du sol 3,5 → 0,1 niveau).
+- **Photo d'avant l'interface** : rafale enrichie (photo brute, photo gardée). Dans RDR2, **l'écran ne reçoit
+  qu'un seul dessin par image**, qui assemble la scène et l'interface préparées ailleurs : la photo prise
+  avant lui est une image précédente, interface comprise (mini-carte identique à l'image finale) ; aucune
+  photo sans interface n'existe. Pire : la photo « gardée » (v58) ne ressemblait plus qu'à 2 % à l'image
+  courante. Corrections :
+  - dans RDR2, `ui_photo=0` (urti.ini du jeu) ;
+  - plus jamais de photo gardée ;
+  - interface repérée avec une tolérance (grain du jeu d'un ou deux niveaux) ;
+  - **zone d'interface fixe** `ui_zone=0.012,0.69,0.16,0.97` (mini-carte et icônes) : mini-carte modifiée
+    7,5 → 1,7 niveaux.
+  - La photo prise juste après le premier dessin (seulement dans une liste directe) ne fait plus planter
+    le jeu.
+- Convention des vecteurs de mouvement remesurée dans le jeu : la même (n° 2). En mouvement, l'effet suit
+  l'image à **98 %** (`tools/reshade/urti_rafale_decalage.py` : glissement de l'effet / glissement de l'image
+  par corrélation de phase).
+- **Décalage sous-pixel** : compensation coupée dans RDR2 (`jitter=0`) : tremblent 0,19 → 0,13 % ; zone des
+  reflets tremble 2,57 → 1,79 %, saute 0,10 → 0,06 %. Garde la compensation dans le bac à sable.
+- **Mises à jour de la structure** :
+  - v58 : places redistribuées à chaque image (seuil de 70 % dépassé) alors que la mise à jour restait
+    permise : 4,5 i/s. Corrigé (reconstruction obligatoire après une redistribution).
+  - Triangles plats à l'origine (la caméra) : une mise à jour qui les rendait réels étirait des boîtes à
+    travers toute la vue (rayons 10 fois plus lents) ; posés sur le premier sommet de leur place.
+  - Régulateur au coût mesuré (reconstruction contre ralentissement des rayons).
+  - Mesure finale, même scène : mises à jour 1,2 + 3,7 + 6,8 ms (structure, occultation, reflets), 38 i/s ;
+    reconstruction à chaque image 5,7 + 1,2 + 0,5 ms, 45 i/s. Une seule mise à jour rend les reflets
+    quatorze fois plus lents (lots de végétation triés par le GPU : les triangles changent de place).
+  - **Reconstruction à chaque image par défaut** (`blas_refit=0`) ; places sans marge, redistribuées dès
+    qu'un cinquième de la partie occupée est perdu en trous.
+  - Gare de triage, ciel couvert : URTI 3,9 ms au total, 73 i/s.
+- Avis du joueur sur la v66 : « parfait, le rendu est dingue », reste à gagner des images par seconde.
+- **Bac à sable** (`suite/tableau_v66.txt`) :
+  - arbres et personnage nettement mieux (sautent 0,010 → 0 %) ;
+  - **caméra en mouvement moins bonne** : sautent 0,63 → 1,24 % (clignotent 0,68 → 0,55 %), écarts à la vérité
+    plus grands partout. À comprendre : changements des reflets (seuil de poids, portée minimale, normale
+    centrée) ou de la photo d'avant l'interface (photo après le premier dessin, tolérance).

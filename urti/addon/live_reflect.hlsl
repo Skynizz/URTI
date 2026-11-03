@@ -126,11 +126,23 @@ bool SeenThrough(float3 h)
 
 float3 NormalAt(int2 t, float3 p)
 {
-    // différences sur deux pixels (normale moins bruitée qu'à un pixel : moins de reflets qui tremblent)
-    const float3 l = PointAt(t - int2(2, 0)), r = PointAt(t + int2(2, 0)), u = PointAt(t - int2(0, 2)), b = PointAt(t + int2(0, 2));
-    const float3 dx = (r.z > 0 && (l.z <= 0 || abs(r.z - p.z) < abs(l.z - p.z))) ? r - p : p - l;
-    const float3 dy = (b.z > 0 && (u.z <= 0 || abs(b.z - p.z) < abs(u.z - p.z))) ? b - p : p - u;
-    float3 n = normalize(cross(dx, dy));
+    // différence centrée sur quatre pixels de part et d'autre quand les deux côtés sont sur la même surface
+    // (leur milieu retombe sur le point) : normale lissée, les vaguelettes de l'eau et le grain de la profondeur
+    // ne font plus trembler le reflet ; sinon (bord d'objet) le côté le plus proche, sur deux pixels
+    float3 axis[2];
+    for (uint k = 0; k < 2; k++)
+    {
+        const int2 o = k == 0 ? int2(1, 0) : int2(0, 1);
+        const float3 l4 = PointAt(t - o * 4), r4 = PointAt(t + o * 4);
+        if (l4.z > 0 && r4.z > 0 && length(0.5 * (l4 + r4) - p) < 0.01 * p.z + 0.01)
+            axis[k] = r4 - l4;
+        else
+        {
+            const float3 l = PointAt(t - o * 2), r = PointAt(t + o * 2);
+            axis[k] = (r.z > 0 && (l.z <= 0 || abs(r.z - p.z) < abs(l.z - p.z))) ? r - p : p - l;
+        }
+    }
+    float3 n = normalize(cross(axis[0], axis[1]));
     return dot(n, p) > 0 ? -n : n;
 }
 
@@ -184,7 +196,9 @@ void main(uint2 id : SV_DispatchThreadID)
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
-    if (p.z > 0 && s >= sMin)
+    // pas de rayon là où le reflet serait presque invisible (surface vue de face : Fresnel ~4 %) : moins de 3 %
+    const float fresnelEarly = f0 + (1.0 - f0) * pow(1.0 - saturate(dot(-normalize(p), n)), 5.0);
+    if (p.z > 0 && s >= sMin && fresnelEarly * saturate((s - sMin) / max(1e-3, 1.0 - sMin)) >= 0.03)
     {
         // surface-miroir dans la géométrie captée : le premier triangle sur le rayon de la caméra, s'il est à
         // la profondeur que l'image montre
@@ -219,8 +233,8 @@ void main(uint2 id : SV_DispatchThreadID)
         RayDesc ray;
         ray.Origin = p + n * (bias * p.z);
         ray.Direction = r;
-        ray.TMin = 0.0;
-        ray.TMax = 1e5;
+        ray.TMin = 0.05; // pas les décalques du jeu posés juste au-dessus de la surface
+        ray.TMax = 500.0; // au-delà, la brume du jeu efface tout reflet
         // chaque triangle rencontré est examiné : gardé sauf si c'est un trou que la caméra voit à travers
         RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
         q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);

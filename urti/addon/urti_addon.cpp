@@ -495,8 +495,8 @@ struct CommandListState
     uint64_t pipeline = 0;
     uint64_t depth = 0;
     uint64_t indexBuffer = 0, vertexBuffer = 0; // tampons liés (ressource et position mêlées) : identité des ExecuteIndirect
-    uint64_t backBuffer = 0; // image d'écran liée en cible (photo avant l'interface au premier dessin)
-    bool snapped = false;
+    uint64_t backBuffer = 0; // image d'écran liée en cible (photos avant l'interface à ses premiers dessins)
+    uint32_t backBufferDraws = 0; // dessins dans l'image d'écran depuis sa liaison
     float viewport[4] = {}; // x, y, largeur, hauteur (le premier)
 };
 
@@ -655,7 +655,7 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
     CommandListState& st = g.lists[cmd->get_native()];
     st.depth = depth;
     st.backBuffer = first && g_liveBackBuffers.count(first) ? first : 0;
-    st.snapped = false;
+    st.backBufferDraws = 0;
     if (targets[0])
         if (auto it = g.screenLike.find(depth); it != g.screenLike.end() && it->second == 1 && count >= g_liveGbufferCount)
         {
@@ -929,8 +929,9 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                     LiveFreePlace(it->second), g_livePlaces.erase(it), it = g_livePlaces.end();
                 if (it == g_livePlaces.end())
                 {
-                    // un quart de marge : un objet qui grossit un peu (taille apprise) garde sa place
-                    const uint32_t size = uint32_t(std::min<uint64_t>(kSlotBytes, (uint64_t(capacity) * 5 / 4 + 47) / 48 * 48));
+                    // sans marge : la structure est reconstruite à chaque image, une place redistribuée ne coûte rien,
+                    // et chaque sommet de trop (marge, trou) alourdit la reconstruction
+                    const uint32_t size = uint32_t(std::min<uint64_t>(kSlotBytes, (uint64_t(capacity) + 47) / 48 * 48));
                     uint32_t offset = ~0u;
                     for (auto f = g_liveFreeSpace.begin(); f != g_liveFreeSpace.end(); ++f)
                         if (f->second >= size)
@@ -1021,7 +1022,9 @@ void CountDevice(command_list* cmd)
     g.drawsPerDevice[cmd->get_device()->get_native()]++;
 }
 
-// premier dessin dans l'image d'écran depuis sa liaison : photo de son contenu (avant ce dessin)
+// photos du contenu de l'image d'écran avant ses 1er, 2e, 8e et 32e dessins depuis sa liaison : dans RDR2, le
+// premier dessin écrit lui-même l'image de la scène (photo prise avant : l'image précédente, une fois sur deux
+// environ) ; live_uiselect garde la plus tôt qui contient déjà l'image courante
 void LiveUiSnapshot(command_list* cmd)
 {
     ID3D12Resource *target = nullptr, *snap = nullptr;
@@ -1029,9 +1032,16 @@ void LiveUiSnapshot(command_list* cmd)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         const auto it = g.lists.find(cmd->get_native());
-        if (it == g.lists.end() || !it->second.backBuffer || it->second.snapped)
+        if (it == g.lists.end() || !it->second.backBuffer)
             return;
-        it->second.snapped = true;
+        // avant le premier dessin (contenu laissé là : dans RDR2 une image précédente, interface comprise) et
+        // avant le deuxième (le premier a écrit l'image de la scène, pas encore l'interface) ; seulement dans une
+        // liste de commandes directe : une copie est interdite dans les autres (les « bundles » de l'interface),
+        // en prendre au 8e et 32e dessins faisait planter RDR2 dès son menu (v56)
+        if (it->second.backBufferDraws++ > 1)
+            return;
+        if (ID3D12GraphicsCommandList* native = Native(cmd); !native || native->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+            return;
         if (g_liveSnapCount >= kLiveSnaps || !g_liveSnap[g_liveSnapCount])
             return;
         target = reinterpret_cast<ID3D12Resource*>(it->second.backBuffer);
@@ -1224,8 +1234,9 @@ void BeginList()
 // image de la frame (pour savoir ce qui a été capturé)
 // ------------------------------------------------------------------------------------------------
 
-// copyOf : un tampon de même disposition (copie de l'image, état COPY_DEST) enregistré à la place de l'image
-void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path, uint32_t step = 2, ID3D12Resource* copyOf = nullptr)
+// copyOf : un tampon de même disposition (copie de l'image, dans l'état copyState) enregistré à la place de l'image
+void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const std::string& path, uint32_t step = 2, ID3D12Resource* copyOf = nullptr,
+                    D3D12_RESOURCE_STATES copyState = D3D12_RESOURCE_STATE_COPY_DEST)
 {
     const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
@@ -1244,9 +1255,9 @@ void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     if (copyOf)
     {
-        Transition(g.list.Get(), copyOf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(g.list.Get(), copyOf, copyState, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g.list->CopyBufferRegion(readback.Get(), 0, copyOf, 0, total);
-        Transition(g.list.Get(), copyOf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        Transition(g.list.Get(), copyOf, D3D12_RESOURCE_STATE_COPY_SOURCE, copyState);
     }
     else
         g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);

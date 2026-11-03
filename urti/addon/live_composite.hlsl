@@ -11,7 +11,9 @@ ByteAddressBuffer prevMask : register(t3);   // masque de l'image réelle préc�
 ByteAddressBuffer resolvedRefl : register(t4); // reflets stabilisés (live_reflresolve) : couleur × poids, poids
 ByteAddressBuffer preUi : register(t5);      // photo de l'écran avant l'interface du jeu (bit 10 de debugReflect)
 ByteAddressBuffer sunBuf : register(t6);     // décalage sous-pixel du jeu mesuré (octets 1184 à 1191)
+ByteAddressBuffer uiCounts : register(t7);   // live_uiselect : choix de la photo + 1 (octets 64, 68 selon la parité ; 0 : aucune)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
+RWByteAddressBuffer uiMask : register(u1);   // 1 par pixel d'interface, retenu de la dernière photo sûre
 
 cbuffer Constants : register(b0)
 {
@@ -33,6 +35,8 @@ cbuffer Constants : register(b0)
     float tintR;        // rapport soleil / ciel de chaque canal sur celui de la luminance (live_sunlight) : 1 sans mesure
     float tintG;        // (trois nombres : un float3 ici serait déplacé à la frontière de 16 octets suivante)
     float tintB;
+    uint uiParity;      // parité de l'image (case du choix de live_uiselect)
+    float4 uiZone;      // zone d'interface fixe (fractions de l'écran : x0, y0, x1, y1 ; vide si x1 <= x0), jamais retouchée
 };
 
 // décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
@@ -55,6 +59,24 @@ float3 NitsToPq(float3 l)
 }
 
 uint Address(int2 px) { return uint(px.y) * pitch + uint(px.x) * (format == 3 ? 8 : 4); }
+
+// pixel d'interface : nettement différent de la photo d'avant l'interface. Dans RDR2, le jeu retouche toute
+// l'image après la photo (grain ou tramage, d'un niveau ou deux) : une comparaison à l'identique prenait 10 à
+// 30 % des pixels de la scène pour de l'interface (URTI n'y posait rien : points sans effet, figés à l'écran)
+bool IsUi(uint a)
+{
+    if (format == 3)
+    {
+        const uint2 x = image.Load2(a), y = preUi.Load2(a);
+        const float3 cx = float3(f16tof32(x.x & 0xFFFF), f16tof32(x.x >> 16), f16tof32(x.y & 0xFFFF));
+        const float3 cy = float3(f16tof32(y.x & 0xFFFF), f16tof32(y.x >> 16), f16tof32(y.y & 0xFFFF));
+        return any(abs(cx - cy) > 0.03 * max(abs(cx), abs(cy)) + 0.002);
+    }
+    const uint x = image.Load(a), y = preUi.Load(a);
+    if (format == 2)
+        return any(abs(int3(x & 1023, (x >> 10) & 1023, (x >> 20) & 1023) - int3(y & 1023, (y >> 10) & 1023, (y >> 20) & 1023)) > 12);
+    return any(abs(int3(x & 255, (x >> 8) & 255, (x >> 16) & 255) - int3(y & 255, (y >> 8) & 255, (y >> 16) & 255)) > 3);
+}
 
 // couleurs lues dans la photo d'avant l'interface quand elle existe (les reflets n'y prennent pas les menus)
 static bool gPre = false;
@@ -122,12 +144,36 @@ void main(uint2 id : SV_DispatchThreadID)
     if (id.x >= width || id.y >= height)
         return;
     const int2 px = int2(id);
+    // zone d'interface fixe (urti.ini ui_zone=, ex. la mini-carte de RDR2, dont l'écran ne reçoit jamais d'image
+    // sans interface) : laissée telle quelle
+    if (uiZone.z > uiZone.x && all(float2(id) >= uiZone.xy * float2(width, height)) && all(float2(id) < uiZone.zw * float2(width, height)))
+    {
+        const uint a = Address(px);
+        if (format == 3)
+            output.Store2(a, image.Load2(a));
+        else
+            output.Store(a, image.Load(a));
+        return;
+    }
     // interface du jeu (pixel différent de la photo d'avant l'interface) : laissée telle quelle, sans ombre
     // ni reflet par-dessus
     if (debugReflect & 0x400)
     {
         const uint a = Address(px);
-        if (format == 3 ? any(image.Load2(a) != preUi.Load2(a)) : image.Load(a) != preUi.Load(a))
+        // photo de cette image sûre : l'interface est ce qui en diffère (retenu) ; photo périmée (prise avant que
+        // le jeu écrive son image) : l'interface retenue de la dernière photo sûre (elle bouge peu), et l'image
+        // elle-même, pas la photo (qui est d'avant)
+        const bool photoOk = uiCounts.Load(64 + uiParity * 4) != 0;
+        const uint m = (id.y * width + id.x) * 4;
+        bool isUi;
+        if (photoOk)
+        {
+            isUi = IsUi(a);
+            uiMask.Store(m, isUi ? 1u : 0u);
+        }
+        else
+            isUi = uiMask.Load(m) != 0;
+        if (isUi)
         {
             if (format == 3)
                 output.Store2(a, image.Load2(a));
@@ -135,7 +181,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 output.Store(a, image.Load(a));
             return;
         }
-        gPre = true;
+        gPre = photoOk;
     }
     if (split != 0 && id.x == width / 2)
     {

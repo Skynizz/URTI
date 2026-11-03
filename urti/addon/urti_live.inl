@@ -56,6 +56,10 @@ struct LiveState
     int uiChoice = -1; // rang de la photo d'avant l'interface (-1 : aucune sûre), lu trois images plus tard
     uint32_t uiParity[3] = {};
     float uiReflGate = 1.0f; // reflets RT effacés en douceur quand aucune photo sûre (sinon l'interface s'y reflète)
+    uint32_t uiBadReadbacks = 0; // photos périmées de suite (lues trois images plus tard)
+    float uiZone[4] = {}; // urti.ini ui_zone=x0,y0,x1,y1 (fractions de l'écran) : zone d'interface jamais retouchée
+    ComPtr<ID3D12Resource> uiMaskBuf; // pixels d'interface retenus de la dernière photo sûre (live_composite)
+    uint64_t uiMaskBytes = 0;
     bool uiPhoto = true; // urti.ini ui_photo=0 : sans la photo d'avant l'interface (contrôle)
     ComPtr<ID3D12RootSignature> statsRs;
     ComPtr<ID3D12PipelineState> statsPso;
@@ -113,7 +117,9 @@ struct LiveState
     // structure d'accélération : mise à jour (refit, plusieurs fois moins chère) tant que la liste des
     // dessins est la même qu'à la dernière construction, reconstruite au plus tous les blasRefit images
     uint64_t blasLayout = 0;
-    uint32_t blasAge = ~0u, blasRefit = 8, statRebuilds = 0, statUpdates = 0;
+    // blasRefit : mises à jour de suite au plus ; 0 par défaut : dans RDR2 une seule mise à jour rendait les rayons
+    // de reflet quatorze fois plus lents (lots de végétation triés par le GPU : les triangles changent de place)
+    uint32_t blasAge = ~0u, blasRefit = 0, statRebuilds = 0, statUpdates = 0;
     uint64_t statVertices = 0;
     std::vector<ComPtr<ID3D12Resource>> retired[3]; // libérées trois images plus tard
     uint32_t photoIndex = 0;
@@ -197,6 +203,17 @@ struct LiveState
     ComPtr<ID3D12RootSignature> countsRs;
     ComPtr<ID3D12PipelineState> countsPso;
     uint32_t blasConverted = 0; // sommets de la dernière construction complète (mise à jour : même nombre)
+    // places redistribuées à la fin de l'image précédente, ou beaucoup de nouvelles dans celle-ci : les triangles
+    // ne sont plus là où la structure les attend, une mise à jour la rendrait très lente (v58 : 4,5 i/s) ;
+    // reconstruction complète
+    bool placesMoved = false, placesResetPending = false;
+    // mise à jour ou reconstruction, au coût mesuré (chronomètres du GPU lus trois images plus tard) : une mise à
+    // jour coûte moins cher que la reconstruction, mais ralentit les rayons ; dès que leur ralentissement
+    // cumulé depuis la dernière reconstruction dépasse ce qu'elle épargne, la structure est reconstruite
+    uint32_t buildCycle = 0, slotCycle[3] = {};
+    bool slotRefit[3] = {}, slotBuilt[3] = {};
+    double rebuildMs = 2.0, refitMs = 0.5, traceBase = -1.0, refitExtra = 0.0;
+    uint64_t statCycles = 0;
     uint64_t statPlaces = 0, statPlaceHeld = 0, statPlaceHigh = 0, statPlaceNew = 0, statPlaceFrames = 0, statPlaceResets = 0;
     ComPtr<ID3D12Resource> atlasBuf; // copie de la carte d'ombres du jeu, pour recalculer son ombre
     // application à l'image présentée (toutes les présentations, images générées comprises)
@@ -547,12 +564,12 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 26, 2) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 7, live.shadowRs, live.shadowPso, 27, 2) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
-           make(g_live_composite, sizeof(g_live_composite), 7, live.compositeRs, live.compositePso, 17) &&
+           make(g_live_composite, sizeof(g_live_composite), 8, live.compositeRs, live.compositePso, 22, 2) &&
            make(g_live_sunlight, sizeof(g_live_sunlight), 3, live.sunlightRs, live.sunlightPso, 20) &&
            make(g_live_counts, sizeof(g_live_counts), 2, live.countsRs, live.countsPso, 4) &&
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
@@ -719,8 +736,9 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 8, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
+            float zone[4] = {};
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -744,6 +762,8 @@ void LiveHotReload(ID3D12Device* device)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
+                if (l.rfind("ui_zone=", 0) == 0)
+                    std::sscanf(l.c_str() + 8, "%f,%f,%f,%f", &zone[0], &zone[1], &zone[2], &zone[3]);
                 value("shadows=", sunShadows);
                 float jl = 0;
                 value("jitter_log=", jl);
@@ -775,6 +795,7 @@ void LiveHotReload(ID3D12Device* device)
             live.jitterMode = uint32_t(std::clamp(jitter, 0.0f, 2.0f));
             live.fovAuto = fovAuto != 0;
             live.sunMeasure = sunMeasure != 0;
+            std::copy(std::begin(zone), std::end(zone), std::begin(live.uiZone));
             live.gameDilate = uint32_t(std::clamp(gameDilate, 0.0f, 3.0f));
             live.gameMin = gameMin != 0;
             live.aoAmount = std::clamp(ao, 0.0f, 1.0f), live.aoRadius = std::clamp(aoRadius, 0.1f, 10.0f);
@@ -1024,11 +1045,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             cursorNow = g_livePlaceHigh, persistNow = true;
             live.statPlaces += g_livePlaces.size(), live.statPlaceHeld += held, live.statPlaceHigh += g_livePlaceHigh;
             live.statPlaceNew += g_livePlaceNew, live.statPlaceFrames++;
-            // une place refusée (emplacement plein), ou plus de 70 % de l'emplacement occupé : toutes les places
-            // sont rendues, l'image suivante les redistribue à la suite (une reconstruction, pas d'objet perdu)
-            if (g_livePlaceFailed || g_livePlaceHigh > kSlotBytes / 10 * 7)
+            live.placesMoved = live.placesResetPending || g_livePlaceNew > placesNow.size() / 16 + 8;
+            live.placesResetPending = false;
+            // une place refusée (emplacement plein), ou plus d'un cinquième de la partie occupée perdu en trous :
+            // toutes les places sont rendues, l'image suivante les redistribue à la suite (la structure étant
+            // reconstruite à chaque image, seuls les objets gardés sans être dessinés manquent une image)
+            if (g_livePlaceFailed || held < uint64_t(g_livePlaceHigh) * 8 / 10)
             {
-                live.statPlaceResets++;
+                live.statPlaceResets++, live.placesResetPending = true;
                 g_livePlaces.clear(), g_liveFreeSpace.clear(), g_liveFreeCounts.clear(), g_livePlaceHigh = 0, g_liveNextCount = 0;
             }
             g_livePlaceNew = g_livePlaceFailed = 0;
@@ -1408,6 +1432,26 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             for (int k = 0; k < 5; k++)
                 live.timeSum[k] += double(t[k + 1] - t[k]) * 1000.0 / double(freq);
+            if (const uint32_t s = uint32_t(live.frame % 3); live.slotBuilt[s])
+            {
+                const double build = std::min(50.0, double(t[2] - t[1]) * 1000.0 / double(freq)), trace = std::min(100.0, double(t[5] - t[3]) * 1000.0 / double(freq));
+                if (!live.slotRefit[s])
+                {
+                    live.rebuildMs += (build - live.rebuildMs) * 0.2;
+                    // le coût de la mise à jour revient lentement vers une valeur plausible : une seule mesure
+                    // aberrante (image chargée, autre programme) ne bloque pas les mises à jour pour toujours
+                    live.refitMs += (0.3 * live.rebuildMs - live.refitMs) * 0.05;
+                    if (live.slotCycle[s] == live.buildCycle)
+                        live.traceBase = trace;
+                }
+                else
+                {
+                    live.refitMs += (build - live.refitMs) * 0.2;
+                    if (live.slotCycle[s] == live.buildCycle && live.traceBase >= 0)
+                        live.refitExtra += std::max(0.0, trace - live.traceBase);
+                }
+                live.slotBuilt[s] = false;
+            }
             if (t[7] > t[6] && t[7] - t[6] < freq)
                 live.timeSum[5] += double(t[7] - t[6]) * 1000.0 / double(freq);
             if (++live.timeFrames == 300)
@@ -1418,8 +1462,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     live.timeSum[4] / n, live.timeSum[5] / n);
                 const uint32_t builds = live.statRebuilds + live.statUpdates;
                 if (builds)
-                    Log("URTI direct : structure d'accélération : %.0f sommets en moyenne (capacité %llu), %u reconstructions et %u mises à jour",
-                        double(live.statVertices) / builds, (unsigned long long)live.capacity, live.statRebuilds, live.statUpdates);
+                    Log("URTI direct : structure d'accélération : %.0f sommets en moyenne (capacité %llu), %u reconstructions et %u mises à jour "
+                        "(reconstruction %.2f ms, mise à jour %.2f ms)", double(live.statVertices) / builds, (unsigned long long)live.capacity,
+                        live.statRebuilds, live.statUpdates, live.rebuildMs, live.refitMs);
                 if (live.statPlaceFrames)
                 {
                     const double f = double(live.statPlaceFrames);
@@ -1736,7 +1781,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     for (const LiveRegion& r : regionsNow)
         layout = (layout ^ (uint64_t(r.offset) << 32 ^ r.capacity ^ uint64_t(r.id) << 17)) * 1099511628211ull;
     const bool refit = live.blasRefit > 0 && live.blasAge < live.blasRefit &&
-                       (persistNow ? converted == live.blasConverted : layout == live.blasLayout);
+                       (persistNow ? converted == live.blasConverted && !live.placesMoved && live.refitExtra < live.rebuildMs - live.refitMs
+                                   : layout == live.blasLayout);
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bd = {};
     bd.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     bd.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
@@ -1744,7 +1790,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (refit)
         bd.SourceAccelerationStructureData = live.blas->GetGPUVirtualAddress(), live.blasAge++, live.statUpdates++;
     else
-        live.blasLayout = layout, live.blasConverted = converted, live.blasAge = 0, live.statRebuilds++;
+        live.blasLayout = layout, live.blasConverted = converted, live.blasAge = 0, live.statRebuilds++,
+        live.buildCycle++, live.refitExtra = 0.0, live.traceBase = -1.0;
+    live.slotCycle[live.frame % 3] = live.buildCycle, live.slotRefit[live.frame % 3] = refit, live.slotBuilt[live.frame % 3] = true;
     live.statVertices += converted;
     bd.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     bd.Inputs.NumDescs = 1;
@@ -1912,12 +1960,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         float sunSky;
         uint32_t gameDilate, gameMin;
         float aoAmount, aoRadius;
+        uint32_t aoMotion;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
-             live.aoAmount, live.aoRadius };
-    list->SetComputeRoot32BitConstants(9, 26, &sc, 0);
+             live.aoAmount, live.aoRadius, motionOk && live.mvConvention < 16 ? live.mvConvention : 255u };
+    list->SetComputeRoot32BitConstants(9, 27, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     // débruitage : SIGMA de NVIDIA ; sinon celui d'URTI (flou guidé par la profondeur, historique reprojeté,
     // bornage statistique, mélange adaptatif)
@@ -1955,7 +2004,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
                  // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
                  // accumulées et un bornage plus large (moins de grain qui tremble)
-                 live.sunShadows ? 0.1f : 0.05f, live.sunShadows ? 0.5f : 0.2f, live.sunShadows ? 1.5f : 2.0f, live.sunShadows ? 1u : 2u,
+                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f, live.sunShadows ? 1u : 2u,
                  live.p00, live.p11 };
         list->SetComputeRoot32BitConstants(7, 14, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
@@ -2333,7 +2382,10 @@ void LiveComposite(effect_runtime* runtime)
     // pas de photo sûre d'avant l'interface (lu trois images plus tard) : les couleurs des reflets viendraient de
     // l'image finale, menus compris ; les reflets RT s'effacent en douceur (le jeu garde les siens) et reviennent
     // avec la photo
-    const bool uiUnsafe = preUi && live.uiChoice < 0;
+    // (une photo périmée de temps en temps est rattrapée par live_composite : dernière photo sûre ; seulement
+    // au-delà de dix de suite, les couleurs gardées deviennent trop vieilles)
+    live.uiBadReadbacks = live.uiChoice < 0 ? live.uiBadReadbacks + 1 : 0;
+    const bool uiUnsafe = preUi && live.uiBadReadbacks > 10;
     live.uiReflGate = uiUnsafe ? std::max(0.0f, live.uiReflGate - 0.15f) : std::min(1.0f, live.uiReflGate + 0.1f);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     // vues 4 à 8 : lissé, poids, couleur reflétée, distance de touche (dans le canal du lissé), confiance
@@ -2472,7 +2524,13 @@ void LiveComposite(effect_runtime* runtime)
     list->SetComputeRootShaderResourceView(5, preUi ? preUi->GetGPUVirtualAddress() : live.imageIn->GetGPUVirtualAddress());
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(6, live.sunBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(7, live.imageOut->GetGPUVirtualAddress());
+    if (live.uiCounts)
+        Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    list->SetComputeRootShaderResourceView(7, live.uiCounts ? live.uiCounts->GetGPUVirtualAddress() : live.sunBuf->GetGPUVirtualAddress());
+    if (const uint64_t maskBytes = uint64_t(bd.Width) * bd.Height * 4; !live.uiMaskBuf || live.uiMaskBytes < maskBytes)
+        Retire(live.uiMaskBuf), live.uiMaskBuf = UavBuffer(g.device, maskBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), live.uiMaskBytes = maskBytes;
+    list->SetComputeRootUnorderedAccessView(8, live.imageOut->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(9, live.uiMaskBuf ? live.uiMaskBuf->GetGPUVirtualAddress() : live.imageOut->GetGPUVirtualAddress());
     const bool tinted = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] > 0.01f; // teinte des ombres mesurée
     const struct
     {
@@ -2483,14 +2541,19 @@ void LiveComposite(effect_runtime* runtime)
         uint32_t debugReflect;
         float p00, p11;
         float tint[3];
+        uint32_t uiParity;
+        float uiZone[4];
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u,
              (reflections && !(generated && live.fgMode == 2)) ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
              (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u), live.p00, live.p11,
-             { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f } };
-    list->SetComputeRoot32BitConstants(8, 17, &cc, 0);
+             { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f },
+             uint32_t((live.uiFrame - 1) & 1), { live.uiZone[0], live.uiZone[1], live.uiZone[2], live.uiZone[3] } };
+    list->SetComputeRoot32BitConstants(10, 22, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (live.uiCounts)
+        Transition(list.Get(), live.uiCounts.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Transition(list.Get(), live.shadowBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (blend)
         Transition(list.Get(), live.prevShadowBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2555,6 +2618,12 @@ void OnReshadePresent(effect_runtime* runtime)
             const std::string base = live.burstFolder + "\\";
             SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "apres_" + std::to_string(live.burstIndex) + ".ppm", 2);
             SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "avant_" + std::to_string(live.burstIndex) + ".ppm", 2, live.imageIn.Get());
+            // photo d'avant l'interface : la première prise dans cette image (brute) et celle qu'URTI a gardée
+            if (live.snaps[0])
+                SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "photo_" + std::to_string(live.burstIndex) + ".ppm", 2, live.snaps[0].Get());
+            if (live.preUiBuf)
+                SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "gardee_" + std::to_string(live.burstIndex) + ".ppm", 2, live.preUiBuf.Get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
                 live.churnOut);
             live.burstIndex++;
