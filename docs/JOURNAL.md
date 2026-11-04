@@ -1340,3 +1340,51 @@ dossier du jeu (aucun fichier du jeu remplacé), lancement par Steam (lanceur du
 - À faire : relever les cibles 1, 3, 4 (rugosité, métal) ; budget de géométrie adapté aux objets lourds
   (structures par objet gardées d'une image à l'autre plutôt qu'une seule reconstruite) ; comptage des
   dessins par présentation.
+
+## v72 — URTI : capture rangée dans l'ordre d'exécution ; génération d'images (DLSS-G) reconnue
+
+Suite d'Horizon Forbidden West, vers un URTI qui découvre le fonctionnement de chaque jeu au lieu de le supposer.
+
+- **Diagnostic** (compteur par liste de commandes : présentation de son premier dessin, présentation de son
+  exécution) : Horizon écrit **35 % de ses dessins avant la présentation précédente** (listes de l'image suivante
+  préparées en avance) ; RDR2 : 0 %. Rangés à l'écriture, les dessins mêlaient deux images : rang parmi les
+  dessins de même signature (donc identité) différent à chaque image, zones lues avant d'être remplies,
+  compteurs repris par d'autres dessins. D'où les objets qui entraient et sortaient de la scène RT (60 à 130 par
+  image), 80 à 110 nouvelles places par image, une scène RT gonflée de trous (4,2 M sommets pour 1,5 M de
+  budget, reconstruction 8,7 ms), des captures d'étalonnage à 0 dessin et une présentation sur six prise pour une
+  image générée.
+- **Capture dans l'ordre d'exécution** (événement `execute_command_list` de ReShade). À l'écriture, un dessin
+  capté reçoit seulement une zone dans la partie du flux de sa fenêtre d'écriture (trois parties tournantes par
+  emplacement) et un compteur de cette partie. À l'exécution de sa liste : rang, identité, place dans la scène
+  RT et présentation à laquelle il appartient. La conversion lit chaque place depuis sa zone du flux (les places
+  sont maintenant dans l'espace de la scène RT, plus dans le flux) ; place gardée sans être dessinée : laissée
+  telle quelle ; hors de toute place : triangle plat à l'origine. Compteurs de la partie suivante remis à zéro à
+  la fin de chaque image (avant toute liste écrite dans la nouvelle fenêtre). Liste exécutée plus de deux fenêtres
+  après son écriture : ignorée (jamais vu). Budget de géométrie par maillage (tous ses exemplaires) : l'identité
+  d'un exemplaire n'est connue qu'à l'exécution, le choix de capter se fait à l'écriture.
+- **Génération d'images** : activée par l'utilisateur dans Horizon (DLSS-G). ReShade est sous Streamline : il voit
+  deux présentations par image du jeu, sur la même file (le jeu exécute ses dessins sur une autre). Horizon ne
+  dessine jamais dans l'image présentée (image intermédiaire de Streamline), RDR2 si.
+  Règles :
+  - une présentation sans dessin exécuté n'avance pas la fenêtre de capture ;
+  - image générée = image où le jeu n'a pas dessiné ; sinon, quand les présentations alternent, celle qui suit
+    les dessins du jeu, car une génération par interpolation montre l'image fabriquée avant la vraie (URTI les
+    inversait : le mélange tombait sur la vraie image) ;
+  - le calcul RT se fait dès que les dessins sont exécutés ; l'image fabriquée reçoit le mélange de l'avant-dernier
+    et du dernier résultat, la vraie son résultat ;
+  - le rebond de lumière est gardé sur les images générées (coupé une image sur deux : clignotement).
+  Ordre « fabriquée d'abord » déduit du principe de l'interpolation, pas encore vérifié en mouvement.
+- **Mesures Horizon** (même endroit, génération d'images active) : tremble 1,91 % -> 0,04 %, saute 0,148 % ->
+  0,002 % ; nouvelles places 80-111 -> 9-15 par image ; refusés 100-460 -> 6-11 ; scène RT 4,2 M -> 2,0 M sommets ;
+  coût 9 -> 6 ms par vraie image (97 i/s affichées avec URTI, 137 sans). Mais l'effet tombe à 0,5 % des pixels
+  (8,5 % au premier essai) : 609 maillages et 14 M de sommets à l'écran pour un budget au plancher de 1,5 M, les
+  grandes structures en bois n'y entrent plus. Suite : structures par objet gardées d'une image à l'autre dans un
+  espace stable (mouvement de la caméra mesuré sur notre propre géométrie) au lieu d'une reconstruction à chaque image.
+- **RDR2, vérification de non-régression** (quai mouillé de Saint-Denis) : effet 10,2 %, tremble 0,01 %, saute
+  0,000 % (comme v70) ; 0 dessin en retard, 518 objets stables (0 nouvelle place, 0 entrée ou sortie par image),
+  64,6 i/s.
+- Horizon, restes : vecteurs de mouvement jamais départagés (toutes les cibles RG16F essayées) ; cibles 1, 3, 4 du
+  G-buffer jamais passées en lecture (le relevé ne peut pas les copier) ; touches envoyées ignorées par le jeu
+  (Entrée, F7 : fichiers déclencheurs à la place) ; « Continuer » repéré sur une capture du menu
+  (`urti_hfw_menu.py`, sa place change avec la ligne PlayStation Network), parfois deux clics.
+- Outils : `premier_plan.ps1` (le jeu est-il au premier plan, sans rien lire d'autre).

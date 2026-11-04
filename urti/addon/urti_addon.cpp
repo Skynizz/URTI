@@ -76,6 +76,17 @@ bool g_liveAtStart = false;      // urti.ini live=1 : ombres RT en direct dès l
 uint32_t g_calibrationInterval = 180;
 bool g_liveCapture = false;
 std::atomic<uint32_t> g_presentDraws{ 0 }; // dessins du jeu depuis la dernière présentation (0 : image générée)
+// dessins exécutés par la file du jeu : écrits dans la même fenêtre de présentation, ou dans une précédente
+std::atomic<uint64_t> g_presentIndex{ 0 };
+std::atomic<uint32_t> g_execOnTime{ 0 }, g_execLate{ 0 }, g_execLists{ 0 }, g_execLateLists{ 0 };
+std::atomic<uint32_t> g_presentExecDraws{ 0 }; // dessins exécutés depuis la dernière présentation (0 : image générée)
+// diagnostic de la génération d'images : par file, présentations et présentations précédées de dessins exécutés ;
+// files où le jeu exécute ses dessins ; suite des présentations (1 : dessins exécutés avant elle)
+std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_diagPresentQueues;
+std::unordered_map<uint64_t, uint32_t> g_diagExecQueues;
+uint64_t g_diagPattern = 0, g_diagBbPattern = 0;
+// images d'écran où le jeu a dessiné dans des listes exécutées depuis la dernière présentation
+std::unordered_set<uint64_t> g_execBackBuffers;
 // G-buffer du jeu : cibles de rendu liées avec la profondeur de l'écran (au moins trois). Parmi ces jeux de
 // cibles, celui où le jeu dessine le plus : dans RDR2, une passe plus tardive (transparents) lie aussi cinq
 // cibles, dont deux du G-buffer ; la dernière liaison vue la prenait une partie du temps (lissé perdu)
@@ -107,16 +118,42 @@ struct LiveRegion
 {
     uint32_t offset = 0, capacity = 0, counter = 0, id = 0;
 };
-std::unordered_map<uint64_t, uint32_t> g_liveKeyRank; // dessins de l'écran de chaque signature dans cette image
+std::unordered_map<uint64_t, uint32_t> g_liveKeyRank; // dessins de l'écran de chaque signature exécutés dans cette image
+// Dessins rangés dans l'ordre où la file du jeu les exécute, pas dans celui où ils sont écrits : Horizon Forbidden
+// West (Decima) écrit un tiers de ses listes de commandes avant la présentation précédente (image suivante préparée
+// en avance) ; rangés à l'écriture, ses objets changeaient d'identité à chaque image (rang parmi les dessins de même
+// signature mêlant deux images), leurs zones étaient lues avant d'être remplies et leurs compteurs repris par
+// d'autres. À l'écriture, un dessin capté reçoit une zone dans la partie du flux de sa fenêtre d'écriture (trois
+// parties tournantes) et un compteur de cette partie ; à l'exécution de sa liste, son rang, son identité, sa place
+// dans la scène RT et la présentation à laquelle il appartient
+struct LivePending
+{
+    uint64_t rankKey = 0, key = 0, window = 0;
+    uint32_t slot = 0, src = 0, capacity = 0, counter = 0, vertices = 0, sig = 0;
+    bool screen = false, mainScreen = false, probe = false, sunMap = false, marked = false, indirect = false;
+    float viewport[4] = {};
+};
+constexpr uint32_t kLiveAreas = 3;
+std::unordered_map<uint64_t, std::vector<LivePending>> g_livePending; // liste de commandes -> dessins captés pas encore exécutés
+uint64_t g_liveWindow = 0;                                // fenêtre de présentation (avancée par urti_live.inl)
+uint32_t g_liveAreaCursor[4][kLiveAreas] = {}, g_liveAreaProbe[4][kLiveAreas] = {}; // octets pris dans chaque partie (début, fin)
+uint32_t g_liveAreaCounters[kLiveAreas] = {};             // compteurs pris dans chaque partie
+uint32_t g_liveStaleDraws = 0;                            // dessins exécutés trop tard (partie du flux déjà reprise), ignorés
+// signature du maillage sans le rang : budget et tailles apprises sont par maillage (tous ses exemplaires)
+uint32_t MeshId(uint64_t idKey)
+{
+    const uint64_t h = (idKey ^ (idKey >> 31)) * 0x9E3779B97F4A7C15ull;
+    return uint32_t(h ^ (h >> 32)) | 1u;
+}
+std::unordered_map<uint32_t, uint32_t> g_liveIdMesh; // identité -> maillage (cette image)
 // budget de géométrie (urti_live.inl le met à jour à chaque image) : un objet déjà mesuré et peu important
 // (petit, lointain) n'entre pas dans la scène RT ; ceux à re-mesurer sont captés dans la zone de mesure, à
 // la fin de l'emplacement, hors de la structure d'accélération
 std::vector<LiveRegion> g_liveProbes[4];
-uint32_t g_liveProbeUsed[4] = {};
-std::unordered_set<uint32_t> g_liveKnown, g_liveAdmit, g_liveProbeWant;
-std::unordered_map<uint32_t, uint32_t> g_liveSeen; // identités de l'écran dans cette image -> sommets
+std::unordered_set<uint32_t> g_liveKnown, g_liveAdmit, g_liveProbeWant; // maillages
+std::unordered_map<uint32_t, uint32_t> g_liveSeen; // maillages de l'écran dans cette image -> sommets (tous exemplaires)
 // ExecuteIndirect : nombre de sommets inconnu avant le dessin ; on réservait 65 536 sommets à chacun (place
-// vide prise dans l'emplacement et dans la structure). Taille apprise par identité (mesurée), marge comprise.
+// vide prise dans l'emplacement et dans la structure). Taille apprise par maillage (mesurée), marge comprise.
 std::unordered_map<uint32_t, uint32_t> g_liveLearned;
 // dans RDR2 l'ordre des ExecuteIndirect change d'une image à l'autre (identité instable) : la taille est
 // aussi apprise par signature de commande (le plus grand nombre de sommets écrits par ses dessins)
@@ -134,9 +171,9 @@ bool g_liveBudget = false;
 uint64_t g_liveMainDepth = 0; // profondeur de l'écran principal (celle dont le flux fait la scène RT) : seule soumise au budget
 uint64_t g_liveSlotLimit = 0; // essai (urti.ini slot_limit=, sommets) : emplacement réduit, pour reproduire la saturation
 uint32_t g_liveOverflow = 0, g_liveOutOfBudget = 0;
-std::vector<LiveRegion> g_liveRegions[4]; // par emplacement (kSlots), dans l'ordre d'attribution
-uint32_t g_liveCursor[4] = {};            // octets attribués dans chaque emplacement
-uint32_t g_liveNextCounter = 4;           // compteurs par dessin après ceux des emplacements
+std::vector<LiveRegion> g_liveRegions[4]; // par emplacement (kSlots), dans l'ordre d'exécution : place dans la scène RT
+std::vector<uint32_t> g_liveRegionSrc[4]; // même ordre : début de la zone écrite dans le flux (octets)
+uint32_t g_liveCursor[4] = {};            // sans places fixes : zones à la suite dans la scène RT (octets)
 // place fixe de chaque objet de l'écran principal dans son emplacement, d'une image à l'autre : un objet que le
 // jeu ne dessine pas pendant quelques images garde sa dernière géométrie dans la scène RT (plus de flash), et
 // la disposition stable permet de mettre à jour la structure au lieu de la reconstruire (urti.ini persist=0 :
@@ -490,6 +527,9 @@ constexpr uint64_t kSoBytes = 512ull << 20; // 32 M sommets
 constexpr uint32_t kSlots = 4; // l'écran et jusqu'à trois cartes d'ombres (direction du soleil)
 constexpr uint64_t kSlotBytes = kSoBytes / kSlots;
 constexpr uint32_t kMaxDraws = 65536;
+// direct : trois parties tournantes par emplacement (une par fenêtre d'écriture), compteurs par partie
+constexpr uint64_t kLiveAreaBytes = kSlotBytes / kLiveAreas / 48 * 48;
+constexpr uint32_t kLiveAreaCounters = (kMaxDraws - kSlots) / kLiveAreas;
 
 // un dessin capturé : signature (pour le retrouver d'une frame à l'autre) et place dans son flux
 struct DrawRecord
@@ -508,6 +548,11 @@ struct CommandListState
     uint32_t backBufferDraws = 0; // dessins dans l'image d'écran depuis sa liaison
     uint64_t gbufferSet = 0; // jeu de cibles candidat au G-buffer lié (sa première cible), 0 : aucun
     float viewport[4] = {}; // x, y, largeur, hauteur (le premier)
+    // présentation pendant laquelle la liste a reçu son premier dessin, dessins depuis sa remise à zéro : une liste
+    // écrite avant une présentation et exécutée après (moteurs qui préparent l'image suivante en avance) est vue
+    uint64_t window = ~0ull;
+    uint32_t draws = 0;
+    uint64_t drewBackBuffer = 0; // image d'écran où cette liste a dessiné (image réelle ou générée : voir OnPresent)
 };
 
 enum class Phase
@@ -841,15 +886,13 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         // début du flux ; une zone d'un autre multiple décalerait toutes les suivantes (triangles géants
         // reliant des objets différents)
         uint64_t vertices = (kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]) + 2) / 3 * 3;
-        uint32_t capacity = uint32_t(std::min<uint64_t>(vertices * 16, kSlotBytes));
-        LiveRegion region;
-        bool probe = false;
+        LivePending pend;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            // identité, avant tout refus : le rang parmi les dessins de même signature ne doit pas dépendre
-            // des dessins refusés (sinon les identités glissent quand l'emplacement est plein)
-            uint32_t id = 0;
             const bool mainScreen = screen && state.depth == g_liveMainDepth;
+            uint64_t idKey = kind * 1000003ull;
+            uint32_t mesh = 0;
+            bool probe = false;
             if (screen)
             {
                 // identité stable d'une image à l'autre : le maillage (nombre d'indices ou de sommets, début dans
@@ -859,7 +902,6 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 // liés, son nombre maximal de commandes ; pas son tampon d'arguments, qui tourne dans RDR2 (une
                 // identité par image : 107 000 mesures en mémoire pour 900 objets, jamais connus, la scène RT
                 // tirée au hasard parmi eux à chaque image)
-                uint64_t idKey = kind * 1000003ull;
                 if (kind == 2)
                     idKey = ((((idKey * 1315423911ull + params[3]) * 1315423911ull + state.pipeline) * 1315423911ull + state.indexBuffer) * 1315423911ull +
                              state.vertexBuffer) * 1315423911ull + params[0];
@@ -869,38 +911,28 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                     if (kind == 1)
                         idKey = idKey * 1315423911ull + params[3];
                 }
-                const uint64_t h = (idKey ^ (idKey >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[idKey]++;
-                id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
+                mesh = MeshId(idKey);
+                // taille apprise de ce maillage (une même signature sert à des dessins de toutes tailles : son
+                // maximum imposait 65 536 sommets à tous)
                 if (kind == 2)
-                {
-                    g_liveIdSig[id] = params[3];
-                    // taille apprise de ce dessin (une même signature sert à des dessins de toutes tailles : son
-                    // maximum imposait 65 536 sommets à tous)
-                    uint64_t learned = ~0ull;
-                    if (const auto jt = g_liveLearned.find(id); jt != g_liveLearned.end())
-                        learned = jt->second;
-                    if (learned != ~0ull)
-                    {
-                        vertices = std::min<uint64_t>(65536, (learned * 5 / 4 + 64 + 2) / 3 * 3);
-                        capacity = uint32_t(vertices * 16);
-                    }
-                }
+                    if (const auto jt = g_liveLearned.find(mesh); jt != g_liveLearned.end())
+                        vertices = std::min<uint64_t>(65536, (uint64_t(jt->second) * 5 / 4 + 64 + 2) / 3 * 3);
                 // tous les dessins comptent pour choisir l'écran principal, même hors budget (sinon une autre
                 // profondeur, moins chargée, finirait par passer devant)
                 g.slotDraws[slot]++;
             }
             if (mainScreen)
             {
-                g_liveSeen[id] = uint32_t(vertices);
-                if (g_liveBudget && !g_liveAdmit.count(id))
+                g_liveSeen[mesh] += uint32_t(vertices);
+                if (g_liveBudget && !g_liveAdmit.count(mesh))
                 {
-                    // hors des objets choisis : un inconnu entre tant que la place du budget le permet ; sinon
-                    // (et pour un objet connu dont la mesure est à refaire) il est mesuré dans la zone de mesure,
+                    // hors des maillages choisis : un inconnu entre tant que la place du budget le permet ; sinon
+                    // (et pour un maillage connu dont la mesure est à refaire) il est mesuré dans la zone de mesure,
                     // dans sa limite par image ; le reste n'est pas capté du tout
-                    const bool known = g_liveKnown.count(id) != 0;
+                    const bool known = g_liveKnown.count(mesh) != 0;
                     if (known || g_liveReserved + vertices > g_liveBudgetVertices)
                     {
-                        if ((known && !g_liveProbeWant.count(id)) || g_liveProbeVerts + vertices > g_liveProbeBudget)
+                        if ((known && !g_liveProbeWant.count(mesh)) || g_liveProbeVerts + vertices > g_liveProbeBudget)
                         {
                             g_liveOutOfBudget++;
                             return;
@@ -917,91 +949,38 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                     return;
                 g_liveSunMarked++;
                 g_liveSunKeys.insert(key);
-                marked = g_liveMarks.size() < kLiveMaxMarks;
-                if (!marked)
-                    return;
+                marked = true;
             }
             else
-                marked = !probe && g_liveMarks.size() < kLiveMaxMarks && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
-            const uint64_t limit = g_liveSlotLimit ? std::min<uint64_t>(kSlotBytes, g_liveSlotLimit * 16) : kSlotBytes;
-            const bool persist = mainScreen && g_livePersist && !probe;
-            const uint32_t used = mainScreen && g_livePersist ? std::max(g_liveCursor[slot], g_livePlaceHigh) : g_liveCursor[slot];
-            if (!capacity || uint64_t(used) + g_liveProbeUsed[slot] + (persist ? 0 : capacity) > limit || g_liveNextCounter >= kMaxDraws)
+                marked = !probe && (g_liveSunKeys.count(key) || g_livePrevSunKeys.count(key));
+            // zone dans la partie du flux de cette fenêtre d'écriture : les dessins depuis son début, la zone de
+            // mesure depuis sa fin
+            const uint32_t area = uint32_t(g_liveWindow % kLiveAreas);
+            const uint32_t capacity = uint32_t(std::min<uint64_t>(vertices * 16, kLiveAreaBytes / 2));
+            const uint32_t size = (capacity + 15) & ~15u;
+            uint32_t &cursor = g_liveAreaCursor[slot][area], &probeUsed = g_liveAreaProbe[slot][area];
+            if (!capacity || uint64_t(cursor) + probeUsed + size > kLiveAreaBytes || g_liveAreaCounters[area] >= kLiveAreaCounters)
             {
                 if (screen && !probe)
                     g_liveOverflow++;
-                return; // emplacement plein : ce dessin n'est pas capté
+                return; // partie pleine : ce dessin n'est pas capté
             }
+            const uint32_t base = uint32_t(area * kLiveAreaBytes);
             if (probe)
-            {
-                // zone de mesure : depuis la fin de l'emplacement, vers le début
-                g_liveProbeUsed[slot] += (capacity + 15) & ~15u;
-                region = { uint32_t(limit - g_liveProbeUsed[slot]), capacity, g_liveNextCounter++, id };
-                g_liveProbes[slot].push_back(region);
-            }
-            else if (persist)
-            {
-                // sa place s'il en a une assez grande (et pas déjà prise dans cette image), sinon une nouvelle :
-                // le premier espace libre qui convient, sinon au bout de la partie occupée
-                auto it = g_livePlaces.find(id);
-                if (it != g_livePlaces.end() && it->second.lastFrame == g_livePlaceFrame)
-                    return; // même identité deux fois dans l'image : la seconde n'est pas captée
-                if (it != g_livePlaces.end() && it->second.capacity < capacity)
-                    LiveFreePlace(it->second), g_livePlaces.erase(it), it = g_livePlaces.end();
-                if (it == g_livePlaces.end())
-                {
-                    // sans marge : la structure est reconstruite à chaque image, une place redistribuée ne coûte rien,
-                    // et chaque sommet de trop (marge, trou) alourdit la reconstruction
-                    const uint32_t size = uint32_t(std::min<uint64_t>(kSlotBytes, (uint64_t(capacity) + 47) / 48 * 48));
-                    uint32_t offset = ~0u;
-                    for (auto f = g_liveFreeSpace.begin(); f != g_liveFreeSpace.end(); ++f)
-                        if (f->second >= size)
-                        {
-                            offset = f->first;
-                            const uint32_t rest = f->second - size, at = f->first + size;
-                            g_liveFreeSpace.erase(f);
-                            if (rest)
-                                g_liveFreeSpace[at] = rest;
-                            break;
-                        }
-                    if (offset == ~0u)
-                    {
-                        if (uint64_t(g_livePlaceHigh) + size + g_liveProbeUsed[slot] > limit)
-                        {
-                            g_liveOverflow++, g_livePlaceFailed++;
-                            return; // emplacement plein : ce dessin n'est pas capté (les places sont redistribuées ensuite)
-                        }
-                        offset = g_livePlaceHigh, g_livePlaceHigh += size;
-                    }
-                    LivePlace p;
-                    p.offset = offset, p.capacity = size;
-                    if (!g_liveFreeCounts.empty())
-                        p.countIndex = g_liveFreeCounts.back(), g_liveFreeCounts.pop_back();
-                    else
-                        p.countIndex = g_liveNextCount++;
-                    it = g_livePlaces.emplace(id, p).first;
-                    g_livePlaceNew++;
-                }
-                region = { it->second.offset, it->second.capacity, g_liveNextCounter++, id };
-                it->second.lastFrame = g_livePlaceFrame, it->second.frameCounter = region.counter;
-                g_liveRegions[slot].push_back(region);
-                g_liveReserved += vertices;
-            }
+                probeUsed += size, pend.src = base + uint32_t(kLiveAreaBytes) - probeUsed;
             else
-            {
-                region = { g_liveCursor[slot], capacity, g_liveNextCounter++, id };
-                g_liveCursor[slot] += (capacity + 15) & ~15u;
-                if (screen)
-                    g_liveRegions[slot].push_back(region);
-                if (mainScreen)
-                    g_liveReserved += vertices;
-            }
-            if (marked)
-                g_liveMarks.push_back({ key, uint32_t(slot), sunMap, { state.viewport[0], state.viewport[1], state.viewport[2], state.viewport[3] },
-                                        region.offset, region.capacity, region.counter });
+                pend.src = base + cursor, cursor += size;
+            pend.counter = kSlots + area * kLiveAreaCounters + g_liveAreaCounters[area]++;
+            pend.rankKey = idKey, pend.key = key, pend.window = g_liveWindow;
+            pend.slot = uint32_t(slot), pend.capacity = capacity, pend.vertices = uint32_t(vertices), pend.sig = params[3];
+            pend.screen = screen, pend.mainScreen = mainScreen, pend.probe = probe, pend.sunMap = sunMap, pend.marked = marked, pend.indirect = kind == 2;
+            std::memcpy(pend.viewport, state.viewport, sizeof(pend.viewport));
+            if (mainScreen && !probe)
+                g_liveReserved += vertices;
+            g_livePending[(uint64_t)list].push_back(pend);
         }
-        D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes + region.offset, region.capacity,
-                                                 g.counters->GetGPUVirtualAddress() + region.counter * 8ull };
+        D3D12_STREAM_OUTPUT_BUFFER_VIEW view = { g.so->GetGPUVirtualAddress() + slot * kSlotBytes + pend.src, pend.capacity,
+                                                 g.counters->GetGPUVirtualAddress() + pend.counter * 8ull };
         list->SetPipelineState(shadow);
         list->SOSetTargets(0, 1, &view);
         issue(list);
@@ -1088,8 +1067,138 @@ void LiveUiSnapshot(command_list* cmd)
     list->ResourceBarrier(1, &b);
 }
 
+// un dessin de plus dans cette liste (fenêtre de présentation de son premier dessin)
+void NoteDraw(uint64_t list)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    CommandListState& st = g.lists[list];
+    if (st.draws++ == 0)
+        st.window = g_presentIndex.load(std::memory_order_relaxed);
+    if (st.backBuffer)
+        st.drewBackBuffer = st.backBuffer;
+}
+
+// liste remise à zéro sans avoir été exécutée : ses dessins captés ne seront jamais remplis
+void OnResetCommandList(command_list* cmd)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (const auto it = g.lists.find(cmd->get_native()); it != g.lists.end())
+        it->second.draws = 0, it->second.window = ~0ull, it->second.drewBackBuffer = 0;
+    g_livePending.erase(cmd->get_native());
+}
+
+// dessins captés d'une liste soumise à la file du jeu : ils appartiennent à la présentation en cours (rang,
+// identité, place dans la scène RT), quelle que soit la fenêtre où la liste a été écrite (appelé sous g_mutex)
+void LiveCommit(const std::vector<LivePending>& pending)
+{
+    for (const LivePending& p : pending)
+    {
+        // partie du flux déjà reprise par des dessins plus récents (liste exécutée trois fenêtres après son
+        // écriture) : ignoré
+        if (g_liveWindow - p.window >= kLiveAreas)
+        {
+            g_liveStaleDraws++;
+            continue;
+        }
+        uint32_t id = 0;
+        if (p.screen)
+        {
+            // rang parmi les dessins de même signature, dans l'ordre d'exécution (le même d'une image à l'autre)
+            const uint64_t h = (p.rankKey ^ (p.rankKey >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[p.rankKey]++;
+            id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
+            if (p.indirect)
+                g_liveIdSig[id] = p.sig;
+            if (p.mainScreen)
+                g_liveIdMesh[id] = MeshId(p.rankKey);
+        }
+        if (p.marked && g_liveMarks.size() < kLiveMaxMarks)
+            g_liveMarks.push_back({ p.key, p.slot, p.sunMap, { p.viewport[0], p.viewport[1], p.viewport[2], p.viewport[3] }, p.src, p.capacity, p.counter });
+        if (p.probe)
+        {
+            g_liveProbes[p.slot].push_back({ p.src, p.capacity, p.counter, id });
+            continue;
+        }
+        if (!p.screen)
+            continue;
+        uint32_t dst = 0, room = 0;
+        if (p.mainScreen && g_livePersist)
+        {
+            // sa place s'il en a une assez grande (et pas déjà prise dans cette image), sinon une nouvelle :
+            // le premier espace libre qui convient, sinon au bout de la partie occupée
+            auto it = g_livePlaces.find(id);
+            if (it != g_livePlaces.end() && it->second.lastFrame == g_livePlaceFrame)
+                continue; // même identité deux fois dans l'image : la seconde n'est pas gardée
+            if (it != g_livePlaces.end() && it->second.capacity < p.capacity)
+                LiveFreePlace(it->second), g_livePlaces.erase(it), it = g_livePlaces.end();
+            if (it == g_livePlaces.end())
+            {
+                // sans marge : la structure est reconstruite à chaque image, une place redistribuée ne coûte rien,
+                // et chaque sommet de trop (marge, trou) alourdit la reconstruction
+                const uint32_t size = (p.capacity + 47) / 48 * 48;
+                uint32_t offset = ~0u;
+                for (auto f = g_liveFreeSpace.begin(); f != g_liveFreeSpace.end(); ++f)
+                    if (f->second >= size)
+                    {
+                        offset = f->first;
+                        const uint32_t rest = f->second - size, at = f->first + size;
+                        g_liveFreeSpace.erase(f);
+                        if (rest)
+                            g_liveFreeSpace[at] = rest;
+                        break;
+                    }
+                if (offset == ~0u)
+                {
+                    if (uint64_t(g_livePlaceHigh) + size > kSlotBytes)
+                    {
+                        g_liveOverflow++, g_livePlaceFailed++;
+                        continue; // scène RT pleine : pas gardé (les places sont redistribuées ensuite)
+                    }
+                    offset = g_livePlaceHigh, g_livePlaceHigh += size;
+                }
+                LivePlace place;
+                place.offset = offset, place.capacity = size;
+                if (!g_liveFreeCounts.empty())
+                    place.countIndex = g_liveFreeCounts.back(), g_liveFreeCounts.pop_back();
+                else
+                    place.countIndex = g_liveNextCount++;
+                it = g_livePlaces.emplace(id, place).first;
+                g_livePlaceNew++;
+            }
+            it->second.lastFrame = g_livePlaceFrame, it->second.frameCounter = p.counter;
+            dst = it->second.offset, room = it->second.capacity;
+        }
+        else
+            dst = g_liveCursor[p.slot], room = (p.capacity + 47) / 48 * 48, g_liveCursor[p.slot] += room;
+        g_liveRegions[p.slot].push_back({ dst, room, p.counter, id });
+        g_liveRegionSrc[p.slot].push_back(p.src);
+    }
+}
+
+// liste soumise à une file : ses dessins comptent pour la présentation en cours, pas pour celle où ils ont été écrits
+void OnExecuteCommandList(command_queue* queue, command_list* cmd)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (const auto pt = g_livePending.find(cmd->get_native()); pt != g_livePending.end())
+    {
+        LiveCommit(pt->second);
+        g_livePending.erase(pt);
+    }
+    const auto it = g.lists.find(cmd->get_native());
+    if (it == g.lists.end() || !it->second.draws)
+        return;
+    const bool late = it->second.window != g_presentIndex.load(std::memory_order_relaxed);
+    (late ? g_execLate : g_execOnTime).fetch_add(it->second.draws, std::memory_order_relaxed);
+    (late ? g_execLateLists : g_execLists).fetch_add(1, std::memory_order_relaxed);
+    g_presentExecDraws.fetch_add(it->second.draws, std::memory_order_relaxed);
+    g_diagExecQueues[queue ? queue->get_native() : 0] += it->second.draws;
+    if (it->second.drewBackBuffer)
+        g_execBackBuffers.insert(it->second.drewBackBuffer);
+    it->second.draws = 0, it->second.window = ~0ull, it->second.drewBackBuffer = 0;
+}
+
 bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
+    NoteDraw(cmd->get_native());
     if (g_liveCapture)
         LiveUiSnapshot(cmd);
     g_presentDraws.fetch_add(1, std::memory_order_relaxed);
@@ -1105,6 +1214,7 @@ bool OnDraw(command_list* cmd, uint32_t vertexCount, uint32_t instanceCount, uin
 
 bool OnDrawIndexed(command_list* cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
+    NoteDraw(cmd->get_native());
     if (g_liveCapture)
         LiveUiSnapshot(cmd);
     g_presentDraws.fetch_add(1, std::memory_order_relaxed);
@@ -1129,6 +1239,7 @@ void STDMETHODCALLTYPE HookExecuteIndirect(ID3D12GraphicsCommandList* self, ID3D
 {
     PassDraw(reinterpret_cast<uint64_t>(self), false);
     g_presentDraws.fetch_add(1, std::memory_order_relaxed);
+    NoteDraw(reinterpret_cast<uint64_t>(self));
     if ((g.phase == Phase::Capturing || g_liveCapture) && g.device && self->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
     {
         ComPtr<ID3D12Device> owner;
@@ -1590,6 +1701,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     }
     if (!OurDevice(dev) || !g.list)
         return;
+    g_presentIndex.fetch_add(1, std::memory_order_relaxed);
     if (!g.screenW)
     {
         const resource back = swap->get_current_back_buffer();
@@ -1631,7 +1743,53 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.enabled = !live.enabled;
         Log("URTI : ombres RT en direct %s", live.enabled ? "actives" : "coupées");
     }
-    live.lastPresentDraws = g_presentDraws.exchange(0);
+    g_presentDraws.exchange(0);
+    // image générée : aucun dessin du jeu exécuté depuis la présentation précédente (écrits : Decima écrit souvent
+    // ceux de l'image suivante avant de présenter, une image sur six semblait générée)
+    live.lastPresentDraws = g_presentExecDraws.exchange(0);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto& pq = g_diagPresentQueues[queue->get_native()];
+        pq.first++, pq.second += live.lastPresentDraws ? 1 : 0;
+        g_diagPattern = (g_diagPattern << 1) | (live.lastPresentDraws ? 1 : 0);
+        // image générée (DLSS-G, FSR3) : le jeu n'a pas dessiné dans l'image présentée depuis la présentation
+        // précédente (l'image fabriquée est écrite par la génération, hors des listes du jeu). Quand le jeu ne dessine
+        // jamais dans l'image d'écran (Horizon Forbidden West avec DLSS-G : il dessine dans une image intermédiaire de
+        // Streamline), l'alternance des présentations en tient lieu : une génération par interpolation présente
+        // l'image fabriquée avant la vraie, donc celle qui suit les dessins du jeu est la fabriquée, la suivante (sans
+        // dessin exécuté) la vraie. Sans alternance, une présentation sans dessin reprend simplement l'image précédente
+        const uint64_t presented = swap ? swap->get_current_back_buffer().handle : 0;
+        const bool drawn = presented && g_execBackBuffers.count(presented);
+        g_execBackBuffers.clear();
+        live.backBufferDrawn = (live.backBufferDrawn << 1) | (drawn ? 1u : 0u);
+        live.presentNoDraw = (live.presentNoDraw << 1) | (live.lastPresentDraws ? 0u : 1u);
+        const bool alternating = __popcnt(live.presentNoDraw & 0xFFFF) >= 6;
+        live.imageGenerated = (live.backBufferDrawn & 0xFF) ? !drawn : alternating ? live.lastPresentDraws > 0 : live.lastPresentDraws == 0;
+        g_diagBbPattern = (g_diagBbPattern << 1) | (drawn ? 1 : 0);
+        if (g.frame % 300 == 7)
+        {
+            char text[512] = "";
+            for (const auto& [q, c] : g_diagPresentQueues)
+            {
+                char item[64];
+                std::snprintf(item, sizeof(item), " file %04llx : %u (%u avec dessins)", (unsigned long long)(q & 0xFFFF), c.first, c.second);
+                std::strncat(text, item, sizeof(text) - std::strlen(text) - 1);
+            }
+            char exec[256] = "";
+            for (const auto& [q, d] : g_diagExecQueues)
+            {
+                char item[48];
+                std::snprintf(item, sizeof(item), " file %04llx : %u", (unsigned long long)(q & 0xFFFF), d);
+                std::strncat(exec, item, sizeof(exec) - std::strlen(exec) - 1);
+            }
+            char bits[65] = "", bbBits[65] = "";
+            for (int k = 0; k < 64; k++)
+                bits[k] = (g_diagPattern >> (63 - k)) & 1 ? '1' : '0', bbBits[k] = (g_diagBbPattern >> (63 - k)) & 1 ? '1' : '0';
+            Log("URTI direct : présentations par file :%s ; dessins exécutés par file :%s ; suite (dessins exécutés) %s ; suite (image dessinée par "
+                "le jeu) %s ; dessins ignorés (exécutés trop tard) %u", text, exec, bits, bbBits, g_liveStaleDraws);
+            g_diagPresentQueues.clear(), g_diagExecQueues.clear(), g_liveStaleDraws = 0;
+        }
+    }
     // G-buffer : le jeu de cibles le plus dessiné, revu toutes les 30 images (tout de suite s'il n'y en a pas)
     if (g.frame % 30 == 0 || !g_liveGbufferCount)
     {
@@ -1740,8 +1898,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for (uint32_t s = 0; s < kSlots; s++)
-                    g_liveRegions[s].clear(), g_liveCursor[s] = 0;
-                g_liveNextCounter = kSlots;
+                    g_liveRegions[s].clear(), g_liveRegionSrc[s].clear(), g_liveCursor[s] = 0;
             }
             g.frameDraws = 0;
             g.skippedDraws = 0;
@@ -1854,6 +2011,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
         reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
         reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
+        reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+        reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
         reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
         reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
         reshade::register_event<reshade::addon_event::bind_vertex_buffers>(OnBindVertexBuffers);

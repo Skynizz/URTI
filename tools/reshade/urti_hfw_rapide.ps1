@@ -11,7 +11,10 @@ $skip = if (Test-Path $log) { @(Get-Content $log).Count } else { 0 }
 function Fresh { if (Test-Path $log) { Get-Content $log | Select-Object -Skip $skip } }
 function Draws {
     $l = Fresh | Select-String -Pattern 'capture 0, frame \d+ : (\d+) dessins' | Select-Object -Last 1
-    if ($l) { [int]$l.Matches[0].Groups[1].Value } else { -1 }
+    if ($l) { return [int]$l.Matches[0].Groups[1].Value }
+    # étalonnage stocké : plus de capture ; la scène RT (sommets) en tient lieu
+    $v = Fresh | Select-String -Pattern "structure d'accélération : (\d+) sommets en moyenne" | Select-Object -Last 1
+    if ($v) { if ([int]$v.Matches[0].Groups[1].Value -lt 1000) { 50 } else { 1000 } } else { -1 }
 }
 function Idle { [int](& (Join-Path $PSScriptRoot 'inactif.ps1')) -ge 60 }
 Add-Type @"
@@ -29,7 +32,7 @@ function WindowWidth {
 $t0 = Get-Date
 if (-not (Get-Process $proc -ErrorAction SilentlyContinue)) { Start-Process 'steam://rungameid/2420110' }
 "jeu lancé"
-$played = $false; $continued = $false; $menuSeen = $null
+$played = $false; $continued = $false; $menuSeen = $null; $clicks = 0
 while (((Get-Date) - $t0).TotalMinutes -lt $TimeoutMin) {
     Start-Sleep 3
     $s = [int]((Get-Date) - $t0).TotalSeconds
@@ -43,12 +46,26 @@ while (((Get-Date) - $t0).TotalMinutes -lt $TimeoutMin) {
         $played = $true; "lanceur : Jouer cliqué après $s s"
         continue
     }
-    # menu principal : l'add-on présente (quelques dizaines de dessins) ; il finit d'apparaître
-    if (-not $continued -and $w -ge 1200 -and $d -ge 0 -and $d -lt 1000) {
+    # menu principal : l'add-on présente (journal : bilan des présentations ; sans capture d'étalonnage quand
+    # l'étalonnage est stocké) ; il finit d'apparaître. Le jeu ignore les touches envoyées : clic sur « Continuer »,
+    # dont la place change (une ligne PlayStation Network s'ajoute au menu quand le compte est lié)
+    $presenting = [bool](Fresh | Select-String -Pattern 'sur 300 présentations|première image' -Quiet)
+    if (-not $continued -and $w -ge 1200 -and $presenting -and $d -lt 1000) {
         if (-not $menuSeen) { $menuSeen = Get-Date }
-        elseif (((Get-Date) - $menuSeen).TotalSeconds -ge 12 -and (Idle)) {
-            & (Join-Path $PSScriptRoot 'click.ps1') -Process $proc -X 0.095 -Y 0.645 | Out-Null
-            $continued = $true; "menu : Continuer cliqué après $s s"
+        elseif (((Get-Date) - $menuSeen).TotalSeconds -ge 12 -and ($clicks -gt 0 -or (Idle))) {
+            # place de « Continuer » lue sur une capture de la fenêtre (deuxième ligne du menu)
+            $shot = Join-Path $env:TEMP 'urti_hfw_menu.png'
+            & (Join-Path $PSScriptRoot 'capture_fenetre.ps1') -Process $proc -Out $shot | Out-Null
+            $y = & python (Join-Path $PSScriptRoot 'urti_hfw_menu.py') $shot
+            Remove-Item $shot -ErrorAction SilentlyContinue
+            # le premier clic ne fait parfois que choisir la ligne : un autre, tant que le menu est là (trois au plus)
+            if ($y) {
+                & (Join-Path $PSScriptRoot 'click.ps1') -Process $proc -X 0.095 -Y ([double]::Parse($y, [Globalization.CultureInfo]::InvariantCulture)) | Out-Null
+                $clicks++; $menuSeen = (Get-Date).AddSeconds(-6)
+                "menu : Continuer (à $y de la hauteur) cliqué après $s s"
+                if ($clicks -ge 3) { $continued = $true }
+            }
+            else { $continued = $true }
         }
     }
 }

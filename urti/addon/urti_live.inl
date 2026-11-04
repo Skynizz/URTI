@@ -192,7 +192,11 @@ struct LiveState
     ComPtr<ID3D12Resource> timeReadback[3];
     double timeSum[8] = {};
     uint32_t timeFrames = 0;
-    uint32_t lastPresentDraws = 1; // dessins du jeu avant cette présentation (0 : image générée)
+    uint32_t lastPresentDraws = 1; // dessins du jeu exécutés avant cette présentation (0 : rien de neuf à calculer)
+    // présentations récentes où le jeu avait dessiné dans l'image présentée (bit 0 : celle-ci) ; image présentée
+    // fabriquée par la génération d'images (pas par le jeu)
+    uint32_t backBufferDrawn = 0, presentNoDraw = 0; // et présentations récentes sans dessin du jeu exécuté
+    bool imageGenerated = false;
     // reflets : matériau du G-buffer copié à chaque image, rayons réfléchis
     ComPtr<ID3D12RootSignature> reflectRs, depthfitRs;
     ComPtr<ID3D12PipelineState> reflectPso, depthfitPso;
@@ -245,7 +249,8 @@ struct LiveState
     ComPtr<ID3D12Resource> regionUpload[3]; // table des zones de l'écran pour le GPU (par image)
     // places fixes (g_livePersist) : table de toutes les places tenues, comptes de sommets gardés d'une image à
     // l'autre (8 octets par place), paires (compteur de l'image, case de compte) des dessins de l'image
-    ComPtr<ID3D12Resource> placeUpload[3], countUpload[3], countsBuf;
+    ComPtr<ID3D12Resource> placeUpload[3], srcUpload[3], fitUpload[3];
+    std::unordered_map<uint32_t, uint32_t> idMesh; // identité d'un exemplaire -> son maillage (budget par maillage)
     ComPtr<ID3D12RootSignature> countsRs;
     ComPtr<ID3D12PipelineState> countsPso;
     uint32_t blasConverted = 0; // sommets de la dernière construction complète (mise à jour : même nombre)
@@ -610,7 +615,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
         cd.CS = { code, size };
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
-    return make(g_live_convert, sizeof(g_live_convert), 3, live.convertRs, live.convertPso, 4) &&
+    return make(g_live_convert, sizeof(g_live_convert), 4, live.convertRs, live.convertPso, 4) &&
            make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 29, 3) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
@@ -1096,14 +1101,25 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const uint32_t drawsThisFrame = slot >= 0 ? uint32_t(g.slotDraws[slot]) : 0;
     std::vector<LiveMark> marksNow;
     std::vector<LiveRegion> regionsNow, probesNow, placesNow;
-    std::vector<uint32_t> countPairs; // compteur de l'image, case de compte (dessins de cette image tenus à leur place)
-    uint32_t cursorNow = 0, countersUsed = kSlots;
+    // début dans le flux (octets) de la zone écrite par chaque dessin de cette image, dans l'ordre de regionsNow ;
+    // de chaque place, dans l'ordre de placesNow (place gardée sans être dessinée : pas lue)
+    std::vector<uint32_t> srcNow, placeSrc;
+    uint32_t cursorNow = 0, zeroArea = ~0u;
     bool persistNow = false;
+    if (live.lastPresentDraws == 0 && live.bound)
+    {
+        // aucun dessin du jeu exécuté depuis la présentation précédente (image générée par DLSS-G ou FSR3, ou jeu
+        // qui présente deux fois) : rien de neuf à calculer, le dernier résultat est reposé ; la fenêtre de capture
+        // n'avance pas (les dessins exécutés ensuite appartiennent à l'image suivante du jeu)
+        live.statNoDraw++;
+        live.frame++;
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         marksNow.swap(g_liveMarks);
         if (slot >= 0)
-            regionsNow.swap(g_liveRegions[slot]), cursorNow = g_liveCursor[slot];
+            regionsNow.swap(g_liveRegions[slot]), srcNow.swap(g_liveRegionSrc[slot]), cursorNow = g_liveCursor[slot];
         // places fixes : un objet absent depuis plus de kLiveKeepFrames images rend sa place ; les autres restent
         // dans la scène RT avec leur dernière géométrie ; partie occupée trop morcelée : tout est redistribué
         if (g_livePersist && slot >= 0 && g.slotDepth[slot] == g_liveMainDepth)
@@ -1118,14 +1134,34 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     it = g_livePlaces.erase(it);
                     continue;
                 }
-                placesNow.push_back({ it->second.offset, it->second.capacity, it->second.countIndex, it->first });
-                if (it->second.lastFrame == g_livePlaceFrame)
-                    countPairs.push_back(it->second.frameCounter), countPairs.push_back(it->second.countIndex);
+                // dessinée dans cette image : convertie depuis sa zone du flux, jusqu'à son compteur ; sinon gardée
+                // telle quelle dans la scène RT (compteur ~0 : la conversion n'y touche pas)
+                const bool drawn = it->second.lastFrame == g_livePlaceFrame;
+                placesNow.push_back({ it->second.offset, it->second.capacity, drawn ? it->second.frameCounter : ~0u, it->first });
                 held += it->second.capacity;
                 ++it;
             }
             std::sort(placesNow.begin(), placesNow.end(), [](const LiveRegion& a, const LiveRegion& b) { return a.offset < b.offset; });
-            std::sort(regionsNow.begin(), regionsNow.end(), [](const LiveRegion& a, const LiveRegion& b) { return a.offset < b.offset; });
+            {
+                std::vector<uint32_t> order(regionsNow.size());
+                for (uint32_t i = 0; i < order.size(); i++)
+                    order[i] = i;
+                std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return regionsNow[a].offset < regionsNow[b].offset; });
+                std::vector<LiveRegion> r(order.size());
+                std::vector<uint32_t> src(order.size());
+                for (size_t i = 0; i < order.size(); i++)
+                    r[i] = regionsNow[order[i]], src[i] = srcNow[order[i]];
+                regionsNow.swap(r), srcNow.swap(src);
+            }
+            std::unordered_map<uint32_t, uint32_t> srcOf;
+            for (size_t i = 0; i < regionsNow.size(); i++)
+                srcOf[regionsNow[i].id] = srcNow[i];
+            placeSrc.resize(placesNow.size());
+            for (size_t i = 0; i < placesNow.size(); i++)
+            {
+                const auto f = srcOf.find(placesNow[i].id);
+                placeSrc[i] = f != srcOf.end() ? f->second : 0;
+            }
             cursorNow = g_livePlaceHigh, persistNow = true;
             live.statPlaces += g_livePlaces.size(), live.statPlaceHeld += held, live.statPlaceHigh += g_livePlaceHigh;
             live.statPlaceNew += g_livePlaceNew, live.statPlaceFrames++;
@@ -1145,12 +1181,26 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             g_livePlaces.clear(), g_liveFreeSpace.clear(), g_liveFreeCounts.clear(), g_livePlaceHigh = 0, g_liveNextCount = 0;
         g_livePlaceFrame++;
         for (uint32_t s = 0; s < kSlots; s++)
-            g_liveRegions[s].clear(), g_liveCursor[s] = 0;
+            g_liveRegions[s].clear(), g_liveRegionSrc[s].clear(), g_liveCursor[s] = 0;
         g_liveKeyRank.clear();
         if (slot >= 0)
             probesNow.swap(g_liveProbes[slot]);
         for (uint32_t s = 0; s < kSlots; s++)
-            g_liveProbes[s].clear(), g_liveProbeUsed[s] = 0;
+            g_liveProbes[s].clear();
+        // fenêtre suivante : sa partie du flux (servie il y a trois fenêtres) repart du début ; ses compteurs sont
+        // remis à zéro à la fin de cette image, avant toute liste écrite dans la nouvelle fenêtre
+        g_liveWindow++;
+        zeroArea = uint32_t(g_liveWindow % kLiveAreas);
+        for (uint32_t s = 0; s < kSlots; s++)
+            g_liveAreaCursor[s][zeroArea] = g_liveAreaProbe[s][zeroArea] = 0;
+        g_liveAreaCounters[zeroArea] = 0;
+        for (auto it = g_livePending.begin(); it != g_livePending.end();) // listes écrites mais jamais exécutées
+            it = !it->second.empty() && g_liveWindow - it->second.front().window > 8 ? g_livePending.erase(it) : std::next(it);
+        for (const auto& [id, mesh] : g_liveIdMesh)
+            live.idMesh[id] = mesh;
+        g_liveIdMesh.clear();
+        if (live.idMesh.size() > 200000)
+            live.idMesh.clear();
         live.seenNow.swap(g_liveSeen);
         for (const auto& [id, sig] : g_liveIdSig)
             live.idSig[id] = sig;
@@ -1160,13 +1210,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         g_liveSeen.clear();
         live.statOverflow += g_liveOverflow, live.statOutOfBudget += g_liveOutOfBudget, live.statReserved += g_liveReserved;
         g_liveOverflow = g_liveOutOfBudget = 0, g_liveReserved = 0, g_liveProbeVerts = 0;
-        countersUsed = g_liveNextCounter;
-        g_liveNextCounter = kSlots;
         if (!g_liveSunKeys.empty())
             g_livePrevSunKeys.swap(g_liveSunKeys);
         g_liveSunKeys.clear();
         g_liveSunMarked = 0;
     }
+    // compteurs remis à zéro dans la liste de cette image (avant toute liste écrite dans la fenêtre suivante) : ceux
+    // des emplacements (étalonnage) et ceux de la partie du flux de la fenêtre suivante, après leur dernière lecture
+    auto zeroCounters = [&](D3D12_RESOURCE_STATES from) {
+        Transition(list.Get(), g.counters.Get(), from, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kSlots * 8ull);
+        if (zeroArea != ~0u)
+            list->CopyBufferRegion(g.counters.Get(), (kSlots + uint64_t(zeroArea) * kLiveAreaCounters) * 8ull, g.zeros.Get(), 0, uint64_t(kLiveAreaCounters) * 8ull);
+        Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    };
     // budget de géométrie : mesures arrivées (trois images plus tard), puis choix des objets de la scène RT
     // pour les images suivantes : par taille apparente décroissante jusqu'au budget (bonus aux objets déjà
     // dedans : pas de va-et-vient au bord du budget) ; les objets inconnus entrent d'office (mesurés ensuite)
@@ -1198,72 +1255,88 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         if (live.objects.size() > 200000)
             live.objects.clear();
+        // budget par maillage (tous ses exemplaires ensemble) : l'identité d'un exemplaire n'est connue qu'à
+        // l'exécution, le choix de capter se fait à l'écriture. Mesures des exemplaires réunies : importance du plus
+        // important, sommets écrits du plus gros, mesure la plus ancienne
+        struct MeshInfo
+        {
+            float importance = 0;
+            uint32_t vertices = 0;
+            uint64_t frame = ~0ull;
+        };
+        std::unordered_map<uint32_t, MeshInfo> meshes;
+        for (const auto& [id, o] : live.objects)
+            if (const auto m = live.idMesh.find(id); m != live.idMesh.end())
+            {
+                MeshInfo& mi = meshes[m->second];
+                mi.importance = std::max(mi.importance, o.importance);
+                mi.vertices = std::max(mi.vertices, o.vertices);
+                mi.frame = std::min(mi.frame, o.frame);
+            }
         std::unordered_set<uint32_t> known, admit, probe;
         if (live.vertexBudget > 0)
         {
             std::vector<std::pair<float, uint32_t>> ranked;
             uint64_t used = 0;
-            for (const auto& [id, vertices] : live.seenNow)
+            for (const auto& [mesh, vertices] : live.seenNow)
             {
-                const auto it = live.objects.find(id);
-                if (it == live.objects.end())
+                const auto it = meshes.find(mesh);
+                if (it == meshes.end())
                 {
                     used += vertices; // inconnu : entre d'office
                     continue;
                 }
-                known.insert(id);
-                ranked.push_back({ it->second.importance * (live.admitted.count(id) ? 1.3f : 1.0f), id });
+                known.insert(mesh);
+                ranked.push_back({ it->second.importance * (live.admitted.count(mesh) ? 1.3f : 1.0f), mesh });
             }
             std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<uint64_t, uint32_t>> stale;
-            bool full = false;
-            // un objet trop gros pour la place restante est sauté, les suivants peuvent entrer ; sommets
-            // comptés : ceux réellement écrits (un ExecuteIndirect en réserve plus qu'il n'en dessine)
-            for (const auto& [score, id] : ranked)
+            // un maillage trop gros pour la place restante est sauté, les suivants peuvent entrer ; sommets comptés :
+            // ceux réservés par tous ses exemplaires dans cette image
+            for (const auto& [score, mesh] : ranked)
             {
-                const uint32_t vertices = std::min(live.seenNow[id], std::max(live.objects[id].vertices, 3u));
+                const uint32_t vertices = live.seenNow[mesh];
                 if (used + vertices <= live.vertexBudget)
-                    used += vertices, admit.insert(id);
+                    used += vertices, admit.insert(mesh);
                 else
-                    full = true, stale.push_back({ live.objects[id].frame, id });
+                    stale.push_back({ meshes[mesh].frame, mesh });
             }
-            (void)full;
             // re-mesures : les mesures les plus anciennes d'abord
             std::sort(stale.begin(), stale.end());
             uint64_t probed = 0;
-            for (const auto& [frame, id] : stale)
+            for (const auto& [frame, mesh] : stale)
             {
-                const uint32_t vertices = live.seenNow[id];
+                const uint32_t vertices = live.seenNow[mesh];
                 if (probed + vertices > live.probeBudget)
                     continue;
-                probed += vertices, probe.insert(id);
+                probed += vertices, probe.insert(mesh);
             }
         }
         if (live.frame % 300 == 150)
         {
             uint64_t unknownVerts = 0, knownVerts = 0;
-            for (const auto& [id, vertices] : live.seenNow)
-                (known.count(id) ? knownVerts : unknownVerts) += vertices;
-            Log("URTI direct : budget : %zu objets à l'écran (%llu sommets mesurés, %llu pas encore mesurés), %zu dans la scène RT, %zu mesures en mémoire", live.seenNow.size(),
-                (unsigned long long)knownVerts, (unsigned long long)unknownVerts, admit.size(), live.objects.size());
+            for (const auto& [mesh, vertices] : live.seenNow)
+                (known.count(mesh) ? knownVerts : unknownVerts) += vertices;
+            Log("URTI direct : budget : %zu maillages à l'écran (%llu sommets mesurés, %llu pas encore mesurés), %zu dans la scène RT, %zu exemplaires mesurés",
+                live.seenNow.size(), (unsigned long long)knownVerts, (unsigned long long)unknownVerts, admit.size(), live.objects.size());
             // les plus gros objets : sommets réservés (nombre d'indices × instances) et réellement écrits
             std::vector<std::pair<uint32_t, uint32_t>> big;
             for (const auto& [id, vertices] : live.seenNow)
                 big.push_back({ vertices, id });
             std::sort(big.begin(), big.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-            uint64_t admittedMeasured = 0;
-            for (uint32_t id : admit)
-                if (const auto it = live.objects.find(id); it != live.objects.end())
-                    admittedMeasured += it->second.vertices;
+            uint64_t admittedReserved = 0;
+            for (uint32_t mesh : admit)
+                admittedReserved += live.seenNow[mesh];
             char top[256] = "";
             for (size_t i = 0; i < big.size() && i < 5; i++)
             {
-                const auto it = live.objects.find(big[i].second);
+                const auto it = meshes.find(big[i].second);
                 char item[48];
-                std::snprintf(item, sizeof(item), " %u/%u", big[i].first, it != live.objects.end() ? it->second.vertices : 0u);
+                std::snprintf(item, sizeof(item), " %u/%u", big[i].first, it != meshes.end() ? it->second.vertices : 0u);
                 std::strncat(top, item, sizeof(top) - std::strlen(top) - 1);
             }
-            Log("URTI direct : budget : sommets écrits des objets admis %llu ; plus gros objets (réservés/écrits) :%s", (unsigned long long)admittedMeasured, top);
+            Log("URTI direct : budget : sommets réservés des maillages admis %llu ; plus gros maillages (réservés, tous exemplaires / plus gros exemplaire écrit) :%s",
+                (unsigned long long)admittedReserved, top);
         }
         live.churnIn = live.churnOut = 0;
         for (const uint32_t id : admit)
@@ -1284,7 +1357,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             g_liveLearned.clear();
             for (const auto& [id, o] : live.objects)
                 if (live.frame - o.frame < 120) // 0 compris : un ExecuteIndirect qui ne dessine rien ne réserve presque rien
-                    g_liveLearned[id] = o.vertices;
+                    if (const auto m = live.idMesh.find(id); m != live.idMesh.end())
+                    {
+                        const auto [jt, added] = g_liveLearned.emplace(m->second, o.vertices);
+                        if (!added)
+                            jt->second = std::max(jt->second, o.vertices);
+                    }
         }
     }
     // bilan du suivi du soleil, lu trois images plus tard
@@ -1468,18 +1546,6 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             }
             live.mvErrorsReadback[live.frame % 3]->Unmap(0, nullptr);
         }
-    if (live.lastPresentDraws == 0 && live.bound)
-    {
-        live.statNoDraw++;
-        // image sans dessin du jeu (image générée par DLSS) : l'image d'ombres précédente reste
-        Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, uint64_t(std::max(countersUsed, kSlots)) * 8ull);
-        Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
-        for (uint32_t s = 0; s < kSlots; s++)
-            g.slotDraws[s] = 0;
-        live.frame++;
-        return;
-    }
     const effect_texture_variable var = runtime->find_texture_variable("urti.fx", "UrtiDepth");
     resource_view depthSrv = {}, depthSrgb = {};
     if (var.handle)
@@ -1496,6 +1562,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     {
         if (active.handle)
             runtime->set_uniform_value_bool(active, false);
+        zeroCounters(D3D12_RESOURCE_STATE_STREAM_OUT);
         live.frame++;
         return;
     }
@@ -1505,7 +1572,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     live.lastFilled = cursorNow / 16;
     if (!LiveEnsureCapacity(device.Get(), std::max<uint64_t>(std::max<uint64_t>(live.lastFilled, 300000), cursorNow / 16)) || !LiveEnsureImages(runtime, g.device, depthDesc) ||
         !LiveEnsureSun(g.device))
+    {
+        zeroCounters(D3D12_RESOURCE_STATE_STREAM_OUT);
         return;
+    }
 
     const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (!live.timeHeap)
@@ -1626,10 +1696,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             up->Unmap(0, nullptr);
             placesBuf = up.Get();
         }
-        if (!live.countsBuf)
-            live.countsBuf = UavBuffer(g.device, kMaxDraws * 8ull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (!placesBuf || !live.countsBuf || !live.countsPso)
+        if (!placesBuf)
+        {
+            zeroCounters(srv), Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
             return;
+        }
     }
     ID3D12Resource* regionsBuf = nullptr;
     {
@@ -1649,7 +1720,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
     }
     if (!regionsBuf)
+    {
+        zeroCounters(srv), Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
         return;
+    }
     // par zone : identité, début de la zone du même objet dans l'image précédente (+ 1 ; 0 : inconnue)
     ID3D12Resource* linksBuf = nullptr;
     {
@@ -1678,33 +1752,34 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             linksBuf = up.Get();
         }
     }
-    if (!linksBuf)
-        return;
-    // places fixes : comptes de sommets des dessins de cette image recopiés dans leur case (les objets absents
-    // gardent leur compte, et leurs sommets sont toujours à leur place dans le flux)
-    if (persistNow && !countPairs.empty())
-    {
-        ComPtr<ID3D12Resource>& up = live.countUpload[live.frame % 3];
-        const uint64_t bytes = countPairs.size() * 4;
+    // début dans le flux de la zone de chaque entrée de la table convertie ; zones de cette image triées par leur
+    // début dans le flux, pour la loi de profondeur (live_depthfit y tire ses sommets)
+    const std::vector<uint32_t>& srcTable = persistNow ? placeSrc : srcNow;
+    std::vector<LiveRegion> fitNow(regionsNow.size());
+    uint32_t fitEnd = 0;
+    for (size_t i = 0; i < regionsNow.size(); i++)
+        fitNow[i] = { srcNow[i], regionsNow[i].capacity, regionsNow[i].counter, regionsNow[i].id }, fitEnd = std::max(fitEnd, srcNow[i] + regionsNow[i].capacity);
+    std::sort(fitNow.begin(), fitNow.end(), [](const LiveRegion& a, const LiveRegion& b) { return a.offset < b.offset; });
+    auto upload = [&](ComPtr<ID3D12Resource>& up, const void* data, uint64_t bytes) -> ID3D12Resource* {
+        bytes = std::max<uint64_t>(bytes, 16);
         if (!up || up->GetDesc().Width < bytes)
             Retire(up), up = MakeBuffer(g.device, std::max<uint64_t>(bytes * 2, 65536), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         void* p = nullptr;
-        if (up && SUCCEEDED(up->Map(0, nullptr, &p)))
-        {
-            std::memcpy(p, countPairs.data(), bytes);
-            up->Unmap(0, nullptr);
-            list->SetComputeRootSignature(live.countsRs.Get());
-            list->SetPipelineState(live.countsPso.Get());
-            list->SetComputeRootShaderResourceView(0, up->GetGPUVirtualAddress());
-            list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(2, live.countsBuf->GetGPUVirtualAddress());
-            const uint32_t pc[4] = { uint32_t(countPairs.size() / 2), 0, 0, 0 };
-            list->SetComputeRoot32BitConstants(3, 4, pc, 0);
-            list->Dispatch(UINT((countPairs.size() / 2 + 63) / 64), 1, 1);
-        }
+        if (!up || FAILED(up->Map(0, nullptr, &p)))
+            return nullptr;
+        std::memset(p, 0, 16);
+        if (data)
+            std::memcpy(p, data, bytes);
+        up->Unmap(0, nullptr);
+        return up.Get();
+    };
+    ID3D12Resource* srcBuf = upload(live.srcUpload[live.frame % 3], srcTable.empty() ? nullptr : srcTable.data(), srcTable.size() * 4);
+    ID3D12Resource* fitBuf = upload(live.fitUpload[live.frame % 3], fitNow.empty() ? nullptr : fitNow.data(), fitNow.size() * sizeof(LiveRegion));
+    if (!linksBuf || !srcBuf || !fitBuf)
+    {
+        zeroCounters(srv), Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
+        return;
     }
-    if (persistNow)
-        Transition(list.Get(), live.countsBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     // table des zones de la scène RT copiée en mémoire vidéo : chaque sommet (conversion), chaque reflet et le cache
     // de surfaces y cherchent leur zone ; dans le tampon d'envoi, chaque lecture traversait le bus PCIe
     ID3D12Resource* sceneTable = persistNow ? placesBuf : regionsBuf;
@@ -1729,15 +1804,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootSignature(live.convertRs.Get());
     list->SetPipelineState(live.convertPso.Get());
     list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
-    list->SetComputeRootShaderResourceView(1, persistNow ? live.countsBuf->GetGPUVirtualAddress() : g.counters->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, sceneTable->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(3, live.view->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(3, srcBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(4, live.view->GetGPUVirtualAddress());
     const uint32_t converted = std::max(3u, uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity)) / 3 * 3);
     const struct { float p00, p11; uint32_t count, regionCount; } cc = { live.p00, live.p11, converted, uint32_t(tableNow.size()) };
-    list->SetComputeRoot32BitConstants(4, 4, &cc, 0);
+    list->SetComputeRoot32BitConstants(5, 4, &cc, 0);
     list->Dispatch(UINT((converted + 255) / 256), 1, 1);
-    if (persistNow)
-        Transition(list.Get(), live.countsBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // 1a. mesure de chaque objet capté, de la scène RT et de la zone de mesure (budget de géométrie)
     if (live.statsPso && !(regionsNow.empty() && probesNow.empty()))
     {
@@ -1761,7 +1835,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         void* p = nullptr;
         if (live.statsBuf && up && SUCCEEDED(up->Map(0, nullptr, &p)))
         {
-            std::memcpy(p, regionsNow.data(), regionsNow.size() * sizeof(LiveRegion));
+            for (size_t i = 0; i < regionsNow.size(); i++)
+            {
+                const LiveRegion r = { srcNow[i], regionsNow[i].capacity, regionsNow[i].counter, regionsNow[i].id };
+                std::memcpy(static_cast<char*>(p) + i * sizeof(LiveRegion), &r, sizeof(r));
+            }
             std::memcpy(static_cast<char*>(p) + regionsNow.size() * sizeof(LiveRegion), probesNow.data(), probesNow.size() * sizeof(LiveRegion));
             up->Unmap(0, nullptr);
             list->SetComputeRootSignature(live.statsRs.Get());
@@ -1895,9 +1973,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->SetPipelineState(live.depthfitPso.Get());
         list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
         list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
-        list->SetComputeRootShaderResourceView(2, regionsBuf->GetGPUVirtualAddress());
+        list->SetComputeRootShaderResourceView(2, fitBuf->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(3, live.sunBuf->GetGPUVirtualAddress());
-        const uint32_t dc[4] = { uint32_t(regionsNow.size()), cursorNow, 0, 0 };
+        const uint32_t dc[4] = { uint32_t(fitNow.size()), fitEnd, 0, 0 };
         list->SetComputeRoot32BitConstants(4, 4, dc, 0);
         list->Dispatch(1, 1, 1);
     }
@@ -2368,8 +2446,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), g.counters.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(live.counterReadback[live.frame % 3].Get(), 0, g.counters.Get(), 0, kSlots * 8ull);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, uint64_t(std::max(countersUsed, kSlots)) * 8ull);
-    Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+    zeroCounters(D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
     for (uint32_t s = 0; s < kSlots; s++)
         g.slotDraws[s] = 0;
@@ -2409,7 +2486,7 @@ void LiveComposite(effect_runtime* runtime)
         return;
     if (live.overlayOpen)
         return; // menu de ReShade ouvert : il doit rester lisible (la passe le recouvrirait)
-    if (live.fgMode == 1 && live.lastPresentDraws == 0)
+    if (live.fgMode == 1 && live.imageGenerated)
         return; // image générée laissée telle quelle (réglage du menu)
     const effect_technique technique = runtime->find_technique("urti.fx", "URTI");
     const bool techniqueOn = runtime->get_effects_state() && (!technique.handle || runtime->get_technique_state(technique));
@@ -2745,7 +2822,10 @@ void LiveComposite(effect_runtime* runtime)
     list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(1, live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, reflections ? live.reflectBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    const bool generated = live.lastPresentDraws == 0;
+    // image générée : fabriquée entre la vraie image précédente et celle dont le calcul est le dernier fait (le
+    // calcul a lieu dès que les dessins du jeu sont exécutés : avec DLSS-G, juste avant l'image générée) ; mode
+    // mélange : moitié de chaque
+    const bool generated = live.imageGenerated;
     const bool blend = generated && live.fgMode == 2 && live.prevShadowBuf;
     if (blend)
         Transition(list.Get(), live.prevShadowBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
@@ -2758,7 +2838,9 @@ void LiveComposite(effect_runtime* runtime)
         Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(7, live.uiCounts ? live.uiCounts->GetGPUVirtualAddress() : live.sunBuf->GetGPUVirtualAddress());
     // rebond de lumière de cette image et couleur propre des surfaces (copiée pendant l'image du jeu)
-    const bool giUse = live.giStrength > 0 && live.giValid && live.giStamp + 1 == live.frame && live.albedoBuf && live.albedoFrame != ~0ull &&
+    // rebond de lumière : celui de ce calcul, ou le dernier calculé quand rien de neuf n'a été calculé (image générée)
+    const bool giFresh = live.giStamp + 1 == live.frame || (live.lastPresentDraws == 0 && live.giStamp + 2 == live.frame);
+    const bool giUse = live.giStrength > 0 && live.giValid && giFresh && live.albedoBuf && live.albedoFrame != ~0ull &&
                        live.frame <= live.albedoFrame + 3 && live.albedoWidth == live.width && live.albedoHeight == live.height;
     const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 3 && live.normalWidth == live.width &&
                            live.normalHeight == live.height;
@@ -2894,6 +2976,8 @@ void OnReshadePresent(effect_runtime* runtime)
     {
         Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées",
             live.statNoDraw, live.statEffects, live.statComposited);
+        Log("URTI direct : dessins exécutés : %u écrits dans la même fenêtre de présentation (%u listes), %u écrits avant la présentation "
+            "précédente (%u listes)", g_execOnTime.exchange(0), g_execLists.exchange(0), g_execLate.exchange(0), g_execLateLists.exchange(0));
         live.statPresents = live.statNoDraw = live.statEffects = live.statComposited = 0;
     }
     if (std::binary_search(g_photoFrames.begin(), g_photoFrames.end(), g.frame))
