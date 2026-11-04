@@ -93,6 +93,9 @@ struct LiveState
     ComPtr<ID3D12PipelineState> mvcalPso;
     uint64_t mvBytes = 0, mvFrame = ~0ull;
     uint32_t mvPitch = 0, mvWidth = 0, mvHeight = 0, mvConvention = 255, mvMovingFrames = 0;
+    // cible essayée parmi celles du G-buffer en deux flottants 16 bits (Horizon Forbidden West en a deux, la
+    // première presque vide : toutes les conventions y restaient à égalité) ; mesures sans vainqueur sur celle-ci
+    uint32_t mvCandidate = 0, mvUndecided = 0;
     double mvErr[16] = {}, mvCount[16] = {};
     float temporalAlpha = 0.3f;
     float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f; // reflets : part de l'image courante, à l'arrêt et en mouvement rapide
@@ -216,6 +219,7 @@ struct LiveState
     // débruité (live_shadowtemporal), précédent (historique). Reçu selon la couleur propre des surfaces (albedo du
     // G-buffer, copiée à chaque image)
     float giStrength = 1.0f;
+    bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
     ComPtr<ID3D12Resource> giRaw, giBuf, giPrev;
     bool giValid = false;       // giBuf écrit à la dernière image (sinon pas d'historique, pas de pose)
     uint64_t giStamp = ~0ull;
@@ -290,8 +294,8 @@ void LiveSaveCalibration()
     if (FILE* f = std::fopen((g_dir + "\\urti_calib.ini").c_str(), "w"))
     {
         std::fprintf(f, "; étalonnage URTI de ce jeu (relu au lancement ; F6 le refait)\n");
-        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\n", live.A, live.B, live.sunSign > 0 ? 1 : -1, live.sunMapWidth,
-                     live.sunMapHeight, live.sunMapFormat, live.mvConvention);
+        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\nmotion_target=%u\n", live.A, live.B, live.sunSign > 0 ? 1 : -1,
+                     live.sunMapWidth, live.sunMapHeight, live.sunMapFormat, live.mvConvention, live.mvCandidate);
         std::fclose(f);
     }
 }
@@ -324,6 +328,7 @@ void LiveLoadCalibration()
         unsigned motionConvention = 255;
         if (std::sscanf(line, "motion=%u", &motionConvention) == 1 && motionConvention < 16)
             live.mvConvention = motionConvention;
+        std::sscanf(line, "motion_target=%u", &live.mvCandidate);
     }
     std::fclose(f);
     if (b == 0 || !sign || !w)
@@ -784,7 +789,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
@@ -810,6 +815,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
+                value("person_mask=", personMask);
                 if (l.rfind("ui_zone=", 0) == 0)
                     std::sscanf(l.c_str() + 8, "%f,%f,%f,%f", &zone[0], &zone[1], &zone[2], &zone[3]);
                 value("shadows=", sunShadows), value("ao_quarter=", aoQuarter), value("build_ms=", buildMs), value("surf_cache=", surfCache), value("ao_ms=", aoMs), value("gi=", gi);
@@ -853,6 +859,7 @@ void LiveHotReload(ID3D12Device* device)
             live.aoQuarter = aoQuarter != 0, live.buildTarget = std::max(0.0f, buildMs), live.surfCacheOn = surfCache != 0;
             live.aoTarget = std::max(0.0f, aoMs);
             live.giStrength = std::clamp(gi, 0.0f, 4.0f);
+            live.personMask = personMask != 0;
             if (live.aoTarget <= 0)
                 live.aoRays = 4;
         }
@@ -955,15 +962,19 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
             target = g_liveGbuffer[live.materialSlot];
         // couleur propre des surfaces (première cible du G-buffer) : rebond de lumière
         if (g_liveGbufferCount >= 3 && live.giStrength > 0 && live.aoAmount > 0)
-            albedoTarget = g_liveGbuffer[0], normalTarget = g_liveGbuffer[1];
-        // vecteurs de mouvement : la cible du G-buffer en deux flottants 16 bits
-        for (uint32_t k = 0; k < g_liveGbufferCount && !motionTarget; k++)
+            albedoTarget = g_liveGbuffer[0], normalTarget = live.personMask ? g_liveGbuffer[1] : 0;
+        // vecteurs de mouvement : une cible du G-buffer en deux flottants 16 bits (la n-ième s'il y en a plusieurs)
+        uint64_t candidates[8] = {};
+        uint32_t found = 0;
+        for (uint32_t k = 0; k < g_liveGbufferCount && k < 8; k++)
             if (g_liveGbuffer[k])
             {
                 const DXGI_FORMAT f = reinterpret_cast<ID3D12Resource*>(g_liveGbuffer[k])->GetDesc().Format;
                 if (f == DXGI_FORMAT_R16G16_FLOAT || f == DXGI_FORMAT_R16G16_TYPELESS)
-                    motionTarget = g_liveGbuffer[k];
+                    candidates[found++] = g_liveGbuffer[k];
             }
+        if (found)
+            motionTarget = candidates[live.mvCandidate % found];
     }
     for (uint32_t i = 0; i < count && motionTarget; i++)
     {
@@ -1440,6 +1451,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                             bestErr, secondErr);
                         if (live.verified || live.fromStore)
                             LiveSaveCalibration();
+                    }
+                    else if (++live.mvUndecided >= 3)
+                    {
+                        // trois mesures en mouvement sans vainqueur : ce ne sont pas des vecteurs de mouvement, la cible
+                        // suivante du même format est essayée
+                        live.mvUndecided = 0, live.mvCandidate++;
+                        Log("URTI direct : vecteurs de mouvement jamais départagés (meilleure %.4f, suivante %.4f) : essai de la cible n° %u de ce format",
+                            bestErr, secondErr, live.mvCandidate);
                     }
                     else
                         Log("URTI direct : vecteurs de mouvement pas encore départagés (meilleure %.4f, suivante %.4f), on continue", bestErr, secondErr);
@@ -2741,7 +2760,7 @@ void LiveComposite(effect_runtime* runtime)
     // rebond de lumière de cette image et couleur propre des surfaces (copiée pendant l'image du jeu)
     const bool giUse = live.giStrength > 0 && live.giValid && live.giStamp + 1 == live.frame && live.albedoBuf && live.albedoFrame != ~0ull &&
                        live.frame <= live.albedoFrame + 3 && live.albedoWidth == live.width && live.albedoHeight == live.height;
-    const bool normalUse = giUse && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 3 && live.normalWidth == live.width &&
+    const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 3 && live.normalWidth == live.width &&
                            live.normalHeight == live.height;
     if (giUse)
     {

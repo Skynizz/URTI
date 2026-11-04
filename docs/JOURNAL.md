@@ -1304,3 +1304,39 @@ l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celle
   absents par moments (état remis à zéro, à examiner) : attendre 20 s. Un shader de diagnostic rechargé à
   chaud reste actif après l'effacement de son `.cso` (jusqu'au prochain rechargement ou relancement) : une
   première rafale « parfaite » avait été prise avec un rebond gris de diagnostic.
+
+## v71 — URTI dans un deuxième jeu : Horizon Forbidden West (moteur Decima, DX12)
+
+Premier essai hors de RDR2, sans rien adapter d'abord : ReShade 6.8 (dxgi.dll) et l'add-on posés dans le
+dossier du jeu (aucun fichier du jeu remplacé), lancement par Steam (lanceur du jeu puis « Continuer » :
+`tools/reshade/urti_hfw_rapide.ps1`).
+
+- **Ce qui marche tout seul** : chargement avec Streamline (DLSS) ; capture de la géométrie (1 600 dessins
+  captés sur 5 800, 3 millions de sommets dans la scène RT) ; loi de profondeur et projection ; occultation RT
+  visible (dessous des planchers, pieds des poteaux) ; G-buffer trouvé (7 cibles, rendu natif 2560×1440).
+- **Coût trop élevé** : 69 i/s sans URTI, 43 avec (désert de la Côte embrasée), soit 9 ms. Les objets de
+  Decima sont lourds (jusqu'à 464 000 sommets, 13 millions à l'écran contre ~2,5 dans RDR2) : la
+  reconstruction de la structure prend 3 à 11 ms, le budget tombe au plancher (1,5 M sommets), 46 dessins
+  seulement dans la scène RT et beaucoup d'entrées et sorties par image (rafale : tremble 1,9 %, saute
+  0,15 %, contre 0,01 % / 0,001 % dans RDR2). Image native 1440p (pas de mise à l'échelle) : occultation et
+  composition plus de deux fois plus chères que dans RDR2 (1707×960).
+- **G-buffer de Decima** (relevé des passes) : cible 0 couleur propre (RGBA8 sRGB) ; cible 2 normale en
+  octaèdre (RG16 UNORM, deux canaux autour de 0,5) ; cible 5 vecteurs de mouvement (RG16F, seul le
+  personnage bouge à l'arrêt) ; cible 6 vide ; cibles 1, 3, 4 réutilisées par le jeu avant la copie de fin
+  d'image (à relever). Les réglages de RDR2 y lisaient de mauvais canaux : lissé des reflets pris dans la
+  normale, repère des personnages dans une cible R11G11B10 sans alpha.
+- **Corrections** : vecteurs de mouvement : avec plusieurs cibles RG16F, la première était prise (presque
+  vide dans Horizon : toutes les conventions à égalité) ; après trois mesures sans vainqueur, la suivante est
+  essayée (gardée dans `urti_calib.ini`, `motion_target=`). Repère des personnages réglable
+  (`person_mask=0` : aucun). Relevé des passes : deux instantanés au plus par image (une image réécrite à
+  chaque étape prenait toutes les places avant le G-buffer), 64 au total.
+- `urti.ini` d'Horizon : `person_mask=0`, `reflect=0` (reflets coupés tant que le canal de lissé n'est pas
+  trouvé).
+- **Génération d'images** (DLSS-FG, signalée par l'utilisateur) : pas active d'après le journal (une image
+  générée arrive sans dessin du jeu : on en verrait une sur deux). Mais une présentation sur six arrive sans
+  dessin compté et certaines captures d'étalonnage tombent sur 0 dessin : Decima enregistre sans doute ses
+  listes de commandes en avance, à cheval sur deux présentations (à examiner : URTI prend ces images pour
+  des images générées et y garde l'image RT précédente).
+- À faire : relever les cibles 1, 3, 4 (rugosité, métal) ; budget de géométrie adapté aux objets lourds
+  (structures par objet gardées d'une image à l'autre plutôt qu'une seule reconstruite) ; comptage des
+  dessins par présentation.

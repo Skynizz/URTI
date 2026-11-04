@@ -25,7 +25,7 @@ struct PassSurvey
     struct Snapshot { ComPtr<ID3D12Resource> copy; uint32_t order, format, width, height; };
     std::vector<Snapshot> snapshots;
 } g_pass;
-constexpr uint32_t kPassMaxSnapshots = 48;
+constexpr uint32_t kPassMaxSnapshots = 64;
 
 PassTarget& PassTargetFor(uint64_t res)
 {
@@ -115,6 +115,10 @@ void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, c
         const bool screenSized = t.width && g.screenW && t.width >= g.screenW / 4 && t.height >= g.screenH / 4 &&
                                  std::fabs(double(t.width) / t.height - double(g.screenW) / g.screenH) < 0.1;
         if (!written || !screenSized || g_pass.snapshots.size() >= kPassMaxSnapshots)
+            continue;
+        // deux instantanés au plus par image : une image réécrite à chaque étape (flou, accumulation) prenait toutes
+        // les places avant les cibles du G-buffer (Horizon Forbidden West)
+        if (std::count_if(g_pass.snapshots.begin(), g_pass.snapshots.end(), [&](const PassSurvey::Snapshot& n) { return n.order == t.order; }) >= 2)
             continue;
         ID3D12Resource* res = reinterpret_cast<ID3D12Resource*>(resources[i].handle);
         D3D12_RESOURCE_DESC d = res->GetDesc();
