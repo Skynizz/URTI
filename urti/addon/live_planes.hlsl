@@ -93,4 +93,16 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
         for (uint k = ti; k < total; k += T)
             view.Store3((first + k) * 12, asuint(float3(nan, nan, nan)));
     }
+    else
+    {
+        // surface gardée : sommets ramenés sur son plan moyen. L'eau d'un jeu est un maillage à grands triangles
+        // légèrement ondulé : avec la normale de chaque facette, le reflet se cassait en pavés de la taille des
+        // triangles ; à plat, il est continu (les vagues restent dans la couleur que le jeu donne à son eau)
+        for (uint k = ti; k < count; k += T)
+        {
+            const float3 p = Vertex(first + k);
+            if (all(isfinite(p)))
+                view.Store3((first + k) * 12, asuint(p - N * dot(N, p - C)));
+        }
+    }
 }

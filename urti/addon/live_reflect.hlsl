@@ -214,6 +214,7 @@ void main(uint2 id : SV_DispatchThreadID)
     gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
     gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
     float3 p = PointAt(int2(id));
+    float waterFade = 1.0; // eau : reflet effacé là où elle est trop mince (berges, fond qui affleure)
     // eau, vitre : surface transparente plane devant le point que montre la profondeur (couche 2 de la scène RT,
     // triée par live_planes ; le jeu ne l'écrit pas dans la profondeur, il y montre le fond) : le reflet part d'elle,
     // avec la normale de son triangle, lisse comme un miroir
@@ -238,6 +239,9 @@ void main(uint2 id : SV_DispatchThreadID)
             {
                 nw = normalize(nw);
                 water = true, nWater = dot(nw, ew.Direction) > 0 ? -nw : nw;
+                // épaisseur d'eau le long du regard (de la surface au fond que montre la profondeur) : la surface du jeu
+                // continue sous les berges, un reflet plein sur quelques millimètres d'eau y faisait des taches
+                waterFade = saturate((length(p) - qw.CommittedRayT() - 0.05) / 0.3);
                 p = ew.Direction * qw.CommittedRayT();
             }
         }
@@ -257,7 +261,7 @@ void main(uint2 id : SV_DispatchThreadID)
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
     // pas de rayon là où le reflet serait presque invisible (surface vue de face : Fresnel ~4 %) : moins de 3 %
     const float fresnelEarly = f0 + (1.0 - f0) * pow(1.0 - saturate(dot(-normalize(p), n)), 5.0);
-    if (p.z > 0 && s >= sMin && fresnelEarly * saturate((s - sMin) / max(1e-3, 1.0 - sMin)) >= 0.03)
+    if (p.z > 0 && s >= sMin && fresnelEarly * saturate((s - sMin) / max(1e-3, 1.0 - sMin)) * waterFade >= 0.03)
     {
         // surface-miroir dans la géométrie captée : le premier triangle sur le rayon de la caméra, s'il est à
         // la profondeur que l'image montre
@@ -285,7 +289,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const float cosTheta = saturate(dot(-v, n));
         // Fresnel (Schlick) ; le lissé au-dessus du seuil module le poids
         const float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
-        const float weight = fresnel * saturate((s - sMin) / max(1e-3, 1.0 - sMin));
+        const float weight = fresnel * saturate((s - sMin) / max(1e-3, 1.0 - sMin)) * waterFade;
         // par défaut : reflet attendu, couleur inconnue (remplacé ci-dessous si le point reflété est visible)
         if (weight > 0)
             result.z = -weight;
