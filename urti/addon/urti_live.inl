@@ -138,6 +138,7 @@ struct LiveState
     float viewMax[2] = {};                    // zone de dessin du jeu mesurée (dernière fenêtre)
     uint32_t viewLogCount = 0, viewCandidate = 0, viewStreak = 0;
     bool renderAreaOn = true; // urti.ini render_area=0 : toute la profondeur (essai)
+    bool aoRough = false;     // urti.ini ao_rough=1 : occultation aussi sur les surfaces rugueuses (herbe), pente d'ensemble
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     resource_view maskSrv = {};
     uint64_t frame = 0, lastFilled = 0;
@@ -858,7 +859,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 1, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
@@ -884,7 +885,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
-                value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea), value("water=", water);
+                value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea), value("water=", water), value("ao_rough=", aoRoughIni);
                 if (l.rfind("ui_zone=", 0) == 0)
                     std::sscanf(l.c_str() + 8, "%f,%f,%f,%f", &zone[0], &zone[1], &zone[2], &zone[3]);
                 value("shadows=", sunShadows), value("ao_quarter=", aoQuarter), value("build_ms=", buildMs), value("surf_cache=", surfCache), value("ao_ms=", aoMs), value("gi=", gi);
@@ -931,6 +932,7 @@ void LiveHotReload(ID3D12Device* device)
             live.personMask = personMask != 0;
             live.renderAreaOn = renderArea != 0;
             live.waterOn = water != 0;
+            live.aoRough = aoRoughIni != 0;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_liveTranspOn = live.waterOn;
@@ -2529,7 +2531,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                            (sunNow ? 0u : 16u) | (live.sunShadows ? 0u : 64u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) |
                            (nrdActive ? 4096u : 0u) |
                            (live.aoQuarter && !live.sunShadows && !nrdActive && live.shadowRawBuf && live.denoisePso ? 128u | (live.aoRays << 16) : 0u) |
-                           (giNow && !nrdActive ? 1u << 20 : 0u);
+                           (giNow && !nrdActive ? 1u << 20 : 0u) | (live.aoRough ? 1u << 21 : 0u);
     const struct
     {
         float sunSign, gameBias, unused, bias;

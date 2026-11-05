@@ -262,6 +262,19 @@ bool SeesThroughAround(int2 t, float3 p)
     return false;
 }
 
+// normale d'ensemble d'une surface rugueuse (herbe, fougères sur le sol) : pente du terrain prise à 8 pixels de part
+// et d'autre ; 0 si un voisin manque ou saute trop (bord d'objet)
+float3 MacroNormal(int2 t, float3 p)
+{
+    const float3 l = PointAt(t - int2(8, 0)), r = PointAt(t + int2(8, 0)), u = PointAt(t - int2(0, 8)), b = PointAt(t + int2(0, 8));
+    if (l.z <= 0 || r.z <= 0 || u.z <= 0 || b.z <= 0)
+        return 0;
+    if (max(max(abs(l.z - p.z), abs(r.z - p.z)), max(abs(u.z - p.z), abs(b.z - p.z))) > 0.3 * p.z + 0.5)
+        return 0;
+    const float3 n = normalize(cross(r - l, b - u));
+    return dot(n, p) > 0 ? -n : n;
+}
+
 float3 NormalAt(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
@@ -372,16 +385,21 @@ void main(uint2 id : SV_DispatchThreadID)
     const float3 p3 = float3(ndc3.x * w / p00, ndc3.y * w / p11, w);
     bool aoSkipped = false; // occultation au quart : ce pixel n'est pas calculé à cette image
     float3 bounceSum = 0;   // rebond de lumière : couleur des surfaces touchées, pondérée comme l'occultation
-    if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5 && !SeesThroughAround(int2(id), p3))
+    // surface rugueuse (bit 21) : herbe, fougères qui couvrent le sol ; l'occultation y part de la pente d'ensemble,
+    // au-dessus des brins (sinon le pied des troncs et des rochers posés dans l'herbe n'en recevait aucune)
+    const bool flatHere = Flatness(int2(id), p3) > 0.5;
+    const float3 macroN = (!flatHere && (flags & (1u << 21))) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
+    const bool rough = any(macroN != 0);
+    if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && (flatHere || rough) && !SeesThroughAround(int2(id), p3))
     {
         // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
         static const uint2 kQuarter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
         aoSkipped = (flags & 128) && any((id & 1u) != kQuarter[frameIndex & 3]);
     }
-    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && Flatness(int2(id), p3) > 0.5 &&
+    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && (flatHere || rough) &&
         !SeesThroughAround(int2(id), p3))
     {
-        const float3 n = NormalAt(int2(id), p3);
+        const float3 n = rough ? macroN : NormalAt(int2(id), p3);
         const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
         const float3 b2 = cross(n, b1);
         // deux rayons (strates en azimut) ; quatre là où l'image bouge de plus d'un pixel et demi : l'historique y
@@ -407,11 +425,11 @@ void main(uint2 id : SV_DispatchThreadID)
             const float u1 = float(h & 0xFFFF) / 65536.0, u2 = (float(h >> 16) / 65536.0 + float(k)) / float(aoRays);
             const float r = sqrt(u1), phi = 6.2831853 * u2;
             RayDesc ray;
-            ray.Origin = p3 + n * max(0.01, 0.002 * length(p3));
+            ray.Origin = p3 + n * (rough ? max(0.08, 0.004 * length(p3)) : max(0.01, 0.002 * length(p3)));
             ray.Direction = normalize(b1 * (r * cos(phi)) + b2 * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
             // obstacles à moins de 6 cm ignorés : les décalques du jeu (boue, marques, flaques), posés juste au-dessus
             // du sol sans écrire la profondeur, faisaient des taches sombres à leur forme exacte
-            ray.TMin = 0.06;
+            ray.TMin = rough ? 0.25 : 0.06; // surface rugueuse : pas les brins eux-mêmes
             ray.TMax = aoRadius;
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
@@ -421,7 +439,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     q.CommitNonOpaqueTriangleHit(); // le plus proche reste (les candidats plus loin sont écartés)
             // obstacle proche : occultation forte ; vers la portée, elle s'éteint en douceur
             const float t = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() / aoRadius : 1.0;
-            occlusion += (1.0 - t) * (1.0 - t) / float(aoRays);
+            occlusion += (1.0 - t) * (1.0 - t) / float(aoRays) * (rough ? 0.75 : 1.0);
             // la lumière du ciel retirée dans cette direction est remplacée par celle que renvoie l'obstacle (même
             // poids) ; obstacle jamais vu à l'écran : rien (le jeu garde son propre éclairage d'ambiance au loin)
             float3 hc;
