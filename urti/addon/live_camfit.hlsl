@@ -22,7 +22,7 @@ cbuffer Constants : register(b0)
 #define T 512
 groupshared float sAcc[T][10];
 groupshared float sR[9], sT[3];
-groupshared float sTau, sWeight;
+groupshared float sTau, sRel, sWeight; // tolérance : absolue (m) et relative à la distance
 
 void Reduce(uint ti, uint count)
 {
@@ -53,7 +53,7 @@ void main(uint ti : SV_GroupIndex)
             sR[k] = prevValid ? asfloat(motion.Load(k * 4)) : (k % 4 == 0 ? 1.0 : 0.0);
         for (uint k2 = 0; k2 < 3; k2++)
             sT[k2] = prevValid ? asfloat(motion.Load(36 + k2 * 4)) : 0.0;
-        sTau = prevValid ? 0.25 : 2.0;
+        sTau = prevValid ? 0.25 : 2.0, sRel = 0.01;
         // sauvegarde de l'estimation précédente (octets 64 à 111)
         for (uint k3 = 0; k3 < 12; k3++)
             motion.Store(64 + k3 * 4, motion.Load(k3 * 4));
@@ -61,7 +61,7 @@ void main(uint ti : SV_GroupIndex)
     GroupMemoryBarrierWithGroupSync();
     float rms = 0, kept = 0;
     bool ok = n >= 64;
-    for (uint iter = 0; iter < 5 && ok; iter++)
+    for (uint iter = 0; iter < 7 && ok; iter++)
     {
         // poids : paire proche de l'estimation en cours (tolérance absolue + 1 % de la distance)
         float acc[7] = { 0, 0, 0, 0, 0, 0, 0 };
@@ -69,7 +69,7 @@ void main(uint ti : SV_GroupIndex)
         {
             const float3 p = LoadP(i), q = LoadQ(i);
             const float e = length(Apply(p) - q);
-            if (e < sTau + 0.01 * length(q))
+            if (e < sTau + sRel * length(q))
                 acc[0] += 1, acc[1] += p.x, acc[2] += p.y, acc[3] += p.z, acc[4] += q.x, acc[5] += q.y, acc[6] += q.z;
         }
         for (uint k = 0; k < 7; k++)
@@ -84,7 +84,7 @@ void main(uint ti : SV_GroupIndex)
             {
                 for (uint k = 0; k < 9; k++)
                     sR[k] = k % 4 == 0 ? 1.0 : 0.0;
-                sT[0] = sT[1] = sT[2] = 0, sTau = 2.0;
+                sT[0] = sT[1] = sT[2] = 0, sTau = 2.0, sRel = 0.01;
             }
             GroupMemoryBarrierWithGroupSync();
             iter = ~0u; // la boucle reprend à 0
@@ -103,7 +103,7 @@ void main(uint ti : SV_GroupIndex)
         {
             const float3 p = LoadP(i2), q = LoadQ(i2);
             const float e = length(Apply(p) - q);
-            if (e < sTau + 0.01 * length(q))
+            if (e < sTau + sRel * length(q))
             {
                 const float3 a = p - pm, b = q - qm;
                 s[0] += a.x * b.x, s[1] += a.x * b.y, s[2] += a.x * b.z;
@@ -150,15 +150,19 @@ void main(uint ti : SV_GroupIndex)
         {
             const float3 p = LoadP(i3), q = LoadQ(i3);
             const float e = length(Apply(p) - q);
-            if (e < sTau + 0.01 * length(q))
+            if (e < sTau + sRel * length(q))
                 e2 += e * e, cnt += 1;
         }
         sAcc[ti][0] = e2, sAcc[ti][1] = cnt;
         Reduce(ti, 2);
         rms = sqrt(sAcc[0][0] / max(sAcc[0][1], 1.0));
         kept = sAcc[0][1];
+        // tolérance suivante : elle ne fait que se resserrer (2,5 écarts, 1,5 cm au moins). Dans une forêt au vent
+        // (Horizon), ce qui bouge est majoritaire : une tolérance qui suivait l'écart restait large et le mouvement
+        // mesuré était un compromis (3 à 6 cm par image, caméra immobile) ; resserrée, il ne reste que le noyau
+        // immobile (sol, rochers, troncs)
         if (ti == 0)
-            sTau = max(0.02, 3.0 * rms);
+            sTau = max(0.015, min(sTau, 2.5 * rms)), sRel = 0.004;
         GroupMemoryBarrierWithGroupSync();
     }
     if (ti == 0)
