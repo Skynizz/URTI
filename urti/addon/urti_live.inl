@@ -28,6 +28,7 @@
 #include "live_surfcache_cs.h" // g_live_surfcache
 #include "live_camfit_cs.h" // g_live_camfit
 #include "live_mvsynth_cs.h" // g_live_mvsynth
+#include "live_planes_cs.h" // g_live_planes
 
 struct LiveState
 {
@@ -105,6 +106,12 @@ struct LiveState
     ComPtr<ID3D12PipelineState> camfitPso, mvsynthPso;
     ComPtr<ID3D12Resource> pairsBuf, motionBuf, motionReadback[3];
     bool mvSynthetic = false;
+    // couche des surfaces transparentes planes (eau, vitres : reflets) ; état de son tampon de sommets
+    ComPtr<ID3D12RootSignature> planesRs;
+    ComPtr<ID3D12PipelineState> planesPso;
+    ComPtr<ID3D12Resource> viewT, blasT, blasTScratch, transpUpload[3], transpSrcUpload[3], planeStats, planeReadback[3];
+    bool viewTRead = false, transpBuilt = false, waterOn = true;
+    uint64_t planeFrames = 0, planeKept = 0, planeTris = 0, planeSeen = 0;
     uint32_t mvGiveUps = 0, motionSource = 0, motMovingNoGame = 0; // images où la caméra bougeait sans convention du jeu trouvée
     double motRot = 0, motTrans = 0, motKept = 0, motRms = 0;
     uint32_t motFrames = 0, motValid = 0;
@@ -649,6 +656,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
     return make(g_live_convert, sizeof(g_live_convert), 4, live.convertRs, live.convertPso, 8, 2) &&
            make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
            make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
+           make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
            make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 29, 3) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
@@ -660,7 +668,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
            make(g_live_uiselect, sizeof(g_live_uiselect), 5, live.uiSelRs, live.uiSelPso, 8, 2) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20) &&
-           make(g_live_reflect, sizeof(g_live_reflect), 9, live.reflectRs, live.reflectPso, 20, 2) &&
+           make(g_live_reflect, sizeof(g_live_reflect), 10, live.reflectRs, live.reflectPso, 20, 2) &&
            make(g_live_surfcache, sizeof(g_live_surfcache), 5, live.surfRs, live.surfPso, 18) &&
            make(g_live_regionstats, sizeof(g_live_regionstats), 3, live.statsRs, live.statsPso, 4) &&
            make(g_live_depthfit, sizeof(g_live_depthfit), 3, live.depthfitRs, live.depthfitPso, 4);
@@ -724,11 +732,11 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
         D3D12_RAYTRACING_INSTANCE_DESC inst = {};
         inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
         inst.InstanceMask = 0xFF;
-        live.instances = MakeBuffer(device, sizeof(inst), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        live.instances = MakeBuffer(device, 2 * sizeof(inst), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tin = {};
         tin.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
         tin.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        tin.NumDescs = 1;
+        tin.NumDescs = 2; // scène opaque (masque 1) et surfaces transparentes planes (masque 2)
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO ti = {};
         device->GetRaytracingAccelerationStructurePrebuildInfo(&tin, &ti);
         live.tlas = UavBuffer(device, ti.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
@@ -850,7 +858,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
@@ -876,7 +884,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
-                value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea);
+                value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea), value("water=", water);
                 if (l.rfind("ui_zone=", 0) == 0)
                     std::sscanf(l.c_str() + 8, "%f,%f,%f,%f", &zone[0], &zone[1], &zone[2], &zone[3]);
                 value("shadows=", sunShadows), value("ao_quarter=", aoQuarter), value("build_ms=", buildMs), value("surf_cache=", surfCache), value("ao_ms=", aoMs), value("gi=", gi);
@@ -922,6 +930,11 @@ void LiveHotReload(ID3D12Device* device)
             live.giStrength = std::clamp(gi, 0.0f, 4.0f);
             live.personMask = personMask != 0;
             live.renderAreaOn = renderArea != 0;
+            live.waterOn = water != 0;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_liveTranspOn = live.waterOn;
+            }
             live.motionSource = uint32_t(std::clamp(motionSource, 0.0f, 2.0f));
             if (live.motionSource == 2 && !live.mvSynthetic)
                 live.mvSynthetic = true, live.mvConvention = 0;
@@ -1166,6 +1179,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // début dans le flux (octets) de la zone écrite par chaque dessin de cette image, dans l'ordre de regionsNow ;
     // de chaque place, dans l'ordre de placesNow (place gardée sans être dessinée : pas lue)
     std::vector<uint32_t> srcNow, placeSrc;
+    std::vector<LiveRegion> transpNow; // surfaces transparentes exécutées (couche 2) et leur début dans le flux
+    std::vector<uint32_t> transpSrcNow;
+    uint32_t transpCursorNow = 0;
     uint32_t cursorNow = 0, zeroArea = ~0u;
     bool persistNow = false;
     if (live.lastPresentDraws == 0 && live.bound)
@@ -1220,6 +1236,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         if (slot >= 0)
             regionsNow.swap(g_liveRegions[slot]), srcNow.swap(g_liveRegionSrc[slot]), cursorNow = g_liveCursor[slot];
+        transpNow.swap(g_liveTranspRegions), transpSrcNow.swap(g_liveTranspSrc), transpCursorNow = g_liveTranspCursor;
+        g_liveTranspRegions.clear(), g_liveTranspSrc.clear(), g_liveTranspCursor = 0, g_liveTranspVerts = 0;
         // places fixes : un objet absent depuis plus de kLiveKeepFrames images rend sa place ; les autres restent
         // dans la scène RT avec leur dernière géométrie ; partie occupée trop morcelée : tout est redistribué
         if (g_livePersist && slot >= 0 && g.slotDepth[slot] == g_liveMainDepth)
@@ -1513,6 +1531,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // bilan du suivi du soleil, lu trois images plus tard
     if (const float* r = nullptr; live.sunReadback[live.frame % 3] && SUCCEEDED(live.sunReadback[live.frame % 3]->Map(0, nullptr, (void**)&r)) && r)
     {
+        if (live.frame % 600 == 0)
+            Log("URTI direct : loi de profondeur de l'image : %g + %g / w (valide %.0f) ; stockée : %g + %g / w", r[9], r[10], r[11], live.A, live.B);
         if (live.calibrated)
         {
             live.sunFrames++, live.pairSum += uint64_t(r[4]);
@@ -1993,6 +2013,118 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->CopyBufferRegion(live.motionReadback[live.frame % 3].Get(), 0, live.motionBuf.Get(), 0, 128);
         Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    // 1e. surfaces transparentes (eau, vitres) : leur couche convertie, puis seules les surfaces planes gardées
+    live.transpBuilt = false;
+    if (live.waterOn && !transpNow.empty() && live.planesPso)
+    {
+        if (!live.viewT)
+        {
+            live.viewT = UavBuffer(g.device, uint64_t(kLiveTranspVertices) * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.planeStats = UavBuffer(g.device, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            for (auto& r : live.planeReadback)
+                r = MakeBuffer(g.device, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RAYTRACING_GEOMETRY_DESC tg = {};
+            tg.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            tg.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+            tg.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            tg.Triangles.VertexBuffer.StrideInBytes = 12;
+            tg.Triangles.VertexCount = kLiveTranspVertices;
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS ti = {};
+            ti.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            ti.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+            ti.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            ti.NumDescs = 1;
+            ti.pGeometryDescs = &tg;
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pi = {};
+            device->GetRaytracingAccelerationStructurePrebuildInfo(&ti, &pi);
+            live.blasT = UavBuffer(g.device, pi.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+            live.blasTScratch = UavBuffer(g.device, pi.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.viewTRead = false;
+            Log("URTI direct : couche des surfaces transparentes pour %u sommets (%.1f Mo)", kLiveTranspVertices, pi.ResultDataMaxSizeInBytes / 1048576.0);
+        }
+        auto uploadT = [&](ComPtr<ID3D12Resource>& up, const void* data, uint64_t bytes) -> ID3D12Resource* {
+            if (!up || up->GetDesc().Width < bytes)
+                Retire(up), up = MakeBuffer(g.device, std::max<uint64_t>(bytes * 2, 65536), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* p = nullptr;
+            if (!up || FAILED(up->Map(0, nullptr, &p)))
+                return nullptr;
+            std::memcpy(p, data, bytes);
+            up->Unmap(0, nullptr);
+            return up.Get();
+        };
+        ID3D12Resource* tTable = uploadT(live.transpUpload[live.frame % 3], transpNow.data(), transpNow.size() * sizeof(LiveRegion));
+        ID3D12Resource* tSrc = uploadT(live.transpSrcUpload[live.frame % 3], transpSrcNow.data(), transpSrcNow.size() * 4);
+        const uint32_t tCount = std::max(3u, std::min(transpCursorNow / 16, kLiveTranspVertices) / 3 * 3);
+        if (live.viewT && live.blasT && live.blasTScratch && tTable && tSrc && live.planeStats && live.planeReadback[live.frame % 3])
+        {
+            if (live.viewTRead)
+                Transition(list.Get(), live.viewT.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), live.viewTRead = false;
+            list->SetComputeRootSignature(live.convertRs.Get());
+            list->SetPipelineState(live.convertPso.Get());
+            list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress()); // débuts dans tout le flux
+            list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, tTable->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(3, tSrc->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(4, live.viewT->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(5, live.pairsBuf ? live.pairsBuf->GetGPUVirtualAddress() : live.viewT->GetGPUVirtualAddress());
+            const struct { float p00, p11; uint32_t count, regionCount, maxPairs, pad0, pad1, pad2; } tc = {
+                live.p00, live.p11, tCount, uint32_t(transpNow.size()), 0, 0, 0, 0 };
+            list->SetComputeRoot32BitConstants(6, 8, &tc, 0);
+            list->Dispatch(UINT((tCount + 255) / 256), 1, 1);
+            D3D12_RESOURCE_BARRIER vb = {};
+            vb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            vb.UAV.pResource = live.viewT.Get();
+            list->ResourceBarrier(1, &vb);
+            // tri : surfaces planes gardées, le reste invisible aux rayons ; bilan lu trois images plus tard
+            Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(live.planeStats.Get(), 0, g.zeros.Get(), 0, 16);
+            Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->SetComputeRootSignature(live.planesRs.Get());
+            list->SetPipelineState(live.planesPso.Get());
+            list->SetComputeRootShaderResourceView(0, tTable->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(2, live.viewT->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(3, live.planeStats->GetGPUVirtualAddress());
+            const uint32_t pc[4] = { uint32_t(transpNow.size()), 0, 0, 0 };
+            list->SetComputeRoot32BitConstants(4, 4, pc, 0);
+            list->Dispatch(UINT(transpNow.size()), 1, 1);
+            Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(live.planeReadback[live.frame % 3].Get(), 0, live.planeStats.Get(), 0, 16);
+            Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Transition(list.Get(), live.viewT.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv), live.viewTRead = true;
+            // sa structure, reconstruite à chaque image (quelques surfaces)
+            D3D12_RAYTRACING_GEOMETRY_DESC tg = {};
+            tg.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            tg.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+            tg.Triangles.VertexBuffer = { live.viewT->GetGPUVirtualAddress(), 12 };
+            tg.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            tg.Triangles.VertexCount = tCount;
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tb = {};
+            tb.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            tb.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+            tb.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            tb.Inputs.NumDescs = 1;
+            tb.Inputs.pGeometryDescs = &tg;
+            tb.DestAccelerationStructureData = live.blasT->GetGPUVirtualAddress();
+            tb.ScratchAccelerationStructureData = live.blasTScratch->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&tb, 0, nullptr);
+            vb.UAV.pResource = live.blasT.Get();
+            list->ResourceBarrier(1, &vb);
+            live.transpBuilt = true;
+        }
+    }
+    // bilan des surfaces transparentes, lu trois images plus tard
+    if (const uint32_t* c = nullptr; live.planeReadback[live.frame % 3] && SUCCEEDED(live.planeReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
+    {
+        live.planeFrames++, live.planeKept += c[0], live.planeTris += c[1], live.planeSeen += c[2];
+        live.planeReadback[live.frame % 3]->Unmap(0, nullptr);
+        if (live.planeFrames >= 300)
+        {
+            Log("URTI direct : surfaces transparentes : %.1f dessins par image, dont %.1f planes gardées (eau, vitres : %.0f triangles)",
+                double(live.planeSeen) / live.planeFrames, double(live.planeKept) / live.planeFrames, double(live.planeTris) / live.planeFrames);
+            live.planeFrames = live.planeKept = live.planeTris = live.planeSeen = 0;
+        }
+    }
     // 1a. mesure de chaque objet capté, de la scène RT et de la zone de mesure (budget de géométrie)
     if (live.statsPso && !(regionsNow.empty() && probesNow.empty()))
     {
@@ -2199,21 +2331,27 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     uav.UAV.pResource = live.blas.Get();
     list->ResourceBarrier(1, &uav);
     {
-        D3D12_RAYTRACING_INSTANCE_DESC inst = {};
-        inst.Transform[0][0] = inst.Transform[1][1] = inst.Transform[2][2] = 1.0f;
-        inst.InstanceMask = 0xFF;
-        inst.AccelerationStructure = live.blas->GetGPUVirtualAddress();
+        // exemplaire 0 : la scène opaque (masque 1 : occultation, reflets, cache) ; exemplaire 1 : les surfaces
+        // transparentes planes (masque 2 : seul le rayon de la caméra des reflets les cherche ; masque 0 sans elles)
+        D3D12_RAYTRACING_INSTANCE_DESC inst[2] = {};
+        for (auto& i : inst)
+            i.Transform[0][0] = i.Transform[1][1] = i.Transform[2][2] = 1.0f;
+        inst[0].InstanceMask = 0x01;
+        inst[0].AccelerationStructure = live.blas->GetGPUVirtualAddress();
+        inst[1].InstanceID = 1;
+        inst[1].InstanceMask = live.transpBuilt ? 0x02 : 0x00;
+        inst[1].AccelerationStructure = live.transpBuilt ? live.blasT->GetGPUVirtualAddress() : live.blas->GetGPUVirtualAddress();
         void* p = nullptr;
         if (SUCCEEDED(live.instances->Map(0, nullptr, &p)))
         {
-            std::memcpy(p, &inst, sizeof(inst));
+            std::memcpy(p, inst, sizeof(inst));
             live.instances->Unmap(0, nullptr);
         }
     }
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC td = {};
     td.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     td.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    td.Inputs.NumDescs = 1;
+    td.Inputs.NumDescs = 2;
     td.Inputs.InstanceDescs = live.instances->GetGPUVirtualAddress();
     td.DestAccelerationStructureData = live.tlas->GetGPUVirtualAddress();
     td.ScratchAccelerationStructureData = live.tlasScratch->GetGPUVirtualAddress();
@@ -2588,8 +2726,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRootShaderResourceView(6, live.view->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(7, live.viewPrev ? live.viewPrev->GetGPUVirtualAddress() : live.view->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(8, surfRead ? live.surfCache->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(9, live.reflectBuf->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(10, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(9, live.transpBuilt ? live.viewT->GetGPUVirtualAddress() : live.view->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(10, live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(11, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
             const struct
             {
                 uint32_t width, height, depthPitch, materialPitch;
@@ -2601,10 +2740,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 uint32_t reflectPitch, regionCount, anchors, prevVertexCount, cacheTriangles;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
-                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u), live.f0, live.width * 16,
+                     (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u) |
+                         (live.transpBuilt ? 256u : 0u), live.f0, live.width * 16,
                      uint32_t(tableNow.size()), live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity),
                      surfRead ? uint32_t(live.surfTriangles) : 0u };
-            list->SetComputeRoot32BitConstants(11, 20, &rc, 0);
+            list->SetComputeRoot32BitConstants(12, 20, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             if (surfRead)
                 Transition(list.Get(), live.surfCache.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

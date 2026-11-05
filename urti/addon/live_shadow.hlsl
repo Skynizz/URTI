@@ -312,7 +312,7 @@ void main(uint2 id : SV_DispatchThreadID)
             ray.TMax = 1e5;
             // premier triangle qui n'est pas un trou vu à travers par la caméra ou par le soleil : ombre
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-            q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+            q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
             bool blocked = false;
             while (q.Proceed())
                 if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
@@ -414,7 +414,7 @@ void main(uint2 id : SV_DispatchThreadID)
             ray.TMin = 0.06;
             ray.TMax = aoRadius;
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-            q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+            q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
             while (q.Proceed())
                 if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
                     ((flags & 2048) == 0 || !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p3)))

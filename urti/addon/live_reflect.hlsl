@@ -19,6 +19,7 @@ ByteAddressBuffer links : register(t5);    // par dessin : identité, début (so
 ByteAddressBuffer viewCur : register(t6);  // sommets de cette image (float3, espace caméra)
 ByteAddressBuffer viewPrev : register(t7); // sommets de l'image précédente (son espace caméra)
 ByteAddressBuffer surfCache : register(t8); // par triangle : couleur vue à l'écran (RGB9E5), identité et mesures (live_surfcache)
+ByteAddressBuffer viewT : register(t9);     // couche des surfaces transparentes planes (eau, vitres) : float3 par sommet
 RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé ; poids < 0 : surface
                                                // réfléchissante dont le point reflété est caché ou hors de
                                                // l'écran (couleur inconnue : la stabilisation garde l'historique) ;
@@ -44,7 +45,7 @@ cbuffer Constants : register(b0)
     uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle),
                        // 8 diagnostic : distance de touche normalisée ; 16 diagnostic : lissé ;
                        // 32 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le rayon ;
-                       // 64 : cache de surfaces lisible
+                       // 64 : cache de surfaces lisible ; 256 : couche des surfaces transparentes planes (eau, vitres)
                        // (sinon la 4e composante est la distance de touche, 1e4 pour le ciel)
     float f0;          // réflectance à incidence normale (diélectrique ~0,04)
     uint reflectPitch;
@@ -212,17 +213,45 @@ void main(uint2 id : SV_DispatchThreadID)
     const float3 law = asfloat(sunBuf.Load3(36));
     gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
     gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
-    const float3 p = PointAt(int2(id));
+    float3 p = PointAt(int2(id));
+    // eau, vitre : surface transparente plane devant le point que montre la profondeur (couche 2 de la scène RT,
+    // triée par live_planes ; le jeu ne l'écrit pas dans la profondeur, il y montre le fond) : le reflet part d'elle,
+    // avec la normale de son triangle, lisse comme un miroir
+    bool water = false;
+    float3 nWater = 0;
+    if ((flags & 256) && p.z > 0)
+    {
+        RayDesc ew;
+        ew.Origin = 0;
+        ew.Direction = normalize(p);
+        ew.TMin = 0.05;
+        ew.TMax = max(0.06, length(p) - 0.03);
+        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qw;
+        qw.TraceRayInline(scene, RAY_FLAG_NONE, 0x02, ew);
+        qw.Proceed();
+        if (qw.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            const uint t3 = qw.CommittedPrimitiveIndex() * 36;
+            const float3 a = asfloat(viewT.Load3(t3)), b = asfloat(viewT.Load3(t3 + 12)), c = asfloat(viewT.Load3(t3 + 24));
+            float3 nw = cross(b - a, c - a);
+            if (all(isfinite(nw)) && dot(nw, nw) > 1e-12)
+            {
+                nw = normalize(nw);
+                water = true, nWater = dot(nw, ew.Direction) > 0 ? -nw : nw;
+                p = ew.Direction * qw.CommittedRayT();
+            }
+        }
+    }
     // sol mouillé (smoothMin < 0 : -smoothMin = quantité d'eau) : les surfaces tournées vers le haut
     // deviennent lisses comme une rue après la pluie
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
-    const float3 n = p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
+    const float3 n = water ? nWater : p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
     // reflets RT seulement sur une surface plane (sol, flaque, vitre, eau) : sur un feuillage, des cheveux, un
     // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
     // gris) ; le jeu y garde ses propres reflets. Sol mouillé : en plus, tourné vers le haut
-    const float flat = p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
-    const float s = max(Smoothness(int2(id)) * ((flags & 4) ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
+    const float flat = water ? 1.0 : p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
+    const float s = water ? 1.0 : max(Smoothness(int2(id)) * ((flags & 4) ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
@@ -242,7 +271,7 @@ void main(uint2 id : SV_DispatchThreadID)
             eye.TMin = 0.0;
             eye.TMax = length(p) * 1.05 + 0.1;
             RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qe;
-            qe.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, eye);
+            qe.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, eye);
             qe.Proceed();
             if (qe.CommittedStatus() == COMMITTED_TRIANGLE_HIT && abs(qe.CommittedRayT() - length(p)) < 0.02 * length(p) + 0.05)
             {
@@ -267,7 +296,7 @@ void main(uint2 id : SV_DispatchThreadID)
         ray.TMax = 500.0; // au-delà, la brume du jeu efface tout reflet
         // chaque triangle rencontré est examiné : gardé sauf si c'est un trou que la caméra voit à travers
         RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+        q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
         while (q.Proceed())
             if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && ((flags & 32) == 0 || !SeenThrough(ray.Origin + r * q.CandidateTriangleRayT())))
                 q.CommitNonOpaqueTriangleHit();

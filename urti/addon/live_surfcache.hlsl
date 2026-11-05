@@ -150,7 +150,7 @@ void main(uint2 id : SV_DispatchThreadID)
     eye.TMin = 0.0;
     eye.TMax = length(p) * 1.05 + 0.1;
     RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, eye);
+    q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, eye);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT || abs(q.CommittedRayT() - length(p)) > 0.02 * length(p) + 0.05)
         return; // la caméra voit autre chose que la scène RT ici (objet hors budget, trou d'une plaque découpée)

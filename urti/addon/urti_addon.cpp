@@ -85,6 +85,11 @@ std::atomic<uint32_t> g_presentExecDraws{ 0 }; // dessins exécutés depuis la d
 std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_diagPresentQueues;
 std::unordered_map<uint64_t, uint32_t> g_diagExecQueues;
 uint64_t g_diagPattern = 0, g_diagBbPattern = 0;
+// dessins de l'écran principal ignorés par la capture : surfaces transparentes (profondeur testée, pas écrite),
+// tessellation
+uint64_t g_diagTranspDraws = 0, g_diagTranspVerts = 0, g_diagTranspMax = 0, g_diagTessDraws = 0, g_diagTessVerts = 0;
+uint64_t g_diagBlendDraws = 0, g_diagBlendVerts = 0;
+std::map<uint64_t, uint32_t> g_diagBlendSizes; // sommets d'un dessin mélangé -> nombre de dessins
 // images d'écran où le jeu a dessiné dans des listes exécutées depuis la dernière présentation
 std::unordered_set<uint64_t> g_execBackBuffers;
 // G-buffer du jeu : cibles de rendu liées avec la profondeur de l'écran (au moins trois). Parmi ces jeux de
@@ -135,6 +140,7 @@ struct LivePending
     // des exemplaires choisis sur le GPU changent d'ordre et de nombre : leurs paires de sommets ne disent rien du
     // mouvement de la caméra)
     bool stableOrder = false;
+    bool transp = false; // surface transparente (couche 2)
     float viewport[4] = {};
 };
 constexpr uint32_t kLiveAreas = 3;
@@ -150,6 +156,14 @@ uint32_t MeshId(uint64_t idKey)
     return uint32_t(h ^ (h >> 32)) | 1u;
 }
 std::unordered_map<uint32_t, uint32_t> g_liveIdMesh; // identité -> maillage (cette image)
+// surfaces transparentes de l'écran principal (eau, vitres ; aussi fumée, particules, écartées ensuite par
+// live_planes) : captées à part, rangées à la suite dans leur propre couche de la scène RT, sans budget par maillage
+constexpr uint32_t kLiveTranspVertices = 1500000;   // sommets de la couche (plafond par image)
+std::vector<LiveRegion> g_liveTranspRegions;        // ordre d'exécution : début dans la couche, taille, compteur
+std::vector<uint32_t> g_liveTranspSrc;              // même ordre : début de la zone écrite dans le flux
+uint32_t g_liveTranspCursor = 0;                    // octets de la couche (16 par sommet)
+uint64_t g_liveTranspVerts = 0;                     // sommets réservés dans cette fenêtre d'écriture
+bool g_liveTranspOn = true;                         // urti.ini water=0 : pas de couche transparente
 // zone où le jeu dessine vraiment son image dans la profondeur de l'écran : la plus fréquente parmi les zones de
 // dessin de ses dessins (bord droit, bord bas), cette fenêtre. Avec le DLSS et la résolution dynamique, Horizon
 // Forbidden West dessine en 1280×720 à 1707×960 dans des cibles de 2560×1440 ; quelques dessins (repères en 3D)
@@ -402,6 +416,10 @@ struct PipelineInfo
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     bool usable = false; // vertex shader seul (pas de géométrie / tessellation / mesh)
     bool writesDepth = true; // passes d'éclairage différé, décals, transparents : profondeur en lecture seule
+    bool depthTested = false;   // profondeur testée (une surface transparente : eau, vitre, mais aussi fumée, décals)
+    bool tessellated = false;   // tessellation (vagues de l'eau dans certains moteurs)
+    bool blends = false;        // mélange à l'image sur la première cible (surface transparente : eau, vitre, fumée)
+    bool transparentUsable = false; // surface transparente captée à part (couche 2 de la scène RT : reflets de l'eau)
     ComPtr<ID3D12PipelineState> shadow;
     bool shadowFailed = false;
 };
@@ -431,9 +449,12 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
             }
             break;
         }
-        case pipeline_subobject_type::geometry_shader:
         case pipeline_subobject_type::hull_shader:
         case pipeline_subobject_type::domain_shader:
+            if (s.data && static_cast<const shader_desc*>(s.data)->code_size)
+                other = true, info.tessellated = true;
+            break;
+        case pipeline_subobject_type::geometry_shader:
         case pipeline_subobject_type::mesh_shader:
         case pipeline_subobject_type::amplification_shader:
         case pipeline_subobject_type::compute_shader:
@@ -461,7 +482,14 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
         {
             const depth_stencil_desc* d = static_cast<const depth_stencil_desc*>(s.data);
             if (d)
-                info.writesDepth = d->depth_enable && d->depth_write_mask;
+                info.writesDepth = d->depth_enable && d->depth_write_mask, info.depthTested = d->depth_enable;
+            break;
+        }
+        case pipeline_subobject_type::blend_state:
+        {
+            const blend_desc* d = static_cast<const blend_desc*>(s.data);
+            if (d)
+                info.blends = d->blend_enable[0];
             break;
         }
         case pipeline_subobject_type::primitive_topology:
@@ -487,6 +515,9 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
     info.usable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && info.writesDepth;
     if (info.usable)
         g_pipelinesUsable++;
+    // (mélangé ou non : l'eau d'Horizon Forbidden West calcule sa réfraction elle-même et écrit sa couleur d'un bloc ;
+    // les dessins qui écrivent dans le G-buffer sont écartés à la capture)
+    info.transparentUsable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && info.depthTested && !info.writesDepth;
     std::lock_guard<std::mutex> lock(g_mutex);
     PipelineInfo& stored = g_pipelines[pipe.handle] = std::move(info);
     for (size_t k = 0; k < stored.layout.size(); k++)
@@ -863,6 +894,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
     CommandListState state;
     ID3D12PipelineState* shadow = nullptr;
     int slot = -1;
+    bool transp = false; // surface transparente (eau, vitre…) : couche à part de la scène RT
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         state = g.lists[(uint64_t)list];
@@ -871,8 +903,22 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 set->second.draws++;
         slot = SlotFor(state.depth);
         auto it = g_pipelines.find(state.pipeline);
-        if (slot >= 0 && it != g_pipelines.end() && it->second.usable)
-            shadow = GetShadow(g.device, it->second);
+        // surface transparente (couche 2 de la scène RT) : sur la profondeur principale, profondeur testée sans être
+        // écrite, hors du G-buffer choisi (le passage principal d'un moteur avec passe de profondeur préalable redessine
+        // toute la scène ainsi dans le G-buffer) ; ou tout dessin sur une autre vue de la caméra (même forme que l'écran,
+        // résolution réduite) : Horizon Forbidden West dessine son eau à mi-résolution, dans ses propres images et sa
+        // propre profondeur
+        const bool liveTransp = g.phase != Phase::Capturing && g_liveTranspOn && g_liveMainDepth;
+        const bool otherView = liveTransp && state.depth != g_liveMainDepth && g.screenLike[state.depth] == 1;
+        if (slot >= 0 && it != g_pipelines.end())
+        {
+            if (otherView && (it->second.usable || it->second.transparentUsable))
+                shadow = GetShadow(g.device, it->second), transp = true;
+            else if (it->second.usable)
+                shadow = GetShadow(g.device, it->second);
+            else if (liveTransp && it->second.transparentUsable && state.depth == g_liveMainDepth && (!g_liveGbuffer[0] || state.gbufferSet != g_liveGbuffer[0]))
+                shadow = GetShadow(g.device, it->second), transp = true;
+        }
     }
     if (slot < 0)
     {
@@ -882,6 +928,26 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
     if (!shadow)
     {
         g.skippedDraws++;
+        if (g.phase != Phase::Capturing)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (state.depth == g_liveMainDepth)
+                if (const auto pt = g_pipelines.find(state.pipeline); pt != g_pipelines.end())
+                {
+                    const uint64_t v = kind == 2 ? 0 : uint64_t(params[0]) * std::max(1u, params[1]);
+                    if (pt->second.tessellated)
+                        g_diagTessDraws++, g_diagTessVerts += v;
+                    else if (pt->second.depthTested && !pt->second.writesDepth && pt->second.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+                    {
+                        g_diagTranspDraws++, g_diagTranspVerts += v, g_diagTranspMax = std::max(g_diagTranspMax, v);
+                        if (pt->second.blends)
+                        {
+                            g_diagBlendDraws++, g_diagBlendVerts += v;
+                            g_diagBlendSizes[v]++;
+                        }
+                    }
+                }
+        }
         return;
     }
     if (g.phase != Phase::Capturing)
@@ -907,7 +973,13 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             uint64_t idKey = kind * 1000003ull;
             uint32_t mesh = 0;
             bool probe = false;
-            if (screen)
+            // surface transparente : seulement sur l'écran principal, sans identité ni budget par maillage, dans la
+            // limite de la couche
+            if (transp && (!screen || kind == 2 || g_liveTranspVerts + vertices > kLiveTranspVertices))
+                return;
+            if (transp)
+                g_liveTranspVerts += vertices;
+            if (screen && !transp)
             {
                 // identité stable d'une image à l'autre : le maillage (nombre d'indices ou de sommets, début dans
                 // ses tampons), pas le nombre d'instances ni la première instance (une végétation dessinée par
@@ -935,7 +1007,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 // profondeur, moins chargée, finirait par passer devant)
                 g.slotDraws[slot]++;
             }
-            if (mainScreen)
+            if (mainScreen && !transp)
             {
                 g_liveSeen[mesh] += uint32_t(vertices);
                 if (g_liveBudget && !g_liveAdmit.count(mesh))
@@ -957,7 +1029,9 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 }
             }
             bool marked = false;
-            if (sunMap)
+            if (transp)
+                marked = false;
+            else if (sunMap)
             {
                 if (g_liveSunMarked >= kLiveMaxSunMarks)
                     return;
@@ -989,8 +1063,9 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             pend.slot = uint32_t(slot), pend.capacity = capacity, pend.vertices = uint32_t(vertices), pend.sig = params[3];
             pend.screen = screen, pend.mainScreen = mainScreen, pend.probe = probe, pend.sunMap = sunMap, pend.marked = marked, pend.indirect = kind == 2;
             pend.stableOrder = kind != 2 && params[1] <= 1;
+            pend.transp = transp;
             std::memcpy(pend.viewport, state.viewport, sizeof(pend.viewport));
-            if (mainScreen && !probe)
+            if (mainScreen && !probe && !transp)
                 g_liveReserved += vertices;
             g_livePending[(uint64_t)list].push_back(pend);
         }
@@ -1119,6 +1194,17 @@ void LiveCommit(const std::vector<LivePending>& pending)
         if (g_liveWindow - p.window >= kLiveAreas)
         {
             g_liveStaleDraws++;
+            continue;
+        }
+        if (p.transp)
+        {
+            const uint32_t room = (p.capacity + 47) / 48 * 48;
+            if (uint64_t(g_liveTranspCursor) + room <= uint64_t(kLiveTranspVertices) * 16)
+            {
+                g_liveTranspRegions.push_back({ g_liveTranspCursor, room, p.counter, 0 });
+                g_liveTranspSrc.push_back(uint32_t(p.slot * kSlotBytes) + p.src);
+                g_liveTranspCursor += room;
+            }
             continue;
         }
         uint32_t id = 0;
@@ -1814,6 +1900,24 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
                 bits[k] = (g_diagPattern >> (63 - k)) & 1 ? '1' : '0', bbBits[k] = (g_diagBbPattern >> (63 - k)) & 1 ? '1' : '0';
             Log("URTI direct : présentations par file :%s ; dessins exécutés par file :%s ; suite (dessins exécutés) %s ; suite (image dessinée par "
                 "le jeu) %s ; dessins ignorés (exécutés trop tard) %u", text, exec, bits, bbBits, g_liveStaleDraws);
+            Log("URTI direct : écran principal, ignorés sur 300 présentations : %llu dessins transparents (%llu sommets, le plus gros %llu), "
+                "%llu dessins tessellés (%llu sommets)", (unsigned long long)g_diagTranspDraws, (unsigned long long)g_diagTranspVerts,
+                (unsigned long long)g_diagTranspMax, (unsigned long long)g_diagTessDraws, (unsigned long long)g_diagTessVerts);
+            char sizes[320] = "";
+            {
+                std::vector<std::pair<uint64_t, uint32_t>> v(g_diagBlendSizes.begin(), g_diagBlendSizes.end());
+                std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                for (size_t i = 0; i < v.size() && i < 8; i++)
+                {
+                    char item[40];
+                    std::snprintf(item, sizeof(item), " %llu×%u", (unsigned long long)v[i].first, v[i].second);
+                    std::strncat(sizes, item, sizeof(sizes) - std::strlen(sizes) - 1);
+                }
+            }
+            Log("URTI direct : dont mélangés à l'image (transparents) : %llu dessins, %llu sommets ; plus gros (sommets × dessins) :%s",
+                (unsigned long long)g_diagBlendDraws, (unsigned long long)g_diagBlendVerts, sizes);
+            g_diagTranspDraws = g_diagTranspVerts = g_diagTranspMax = g_diagTessDraws = g_diagTessVerts = 0;
+            g_diagBlendDraws = g_diagBlendVerts = 0, g_diagBlendSizes.clear();
             g_diagPresentQueues.clear(), g_diagExecQueues.clear(), g_liveStaleDraws = 0;
         }
     }
@@ -1867,9 +1971,13 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     }
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
     // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil
-    // image par image est perdu ; sinon le soleil est suivi sur le GPU
+    // image par image est perdu ; sinon le soleil est suivi sur le GPU. Sans ombres RT du soleil (réglage par
+    // défaut) et avec la loi de profondeur connue (mesurée aussi à chaque image), il ne sert à rien : dans Horizon
+    // Forbidden West, sans carte d'ombres reconnue, il recommençait toutes les 480 images et la capture de la scène
+    // RT s'arrêtait pendant ce temps (l'effet disparaissait puis revenait toutes les cinq secondes)
+    const bool calibrationUseful = live.sunShadows || !live.depthReady;
     if (live.enabled && g.phase == Phase::Idle && g.nextCapture == ~0ull &&
-        (live.forceCalibration || (!live.calibrated && g.frame >= live.nextCalibration)))
+        (live.forceCalibration || (!live.calibrated && calibrationUseful && g.frame >= live.nextCalibration)))
     {
         g.liveCalibration = true;
         g.nextCapture = g.frame + 1;
@@ -1926,6 +2034,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for (uint32_t s = 0; s < kSlots; s++)
                     g_liveRegions[s].clear(), g_liveRegionSrc[s].clear(), g_liveCursor[s] = 0;
+                g_liveTranspRegions.clear(), g_liveTranspSrc.clear(), g_liveTranspCursor = 0;
             }
             g.frameDraws = 0;
             g.skippedDraws = 0;

@@ -61,7 +61,7 @@ while (((Get-Date) - $t0).TotalMinutes -lt $TimeoutMin) {
             # le premier clic ne fait parfois que choisir la ligne : un autre, tant que le menu est là (trois au plus)
             if ($y) {
                 & (Join-Path $PSScriptRoot 'click.ps1') -Process $proc -X 0.095 -Y ([double]::Parse($y, [Globalization.CultureInfo]::InvariantCulture)) | Out-Null
-                $clicks++; $menuSeen = (Get-Date).AddSeconds(-6)
+                $clicks++; $menuSeen = (Get-Date).AddSeconds(3) # nouvel essai 15 s plus tard, si le menu principal est toujours là
                 "menu : Continuer (à $y de la hauteur) cliqué après $s s"
                 if ($clicks -ge 3) { $continued = $true }
             }

@@ -1432,3 +1432,45 @@ Suite d'Horizon Forbidden West, vers un URTI qui découvre le fonctionnement de 
   Le relevé des passes devant l'eau est fait. Prochaine étape : trouver la couche où le jeu écrit la surface de
   l'eau (module « surfaces transparentes »).
 - Le script d'Horizon : bonne détection de la partie (motif sans accent : le script est lu en ANSI).
+
+## v74 — URTI : reflets de l'eau (couche des surfaces transparentes planes) ; effet qui disparaissait toutes les cinq secondes ; ombres vérifiées en HDR
+
+- **Effet qui disparaissait et revenait toutes les quelques secondes** (signalé par l'utilisateur) : sans carte
+  d'ombres du soleil reconnue, l'étalonnage complet échouait et recommençait toutes les 480 images ; la capture de
+  la scène RT s'arrêtait pendant ce temps. Il n'est plus relancé quand les ombres RT du soleil sont coupées (réglage
+  par défaut) et la loi de profondeur connue (mesurée aussi à chaque image). Horizon : un seul étalonnage par
+  lancement.
+- **Ombres (occultation) dans Horizon** : vues blanches dans les captures d'écran de Windows, qui écrêtent une image
+  HDR. Les valeurs brutes de la rafale, décodées (PQ), montrent l'occultation (feu de camp, rocher, sol : jusqu'à
+  35 %). La loi de profondeur mesurée à chaque image est valide (1,07e-6 + 0,177 / w) ; elle est maintenant écrite
+  dans le journal.
+- **Reflets de l'eau** (module « surfaces transparentes » de l'auto-découverte). Horizon dessine son eau à
+  mi-résolution, dans ses propres images et sa propre profondeur (relevé des passes devant le marais : 17 dessins
+  en 1280×720, deux images R11G11B10 et une R32F, la surface du marais visible sous une ligne d'horizon). Elle
+  n'est jamais dans la profondeur principale : URTI y voyait le fond.
+  - Capture à part (couche 2 de la scène RT, masque 2) de deux sortes de dessins :
+    - sur la profondeur principale, ceux qui testent la profondeur sans l'écrire, hors du G-buffer choisi ;
+    - tous ceux d'une autre vue de la caméra (même forme que l'écran, résolution réduite).
+  - Conversion dans leur propre tampon (1,5 M sommets au plus) ; ces zones sont adressées dans tout le flux.
+  - `live_planes` garde les surfaces planes (normales alignées, sommets près du plan moyen, plus d'un mètre, pas
+    tournées vers la caméra comme une particule) et rend le reste invisible aux rayons (NaN) : fumée,
+    particules, volumes de lumière, ciel.
+  - Le rayon de la caméra des reflets cherche cette couche devant le point de la profondeur : le reflet part alors
+    de la surface d'eau, avec la normale de son triangle, lisse.
+  - Tous les autres rayons (occultation, ombres, cache, reflets) ne voient que la couche 1.
+  - Horizon, devant le marais : 225 dessins transparents par image, 15 surfaces planes gardées (58 000
+    triangles), eau trouvée sur 9,5 % de l'image (vue des poids), part appliquée pleine sur l'eau.
+  - Essai miroir parfait (`reflect_f0=1`) : le marais renvoie les arbres. Mais le reflet est en gros blocs, et des
+    taches apparaissent sur la berge (sol au niveau de l'eau).
+  - Avec le Fresnel normal de l'eau, de nuit dans la brume, l'effet est discret (le jeu a déjà ses propres
+    reflets) : à revoir de jour.
+  - `urti.ini` d'Horizon : `reflect=1`, `material_slot=7` (pas de canal de matériau : seule l'eau reflète).
+    Réglage `water=0` : pas de couche transparente.
+- Le critère « mélangé à l'image » ne suffisait pas : l'eau d'Horizon calcule sa réfraction elle-même et écrit sa
+  couleur d'un bloc. Relevés en jeu : environ 1 300 dessins « profondeur testée, pas écrite » par image (le passage
+  principal redessine la scène dans le G-buffer après une passe de profondeur), dont 110 mélangés ; pas de
+  tessellation.
+- « Continuer » d'Horizon : repéré par les lignes repères du menu à plusieurs seuils (captures HDR délavées), pas
+  par le nombre de lignes ; l'écran des sauvegardes est refusé (un clic de secours y avait ouvert la liste).
+- Pas encore vérifié : RDR2 avec la couche transparente (non réinstallé ; RDR2 garde la version vérifiée en v72),
+  les blocs du reflet de l'eau.
