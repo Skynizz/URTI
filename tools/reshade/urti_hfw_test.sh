@@ -62,6 +62,8 @@ burst poids "debug_view=5\n"
 burst occultation "debug_view=1\n"
 burst occultation_forte "debug_view=1\nao=1\nao_radius=2.5\n"
 burst normal_forte "ao=1\nao_radius=2.5\n"
+burst occultation_herbe "debug_view=1\nao_rough=1\n"
+burst normal_herbe "ao_rough=1\n"
 cp "$OUT/urti.ini.base" "$H/urti.ini"
 pause_s 3
 tail -n +"$L" "$H/urti_log.txt" > "$OUT/journal.txt"
