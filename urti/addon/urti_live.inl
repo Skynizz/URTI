@@ -26,6 +26,8 @@
 #include "live_sunlight_cs.h" // g_live_sunlight
 #include "live_counts_cs.h" // g_live_counts
 #include "live_surfcache_cs.h" // g_live_surfcache
+#include "live_camfit_cs.h" // g_live_camfit
+#include "live_mvsynth_cs.h" // g_live_mvsynth
 
 struct LiveState
 {
@@ -96,6 +98,16 @@ struct LiveState
     // cible essayée parmi celles du G-buffer en deux flottants 16 bits (Horizon Forbidden West en a deux, la
     // première presque vide : toutes les conventions y restaient à égalité) ; mesures sans vainqueur sur celle-ci
     uint32_t mvCandidate = 0, mvUndecided = 0;
+    // mouvement de la caméra mesuré sur notre géométrie (live_camfit) et vecteurs de mouvement fabriqués avec lui
+    // (live_mvsynth) quand ceux du jeu restent illisibles ; urti.ini motion_source= 0 : choix automatique, 1 : ceux
+    // du jeu seulement, 2 : les nôtres
+    ComPtr<ID3D12RootSignature> camfitRs, mvsynthRs;
+    ComPtr<ID3D12PipelineState> camfitPso, mvsynthPso;
+    ComPtr<ID3D12Resource> pairsBuf, motionBuf, motionReadback[3];
+    bool mvSynthetic = false;
+    uint32_t mvGiveUps = 0, motionSource = 0, motMovingNoGame = 0; // images où la caméra bougeait sans convention du jeu trouvée
+    double motRot = 0, motTrans = 0, motKept = 0, motRms = 0;
+    uint32_t motFrames = 0, motValid = 0;
     double mvErr[16] = {}, mvCount[16] = {};
     float temporalAlpha = 0.3f;
     float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f; // reflets : part de l'image courante, à l'arrêt et en mouvement rapide
@@ -114,7 +126,11 @@ struct LiveState
     double sunJitterSum = 0, sunJitterMax = 0;
     uint32_t sunJitterCount = 0;
     uint64_t capacity = 0; // sommets de la structure
-    uint32_t width = 0, height = 0, depthPitch = 0, shadowPitch = 0;
+    uint32_t width = 0, height = 0, depthPitch = 0, shadowPitch = 0; // width, height : zone rendue (résolution de rendu)
+    uint32_t allocWidth = 0, allocHeight = 0; // taille de la profondeur (images allouées à cette taille)
+    float viewMax[2] = {};                    // zone de dessin du jeu mesurée (dernière fenêtre)
+    uint32_t viewLogCount = 0, viewCandidate = 0, viewStreak = 0;
+    bool renderAreaOn = true; // urti.ini render_area=0 : toute la profondeur (essai)
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     resource_view maskSrv = {};
     uint64_t frame = 0, lastFilled = 0;
@@ -287,6 +303,7 @@ struct LiveState
 constexpr uint32_t kLiveMaxPairs = 256;
 // soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
 // l'image précédente (640)
+constexpr uint32_t kLiveMaxMotionPairs = 32768; // paires de sommets pour le mouvement de la caméra (live_camfit)
 constexpr uint32_t kLiveSunBytes = 2048; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
                                                              // part du soleil dans l'image (1232 : paires, 1248 : histogrammes, 1888 à 2047 : contrôle, live_sunlight)
 
@@ -296,11 +313,16 @@ constexpr uint32_t kLiveSunBytes = 2048; // + suivi du décalage sous-pixel du j
 
 void LiveSaveCalibration()
 {
+    // loi de profondeur invalide : rien n'est écrit (relue au lancement, une loi NaN rendait chaque point de l'écran
+    // invalide : plus d'occultation ni de reflet dans Horizon Forbidden West, jusqu'à la mesure de l'image)
+    if (!std::isfinite(live.A) || !std::isfinite(live.B) || live.B == 0)
+        return;
     if (FILE* f = std::fopen((g_dir + "\\urti_calib.ini").c_str(), "w"))
     {
         std::fprintf(f, "; étalonnage URTI de ce jeu (relu au lancement ; F6 le refait)\n");
-        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\nmotion_target=%u\n", live.A, live.B, live.sunSign > 0 ? 1 : -1,
-                     live.sunMapWidth, live.sunMapHeight, live.sunMapFormat, live.mvConvention, live.mvCandidate);
+        std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\nmotion_target=%u\nmotion_source=%s\n", live.A, live.B,
+                     live.sunSign > 0 ? 1 : -1, live.sunMapWidth, live.sunMapHeight, live.sunMapFormat, live.mvSynthetic ? 255u : live.mvConvention,
+                     live.mvCandidate, live.mvSynthetic ? "camera" : "jeu");
         std::fclose(f);
     }
 }
@@ -334,9 +356,11 @@ void LiveLoadCalibration()
         if (std::sscanf(line, "motion=%u", &motionConvention) == 1 && motionConvention < 16)
             live.mvConvention = motionConvention;
         std::sscanf(line, "motion_target=%u", &live.mvCandidate);
+        if (std::strncmp(line, "motion_source=camera", 20) == 0 && live.motionSource != 1)
+            live.mvSynthetic = true, live.mvConvention = 0;
     }
     std::fclose(f);
-    if (b == 0 || !sign || !w)
+    if (b == 0 || !std::isfinite(a) || !std::isfinite(b) || !sign || !w)
         return;
     live.p00 = 0; // fixée à la première profondeur (rapport largeur / hauteur)
     live.A = float(a), live.B = float(b), g.depthReversed = b > 0, live.sunSign = float(sign);
@@ -420,6 +444,11 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
         return;
     }
     const double A = (n * swz - sw * sz) / (n * sww - sw * sw), B = (sz - A * sw) / n;
+    if (!std::isfinite(A) || !std::isfinite(B) || B == 0)
+    {
+        Log("URTI direct : étalonnage impossible (loi de profondeur dégénérée)");
+        return;
+    }
     if (!live.depthReady)
         Log("URTI direct : loi de profondeur = %.6f + %.6f / w (reflets possibles même sans soleil)", A, B);
     live.A = float(A), live.B = float(B), live.p00 = p00, live.p11 = p11;
@@ -566,6 +595,8 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
             v = -v;
     for (int q = 0; q < 3; q++)
         live.sun[q] = float(bestSun[q]);
+    if (!std::isfinite(A) || !std::isfinite(B) || B == 0)
+        return; // loi dégénérée : rien n'est adopté
     live.A = float(A), live.B = float(B), live.p00 = p00, live.p11 = p11;
     g.depthReversed = B > 0; // profondeur inversée : d = B / w, le ciel (w infini) à 0
     live.calibrated = true;
@@ -615,7 +646,9 @@ bool LiveCreatePipelines(ID3D12Device* device)
         cd.CS = { code, size };
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
-    return make(g_live_convert, sizeof(g_live_convert), 4, live.convertRs, live.convertPso, 4) &&
+    return make(g_live_convert, sizeof(g_live_convert), 4, live.convertRs, live.convertPso, 8, 2) &&
+           make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
+           make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
            make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 29, 3) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
@@ -706,14 +739,34 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
 }
 
 // images (profondeur, ombres) à la taille de la profondeur du jeu
+// zone rendue : celle où le jeu dessine (zones de dessin de ses dessins à l'écran), sinon toute la profondeur.
+// Avec le DLSS ou une résolution dynamique, des moteurs (Decima) dessinent dans un coin de cibles pleine taille :
+// lues en entier, ombres et reflets tombaient décalés et étirés (×1,5 dans Horizon Forbidden West)
+void LiveRenderArea(const D3D12_RESOURCE_DESC& depthDesc, uint32_t& w, uint32_t& h)
+{
+    w = uint32_t(depthDesc.Width), h = depthDesc.Height;
+    const uint32_t vw = uint32_t(live.viewMax[0] + 0.5f), vh = uint32_t(live.viewMax[1] + 0.5f);
+    if (live.renderAreaOn && vw >= 64 && vh >= 64 && vw <= w && vh <= h && (vw < w || vh < h))
+        w = vw, h = vh;
+}
+
 bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12_RESOURCE_DESC& depthDesc)
 {
-    if (live.mask && live.width == depthDesc.Width && live.height == depthDesc.Height && live.depthFormat == depthDesc.Format)
+    uint32_t renderW = 0, renderH = 0;
+    LiveRenderArea(depthDesc, renderW, renderH);
+    if (live.mask && live.allocWidth == depthDesc.Width && live.allocHeight == depthDesc.Height && live.depthFormat == depthDesc.Format)
+    {
+        if (renderW != live.width || renderH != live.height)
+            Log("URTI direct : zone rendue %ux%u dans la profondeur %llux%u", renderW, renderH, (unsigned long long)depthDesc.Width, depthDesc.Height);
+        live.width = renderW, live.height = renderH; // les images (pleine taille) servent telles quelles
         return true;
+    }
     Retire(live.depthBuf), Retire(live.shadowBuf), Retire(live.mask), Retire(live.prevShadowBuf);
     if (live.maskSrv.handle)
         runtime->get_device()->destroy_resource_view(live.maskSrv), live.maskSrv = {};
-    live.width = uint32_t(depthDesc.Width), live.height = depthDesc.Height, live.depthFormat = depthDesc.Format;
+    live.allocWidth = uint32_t(depthDesc.Width), live.allocHeight = depthDesc.Height, live.depthFormat = depthDesc.Format;
+    // images allouées à la taille pleine (une résolution dynamique change la zone rendue sans tout réallouer)
+    live.width = live.allocWidth, live.height = live.allocHeight;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
     UINT64 total = 0;
     device->GetCopyableFootprints(&depthDesc, 0, 1, 0, &fp, nullptr, nullptr, &total);
@@ -748,6 +801,9 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     for (auto& r : live.counterReadback)
         if (!r)
             r = MakeBuffer(device, kSlots * 8ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    live.width = renderW, live.height = renderH;
+    if (renderW != live.allocWidth || renderH != live.allocHeight)
+        Log("URTI direct : zone rendue %ux%u dans la profondeur %ux%u", renderW, renderH, live.allocWidth, live.allocHeight);
     return live.depthBuf && live.shadowBuf;
 }
 
@@ -794,7 +850,7 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
@@ -820,7 +876,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
-                value("person_mask=", personMask);
+                value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea);
                 if (l.rfind("ui_zone=", 0) == 0)
                     std::sscanf(l.c_str() + 8, "%f,%f,%f,%f", &zone[0], &zone[1], &zone[2], &zone[3]);
                 value("shadows=", sunShadows), value("ao_quarter=", aoQuarter), value("build_ms=", buildMs), value("surf_cache=", surfCache), value("ao_ms=", aoMs), value("gi=", gi);
@@ -865,6 +921,12 @@ void LiveHotReload(ID3D12Device* device)
             live.aoTarget = std::max(0.0f, aoMs);
             live.giStrength = std::clamp(gi, 0.0f, 4.0f);
             live.personMask = personMask != 0;
+            live.renderAreaOn = renderArea != 0;
+            live.motionSource = uint32_t(std::clamp(motionSource, 0.0f, 2.0f));
+            if (live.motionSource == 2 && !live.mvSynthetic)
+                live.mvSynthetic = true, live.mvConvention = 0;
+            else if (live.motionSource == 1 && live.mvSynthetic)
+                live.mvSynthetic = false, live.mvConvention = 255;
             if (live.aoTarget <= 0)
                 live.aoRays = 4;
         }
@@ -978,7 +1040,7 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
                 if (f == DXGI_FORMAT_R16G16_FLOAT || f == DXGI_FORMAT_R16G16_TYPELESS)
                     candidates[found++] = g_liveGbuffer[k];
             }
-        if (found)
+        if (found && !live.mvSynthetic)
             motionTarget = candidates[live.mvCandidate % found];
     }
     for (uint32_t i = 0; i < count && motionTarget; i++)
@@ -1118,6 +1180,44 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         marksNow.swap(g_liveMarks);
+        {
+            // la plus grande des zones assez fréquentes (un cinquième des dessins de la plus fréquente) : des passes à
+            // mi-résolution (852×480 dans Horizon) dessinent aussi dans cette profondeur, quelques repères en 3D
+            // gardent la zone pleine
+            uint32_t most = 0;
+            for (const auto& [extent, n] : g_liveViewCounts)
+                most = std::max(most, n);
+            uint32_t best = 0;
+            uint64_t bestArea = 0;
+            for (const auto& [extent, n] : g_liveViewCounts)
+                if (n * 5 >= most && uint64_t(extent >> 16) * (extent & 0xFFFF) > bestArea)
+                    best = extent, bestArea = uint64_t(extent >> 16) * (extent & 0xFFFF);
+            // une image de temps en temps (sonde d'environnement ?) est dominée par une autre zone : la zone rendue ne
+            // change qu'après dix images de suite avec la même nouvelle zone (une résolution dynamique change lentement)
+            if (most >= 16)
+            {
+                if (best == live.viewCandidate)
+                    live.viewStreak++;
+                else
+                    live.viewCandidate = best, live.viewStreak = 1;
+                if (live.viewStreak >= 10 || live.viewMax[0] == 0)
+                    live.viewMax[0] = float(best >> 16), live.viewMax[1] = float(best & 0xFFFF);
+            }
+            if (++live.viewLogCount % 600 == 1 && !g_liveViewCounts.empty())
+            {
+                std::vector<std::pair<uint32_t, uint32_t>> v(g_liveViewCounts.begin(), g_liveViewCounts.end());
+                std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                char text[256] = "";
+                for (size_t i = 0; i < v.size() && i < 5; i++)
+                {
+                    char item[48];
+                    std::snprintf(item, sizeof(item), " %ux%u : %u", v[i].first >> 16, v[i].first & 0xFFFF, v[i].second);
+                    std::strncat(text, item, sizeof(text) - std::strlen(text) - 1);
+                }
+                Log("URTI direct : zones de dessin dans la profondeur de l'écran (dessins) :%s", text);
+            }
+            g_liveViewCounts.clear();
+        }
         if (slot >= 0)
             regionsNow.swap(g_liveRegions[slot]), srcNow.swap(g_liveRegionSrc[slot]), cursorNow = g_liveCursor[slot];
         // places fixes : un objet absent depuis plus de kLiveKeepFrames images rend sa place ; les autres restent
@@ -1161,6 +1261,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             {
                 const auto f = srcOf.find(placesNow[i].id);
                 placeSrc[i] = f != srcOf.end() ? f->second : 0;
+                // dessinée à la même place à l'image précédente : ses anciens sommets servent au mouvement de la caméra
+                if (f != srcOf.end())
+                    if (const auto pl = g_livePlaces.find(placesNow[i].id);
+                        pl != g_livePlaces.end() && pl->second.prevFrame + 1 == g_livePlaceFrame && pl->second.stableOrder && pl->second.uniquePrev &&
+                        g_liveKeyRank[pl->second.rankKey] == 1)
+                        placeSrc[i] |= 0x80000000u;
             }
             cursorNow = g_livePlaceHigh, persistNow = true;
             live.statPlaces += g_livePlaces.size(), live.statPlaceHeld += held, live.statPlaceHigh += g_livePlaceHigh;
@@ -1182,6 +1288,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         g_livePlaceFrame++;
         for (uint32_t s = 0; s < kSlots; s++)
             g_liveRegions[s].clear(), g_liveRegionSrc[s].clear(), g_liveCursor[s] = 0;
+        // maillages dessinés une seule fois dans cette image (pour les paires de l'image suivante)
+        for (auto& [id, place] : g_livePlaces)
+            if (place.lastFrame == g_livePlaceFrame - 1)
+            {
+                const auto r = g_liveKeyRank.find(place.rankKey);
+                place.uniquePrev = r != g_liveKeyRank.end() && r->second == 1;
+            }
         g_liveKeyRank.clear();
         if (slot >= 0)
             probesNow.swap(g_liveProbes[slot]);
@@ -1365,6 +1478,38 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     }
         }
     }
+    // mouvement de la caméra mesuré sur notre géométrie, lu trois images plus tard
+    if (const float* m = nullptr; live.motionReadback[live.frame % 3] && SUCCEEDED(live.motionReadback[live.frame % 3]->Map(0, nullptr, (void**)&m)) && m)
+    {
+        live.motFrames++;
+        if (m[12] > 0.5f)
+        {
+            const double tr = std::clamp((double(m[0]) + m[4] + m[8] - 1.0) * 0.5, -1.0, 1.0);
+            const double rot = std::acos(tr) * 180.0 / 3.14159265, move = std::sqrt(double(m[9]) * m[9] + double(m[10]) * m[10] + double(m[11]) * m[11]);
+            live.motValid++, live.motRot += rot, live.motTrans += move;
+            live.motKept += m[14] > 0 ? m[13] / m[14] : 0.0, live.motRms += m[15];
+            // la caméra bouge (notre mesure) et les vecteurs du jeu ne se laissent toujours pas lire : ils ne
+            // contiennent sans doute pas le mouvement de la caméra (seulement celui des personnages) ; trois secondes
+            // ainsi et les nôtres les remplacent
+            if (live.motionSource == 0 && !live.mvSynthetic && live.mvConvention == 255 && (rot > 0.05 || move > 0.005) && ++live.motMovingNoGame >= 180)
+            {
+                live.mvSynthetic = true, live.mvConvention = 0;
+                Log("URTI direct : la caméra bouge et les vecteurs de mouvement du jeu restent illisibles : mouvement de la caméra mesuré sur notre "
+                    "géométrie à la place");
+                if (live.verified || live.fromStore)
+                    LiveSaveCalibration();
+            }
+        }
+        live.motionReadback[live.frame % 3]->Unmap(0, nullptr);
+        if (live.motFrames >= 300)
+        {
+            const double v = std::max(1u, live.motValid);
+            Log("URTI direct : mouvement de la caméra mesuré sur notre géométrie : %u images sur %u, rotation %.3f° et translation %.1f cm par image en "
+                "moyenne, %.0f %% des paires gardées, écart %.1f mm%s", live.motValid, live.motFrames, live.motRot / v, live.motTrans / v * 100.0,
+                live.motKept / v * 100.0, live.motRms / v * 1000.0, live.mvSynthetic ? " (vecteurs de mouvement fabriqués avec lui)" : "");
+            live.motFrames = live.motValid = 0, live.motRot = live.motTrans = live.motKept = live.motRms = 0;
+        }
+    }
     // bilan du suivi du soleil, lu trois images plus tard
     if (const float* r = nullptr; live.sunReadback[live.frame % 3] && SUCCEEDED(live.sunReadback[live.frame % 3]->Map(0, nullptr, (void**)&r)) && r)
     {
@@ -1530,7 +1675,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                         if (live.verified || live.fromStore)
                             LiveSaveCalibration();
                     }
-                    else if (++live.mvUndecided >= 3)
+                    else if (++live.mvUndecided >= 3 && live.motionSource == 0 && ++live.mvGiveUps >= 2)
+                    {
+                        // deux cibles essayées sans vainqueur : les vecteurs du jeu sont illisibles (Horizon Forbidden
+                        // West), ceux fabriqués avec le mouvement de la caméra mesuré sur notre géométrie les remplacent
+                        live.mvUndecided = 0, live.mvSynthetic = true, live.mvConvention = 0;
+                        Log("URTI direct : vecteurs de mouvement du jeu illisibles : mouvement de la caméra mesuré sur notre géométrie à la place");
+                        if (live.verified || live.fromStore)
+                            LiveSaveCalibration();
+                    }
+                    else if (live.mvUndecided >= 3)
                     {
                         // trois mesures en mouvement sans vainqueur : ce ne sont pas des vecteurs de mouvement, la cible
                         // suivante du même format est essayée
@@ -1808,10 +1962,37 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(2, sceneTable->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(3, srcBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(4, live.view->GetGPUVirtualAddress());
+    if (!live.pairsBuf)
+    {
+        live.pairsBuf = UavBuffer(g.device, 16 + uint64_t(kLiveMaxMotionPairs) * 24, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.motionBuf = UavBuffer(g.device, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        for (auto& r : live.motionReadback)
+            r = MakeBuffer(g.device, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    list->SetComputeRootUnorderedAccessView(5, live.pairsBuf ? live.pairsBuf->GetGPUVirtualAddress() : live.view->GetGPUVirtualAddress());
     const uint32_t converted = std::max(3u, uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity)) / 3 * 3);
-    const struct { float p00, p11; uint32_t count, regionCount; } cc = { live.p00, live.p11, converted, uint32_t(tableNow.size()) };
-    list->SetComputeRoot32BitConstants(5, 4, &cc, 0);
+    const struct { float p00, p11; uint32_t count, regionCount, maxPairs, pad0, pad1, pad2; } cc = {
+        live.p00, live.p11, converted, uint32_t(tableNow.size()), live.pairsBuf ? kLiveMaxMotionPairs : 0u, 0, 0, 0 };
+    list->SetComputeRoot32BitConstants(6, 8, &cc, 0);
     list->Dispatch(UINT((converted + 255) / 256), 1, 1);
+    // 1d. mouvement de la caméra depuis l'image précédente, mesuré sur les paires de sommets de la conversion
+    if (live.camfitPso && live.pairsBuf && live.motionBuf && live.motionReadback[live.frame % 3])
+    {
+        D3D12_RESOURCE_BARRIER pb = {};
+        pb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        pb.UAV.pResource = live.pairsBuf.Get();
+        list->ResourceBarrier(1, &pb);
+        list->SetComputeRootSignature(live.camfitRs.Get());
+        list->SetPipelineState(live.camfitPso.Get());
+        list->SetComputeRootUnorderedAccessView(0, live.motionBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(1, live.pairsBuf->GetGPUVirtualAddress());
+        const uint32_t fc[4] = { kLiveMaxMotionPairs, 0, 0, 0 };
+        list->SetComputeRoot32BitConstants(2, 4, fc, 0);
+        list->Dispatch(1, 1, 1);
+        Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(live.motionReadback[live.frame % 3].Get(), 0, live.motionBuf.Get(), 0, 128);
+        Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     // 1a. mesure de chaque objet capté, de la scène RT et de la zone de mesure (budget de géométrie)
     if (live.statsPso && !(regionsNow.empty() && probesNow.empty()))
     {
@@ -1881,7 +2062,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         void* p = nullptr;
         if (SUCCEEDED(live.sunUpload->Map(0, nullptr, &p)))
         {
-            const float s[12] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0, 0, live.A, live.B, live.B != 0 ? 1.0f : 0.0f };
+            const float s[12] = { live.sun[0], live.sun[1], live.sun[2], 1, 0, 0, 0, 0, 0, live.A, live.B, std::isfinite(live.A) && std::isfinite(live.B) && live.B != 0 ? 1.0f : 0.0f };
             std::memcpy(p, s, sizeof(s));
             live.sunUpload->Unmap(0, nullptr);
         }
@@ -2064,6 +2245,38 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     Transition(list.Get(), depthCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, depthState);
     Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
+    // 3c. vecteurs de mouvement fabriqués avec le mouvement de la caméra mesuré (ceux du jeu sont illisibles)
+    if (live.mvSynthetic && live.mvsynthPso && live.motionBuf)
+    {
+        const uint32_t pitch = (live.width * 4 + 255) & ~255u;
+        const uint64_t bytes = uint64_t(pitch) * live.height;
+        if (!live.mvBuf || live.mvBytes < bytes)
+        {
+            Retire(live.mvBuf);
+            live.mvBuf = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+            live.mvBytes = live.mvBuf ? bytes : 0;
+            Log("URTI direct : vecteurs de mouvement fabriqués %ux%u (mouvement de la caméra mesuré sur notre géométrie)", live.width, live.height);
+        }
+        if (live.mvBuf)
+        {
+            const bool d24m = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+            Transition(list.Get(), live.mvBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+            list->SetComputeRootSignature(live.mvsynthRs.Get());
+            list->SetPipelineState(live.mvsynthPso.Get());
+            list->SetComputeRootShaderResourceView(0, live.depthBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, live.sunBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, live.motionBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(3, live.mvBuf->GetGPUVirtualAddress());
+            const struct { uint32_t width, height, depthPitch, depth24, mvPitch; float p00, p11; uint32_t pad; } mc = {
+                live.width, live.height, live.depthPitch, d24m ? 1u : 0u, pitch, live.p00, live.p11, 0 };
+            list->SetComputeRoot32BitConstants(4, 8, &mc, 0);
+            list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+            Transition(list.Get(), live.motionBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Transition(list.Get(), live.mvBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            live.mvPitch = pitch, live.mvWidth = live.width, live.mvHeight = live.height, live.mvFrame = live.frame, live.mvConvention = 0;
+        }
+    }
 
     LiveTime(list.Get(), 2);
     // 3b. carte d'ombres du jeu (son ombre est recalculée pixel par pixel : nos ombres ne s'ajoutent
@@ -2140,8 +2353,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(1, live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, live.sunBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(3, atlasValid ? live.atlasBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    const bool motionOk = live.mvBuf && live.mvFrame != ~0ull && live.frame <= live.mvFrame + 1 && live.mvWidth == live.width &&
-                          live.mvHeight == live.height && live.depthPrevBuf;
+    const bool motionOk = live.mvBuf && live.mvFrame != ~0ull && live.frame <= live.mvFrame + 1 && live.mvWidth >= live.width &&
+                          live.mvHeight >= live.height && live.depthPrevBuf;
     if (motionOk)
     {
         Transition(list.Get(), live.mvBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
@@ -2343,7 +2556,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.reflectBytes = bytes;
         }
         const bool material = live.materialBuf && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 2 &&
-                              live.materialWidth == live.width && live.materialHeight == live.height;
+                              live.materialWidth >= live.width && live.materialHeight >= live.height;
         if (live.anchorBytes < bytes)
         {
             for (auto& a : live.anchor)
@@ -2526,23 +2739,35 @@ void LiveComposite(effect_runtime* runtime)
         return;
     // photos de l'écran avant l'interface : tampons (même disposition que imageIn), images d'écran connues,
     // choix d'après les comparaisons lues trois présentations plus tard
-    if (live.snapBytes < total)
+    // (et nouvelle disposition dès que l'image d'écran change de format ou de taille : passage en HDR, Alt+Tab)
+    const bool snapLayoutChanged = g_liveSnapFp.Footprint.Format != fp.Footprint.Format || g_liveSnapFp.Footprint.Width != fp.Footprint.Width ||
+                                   g_liveSnapFp.Footprint.Height != fp.Footprint.Height || g_liveSnapFp.Footprint.RowPitch != fp.Footprint.RowPitch;
+    if (live.snapBytes < total || snapLayoutChanged)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        for (uint32_t k = 0; k < kLiveSnaps; k++)
+        if (live.snapBytes < total)
         {
-            Retire(live.snaps[k]);
-            live.snaps[k] = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
-            g_liveSnap[k] = live.snaps[k].Get();
+            for (uint32_t k = 0; k < kLiveSnaps; k++)
+            {
+                Retire(live.snaps[k]);
+                live.snaps[k] = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
+                g_liveSnap[k] = live.snaps[k].Get();
+            }
+            Retire(live.preUiBuf);
+            live.preUiBuf = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.snapBytes = total;
         }
-        Retire(live.preUiBuf);
-        live.preUiBuf = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (snapLayoutChanged && g_liveSnapFp.Footprint.Width)
+            Log("URTI direct : image d'écran changée (format %d, %ux%u) : photos d'avant l'interface remises à zéro", int(fp.Footprint.Format),
+                fp.Footprint.Width, fp.Footprint.Height);
         g_liveSnapFp = fp;
-        live.snapBytes = total;
         live.uiChoice = -1;
     }
     {
+        // images d'écran de cette présentation seulement : après une recréation, les anciennes sont détruites et
+        // leur adresse peut servir à une autre image du jeu
         std::lock_guard<std::mutex> lock(g_mutex);
+        g_liveBackBuffers.clear();
         for (uint32_t i = 0; i < runtime->get_back_buffer_count(); i++)
             g_liveBackBuffers.insert(runtime->get_back_buffer(i).handle);
     }
@@ -2682,8 +2907,8 @@ void LiveComposite(effect_runtime* runtime)
             else if (!isGenerated)
             {
                 const int prev = live.reflHistLast, cur = prev == 0 ? 1 : 0;
-                const bool motionOk = live.mvBuf && live.mvFrame != ~0ull && live.frame <= live.mvFrame + 2 && live.mvWidth == live.width &&
-                                      live.mvHeight == live.height && live.depthPrevBuf && prev >= 0;
+                const bool motionOk = live.mvBuf && live.mvFrame != ~0ull && live.frame <= live.mvFrame + 2 && live.mvWidth >= live.width &&
+                                      live.mvHeight >= live.height && live.depthPrevBuf && prev >= 0;
                 Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
                 if (live.depthPrevBuf)
                     Transition(list.Get(), live.depthPrevBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
@@ -2841,9 +3066,9 @@ void LiveComposite(effect_runtime* runtime)
     // rebond de lumière : celui de ce calcul, ou le dernier calculé quand rien de neuf n'a été calculé (image générée)
     const bool giFresh = live.giStamp + 1 == live.frame || (live.lastPresentDraws == 0 && live.giStamp + 2 == live.frame);
     const bool giUse = live.giStrength > 0 && live.giValid && giFresh && live.albedoBuf && live.albedoFrame != ~0ull &&
-                       live.frame <= live.albedoFrame + 3 && live.albedoWidth == live.width && live.albedoHeight == live.height;
-    const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 3 && live.normalWidth == live.width &&
-                           live.normalHeight == live.height;
+                       live.frame <= live.albedoFrame + 3 && live.albedoWidth >= live.width && live.albedoHeight >= live.height;
+    const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 3 && live.normalWidth >= live.width &&
+                           live.normalHeight >= live.height;
     if (giUse)
     {
         Transition(list.Get(), live.giBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);

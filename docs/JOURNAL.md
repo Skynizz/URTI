@@ -1388,3 +1388,47 @@ Suite d'Horizon Forbidden West, vers un URTI qui découvre le fonctionnement de 
   (Entrée, F7 : fichiers déclencheurs à la place) ; « Continuer » repéré sur une capture du menu
   (`urti_hfw_menu.py`, sa place change avec la ligne PlayStation Network), parfois deux clics.
 - Outils : `premier_plan.ps1` (le jeu est-il au premier plan, sans rien lire d'autre).
+
+## v73 — URTI : mouvement de la caméra mesuré sur notre géométrie ; plantage au passage HDR / Alt+Tab ; zone rendue (DLSS, résolution dynamique) ; loi de profondeur NaN
+
+- **Mouvement de la caméra sans le jeu** (module « mouvement » de l'auto-découverte). La conversion relève des
+  paires de sommets : position à l'image précédente et à celle-ci, pour les objets dessinés à la même place dans les
+  deux images. Elle en prend une quinzaine par objet, pour qu'un personnage qui suit la caméra pèse autant qu'un
+  rocher. Seuls comptent les dessins directs d'un seul exemplaire, dont le maillage n'est dessiné qu'une fois dans
+  les deux images : Horizon trie ses dessins, et le n-ième exemplaire d'un maillage n'est pas le même objet d'une
+  image à l'autre. `live_camfit` fait l'ajustement rigide (méthode de Horn), robuste, repris cinq fois en écartant
+  ce qui bouge ; il repart de l'immobilité si la caméra change d'allure. `live_mvsynth` fabrique les vecteurs de
+  mouvement à partir de ce mouvement et de la profondeur (convention 0).
+  - Bascule automatique quand ceux du jeu restent illisibles : deux cibles essayées sans vainqueur, ou 3 s de
+    caméra en mouvement (notre mesure) sans convention trouvée. Réglage `motion_source=` : 0 automatique, 1 jeu,
+    2 nôtres. Gardé dans `urti_calib.ini` (`motion_source=camera`).
+  - Bac à sable (caméra qui marche, vérité connue) : translation mesurée 2,7 cm par image, exactement la marche
+    du script. Accumulation aussi bonne qu'avec les vecteurs du jeu : scintillement ajouté +0,045 % contre
+    +0,046 %, points qui sautent 0,514 % contre 0,522 %.
+  - Horizon : encore trop bruité (caméra presque immobile, 3 à 6 cm par image et 3 à 14 cm d'écart). Le filtre
+    « un seul exemplaire » vient d'être ajouté (écart 34 mm) ; pas encore satisfaisant.
+- **Plantage au passage en HDR ou à l'Alt+Tab** (signalé par l'utilisateur) : l'image d'écran recréée change de
+  format (RGBA8 -> RGB10A2). Les photos d'avant l'interface étaient copiées avec l'ancienne disposition, d'où une
+  copie invalide, une liste de commandes refusée (E_INVALIDARG) et le plantage. La liste des images d'écran gardait
+  aussi les adresses d'images détruites.
+  - Corrigé : disposition reprise à chaque changement de format ou de taille, copie sautée si elle ne correspond
+    pas, liste des images d'écran refaite à chaque image.
+  - Vérifié : Horizon passe en HDR sans planter (plusieurs lancements). L'Alt+Tab lui-même n'est pas encore
+    retesté.
+- **Zone rendue** : avec le DLSS et la résolution dynamique, Horizon dessine en 1280×720 à 1704×960 dans des
+  cibles de 2560×1440. URTI lisait toute la cible : ombres et reflets étirés de 1,5 fois.
+  - La zone rendue est maintenant la plus grande des zones de dessin fréquentes des dessins de l'écran (repères 3D
+    pleine taille et passes à mi-résolution écartés). Elle est comptée à l'exécution et ne change qu'après dix
+    images de suite. Les images restent allouées pleine taille.
+  - Vérifié : 1704×960 stable dans Horizon. Réglage d'essai : `render_area=0`.
+- **Loi de profondeur NaN** dans `urti_calib.ini`, écrite au moment de la bascule des vecteurs de mouvement. Relue
+  au lancement, elle rendait chaque point invalide, et l'envoi du soleil la marquait valide : plus d'occultation
+  ni de reflet dans Horizon (vue de diagnostic toute blanche).
+  - Corrigé : jamais écrite, jamais relue, jamais adoptée si elle n'est pas finie ; l'envoi du soleil ne la
+    marque plus valide. Le fichier d'Horizon est réparé (dernière loi valide).
+  - Retour de l'occultation : pas encore vérifié.
+- **Reflets de l'eau** (demandés par l'utilisateur) : la surface de l'eau n'est pas dans la profondeur que lit URTI.
+  Le marais est dessiné après, transparent : URTI y voit le fond (mode « sol mouillé » : poids mouchetés sur l'eau).
+  Le relevé des passes devant l'eau est fait. Prochaine étape : trouver la couche où le jeu écrit la surface de
+  l'eau (module « surfaces transparentes »).
+- Le script d'Horizon : bonne détection de la partie (motif sans accent : le script est lu en ANSI).

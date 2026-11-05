@@ -131,6 +131,10 @@ struct LivePending
     uint64_t rankKey = 0, key = 0, window = 0;
     uint32_t slot = 0, src = 0, capacity = 0, counter = 0, vertices = 0, sig = 0;
     bool screen = false, mainScreen = false, probe = false, sunMap = false, marked = false, indirect = false;
+    // sommets dans le même ordre d'une image à l'autre : dessin direct d'un seul exemplaire (un ExecuteIndirect ou
+    // des exemplaires choisis sur le GPU changent d'ordre et de nombre : leurs paires de sommets ne disent rien du
+    // mouvement de la caméra)
+    bool stableOrder = false;
     float viewport[4] = {};
 };
 constexpr uint32_t kLiveAreas = 3;
@@ -146,6 +150,11 @@ uint32_t MeshId(uint64_t idKey)
     return uint32_t(h ^ (h >> 32)) | 1u;
 }
 std::unordered_map<uint32_t, uint32_t> g_liveIdMesh; // identité -> maillage (cette image)
+// zone où le jeu dessine vraiment son image dans la profondeur de l'écran : la plus fréquente parmi les zones de
+// dessin de ses dessins (bord droit, bord bas), cette fenêtre. Avec le DLSS et la résolution dynamique, Horizon
+// Forbidden West dessine en 1280×720 à 1707×960 dans des cibles de 2560×1440 ; quelques dessins (repères en 3D)
+// y gardent la zone pleine
+std::unordered_map<uint32_t, uint32_t> g_liveViewCounts; // (largeur << 16 | hauteur) -> dessins
 // budget de géométrie (urti_live.inl le met à jour à chaque image) : un objet déjà mesuré et peu important
 // (petit, lointain) n'entre pas dans la scène RT ; ceux à re-mesurer sont captés dans la zone de mesure, à
 // la fin de l'emplacement, hors de la structure d'accélération
@@ -181,7 +190,12 @@ uint32_t g_liveCursor[4] = {};            // sans places fixes : zones à la sui
 struct LivePlace
 {
     uint32_t offset = 0, capacity = 0, countIndex = 0, frameCounter = 0;
-    uint64_t lastFrame = 0;
+    uint64_t lastFrame = 0, prevFrame = 0; // dernière image où l'objet a été dessiné, et celle d'avant
+    bool stableOrder = false;              // ses sommets gardent leur ordre (paires pour le mouvement de la caméra)
+    // maillage dessiné une seule fois dans l'image précédente : la place est bien le même objet (Horizon trie ses
+    // dessins de l'avant vers l'arrière : le n-ième exemplaire d'un maillage n'est pas le même d'une image à l'autre)
+    bool uniquePrev = false;
+    uint64_t rankKey = 0;
 };
 bool g_livePersist = true;
 std::unordered_map<uint32_t, LivePlace> g_livePlaces; // identité -> place
@@ -974,6 +988,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             pend.rankKey = idKey, pend.key = key, pend.window = g_liveWindow;
             pend.slot = uint32_t(slot), pend.capacity = capacity, pend.vertices = uint32_t(vertices), pend.sig = params[3];
             pend.screen = screen, pend.mainScreen = mainScreen, pend.probe = probe, pend.sunMap = sunMap, pend.marked = marked, pend.indirect = kind == 2;
+            pend.stableOrder = kind != 2 && params[1] <= 1;
             std::memcpy(pend.viewport, state.viewport, sizeof(pend.viewport));
             if (mainScreen && !probe)
                 g_liveReserved += vertices;
@@ -1045,6 +1060,12 @@ void LiveUiSnapshot(command_list* cmd)
         if (g_liveSnapCount >= kLiveSnaps || !g_liveSnap[g_liveSnapCount])
             return;
         target = reinterpret_cast<ID3D12Resource*>(it->second.backBuffer);
+        // image d'écran recréée (passage en HDR, Alt+Tab, changement de taille) : la photo n'est prise que si elle
+        // a la disposition des tampons (une copie d'un autre format ou d'une autre taille rend la liste du jeu
+        // invalide : Horizon Forbidden West plantait au passage en HDR)
+        const D3D12_RESOURCE_DESC d = target->GetDesc();
+        if (d.Format != g_liveSnapFp.Footprint.Format || d.Width != g_liveSnapFp.Footprint.Width || d.Height != g_liveSnapFp.Footprint.Height)
+            return;
         snap = g_liveSnap[g_liveSnapCount++];
         fp = g_liveSnapFp;
     }
@@ -1109,7 +1130,12 @@ void LiveCommit(const std::vector<LivePending>& pending)
             if (p.indirect)
                 g_liveIdSig[id] = p.sig;
             if (p.mainScreen)
+            {
                 g_liveIdMesh[id] = MeshId(p.rankKey);
+                // zone de dessin, comptée à l'exécution (dans l'ordre d'écriture, deux images s'y mêlaient)
+                g_liveViewCounts[(std::min(65535u, uint32_t(p.viewport[0] + p.viewport[2] + 0.5f)) << 16) |
+                                 std::min(65535u, uint32_t(p.viewport[1] + p.viewport[3] + 0.5f))]++;
+            }
         }
         if (p.marked && g_liveMarks.size() < kLiveMaxMarks)
             g_liveMarks.push_back({ p.key, p.slot, p.sunMap, { p.viewport[0], p.viewport[1], p.viewport[2], p.viewport[3] }, p.src, p.capacity, p.counter });
@@ -1164,7 +1190,8 @@ void LiveCommit(const std::vector<LivePending>& pending)
                 it = g_livePlaces.emplace(id, place).first;
                 g_livePlaceNew++;
             }
-            it->second.lastFrame = g_livePlaceFrame, it->second.frameCounter = p.counter;
+            it->second.prevFrame = it->second.lastFrame, it->second.lastFrame = g_livePlaceFrame, it->second.frameCounter = p.counter;
+            it->second.stableOrder = p.stableOrder, it->second.rankKey = p.rankKey;
             dst = it->second.offset, room = it->second.capacity;
         }
         else

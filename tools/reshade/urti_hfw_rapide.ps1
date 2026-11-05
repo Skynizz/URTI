@@ -13,7 +13,7 @@ function Draws {
     $l = Fresh | Select-String -Pattern 'capture 0, frame \d+ : (\d+) dessins' | Select-Object -Last 1
     if ($l) { return [int]$l.Matches[0].Groups[1].Value }
     # étalonnage stocké : plus de capture ; la scène RT (sommets) en tient lieu
-    $v = Fresh | Select-String -Pattern "structure d'accélération : (\d+) sommets en moyenne" | Select-Object -Last 1
+    $v = Fresh | Select-String -Pattern "acc.l.ration : (\d+) sommets en moyenne" | Select-Object -Last 1 # sans accent : le script est lu en ANSI
     if ($v) { if ([int]$v.Matches[0].Groups[1].Value -lt 1000) { 50 } else { 1000 } } else { -1 }
 }
 function Idle { [int](& (Join-Path $PSScriptRoot 'inactif.ps1')) -ge 60 }
