@@ -36,6 +36,15 @@ function MenuY {
     $y
 }
 
+# Steam Cloud : si la synchronisation échoue (connexion perdue), Steam attend une réponse avant de lancer le jeu, et sa
+# question « Jouer quand même » met en jeu les sauvegardes de l'utilisateur : jamais de clic automatique, l'essai s'arrête
+$steamLog = 'C:\Program Files (x86)\Steam\logs\console_log.txt'
+$steamSkip = if (Test-Path $steamLog) { @(Get-Content $steamLog).Count } else { 0 }
+function CloudBlocked {
+    if (-not (Test-Path $steamLog)) { return $false }
+    [bool](Get-Content $steamLog | Select-Object -Skip $steamSkip | Select-String -SimpleMatch 'waiting for user response to SynchronizingCloud')
+}
+
 $t0 = Get-Date
 if (-not (Get-Process $proc -ErrorAction SilentlyContinue)) { Start-Process 'steam://rungameid/2420110' }
 "jeu lancé"
@@ -43,6 +52,7 @@ $lastPlay = [datetime]::MinValue; $lastMenu = [datetime]::MinValue
 while (((Get-Date) - $t0).TotalMinutes -lt $TimeoutMin) {
     Start-Sleep 3
     $s = [int]((Get-Date) - $t0).TotalSeconds
+    if (CloudBlocked) { "Steam Cloud : synchronisation impossible, Steam attend une réponse : essai arrêté (aucun clic)"; exit 3 }
     $w = WindowWidth
     # lanceur du jeu : petite fenêtre (784 de large)
     if ($w -gt 0 -and $w -lt 1200) {

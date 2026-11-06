@@ -88,7 +88,7 @@ void main(uint id : SV_DispatchThreadID)
             // mouvement de la caméra : une quinzaine de sommets par objet resté à sa place (même poids pour chaque
             // objet : un personnage qui suit la caméra ne l'emporte pas sur le décor), avec leur position précédente
             const uint rel = (byte - r.x) / 16, stride = max(1u, filled / 16 / 16);
-            if ((source[lo] & 0x80000000) && written && rel % stride == 0 && rel / stride < 16)
+            if (maxPairs > 0 && (source[lo] & 0x80000000) && written && rel % stride == 0 && rel / stride < 16)
             {
                 const float3 old = asfloat(view.Load3(id * 12));
                 if (all(isfinite(old)) && any(old != 0) && all(abs(old) < 20000.0))

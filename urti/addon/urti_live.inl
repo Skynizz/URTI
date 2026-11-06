@@ -29,6 +29,10 @@
 #include "live_camfit_cs.h" // g_live_camfit
 #include "live_mvsynth_cs.h" // g_live_mvsynth
 #include "live_planes_cs.h" // g_live_planes
+#include "live_geoconvert_cs.h" // g_live_geoconvert
+#include "live_geoinst_cs.h" // g_live_geoinst
+#include "live_refpairs_cs.h" // g_live_refpairs
+#include "live_objplanes_cs.h" // g_live_objplanes
 
 struct LiveState
 {
@@ -77,6 +81,7 @@ struct LiveState
         float importance;  // taille / distance (taille apparente)
         uint64_t frame;    // image de la dernière mesure
         uint32_t vertices; // sommets réellement écrits (mesurés)
+        float minZ;        // distance au plus près de la caméra
     };
     std::unordered_map<uint32_t, ObjectStat> objects;
     std::unordered_map<uint32_t, uint32_t> seenNow;
@@ -110,7 +115,66 @@ struct LiveState
     ComPtr<ID3D12RootSignature> planesRs;
     ComPtr<ID3D12PipelineState> planesPso;
     ComPtr<ID3D12Resource> viewT, blasT, blasTScratch, transpUpload[3], transpSrcUpload[3], planeStats, planeReadback[3];
-    bool viewTRead = false, transpBuilt = false, waterOn = true;
+    bool viewTRead = false, transpBuilt = false, waterOn = false;
+    uint32_t transpMiss = 0; // fenêtres de suite sans surface transparente (image du jeu coupée entre deux présentations)
+    // cache de géométrie : chaque objet hors du budget de l'image, capté à son tour, a sa structure gardée dans une
+    // réserve (tampon circulaire), posée dans la structure de tête par la pose de la caméra (live_camfit)
+    struct GeoEntry
+    {
+        uint64_t offset = 0, size = 0, frame = 0;
+        uint32_t triangles = 0;
+    };
+    std::unordered_map<uint32_t, GeoEntry> geo;
+    std::map<uint64_t, uint32_t> geoByOffset;
+    std::unordered_map<uint32_t, uint64_t> meshProbed; // dernier tour de chaque maillage
+    // témoins : petits objets à leur place, loin de la caméra, captés à chaque image : le mouvement de la caméra se mesure
+    // sur eux (la scène de l'image ne garde plus que le proche : le personnage, que la caméra suit)
+    std::unordered_set<uint32_t> stableMeshes, sentinels;
+    // leurs points de référence dans le repère du cache (live_refpairs) : place de chaque témoin, places libres
+    std::unordered_map<uint32_t, uint32_t> sentinelRef;
+    std::vector<uint32_t> sentinelFree;
+    ComPtr<ID3D12Resource> sentRefs, sentUpload[3];
+    ComPtr<ID3D12RootSignature> refpairsRs, objplanesRs;
+    ComPtr<ID3D12PipelineState> refpairsPso, objplanesPso;
+    // planéité de chaque objet capté (live_objplanes), lue trois images plus tard : ce qui peut être de l'eau
+    ComPtr<ID3D12Resource> objPlanes, objPlanesRead[3], objPlanesUpload[3];
+    std::vector<uint32_t> objPlanesIds[3];
+    uint64_t objPlanesBytes = 0;
+    std::unordered_set<uint32_t> flatLogged;
+    uint64_t motPairs = 0;
+    bool motionLog = false; // urti.ini motion_log=1 : mouvement mesuré à chaque image (journal)
+    uint32_t reflectDiag = 0; // urti.ini reflect_diag= : vue 7 = direction du rayon réfléchi, normale
+    int depthLawFixed = -1;   // urti.ini depth_law_fixed= : -1 la loi connue dès qu'il y en a une, 0 la mesure, 1 la loi connue
+    float diagReflStrength = 0; // valeurs de la dernière composition (lignes RAFALE du journal)
+    uint32_t diagDebugReflect = 0, diagSnaps = 0;
+    int diagHistOut = -1;
+    bool diagPreUi = false;
+    ComPtr<ID3D12Resource> lawUpload[3];
+    // barrière entre les files du jeu et celle des présentations : par file du jeu, sa barrière et sa dernière valeur
+    struct QueueSync
+    {
+        ComPtr<ID3D12Fence> fence;
+        uint64_t value = 0;
+    };
+    std::unordered_map<uint64_t, QueueSync> queueSync;
+    bool queueSyncOn = true;
+    uint64_t statSyncWaits = 0;
+    // sommets réservés de chaque maillage, gardés quelques fenêtres : une fenêtre de capture ne contient parfois qu'une
+    // partie d'une image du jeu, et un maillage non vu n'est pas sorti de l'écran
+    struct SeenMesh
+    {
+        uint32_t vertices = 0;
+        uint64_t frame = 0;
+    };
+    std::unordered_map<uint32_t, SeenMesh> seenRecent;
+    ComPtr<ID3D12Resource> geoPool, geoView, geoScratch, geoInstances, geoUpload[3], geoRegionUpload[3];
+    ComPtr<ID3D12RootSignature> geoconvRs, geoinstRs;
+    ComPtr<ID3D12PipelineState> geoconvPso, geoinstPso;
+    bool geoOn = true, geoResetPose = true;
+    uint64_t geoHead = 0, geoPoolBytes = 0, geoWantBytes = 1000ull * 1048576, geoLastFlush = 0;
+    uint64_t statGeoFrames = 0, statGeoBuilds = 0, statGeoVerts = 0, statGeoEvicted = 0;
+    uint32_t statGeoFlushes = 0, statGeoBadFit = 0;
+    double geoPoseDistance = 0.0;
     uint64_t planeFrames = 0, planeKept = 0, planeTris = 0, planeSeen = 0;
     uint32_t mvGiveUps = 0, motionSource = 0, motMovingNoGame = 0; // images où la caméra bougeait sans convention du jeu trouvée
     double motRot = 0, motTrans = 0, motKept = 0, motRms = 0;
@@ -229,6 +293,7 @@ struct LiveState
     ComPtr<ID3D12Resource> materialBuf, reflectBuf;
     uint64_t materialBytes = 0, materialFrame = ~0ull, reflectBytes = 0;
     uint32_t materialPitch = 0, materialWidth = 0, materialHeight = 0, materialFormat = 0;
+    bool materialAfterCompute = false; // la cible de matériau est finie par une écriture en calcul
     float reflStrength = 1.0f, smoothMin = 0.5f, f0 = 0.04f, reflEffective = 1.0f;
     uint32_t reflChannel = 1, reflInvert = 0, debugReflect = 0, materialSlot = 2, reflEverywhere = 0;
     // cache de surfaces (live_surfcache) : couleur vue à l'écran de chaque triangle de la scène RT, pour les
@@ -657,6 +722,10 @@ bool LiveCreatePipelines(ID3D12Device* device)
         return SUCCEEDED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
     };
     return make(g_live_convert, sizeof(g_live_convert), 4, live.convertRs, live.convertPso, 8, 2) &&
+           make(g_live_geoconvert, sizeof(g_live_geoconvert), 3, live.geoconvRs, live.geoconvPso, 4, 2) &&
+           make(g_live_geoinst, sizeof(g_live_geoinst), 0, live.geoinstRs, live.geoinstPso, 4, 2) &&
+           make(g_live_refpairs, sizeof(g_live_refpairs), 3, live.refpairsRs, live.refpairsPso, 8, 3) &&
+           make(g_live_objplanes, sizeof(g_live_objplanes), 3, live.objplanesRs, live.objplanesPso, 4, 1) &&
            make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
            make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
@@ -700,6 +769,10 @@ void Retire(ComPtr<ID3D12Resource>& r)
     r.Reset();
 }
 
+// cache de géométrie : tailles par image et de la structure de tête
+constexpr uint32_t kLiveGeoMaxInstances = 16384, kLiveGeoMaxBuilds = 1024, kLiveGeoFrameVerts = 2000000, kLiveGeoMeshVerts = 150000, kLiveSentinels = 96;
+constexpr uint64_t kLiveGeoScratchBytes = 192ull * 1048576;
+
 // structure d'accélération assez grande pour `vertices` sommets
 bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
 {
@@ -739,7 +812,7 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tin = {};
         tin.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
         tin.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        tin.NumDescs = 2; // scène opaque (masque 1) et surfaces transparentes planes (masque 2)
+        tin.NumDescs = 2 + kLiveGeoMaxInstances; // scène opaque (masque 1), surfaces transparentes planes (masque 2), cache de géométrie (masque 1)
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO ti = {};
         device->GetRaytracingAccelerationStructurePrebuildInfo(&tin, &ti);
         live.tlas = UavBuffer(device, ti.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
@@ -861,8 +934,8 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 1, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
-            float vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0, uiPhoto = 1; // budget : 6 M sur les 8 M d'un emplacement
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -884,7 +957,8 @@ void LiveHotReload(ID3D12Device* device)
                 value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0 : toujours reconstruire
                 value("persist=", persist); // persist=0 : zones attribuées à la suite à chaque image (ancienne règle)
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
-                value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto);
+                value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto),
+                value("geo=", geoIni), value("geo_mb=", geoMb), value("motion_log=", motionLogIni), value("queue_sync=", queueSyncIni), value("trace_draw=", traceDraw), value("reflect_diag=", reflectDiag), value("depth_law_fixed=", depthLawFixedIni);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
                 value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea), value("water=", water), value("ao_rough=", aoRoughIni);
@@ -915,6 +989,17 @@ void LiveHotReload(ID3D12Device* device)
                 g_livePlaces.clear(), g_liveFreeSpace.clear(), g_liveFreeCounts.clear(), g_livePlaceHigh = 0, g_liveNextCount = 0;
             }
             live.budgetMax = uint64_t(std::max(0.0f, vertexBudget)), live.probeBudget = uint64_t(std::max(0.0f, probeBudget));
+            // cache de géométrie : la scène de l'image n'a plus à tout porter (objets proches et mobiles)
+            live.geoOn = geoIni != 0;
+            live.motionLog = motionLogIni != 0;
+            g_liveCensusOn = live.motionLog;
+            live.queueSyncOn = queueSyncIni != 0;
+            g_liveTraceVertices = uint32_t(traceDraw);
+            live.reflectDiag = uint32_t(reflectDiag);
+            live.depthLawFixed = int(depthLawFixedIni);
+            live.geoWantBytes = uint64_t(std::clamp(geoMb, 64.0f, 8000.0f)) * 1048576;
+            if (live.geoOn && live.budgetMax > 1500000)
+                live.budgetMax = 1500000;
             if (live.budgetMax == 0 || live.buildTarget <= 0 || live.vertexBudget == 0 || live.vertexBudget > live.budgetMax)
                 live.vertexBudget = live.budgetMax;
             live.slotLimit = uint64_t(std::max(0.0f, slotLimit));
@@ -994,15 +1079,26 @@ void LiveHotReload(ID3D12Device* device)
 // rendu -> lecture), dans la liste de commandes du jeu
 void LiveCopyGbuffer(command_list* cmd, uint64_t target, uint32_t count, const resource* resources, const resource_usage* oldStates,
                      const resource_usage* newStates, ComPtr<ID3D12Resource>& buf, uint64_t& bytes, uint32_t& pitch, uint32_t& width,
-                     uint32_t& height, uint32_t& format, uint64_t& frame, const char* what)
+                     uint32_t& height, uint32_t& format, uint64_t& frame, const char* what, bool* computeSeen = nullptr)
 {
     for (uint32_t i = 0; i < count; i++)
     {
         if (resources[i].handle != target)
             continue;
         const uint32_t before = PassD3D12State(static_cast<uint32_t>(oldStates[i])), after = PassD3D12State(static_cast<uint32_t>(newStates[i]));
-        if (!(before & D3D12_RESOURCE_STATE_RENDER_TARGET) || (after & D3D12_RESOURCE_STATE_RENDER_TARGET))
+        // (computeSeen : aussi à la fin d'une écriture en calcul, et alors seulement elle : Horizon Forbidden West finit sa
+        // cible de matériau ainsi, et c'est là seulement que l'eau y vaut 0 ; la copie de la fin du G-buffer de l'image
+        // suivante l'écrasait avant le calcul des reflets, l'eau n'était vue qu'une image sur dix)
+        const uint32_t written = D3D12_RESOURCE_STATE_RENDER_TARGET | (computeSeen ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : 0);
+        if (!(before & written) || (after & written))
             continue;
+        if (computeSeen)
+        {
+            if (before & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                *computeSeen = true;
+            else if (*computeSeen)
+                continue;
+        }
         ID3D12Resource* res = reinterpret_cast<ID3D12Resource*>(target);
         const D3D12_RESOURCE_DESC d = res->GetDesc();
         if (PassTexelBytes(uint32_t(d.Format)) != 4 || d.SampleDesc.Count != 1)
@@ -1097,7 +1193,7 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
     }
     if (target)
         LiveCopyGbuffer(cmd, target, count, resources, oldStates, newStates, live.materialBuf, live.materialBytes, live.materialPitch,
-                        live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "matériau (cible 2)");
+                        live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "matériau (cible 2)", &live.materialAfterCompute);
     if (albedoTarget)
         LiveCopyGbuffer(cmd, albedoTarget, count, resources, oldStates, newStates, live.albedoBuf, live.albedoBytes, live.albedoPitch,
                         live.albedoWidth, live.albedoHeight, live.albedoFormat, live.albedoFrame, "couleur propre (albedo, cible 0)");
@@ -1111,6 +1207,17 @@ void LiveTime(ID3D12GraphicsCommandList* list, uint32_t k)
 {
     if (live.timeHeap)
         list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * 8 + k);
+}
+
+// cache de géométrie vidé (coupure de la caméra, autre écran principal) : son repère ne vaut plus rien
+void LiveGeoFlush(const char* why)
+{
+    if (!live.geo.empty())
+        Log("URTI direct : cache de géométrie vidé (%s) : %zu objets", why, live.geo.size());
+    live.geo.clear(), live.geoByOffset.clear(), live.meshProbed.clear();
+    live.geoHead = 0, live.geoResetPose = true, live.geoLastFlush = live.frame;
+    live.sentinels.clear(), live.sentinelRef.clear(), live.sentinelFree.clear();
+    live.statGeoFlushes++;
 }
 
 // écran principal : la profondeur de la taille de l'écran la plus dessinée, sur les dernières images (une fenêtre de
@@ -1201,6 +1308,27 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.statNoDraw++;
         live.frame++;
         return;
+    }
+    // tous les dessins du jeu exécutés jusqu'ici finis avant ce calcul : le jeu exécute ses listes sur une autre file que
+    // celle des présentations, et rien ne les ordonne ; ce qui venait d'être exécuté (l'eau, tard dans l'image) n'avait pas
+    // encore écrit ses sommets ni son compteur : objet vide, reflet qui clignote. Attente sur le GPU, pas sur le processeur
+    if (live.queueSyncOn)
+    {
+        ID3D12CommandQueue* presentQueue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (const uint64_t q : g_liveExecQueues)
+        {
+            ID3D12CommandQueue* gameQueue = reinterpret_cast<ID3D12CommandQueue*>(q);
+            if (gameQueue == presentQueue)
+                continue;
+            LiveState::QueueSync& sync = live.queueSync[q];
+            if (!sync.fence && FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&sync.fence))))
+                continue;
+            sync.value++;
+            if (SUCCEEDED(gameQueue->Signal(sync.fence.Get(), sync.value)) && SUCCEEDED(presentQueue->Wait(sync.fence.Get(), sync.value)))
+                live.statSyncWaits++;
+        }
+        g_liveExecQueues.clear();
     }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1330,18 +1458,42 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         // fenêtre suivante : sa partie du flux (servie il y a trois fenêtres) repart du début ; ses compteurs sont
         // remis à zéro à la fin de cette image, avant toute liste écrite dans la nouvelle fenêtre
         g_liveWindow++;
-        zeroArea = uint32_t(g_liveWindow % kLiveAreas);
+        const uint32_t nextArea = uint32_t(g_liveWindow % kLiveAreas);
         for (uint32_t s = 0; s < kSlots; s++)
-            g_liveAreaCursor[s][zeroArea] = g_liveAreaProbe[s][zeroArea] = 0;
-        g_liveAreaCounters[zeroArea] = 0;
+            g_liveAreaCursor[s][nextArea] = g_liveAreaProbe[s][nextArea] = 0;
+        g_liveAreaCounters[nextArea] = 0;
+        // compteurs remis à zéro une fenêtre à l'avance : cette remise à zéro s'exécute à la fin de ce calcul, sur la file
+        // des présentations, et rien ne l'ordonne avec la file du jeu. Pour la fenêtre qui commence, elle arrivait pendant
+        // que le jeu dessinait déjà : tous les compteurs écrits avant elle étaient effacés (objets vides au hasard, l'eau
+        // captée une image sur huit, des places qui clignotent). Celle d'après ne commence qu'après le prochain calcul ; ses
+        // dernières lectures (kLiveAreaMaxAge) sont faites plus haut dans cette image
+        zeroArea = uint32_t((g_liveWindow + 1) % kLiveAreas);
         for (auto it = g_livePending.begin(); it != g_livePending.end();) // listes écrites mais jamais exécutées
             it = !it->second.empty() && g_liveWindow - it->second.front().window > 8 ? g_livePending.erase(it) : std::next(it);
         for (const auto& [id, mesh] : g_liveIdMesh)
             live.idMesh[id] = mesh;
         g_liveIdMesh.clear();
+        live.stableMeshes.insert(g_liveStableNow.begin(), g_liveStableNow.end());
+        g_liveStableNow.clear();
+        if (live.stableMeshes.size() > 100000)
+            live.stableMeshes.clear();
         if (live.idMesh.size() > 200000)
             live.idMesh.clear();
         live.seenNow.swap(g_liveSeen);
+        // (hausse limitée : une fenêtre qui contient deux images du jeu ne double pas le coût des maillages : le budget tombait
+        // de 105 à 27 objets le temps d'une image, et ils revenaient à la suivante)
+        for (const auto& [mesh, vertices] : live.seenNow)
+        {
+            auto& seen = live.seenRecent[mesh];
+            seen.vertices = seen.frame ? std::min(vertices, seen.vertices + seen.vertices / 4 + 64) : vertices;
+            seen.frame = live.frame;
+        }
+        live.seenNow.clear();
+        for (auto it = live.seenRecent.begin(); it != live.seenRecent.end();)
+            if (live.frame > it->second.frame + 8)
+                it = live.seenRecent.erase(it);
+            else
+                live.seenNow.emplace(it->first, it->second.vertices), ++it;
         for (const auto& [id, sig] : g_liveIdSig)
             live.idSig[id] = sig;
         g_liveIdSig.clear();
@@ -1378,7 +1530,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 {
                     const float minZ = v[i * 4], size = v[i * 4 + 1];
                     const float importance = (minZ < 1e8f && size > 0) ? size / std::max(minZ, 0.3f) : 0.0f;
-                    live.objects[ids[i]] = { importance, live.frame, uint32_t(v[i * 4 + 2]) };
+                    live.objects[ids[i]] = { importance, live.frame, uint32_t(v[i * 4 + 2]), minZ };
                     // ExecuteIndirect : une zone remplie jusqu'au bout a été tronquée : réserve maximale à l'image suivante
                     if (live.idSig.count(ids[i]))
                     {
@@ -1403,6 +1555,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             float importance = 0;
             uint32_t vertices = 0;
             uint64_t frame = ~0ull;
+            float minZ = 1e9f;
+            bool indirect = false;
         };
         std::unordered_map<uint32_t, MeshInfo> meshes;
         for (const auto& [id, o] : live.objects)
@@ -1412,6 +1566,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 mi.importance = std::max(mi.importance, o.importance);
                 mi.vertices = std::max(mi.vertices, o.vertices);
                 mi.frame = std::min(mi.frame, o.frame);
+                mi.minZ = std::min(mi.minZ, o.minZ);
+                mi.indirect = mi.indirect || live.idSig.count(id) != 0;
             }
         std::unordered_set<uint32_t> known, admit, probe;
         if (live.vertexBudget > 0)
@@ -1429,28 +1585,77 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 known.insert(mesh);
                 ranked.push_back({ it->second.importance * (live.admitted.count(mesh) ? 1.3f : 1.0f), mesh });
             }
+            // témoins du mouvement de la caméra : dessinés une seule fois (sinon leur ordre d'une image à l'autre n'est pas
+            // sûr), dessin direct, petits, à plus de 4 m (pas le personnage que la caméra suit) ; répartis en distance : les
+            // lointains disent la rotation, les proches le déplacement ; gardés tant qu'ils restent à l'écran
+            if (live.geoOn)
+            {
+                auto single = [&](uint32_t mesh, const MeshInfo& mi) { return live.seenNow[mesh] <= mi.vertices + mi.vertices / 20 + 3; };
+                for (auto it = live.sentinels.begin(); it != live.sentinels.end();)
+                {
+                    const auto mi = meshes.find(*it);
+                    if (live.seenNow.count(*it) && mi != meshes.end() && single(*it, mi->second))
+                        ++it;
+                    else
+                        it = live.sentinels.erase(it);
+                }
+                if (live.sentinels.size() < kLiveSentinels)
+                {
+                    std::vector<std::pair<float, uint32_t>> candidates;
+                    for (const auto& [score, mesh] : ranked)
+                    {
+                        const MeshInfo& mi = meshes[mesh];
+                        const uint32_t reserved = live.seenNow[mesh];
+                        if (!live.sentinels.count(mesh) && !mi.indirect && live.stableMeshes.count(mesh) && reserved >= 30 && reserved <= 3000 && single(mesh, mi) &&
+                            mi.minZ >= 4.0f && mi.minZ <= 200.0f)
+                            candidates.push_back({ mi.minZ, mesh });
+                    }
+                    std::sort(candidates.begin(), candidates.end());
+                    const size_t room = kLiveSentinels - live.sentinels.size();
+                    for (size_t k = 0; k < room && k < candidates.size(); k++)
+                        live.sentinels.insert(candidates[candidates.size() <= room ? k : k * candidates.size() / room].second);
+                }
+                for (uint32_t mesh : live.sentinels)
+                    used += live.seenNow[mesh], admit.insert(mesh);
+            }
             std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<uint64_t, uint32_t>> stale;
             // un maillage trop gros pour la place restante est sauté, les suivants peuvent entrer ; sommets comptés :
             // ceux réservés par tous ses exemplaires dans cette image
             for (const auto& [score, mesh] : ranked)
             {
+                if (admit.count(mesh))
+                    continue; // témoin
                 const uint32_t vertices = live.seenNow[mesh];
                 if (used + vertices <= live.vertexBudget)
                     used += vertices, admit.insert(mesh);
                 else
-                    stale.push_back({ meshes[mesh].frame, mesh });
+                    stale.push_back({ live.geoOn ? live.meshProbed[mesh] : meshes[mesh].frame, mesh });
             }
-            // re-mesures : les mesures les plus anciennes d'abord
+            // re-mesures (et cache de géométrie) : à tour de rôle, les plus anciennes d'abord ; maillage énorme (herbe,
+            // feuillage, des milliers de dessins) : une part de ses dessins à chaque tour
             std::sort(stale.begin(), stale.end());
             uint64_t probed = 0;
+            std::unordered_map<uint32_t, uint32_t> strides;
             for (const auto& [frame, mesh] : stale)
             {
                 const uint32_t vertices = live.seenNow[mesh];
-                if (probed + vertices > live.probeBudget)
+                const uint32_t stride = live.geoOn ? std::max(1u, (vertices + kLiveGeoMeshVerts - 1) / kLiveGeoMeshVerts) : 1u;
+                if (probed + vertices / stride > live.probeBudget)
                     continue;
-                probed += vertices, probe.insert(mesh);
+                probed += vertices / stride, probe.insert(mesh);
+                if (stride > 1)
+                    strides[mesh] = stride;
+                if (live.geoOn)
+                    live.meshProbed[mesh] = live.frame;
             }
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_liveProbeStride.swap(strides);
+                g_liveProbeDraws.clear();
+            }
+            if (live.meshProbed.size() > 100000)
+                live.meshProbed.clear();
         }
         if (live.frame % 300 == 150)
         {
@@ -1488,9 +1693,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         std::lock_guard<std::mutex> lock(g_mutex);
         g_liveKnown.swap(known), g_liveAdmit.swap(admit), g_liveProbeWant.swap(probe);
         g_liveBudget = live.vertexBudget > 0;
-        g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.probeBudget;
+        // (cache de géométrie : la limite par image a été respectée au choix ; ici, seulement une limite dure, les dessins
+        // d'un maillage énorme n'ont pas tous la même taille)
+        g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.geoOn ? std::max<uint64_t>(live.probeBudget, kLiveGeoFrameVerts) : live.probeBudget;
         g_liveSlotLimit = live.slotLimit;
         g_liveMainDepth = slot >= 0 ? g.slotDepth[slot] : 0;
+        g_liveMainSlotIndex = slot;
         // tailles apprises des ExecuteIndirect : par signature de commande (à chaque image), et par identité
         if (live.frame % 10 == 0)
         {
@@ -1509,12 +1717,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (const float* m = nullptr; live.motionReadback[live.frame % 3] && SUCCEEDED(live.motionReadback[live.frame % 3]->Map(0, nullptr, (void**)&m)) && m)
     {
         live.motFrames++;
+        live.motPairs += uint64_t(m[14]);
+        if (live.motionLog)
+            Log("MOUVEMENT %llu valide %.0f paires %.0f gardees %.0f ecart %.4f t %.4f %.4f %.4f trace %.6f pose %.3f", (unsigned long long)live.frame, m[12], m[14], m[13], m[15], m[9], m[10], m[11],
+                m[0] + m[4] + m[8], std::sqrt(m[41] * m[41] + m[42] * m[42] + m[43] * m[43]));
         if (m[12] > 0.5f)
         {
             const double tr = std::clamp((double(m[0]) + m[4] + m[8] - 1.0) * 0.5, -1.0, 1.0);
             const double rot = std::acos(tr) * 180.0 / 3.14159265, move = std::sqrt(double(m[9]) * m[9] + double(m[10]) * m[10] + double(m[11]) * m[11]);
             live.motValid++, live.motRot += rot, live.motTrans += move;
             live.motKept += m[14] > 0 ? m[13] / m[14] : 0.0, live.motRms += m[15];
+            live.geoPoseDistance = std::sqrt(double(m[41]) * m[41] + double(m[42]) * m[42] + double(m[43]) * m[43]);
             // la caméra bouge (notre mesure) et les vecteurs du jeu ne se laissent toujours pas lire : ils ne
             // contiennent sans doute pas le mouvement de la caméra (seulement celui des personnages) ; trois secondes
             // ainsi et les nôtres les remplacent
@@ -1527,14 +1740,24 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     LiveSaveCalibration();
             }
         }
+        // assez de paires, et presque aucune n'accepte le moindre mouvement : coupure de la caméra (cinématique, voyage
+        // rapide). Une coupure non vue n'est pas grave (le tour suivant remplace tout, et les rayons écartent ce que la
+        // caméra voit à travers) ; un vidage de trop fait disparaître la moitié de l'effet pendant une seconde
+        const bool badFit = m[12] <= 0.5f && m[14] >= 256.0f && m[13] < 32.0f;
         live.motionReadback[live.frame % 3]->Unmap(0, nullptr);
+        if (badFit)
+        {
+            live.statGeoBadFit++;
+            if (live.frame > live.geoLastFlush + 120)
+                LiveGeoFlush("mouvement de la caméra impossible à mesurer");
+        }
         if (live.motFrames >= 300)
         {
             const double v = std::max(1u, live.motValid);
             Log("URTI direct : mouvement de la caméra mesuré sur notre géométrie : %u images sur %u, rotation %.3f° et translation %.1f cm par image en "
-                "moyenne, %.0f %% des paires gardées, écart %.1f mm%s", live.motValid, live.motFrames, live.motRot / v, live.motTrans / v * 100.0,
-                live.motKept / v * 100.0, live.motRms / v * 1000.0, live.mvSynthetic ? " (vecteurs de mouvement fabriqués avec lui)" : "");
-            live.motFrames = live.motValid = 0, live.motRot = live.motTrans = live.motKept = live.motRms = 0;
+                "moyenne, %.0f paires reçues par image, %.0f %% gardées, écart %.1f mm, %zu témoins%s", live.motValid, live.motFrames, live.motRot / v, live.motTrans / v * 100.0,
+                double(live.motPairs) / live.motFrames, live.motKept / v * 100.0, live.motRms / v * 1000.0, live.sentinels.size(), live.mvSynthetic ? " (vecteurs de mouvement fabriqués avec lui)" : "");
+            live.motFrames = live.motValid = 0, live.motRot = live.motTrans = live.motKept = live.motRms = 0, live.motPairs = 0;
         }
     }
     // bilan du suivi du soleil, lu trois images plus tard
@@ -1542,6 +1765,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     {
         if (live.frame % 600 == 0)
             Log("URTI direct : loi de profondeur de l'image : %g + %g / w (valide %.0f) ; stockée : %g + %g / w", r[9], r[10], r[11], live.A, live.B);
+        if (live.motionLog)
+            Log("LOI %llu %g %g valide %.0f", (unsigned long long)live.frame, r[9], r[10], r[11]);
         if (live.calibrated)
         {
             live.sunFrames++, live.pairSum += uint64_t(r[4]);
@@ -1799,9 +2024,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     // budget de géométrie : toutes les 30 images, -15 % au-dessus de la cible (+10 %), +8 % bien en dessous
                     if (live.buildTarget > 0 && live.budgetMax > 0 && live.frame % 30 == 0)
                     {
-                        constexpr uint64_t kBudgetMin = 1500000;
+                        const uint64_t kBudgetMin = live.geoOn ? 500000 : 1500000;
                         if (live.rebuildMs > live.buildTarget * 1.1)
-                            live.vertexBudget = std::max<uint64_t>(std::min(kBudgetMin, live.budgetMax), live.vertexBudget * 85 / 100);
+                            live.vertexBudget = std::max<uint64_t>(std::min<uint64_t>(kBudgetMin, live.budgetMax), live.vertexBudget * 85 / 100);
                         else if (live.rebuildMs < live.buildTarget * 0.75)
                             live.vertexBudget = std::min<uint64_t>(live.budgetMax, live.vertexBudget * 108 / 100);
                     }
@@ -2000,13 +2225,71 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     list->SetComputeRootUnorderedAccessView(5, live.pairsBuf ? live.pairsBuf->GetGPUVirtualAddress() : live.view->GetGPUVirtualAddress());
     const uint32_t converted = std::max(3u, uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity)) / 3 * 3);
+    // cache de géométrie : les paires viennent des points de référence des témoins (live_refpairs), pas d'une image à l'autre
+    const bool refPose = live.geoOn && live.refpairsPso;
     const struct { float p00, p11; uint32_t count, regionCount, maxPairs, pad0, pad1, pad2; } cc = {
-        live.p00, live.p11, converted, uint32_t(tableNow.size()), live.pairsBuf ? kLiveMaxMotionPairs : 0u, 0, 0, 0 };
+        live.p00, live.p11, converted, uint32_t(tableNow.size()), live.pairsBuf && !refPose ? kLiveMaxMotionPairs : 0u, 0, 0, 0 };
     list->SetComputeRoot32BitConstants(6, 8, &cc, 0);
     list->Dispatch(UINT((converted + 255) / 256), 1, 1);
     // 1d. mouvement de la caméra depuis l'image précédente, mesuré sur les paires de sommets de la conversion
     if (live.camfitPso && live.pairsBuf && live.motionBuf && live.motionReadback[live.frame % 3])
     {
+        if (refPose)
+        {
+            if (!live.sentRefs)
+            {
+                live.sentRefs = UavBuffer(g.device, 208ull * (kLiveSentinels * 2), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                live.sentinelFree.clear();
+            }
+            // places des points : celles des témoins partis redeviennent libres
+            for (auto it = live.sentinelRef.begin(); it != live.sentinelRef.end();)
+                if (live.sentinels.count(it->first))
+                    ++it;
+                else
+                    live.sentinelFree.push_back(it->second), it = live.sentinelRef.erase(it);
+            if (live.sentinelRef.empty() && live.sentinelFree.size() != kLiveSentinels * 2)
+            {
+                live.sentinelFree.clear();
+                for (uint32_t k = 0; k < kLiveSentinels * 2; k++)
+                    live.sentinelFree.push_back(k);
+            }
+            std::vector<LiveRegion> sentTable;
+            std::unordered_set<uint32_t> sentSeen;
+            for (size_t i = 0; i < regionsNow.size(); i++)
+            {
+                const auto m = live.idMesh.find(regionsNow[i].id);
+                if (m == live.idMesh.end() || !live.sentinels.count(m->second) || !sentSeen.insert(m->second).second)
+                    continue;
+                uint32_t place = 0;
+                if (const auto it = live.sentinelRef.find(m->second); it != live.sentinelRef.end())
+                    place = it->second;
+                else if (!live.sentinelFree.empty())
+                {
+                    place = live.sentinelFree.back() | 0x80000000u;
+                    live.sentinelFree.pop_back();
+                    live.sentinelRef[m->second] = place & 0x7FFFFFFF;
+                }
+                else
+                    continue;
+                sentTable.push_back({ srcNow[i], regionsNow[i].capacity, regionsNow[i].counter, place });
+            }
+            ID3D12Resource* sentBuf = sentTable.empty() ? nullptr : upload(live.sentUpload[live.frame % 3], sentTable.data(), sentTable.size() * sizeof(LiveRegion));
+            if (live.sentRefs && sentBuf)
+            {
+                list->SetComputeRootSignature(live.refpairsRs.Get());
+                list->SetPipelineState(live.refpairsPso.Get());
+                list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
+                list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2, sentBuf->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(3, live.sentRefs->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(4, live.pairsBuf->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(5, live.motionBuf->GetGPUVirtualAddress());
+                const struct { float p00, p11; uint32_t count, maxPairs, identityPose, pad0, pad1, pad2; } rp = {
+                    live.p00, live.p11, uint32_t(sentTable.size()), kLiveMaxMotionPairs, live.geoResetPose ? 1u : 0u, 0, 0, 0 };
+                list->SetComputeRoot32BitConstants(6, 8, &rp, 0);
+                list->Dispatch(UINT(sentTable.size()), 1, 1);
+            }
+        }
         D3D12_RESOURCE_BARRIER pb = {};
         pb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         pb.UAV.pResource = live.pairsBuf.Get();
@@ -2015,23 +2298,28 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->SetPipelineState(live.camfitPso.Get());
         list->SetComputeRootUnorderedAccessView(0, live.motionBuf->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, live.pairsBuf->GetGPUVirtualAddress());
-        const uint32_t fc[4] = { kLiveMaxMotionPairs, 0, 0, 0 };
+        const uint32_t fc[4] = { kLiveMaxMotionPairs, live.geoResetPose ? 1u : 0u, 0, 0 };
+        live.geoResetPose = false;
         list->SetComputeRoot32BitConstants(2, 4, fc, 0);
         list->Dispatch(1, 1, 1);
         Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyBufferRegion(live.motionReadback[live.frame % 3].Get(), 0, live.motionBuf.Get(), 0, 128);
+        list->CopyBufferRegion(live.motionReadback[live.frame % 3].Get(), 0, live.motionBuf.Get(), 0, 176);
         Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     // 1e. surfaces transparentes (eau, vitres) : leur couche convertie, puis seules les surfaces planes gardées
-    live.transpBuilt = false;
+    // (fenêtre sans aucune, image du jeu coupée entre deux présentations : la dernière couche reste, le reflet de l'eau
+    // ne s'éteint pas une image sur deux)
+    if (!live.waterOn || (transpNow.empty() && ++live.transpMiss > 8))
+        live.transpBuilt = false;
     if (live.waterOn && !transpNow.empty() && live.planesPso)
     {
+        live.transpMiss = 0;
         if (!live.viewT)
         {
             live.viewT = UavBuffer(g.device, uint64_t(kLiveTranspVertices) * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            live.planeStats = UavBuffer(g.device, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            live.planeStats = UavBuffer(g.device, 16 + 256 * 24, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             for (auto& r : live.planeReadback)
-                r = MakeBuffer(g.device, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+                r = MakeBuffer(g.device, 16 + 256 * 24, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
             D3D12_RAYTRACING_GEOMETRY_DESC tg = {};
             tg.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
             tg.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
@@ -2064,6 +2352,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         ID3D12Resource* tTable = uploadT(live.transpUpload[live.frame % 3], transpNow.data(), transpNow.size() * sizeof(LiveRegion));
         ID3D12Resource* tSrc = uploadT(live.transpSrcUpload[live.frame % 3], transpSrcNow.data(), transpSrcNow.size() * 4);
         const uint32_t tCount = std::max(3u, std::min(transpCursorNow / 16, kLiveTranspVertices) / 3 * 3);
+        if (live.motionLog)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            Log("COUCHEP %llu dessins %zu sommets %u refuses %u", (unsigned long long)live.frame, transpNow.size(), tCount, g_liveTranspRefused);
+            g_liveTranspRefused = 0;
+        }
         if (live.viewT && live.blasT && live.blasTScratch && tTable && tSrc && live.planeStats && live.planeReadback[live.frame % 3])
         {
             if (live.viewTRead)
@@ -2098,7 +2392,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRoot32BitConstants(4, 4, pc, 0);
             list->Dispatch(UINT(transpNow.size()), 1, 1);
             Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            list->CopyBufferRegion(live.planeReadback[live.frame % 3].Get(), 0, live.planeStats.Get(), 0, 16);
+            list->CopyBufferRegion(live.planeReadback[live.frame % 3].Get(), 0, live.planeStats.Get(), 0, 16 + 256 * 24);
             Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             Transition(list.Get(), live.viewT.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv), live.viewTRead = true;
             // sa structure, reconstruite à chaque image (quelques surfaces)
@@ -2126,6 +2420,21 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (const uint32_t* c = nullptr; live.planeReadback[live.frame % 3] && SUCCEEDED(live.planeReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
     {
         live.planeFrames++, live.planeKept += c[0], live.planeTris += c[1], live.planeSeen += c[2];
+        if (live.motionLog)
+        {
+            char text[2400] = "";
+            // les surfaces à peu près horizontales et assez étendues, celles qui peuvent être de l'eau
+            for (uint32_t k = 0; k < c[2] && k < 256; k++)
+                if (const uint32_t v = c[4 + k * 6]; (v & 0x1FFFFFFF) >= 30 && (c[5 + k * 6] >> 16) >= 300 && std::fabs(reinterpret_cast<const float*>(c)[7 + k * 6]) > 0.6f)
+                {
+                    char item[64];
+                    float nd[4];
+                    std::memcpy(nd, c + 6 + k * 6, sizeof(nd));
+                    std::snprintf(item, sizeof(item), " %u%s/%u/%u/n%.2f,%.2f,%.2f/d%.2f", v & 0x1FFFFFFF, (v >> 31) ? "P" : (v >> 29) & 1 ? "F" : (v >> 30) & 1 ? "c" : "x", c[5 + k * 6] & 0xFFFF, c[5 + k * 6] >> 16, nd[0], nd[1], nd[2], nd[3]);
+                    std::strncat(text, item, sizeof(text) - std::strlen(text) - 1);
+                }
+            Log("COUCHE %llu recus %u plans %u :%s", (unsigned long long)live.frame, c[2], c[0], text);
+        }
         live.planeReadback[live.frame % 3]->Unmap(0, nullptr);
         if (live.planeFrames >= 300)
         {
@@ -2133,6 +2442,126 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 double(live.planeSeen) / live.planeFrames, double(live.planeKept) / live.planeFrames, double(live.planeTris) / live.planeFrames);
             live.planeFrames = live.planeKept = live.planeTris = live.planeSeen = 0;
         }
+    }
+    // 1f. cache de géométrie : les objets captés à leur tour (zone de mesure) sont convertis dans le repère du cache,
+    // chacun a sa structure, gardée jusqu'au tour suivant (toute la forêt d'Horizon : 14 millions de sommets, qu'aucune
+    // reconstruction par image ne peut suivre). Bâti en premier des objets de la scène de l'image, retirés du cache
+    if (live.geoOn && !live.geoPool && live.geoconvPso && live.geoinstPso && live.motionBuf)
+    {
+        live.geoPoolBytes = live.geoWantBytes;
+        live.geoPool = UavBuffer(g.device, live.geoPoolBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        live.geoView = UavBuffer(g.device, uint64_t(kLiveGeoFrameVerts) * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.geoScratch = UavBuffer(g.device, kLiveGeoScratchBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.geoInstances = UavBuffer(g.device, (uint64_t(kLiveGeoMaxInstances) + 2) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (!live.geoPool || !live.geoView || !live.geoScratch || !live.geoInstances)
+            live.geoOn = false, Log("URTI direct : cache de géométrie : mémoire refusée (%llu Mo), coupé", (unsigned long long)(live.geoPoolBytes / 1048576));
+        else
+            Log("URTI direct : cache de géométrie : réserve de %llu Mo", (unsigned long long)(live.geoPoolBytes / 1048576));
+    }
+    const bool geoActive = live.geoOn && live.geoPool && live.geoView && live.geoScratch && live.geoInstances;
+    if (geoActive)
+    {
+        auto geoErase = [&](uint32_t id) {
+            if (const auto it = live.geo.find(id); it != live.geo.end())
+            {
+                live.geoByOffset.erase(it->second.offset);
+                live.geo.erase(it);
+            }
+        };
+        for (const LiveRegion& r : regionsNow)
+            geoErase(r.id);
+        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geoms;
+        std::vector<D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC> builds;
+        std::vector<LiveRegion> geoRegions;
+        geoms.reserve(kLiveGeoMaxBuilds), builds.reserve(kLiveGeoMaxBuilds), geoRegions.reserve(kLiveGeoMaxBuilds);
+        const D3D12_GPU_VIRTUAL_ADDRESS viewVa = live.geoView->GetGPUVirtualAddress(), poolVa = live.geoPool->GetGPUVirtualAddress(),
+                                        scratchVa = live.geoScratch->GetGPUVirtualAddress();
+        uint32_t frameVerts = 0;
+        uint64_t scratchUsed = 0;
+        for (const LiveRegion& r : probesNow)
+        {
+            const uint32_t n = r.capacity / 16 / 3 * 3;
+            if (n < 9 || !r.id)
+                continue;
+            if (geoRegions.size() >= kLiveGeoMaxBuilds || frameVerts + n > kLiveGeoFrameVerts)
+                break;
+            if (live.geo.size() >= kLiveGeoMaxInstances && !live.geo.count(r.id))
+                continue;
+            D3D12_RAYTRACING_GEOMETRY_DESC gd = {};
+            gd.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            gd.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+            gd.Triangles.VertexBuffer = { viewVa + uint64_t(frameVerts) * 12, 12 };
+            gd.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            gd.Triangles.VertexCount = n;
+            geoms.push_back(gd);
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bb = {};
+            bb.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            bb.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+            bb.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            bb.Inputs.NumDescs = 1;
+            bb.Inputs.pGeometryDescs = &geoms.back();
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+            device->GetRaytracingAccelerationStructurePrebuildInfo(&bb.Inputs, &info);
+            const uint64_t size = (info.ResultDataMaxSizeInBytes + 255) & ~255ull, scratch = (info.ScratchDataSizeInBytes + 255) & ~255ull;
+            if (scratchUsed + scratch > kLiveGeoScratchBytes || size > live.geoPoolBytes / 4)
+            {
+                geoms.pop_back();
+                continue;
+            }
+            // place dans la réserve : tampon circulaire, les plus anciens objets sur le chemin laissent la place
+            geoErase(r.id);
+            if (live.geoHead + size > live.geoPoolBytes)
+                live.geoHead = 0;
+            const uint64_t lo = live.geoHead, hi = lo + size;
+            auto it = live.geoByOffset.upper_bound(lo);
+            if (it != live.geoByOffset.begin())
+            {
+                auto before = std::prev(it);
+                if (const auto e = live.geo.find(before->second); e != live.geo.end() && before->first + e->second.size > lo)
+                    it = before;
+            }
+            while (it != live.geoByOffset.end() && it->first < hi)
+            {
+                live.geo.erase(it->second);
+                it = live.geoByOffset.erase(it);
+                live.statGeoEvicted++;
+            }
+            live.geo[r.id] = { lo, size, live.frame, n / 3 };
+            live.geoByOffset[lo] = r.id;
+            live.geoHead = hi;
+            bb.DestAccelerationStructureData = poolVa + lo;
+            bb.ScratchAccelerationStructureData = scratchVa + scratchUsed;
+            builds.push_back(bb);
+            geoRegions.push_back({ r.offset, r.capacity, r.counter, frameVerts * 12 });
+            frameVerts += n, scratchUsed += scratch;
+        }
+        ID3D12Resource* geoTable = geoRegions.empty() ? nullptr : upload(live.geoRegionUpload[live.frame % 3], geoRegions.data(), geoRegions.size() * sizeof(LiveRegion));
+        if (geoTable)
+        {
+            D3D12_RESOURCE_BARRIER gb = {};
+            gb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            gb.UAV.pResource = live.motionBuf.Get();
+            list->ResourceBarrier(1, &gb);
+            list->SetComputeRootSignature(live.geoconvRs.Get());
+            list->SetPipelineState(live.geoconvPso.Get());
+            list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
+            list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, geoTable->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(3, live.geoView->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(4, live.motionBuf->GetGPUVirtualAddress());
+            const struct { float p00, p11; uint32_t count, pad; } gc = { live.p00, live.p11, uint32_t(geoRegions.size()), 0 };
+            list->SetComputeRoot32BitConstants(5, 4, &gc, 0);
+            list->Dispatch(UINT(geoRegions.size()), 1, 1);
+            Transition(list.Get(), live.geoView.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            for (const auto& bb : builds)
+                list->BuildRaytracingAccelerationStructure(&bb, 0, nullptr);
+            Transition(list.Get(), live.geoView.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            gb.UAV.pResource = live.geoPool.Get();
+            list->ResourceBarrier(1, &gb);
+        }
+        else if (!geoRegions.empty())
+            LiveGeoFlush("mémoire d'envoi refusée");
+        live.statGeoFrames++, live.statGeoBuilds += builds.size(), live.statGeoVerts += frameVerts;
     }
     // 1a. mesure de chaque objet capté, de la scène RT et de la zone de mesure (budget de géométrie)
     if (live.statsPso && !(regionsNow.empty() && probesNow.empty()))
@@ -2185,6 +2614,65 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 ids.push_back(r.id), caps.push_back(r.capacity / 16);
         }
         live.statDraws += regionsNow.size(), live.statProbes += probesNow.size(), live.statBudgetFrames++;
+    }
+    // 1g. diagnostic (motion_log=1) : planéité des petits objets captés, tous les huit calculs ; bilan lu trois images plus tard
+    if (live.objplanesPso && live.motionLog)
+    {
+        std::vector<uint32_t>& flatIds = live.objPlanesIds[live.frame % 3];
+        if (const float* f = nullptr; !flatIds.empty() && live.objPlanesRead[live.frame % 3] && SUCCEEDED(live.objPlanesRead[live.frame % 3]->Map(0, nullptr, (void**)&f)) && f)
+        {
+            for (size_t k = 0; k < flatIds.size(); k++)
+            {
+                const uint32_t tris = reinterpret_cast<const uint32_t*>(f)[k * 8];
+                const float coh = f[k * 8 + 1], err = f[k * 8 + 2], size = f[k * 8 + 3], ny = f[k * 8 + 5];
+                const auto m = live.idMesh.find(flatIds[k]);
+                if (m == live.idMesh.end())
+                    continue;
+                if (live.motionLog && tris >= 2 && size >= 8.0f && std::fabs(ny) > 0.8f && coh > 0.8f && err < 0.03f * size + 0.1f && live.flatLogged.insert(m->second).second && live.flatLogged.size() < 400)
+                    Log("OBJETPLAT maillage %08x triangles %u coherence %.3f ecart %.2f taille %.1f normale %.2f %.2f %.2f distance %.2f", m->second, tris, coh, err, size, f[k * 8 + 4], ny, f[k * 8 + 6], f[k * 8 + 7]);
+            }
+            live.objPlanesRead[live.frame % 3]->Unmap(0, nullptr);
+        }
+        flatIds.clear();
+        if (live.frame % 8 == 0)
+        {
+            std::vector<LiveRegion> smallObjs;
+            for (size_t i = 0; i < regionsNow.size(); i++)
+                if (regionsNow[i].capacity / 16 <= 6000)
+                    smallObjs.push_back({ srcNow[i], regionsNow[i].capacity, regionsNow[i].counter, regionsNow[i].id });
+            for (const LiveRegion& r : probesNow)
+                if (r.capacity / 16 <= 6000)
+                    smallObjs.push_back(r);
+            const uint64_t planeBytes = uint64_t(smallObjs.size()) * 32;
+            if (live.objPlanesBytes < planeBytes)
+            {
+                Retire(live.objPlanes);
+                live.objPlanesBytes = std::max<uint64_t>(planeBytes * 2, 65536);
+                live.objPlanes = UavBuffer(g.device, live.objPlanesBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                for (auto& rb : live.objPlanesRead)
+                    Retire(rb), rb = MakeBuffer(g.device, live.objPlanesBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+                for (auto& v : live.objPlanesIds)
+                    v.clear();
+            }
+            ID3D12Resource* smallBuf = smallObjs.empty() ? nullptr : upload(live.objPlanesUpload[live.frame % 3], smallObjs.data(), smallObjs.size() * sizeof(LiveRegion));
+            if (smallBuf && live.objPlanes && live.objPlanesRead[live.frame % 3])
+            {
+                list->SetComputeRootSignature(live.objplanesRs.Get());
+                list->SetPipelineState(live.objplanesPso.Get());
+                list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress() + slot * kSlotBytes);
+                list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(2, smallBuf->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(3, live.objPlanes->GetGPUVirtualAddress());
+                const struct { float p00, p11; uint32_t count, pad; } oc = { live.p00, live.p11, uint32_t(smallObjs.size()), 0 };
+                list->SetComputeRoot32BitConstants(4, 4, &oc, 0);
+                list->Dispatch(UINT(smallObjs.size()), 1, 1);
+                Transition(list.Get(), live.objPlanes.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->CopyBufferRegion(live.objPlanesRead[live.frame % 3].Get(), 0, live.objPlanes.Get(), 0, planeBytes);
+                Transition(list.Get(), live.objPlanes.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                for (const LiveRegion& r : smallObjs)
+                    flatIds.push_back(r.id);
+            }
+        }
     }
     Transition(list.Get(), live.view.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
@@ -2286,6 +2774,24 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
     }
     // 1c. loi de profondeur de cette image, mesurée sur les sommets de l'écran
+    // Une loi déjà sûre (stockée, vérifiée) prime : la mesure fait une moyenne sur les sommets captés, et ils n'ont pas tous la
+    // même loi (Horizon : 0,19 / w pour le décor, autre chose pour le personnage). La scène de l'image ne gardant plus que le
+    // proche, elle tombait entre 0,08 et 0,13 d'une image à l'autre : toutes les distances fausses, le reflet qui décroche
+    // sur tout le lac pendant des séries d'images. urti.ini depth_law_fixed= : 1 toujours la loi connue, 0 toujours la mesure
+    const bool lawKnown = live.depthLawFixed == 1 || (live.depthLawFixed < 0 && (live.fromStore || live.verified));
+    ID3D12Resource* lawUp = nullptr;
+    if (lawKnown)
+    {
+        const float law[4] = { live.A, live.B, 1.0f, 0.0f };
+        lawUp = upload(live.lawUpload[live.frame % 3], law, sizeof(law));
+    }
+    if (lawUp)
+    {
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(live.sunBuf.Get(), 36, lawUp, 0, 12);
+        Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    else
     {
         D3D12_RESOURCE_BARRIER ub = {};
         ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -2339,6 +2845,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav.UAV.pResource = live.blas.Get();
     list->ResourceBarrier(1, &uav);
+    uint32_t tlasCount = 2;
+    D3D12_GPU_VIRTUAL_ADDRESS tlasInstances = live.instances->GetGPUVirtualAddress();
     {
         // exemplaire 0 : la scène opaque (masque 1 : occultation, reflets, cache) ; exemplaire 1 : les surfaces
         // transparentes planes (masque 2 : seul le rayon de la caméra des reflets les cherche ; masque 0 sans elles)
@@ -2356,12 +2864,45 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             std::memcpy(p, inst, sizeof(inst));
             live.instances->Unmap(0, nullptr);
         }
+        // exemplaires du cache de géométrie : même masque que la scène de l'image, identité 2 (ni zones ni sommets
+        // d'image précédente), posés par la pose de la caméra de cette image (live_geoinst)
+        if (geoActive)
+        {
+            std::vector<D3D12_RAYTRACING_INSTANCE_DESC> all(2 + live.geo.size());
+            all[0] = inst[0], all[1] = inst[1];
+            size_t k = 2;
+            const D3D12_GPU_VIRTUAL_ADDRESS poolVa = live.geoPool->GetGPUVirtualAddress();
+            for (const auto& [id, e] : live.geo)
+            {
+                D3D12_RAYTRACING_INSTANCE_DESC& d = all[k++];
+                d.InstanceID = 2;
+                d.InstanceMask = 0x01;
+                d.AccelerationStructure = poolVa + e.offset;
+            }
+            ID3D12Resource* geoUp = upload(live.geoUpload[live.frame % 3], all.data(), all.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+            if (geoUp)
+            {
+                Transition(list.Get(), live.geoInstances.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                list->CopyBufferRegion(live.geoInstances.Get(), 0, geoUp, 0, all.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+                Transition(list.Get(), live.geoInstances.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list->SetComputeRootSignature(live.geoinstRs.Get());
+                list->SetPipelineState(live.geoinstPso.Get());
+                list->SetComputeRootUnorderedAccessView(0, live.geoInstances->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(1, live.motionBuf->GetGPUVirtualAddress());
+                const uint32_t ic[4] = { 2, uint32_t(all.size()), 0, 0 };
+                list->SetComputeRoot32BitConstants(2, 4, ic, 0);
+                list->Dispatch(UINT((all.size() + 63) / 64), 1, 1);
+                Transition(list.Get(), live.geoInstances.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                tlasCount = uint32_t(all.size());
+                tlasInstances = live.geoInstances->GetGPUVirtualAddress();
+            }
+        }
     }
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC td = {};
     td.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     td.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    td.Inputs.NumDescs = 2;
-    td.Inputs.InstanceDescs = live.instances->GetGPUVirtualAddress();
+    td.Inputs.NumDescs = tlasCount;
+    td.Inputs.InstanceDescs = tlasInstances;
     td.DestAccelerationStructureData = live.tlas->GetGPUVirtualAddress();
     td.ScratchAccelerationStructureData = live.tlasScratch->GetGPUVirtualAddress();
     list->BuildRaytracingAccelerationStructure(&td, 0, nullptr);
@@ -2702,7 +3243,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.reflectBuf = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             live.reflectBytes = bytes;
         }
-        const bool material = live.materialBuf && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 2 &&
+        const bool material = live.materialBuf && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 8 &&
                               live.materialWidth >= live.width && live.materialHeight >= live.height;
         if (live.anchorBytes < bytes)
         {
@@ -2750,7 +3291,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
                      (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u) |
-                         (live.transpBuilt ? 256u : 0u), live.f0, live.width * 16,
+                         (live.transpBuilt ? 256u : 0u) | (live.reflectDiag ? 256u << live.reflectDiag : 0u), live.f0, live.width * 16,
                      uint32_t(tableNow.size()), live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity),
                      surfRead ? uint32_t(live.surfTriangles) : 0u };
             list->SetComputeRoot32BitConstants(12, 20, &rc, 0);
@@ -2820,6 +3361,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         const D3D12_RESOURCE_DESC md = slot >= 0 && g.slotDepth[slot] ? reinterpret_cast<ID3D12Resource*>(g.slotDepth[slot])->GetDesc() : D3D12_RESOURCE_DESC{};
         Log("URTI direct : écran principal : flux %d, profondeur %llux%u (%u dessins dans cette image)", slot, (unsigned long long)md.Width, md.Height, drawsThisFrame);
         live.lastMainSlot = slot;
+        LiveGeoFlush("autre écran principal");
     }
     live.lastDrawsThisFrame = drawsThisFrame;
 
@@ -3225,10 +3767,12 @@ void LiveComposite(effect_runtime* runtime)
     list->SetComputeRootShaderResourceView(7, live.uiCounts ? live.uiCounts->GetGPUVirtualAddress() : live.sunBuf->GetGPUVirtualAddress());
     // rebond de lumière de cette image et couleur propre des surfaces (copiée pendant l'image du jeu)
     // rebond de lumière : celui de ce calcul, ou le dernier calculé quand rien de neuf n'a été calculé (image générée)
-    const bool giFresh = live.giStamp + 1 == live.frame || (live.lastPresentDraws == 0 && live.giStamp + 2 == live.frame);
+    // (compté large, comme le masque : avec la génération d'images, plusieurs présentations de suite sans calcul ou sans
+    // G-buffer copié arrivent en régime normal ; le rebond coupé sur l'une d'elles clignotait)
+    const bool giFresh = live.giStamp != ~0ull && live.frame <= live.giStamp + 8;
     const bool giUse = live.giStrength > 0 && live.giValid && giFresh && live.albedoBuf && live.albedoFrame != ~0ull &&
-                       live.frame <= live.albedoFrame + 3 && live.albedoWidth >= live.width && live.albedoHeight >= live.height;
-    const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 3 && live.normalWidth >= live.width &&
+                       live.frame <= live.albedoFrame + 8 && live.albedoWidth >= live.width && live.albedoHeight >= live.height;
+    const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 8 && live.normalWidth >= live.width &&
                            live.normalHeight >= live.height;
     if (giUse)
     {
@@ -3260,7 +3804,8 @@ void LiveComposite(effect_runtime* runtime)
         uint32_t albedoPitch, normalPitch;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u,
-             (reflections && !(generated && live.fgMode == 2)) ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
+             // (image générée aussi : le dernier reflet stabilisé. Coupé sur elles, il s'éteignait une présentation sur deux)
+             reflections ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
              (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u) |
              (live.sunShadows ? 0u : 0x800u), live.p00, live.p11,
              { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f },
@@ -3268,6 +3813,8 @@ void LiveComposite(effect_runtime* runtime)
              giUse ? live.giStrength : 0.0f, live.albedoPitch, normalUse ? live.normalPitch : 0u };
     list->SetComputeRoot32BitConstants(13, 25, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
+    live.diagReflStrength = cc.reflStrength, live.diagDebugReflect = cc.debugReflect, live.diagHistOut = reflHistOut;
+    live.diagPreUi = preUi != nullptr, live.diagSnaps = snapCount;
     if (giUse)
     {
         Transition(list.Get(), live.giBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3348,8 +3895,9 @@ void OnReshadePresent(effect_runtime* runtime)
             if (live.preUiBuf)
                 SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "gardee_" + std::to_string(live.burstIndex) + ".ppm", 2, live.preUiBuf.Get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u dessins %u scene %u", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
-                live.churnOut, live.lastDrawsThisFrame, live.sceneCount);
+            Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u dessins %u scene %u reflet %.2f hist %d bits %x gate %.2f photos %u/%d mauvaises %u materiau %lld", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
+                live.churnOut, live.lastDrawsThisFrame, live.sceneCount, live.diagReflStrength, live.diagHistOut, live.diagDebugReflect, live.uiReflGate, live.diagSnaps, int(live.diagPreUi), live.uiBadReadbacks,
+                (long long)live.frame - (long long)live.materialFrame);
             live.burstIndex++;
             if (--live.burst == 0)
                 Log("URTI direct : rafale %u terminée (%u paires d'images)", live.burstCount, live.burstIndex);
@@ -3362,6 +3910,40 @@ void OnReshadePresent(effect_runtime* runtime)
     {
         Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées",
             live.statNoDraw, live.statEffects, live.statComposited);
+        if (g_liveCensusOn)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            static const char* const kDepthNames[4] = { "sansprof", "principale", "autrevue", "autre" };
+            static const char* const kClass[8] = { "ecrit", "transp", "sanstest", "tess", "autreetage", "reste", "?", "inconnu" };
+            for (const auto& [key, ce] : g_liveCensus)
+            {
+                std::vector<std::pair<uint32_t, uint32_t>> big(ce.sizes.begin(), ce.sizes.end());
+                std::sort(big.begin(), big.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                char top[220] = "";
+                for (size_t k = 0; k < big.size() && k < 8; k++)
+                {
+                    char item[32];
+                    std::snprintf(item, sizeof(item), " %ux%u", big[k].first, big[k].second);
+                    std::strncat(top, item, sizeof(top) - std::strlen(top) - 1);
+                }
+                Log("RECENSEMENT %s %s %s%s : %llu dessins, %llu sommets ;%s", kDepthNames[key >> 8], kClass[(key >> 4) & 15], (key & 2) ? "melange" : "plein", (key & 1) ? " indirect" : "",
+                    (unsigned long long)ce.draws, (unsigned long long)ce.vertices, top);
+            }
+            g_liveCensus.clear();
+        }
+        if (live.geoOn && live.statGeoFrames)
+        {
+            uint64_t triangles = 0, usedBytes = 0;
+            for (const auto& [id, e] : live.geo)
+                triangles += e.triangles, usedBytes += e.size;
+            const double frames = double(live.statGeoFrames);
+            Log("URTI direct : cache de géométrie : %zu objets, %.2f M triangles, %.0f Mo sur %.0f ; construits par image : %.1f objets, %.0f sommets ; %llu chassés de la réserve, %u vidages, %u mouvements impossibles à mesurer ; caméra à %.1f m du repère ; %llu attentes de la file du jeu",
+                live.geo.size(), triangles / 1e6, usedBytes / 1048576.0, live.geoPoolBytes / 1048576.0, live.statGeoBuilds / frames, live.statGeoVerts / frames,
+                (unsigned long long)live.statGeoEvicted, live.statGeoFlushes, live.statGeoBadFit, live.geoPoseDistance, (unsigned long long)live.statSyncWaits);
+            live.statSyncWaits = 0;
+            live.statGeoFrames = live.statGeoBuilds = live.statGeoVerts = live.statGeoEvicted = 0;
+            live.statGeoFlushes = live.statGeoBadFit = 0;
+        }
         Log("URTI direct : dessins exécutés : %u écrits dans la même fenêtre de présentation (%u listes), %u écrits avant la présentation "
             "précédente (%u listes)", g_execOnTime.exchange(0), g_execLists.exchange(0), g_execLate.exchange(0), g_execLateLists.exchange(0));
         live.statPresents = live.statNoDraw = live.statEffects = live.statComposited = 0;

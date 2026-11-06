@@ -154,6 +154,8 @@ void main(uint2 id : SV_DispatchThreadID)
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT || abs(q.CommittedRayT() - length(p)) > 0.02 * length(p) + 0.05)
         return; // la caméra voit autre chose que la scène RT ici (objet hors budget, trou d'une plaque découpée)
+    if (q.CommittedInstanceID() != 0)
+        return; // objet du cache de géométrie : pas de couleurs par triangle
     const uint prim = q.CommittedPrimitiveIndex();
     if (prim >= triangles)
         return;

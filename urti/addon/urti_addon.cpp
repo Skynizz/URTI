@@ -143,7 +143,8 @@ struct LivePending
     bool transp = false; // surface transparente (couche 2)
     float viewport[4] = {};
 };
-constexpr uint32_t kLiveAreas = 3;
+constexpr uint32_t kLiveAreas = 4;
+constexpr uint32_t kLiveAreaMaxAge = 3; // liste exécutée à partir de tant de fenêtres après son écriture : ignorée
 std::unordered_map<uint64_t, std::vector<LivePending>> g_livePending; // liste de commandes -> dessins captés pas encore exécutés
 uint64_t g_liveWindow = 0;                                // fenêtre de présentation (avancée par urti_live.inl)
 uint32_t g_liveAreaCursor[4][kLiveAreas] = {}, g_liveAreaProbe[4][kLiveAreas] = {}; // octets pris dans chaque partie (début, fin)
@@ -163,6 +164,12 @@ std::vector<LiveRegion> g_liveTranspRegions;        // ordre d'exécution : déb
 std::vector<uint32_t> g_liveTranspSrc;              // même ordre : début de la zone écrite dans le flux
 uint32_t g_liveTranspCursor = 0;                    // octets de la couche (16 par sommet)
 uint64_t g_liveTranspVerts = 0;                     // sommets réservés dans cette fenêtre d'écriture
+uint32_t g_liveTranspRefused = 0;                   // dessins refusés (indirects, couche pleine)
+uint32_t g_liveTraceVertices = 0;                   // urti.ini trace_draw= : journal de chaque dessin de cette taille
+int g_liveMainSlotIndex = -1;                       // emplacement de l'écran principal (dessins sans profondeur)
+struct CensusEntry { uint64_t draws = 0, vertices = 0; std::map<uint32_t, uint32_t> sizes; };
+std::map<uint32_t, CensusEntry> g_liveCensus;       // urti.ini motion_log=1 : tous les dessins de la scène, par classe
+bool g_liveCensusOn = false;
 bool g_liveTranspOn = true;                         // urti.ini water=0 : pas de couche transparente
 // zone où le jeu dessine vraiment son image dans la profondeur de l'écran : la plus fréquente parmi les zones de
 // dessin de ses dessins (bord droit, bord bas), cette fenêtre. Avec le DLSS et la résolution dynamique, Horizon
@@ -183,6 +190,9 @@ std::unordered_map<uint32_t, uint32_t> g_liveLearned;
 std::unordered_map<uint32_t, uint32_t> g_liveLearnedSig, g_liveIdSig; // signature -> sommets ; identité -> signature (cette image)
 uint64_t g_liveReserved = 0; // sommets réservés dans l'écran principal (bilan)
 uint64_t g_liveBudgetVertices = 0, g_liveProbeBudget = 0, g_liveProbeVerts = 0; // budget, zone de mesure (par image)
+std::unordered_map<uint32_t, uint32_t> g_liveProbeStride, g_liveProbeDraws; // maillage énorme : un dessin capté sur N à chaque tour
+std::unordered_set<uint32_t> g_liveStableNow; // maillages dont les sommets gardent leur ordre (dessin direct, une instance)
+std::unordered_set<uint64_t> g_liveExecQueues; // files où des dessins du jeu ont été exécutés depuis le dernier calcul
 // photos de l'écran au premier dessin de chaque liaison de l'image d'écran (urti_live.inl choisit celle
 // d'avant l'interface du jeu : les reflets n'y prennent pas les menus, la composition épargne l'interface)
 constexpr uint32_t kLiveSnaps = 4;
@@ -420,6 +430,8 @@ struct PipelineInfo
     bool tessellated = false;   // tessellation (vagues de l'eau dans certains moteurs)
     bool blends = false;        // mélange à l'image sur la première cible (surface transparente : eau, vitre, fumée)
     bool transparentUsable = false; // surface transparente captée à part (couche 2 de la scène RT : reflets de l'eau)
+    bool noDepthUsable = false;     // triangles sans test de profondeur (surface dessinée sans profondeur liée)
+    bool otherStage = false;        // géométrie, tessellation ou mesh shader
     ComPtr<ID3D12PipelineState> shadow;
     bool shadowFailed = false;
 };
@@ -518,6 +530,8 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
     // (mélangé ou non : l'eau d'Horizon Forbidden West calcule sa réfraction elle-même et écrit sa couleur d'un bloc ;
     // les dessins qui écrivent dans le G-buffer sont écartés à la capture)
     info.transparentUsable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && info.depthTested && !info.writesDepth;
+    info.noDepthUsable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && !info.depthTested;
+    info.otherStage = other;
     std::lock_guard<std::mutex> lock(g_mutex);
     PipelineInfo& stored = g_pipelines[pipe.handle] = std::move(info);
     for (size_t k = 0; k < stored.layout.size(); k++)
@@ -897,6 +911,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
     ID3D12PipelineState* shadow = nullptr;
     int slot = -1;
     bool transp = false; // surface transparente (eau, vitre…) : couche à part de la scène RT
+    bool noDepth = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         state = g.lists[(uint64_t)list];
@@ -909,12 +924,35 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         // écrite, hors du G-buffer choisi (le passage principal d'un moteur avec passe de profondeur préalable redessine
         // toute la scène ainsi dans le G-buffer) ; ou tout dessin sur une autre vue de la caméra (même forme que l'écran,
         // résolution réduite) : Horizon Forbidden West dessine son eau à mi-résolution, dans ses propres images et sa
-        // propre profondeur
+        // propre profondeur. live_planes ne garde que les surfaces planes ; live_reflect, que celles qui ont de l'épaisseur
+        // au-dessus de ce que montre la profondeur (pas les décalques posés sur le sol)
         const bool liveTransp = g.phase != Phase::Capturing && g_liveTranspOn && g_liveMainDepth;
         const bool otherView = liveTransp && state.depth != g_liveMainDepth && g.screenLike[state.depth] == 1;
+        if (g_liveCensusOn && g.phase != Phase::Capturing)
+        {
+            const uint32_t depthKind = !state.depth ? 0 : state.depth == g_liveMainDepth ? 1 : g.screenLike[state.depth] == 1 ? 2 : 3;
+            uint32_t cls = 7, blended = 0;
+            if (it != g_pipelines.end())
+            {
+                cls = it->second.usable ? 0 : it->second.transparentUsable ? 1 : it->second.noDepthUsable ? 2 : it->second.tessellated ? 3 : it->second.otherStage ? 4 : 5;
+                blended = it->second.blends ? 1 : 0;
+            }
+            CensusEntry& ce = g_liveCensus[(depthKind << 8) | (cls << 4) | (blended << 1) | (kind == 2 ? 1 : 0)];
+            const uint32_t v = kind == 2 ? 0 : params[0] * std::max(1u, params[1]);
+            ce.draws++, ce.vertices += v;
+            if (kind != 2)
+                ce.sizes[v]++;
+        }
+        // (les dessins sans profondeur d'Horizon sont des nuages de brume : pas captés pour l'instant)
+        if (g_liveTraceVertices && kind != 2 && params[0] * std::max(1u, params[1]) == g_liveTraceVertices)
+            Log("TRACE dessin %u : genre %u profondeur %llx (principale %llx) forme %d flux %d utilisable %d transparent %d phase %d fenetre %llu", g_liveTraceVertices, kind, (unsigned long long)state.depth,
+                (unsigned long long)g_liveMainDepth, state.depth ? g.screenLike[state.depth] : -9, slot, it != g_pipelines.end() ? int(it->second.usable) : -1,
+                it != g_pipelines.end() ? int(it->second.transparentUsable) : -1, int(g.phase.load()), (unsigned long long)g_liveWindow);
         if (slot >= 0 && it != g_pipelines.end())
         {
-            if (otherView && (it->second.usable || it->second.transparentUsable))
+            if (noDepth)
+                shadow = GetShadow(g.device, it->second), transp = true;
+            else if (otherView && it->second.transparentUsable)
                 shadow = GetShadow(g.device, it->second), transp = true;
             else if (it->second.usable)
                 shadow = GetShadow(g.device, it->second);
@@ -956,7 +994,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
     {
         // mode direct : tout le flux de l'écran (structure d'accélération) ; de la carte d'ombres du
         // soleil, seulement des dessins marqués ; à l'écran, marqués ceux qui ont un pendant dans la carte
-        const bool screen = g.screenLike[state.depth] == 1;
+        const bool screen = noDepth || g.screenLike[state.depth] == 1;
         const bool sunMap = g_liveSunDepth && state.depth == g_liveSunDepth;
         if (!screen && !sunMap)
             return;
@@ -980,10 +1018,13 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             // sur une autre vue, ils comptent pour le choix de l'écran principal : sinon, une fois une mauvaise profondeur
             // choisie (l'eau d'Horizon, 15 dessins, juste après le menu), la vraie, dont tous les dessins passent ici, ne
             // reprenait jamais la main
-            if (transp && screen && state.depth != g_liveMainDepth)
+            if (transp && screen && !noDepth && state.depth != g_liveMainDepth)
                 g.slotDraws[slot]++;
             if (transp && (!screen || kind == 2 || g_liveTranspVerts + vertices > kLiveTranspVertices))
+            {
+                g_liveTranspRefused++;
                 return;
+            }
             if (transp)
                 g_liveTranspVerts += vertices;
             if (screen && !transp)
@@ -1030,6 +1071,13 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                             g_liveOutOfBudget++;
                             return;
                         }
+                        // maillage énorme (herbe, feuillage : des milliers de dessins) : un dessin sur N à chaque tour, pas
+                        // toujours les mêmes
+                        if (const auto st = g_liveProbeStride.find(mesh); st != g_liveProbeStride.end() && (g_liveProbeDraws[mesh]++ + g_liveWindow) % st->second != 0)
+                        {
+                            g_liveOutOfBudget++;
+                            return;
+                        }
                         probe = true;
                         g_liveProbeVerts += vertices;
                     }
@@ -1059,6 +1107,13 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                 if (screen && !probe)
                     g_liveOverflow++;
                 return; // partie pleine : ce dessin n'est pas capté
+            }
+            // cache de géométrie : un quart de la partie reste aux dessins de cette image (l'eau arrive tard dans l'image
+            // du jeu : la zone pleine de gros objets du cache, elle n'était pas captée une fois sur deux)
+            if (probe && uint64_t(cursor) + probeUsed + size + kLiveAreaBytes / 4 > kLiveAreaBytes)
+            {
+                g_liveOutOfBudget++;
+                return;
             }
             const uint32_t base = uint32_t(area * kLiveAreaBytes);
             if (probe)
@@ -1198,7 +1253,7 @@ void LiveCommit(const std::vector<LivePending>& pending)
     {
         // partie du flux déjà reprise par des dessins plus récents (liste exécutée trois fenêtres après son
         // écriture) : ignoré
-        if (g_liveWindow - p.window >= kLiveAreas)
+        if (g_liveWindow - p.window >= kLiveAreaMaxAge)
         {
             g_liveStaleDraws++;
             continue;
@@ -1224,7 +1279,10 @@ void LiveCommit(const std::vector<LivePending>& pending)
                 g_liveIdSig[id] = p.sig;
             if (p.mainScreen)
             {
-                g_liveIdMesh[id] = MeshId(p.rankKey);
+                const uint32_t meshNow = MeshId(p.rankKey);
+                g_liveIdMesh[id] = meshNow;
+                if (p.stableOrder)
+                    g_liveStableNow.insert(meshNow);
                 // zone de dessin, comptée à l'exécution (dans l'ordre d'écriture, deux images s'y mêlaient)
                 g_liveViewCounts[(std::min(65535u, uint32_t(p.viewport[0] + p.viewport[2] + 0.5f)) << 16) |
                                  std::min(65535u, uint32_t(p.viewport[1] + p.viewport[3] + 0.5f))]++;
@@ -1311,6 +1369,8 @@ void OnExecuteCommandList(command_queue* queue, command_list* cmd)
     (late ? g_execLateLists : g_execLists).fetch_add(1, std::memory_order_relaxed);
     g_presentExecDraws.fetch_add(it->second.draws, std::memory_order_relaxed);
     g_diagExecQueues[queue ? queue->get_native() : 0] += it->second.draws;
+    if (queue)
+        g_liveExecQueues.insert(queue->get_native());
     if (it->second.drewBackBuffer)
         g_execBackBuffers.insert(it->second.drewBackBuffer);
     it->second.draws = 0, it->second.window = ~0ull, it->second.drewBackBuffer = 0;

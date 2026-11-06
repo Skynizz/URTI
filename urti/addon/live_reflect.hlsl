@@ -125,6 +125,16 @@ bool Anchor(uint prim, float2 bary, out uint id, out float3 prevPos, out float3 
     return all(isfinite(prevPos)) && all(isfinite(prevNormal));
 }
 
+// même chose selon l'exemplaire touché : seule la scène de l'image (exemplaire 0) a des zones et des sommets de l'image
+// précédente ; un objet du cache de géométrie n'a que sa structure
+bool AnchorOf(uint instance, uint prim, float2 bary, out uint id, out float3 prevPos, out float3 prevNormal)
+{
+    id = 0, prevPos = 0, prevNormal = 0;
+    if (instance != 0)
+        return false;
+    return Anchor(prim, bary, id, prevPos, prevNormal);
+}
+
 static float gA, gB, gClear;
 
 float3 PointAt(int2 t)
@@ -215,9 +225,9 @@ void main(uint2 id : SV_DispatchThreadID)
     gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
     float3 p = PointAt(int2(id));
     float waterFade = 1.0; // eau : reflet effacé là où elle est trop mince (berges, fond qui affleure)
-    // eau, vitre : surface transparente plane devant le point que montre la profondeur (couche 2 de la scène RT,
-    // triée par live_planes ; le jeu ne l'écrit pas dans la profondeur, il y montre le fond) : le reflet part d'elle,
-    // avec la normale de son triangle, lisse comme un miroir
+    // eau, vitre : surface transparente plane devant le point que montre la profondeur (couche 2 de la scène RT, triée par
+    // live_planes, urti.ini water=1 ; pour un jeu qui ne l'écrit pas dans la profondeur) : le reflet part d'elle, avec la
+    // normale de son triangle, lisse comme un miroir
     bool water = false;
     float3 nWater = 0;
     if ((flags & 256) && p.z > 0)
@@ -255,7 +265,10 @@ void main(uint2 id : SV_DispatchThreadID)
     // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
     // gris) ; le jeu y garde ses propres reflets. Sol mouillé : en plus, tourné vers le haut
     const float flat = water ? 1.0 : p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
-    const float s = water ? 1.0 : max(Smoothness(int2(id)) * ((flags & 4) ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
+    // miroir parfait d'après le matériau (eau : Horizon Forbidden West y écrit exactement 0 dans sa 5e cible) : la surface est
+    // lisse par définition, ses vagues n'y changent rien
+    const float material = Smoothness(int2(id));
+    const float s = water ? 1.0 : max(material * ((flags & 4) || material > 0.98 ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
@@ -280,7 +293,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (qe.CommittedStatus() == COMMITTED_TRIANGLE_HIT && abs(qe.CommittedRayT() - length(p)) < 0.02 * length(p) + 0.05)
             {
                 uint mirrorId;
-                mirrorKnown = Anchor(qe.CommittedPrimitiveIndex(), qe.CommittedTriangleBarycentrics(), mirrorId, prevMirror, prevMirrorN);
+                mirrorKnown = AnchorOf(qe.CommittedInstanceID(), qe.CommittedPrimitiveIndex(), qe.CommittedTriangleBarycentrics(), mirrorId, prevMirror, prevMirrorN);
                 anchorOut.w = mirrorId;
             }
         }
@@ -304,13 +317,19 @@ void main(uint2 id : SV_DispatchThreadID)
         while (q.Proceed())
             if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && ((flags & 32) == 0 || !SeenThrough(ray.Origin + r * q.CandidateTriangleRayT())))
                 q.CommitNonOpaqueTriangleHit();
+        // diagnostic (flags 8, vue 7) : pourquoi pas de reflet. 0,1 rien touché et vers l'arrière ; 0,2 rien touché, pas de
+        // ciel à cet endroit de l'écran ; 0,4 touché hors de l'écran ; 0,6 touché, l'écran y montre plus près (caché) ; 0,8
+        // touché, l'écran y montre plus loin
+        float why = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.4 : (r.z > 1e-3 ? 0.2 : 0.1);
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT && r.z > 1e-3)
         {
-            // rien de touché : le rayon part vers le ciel ; le ciel étant à l'infini, son reflet est le ciel
-            // vu dans cette direction, s'il est visible à l'écran
+            // rien touché : le rayon part au loin. Ce qui est à l'infini se reflète tel qu'il est vu dans cette direction : le
+            // ciel, ou le lointain que l'écran y montre (forêt noyée de brume au-delà de la scène RT : presque tout le reflet
+            // d'un lac vu en rasant)
             const float2 ndc = float2(r.x * p00 / r.z, r.y * p11 / r.z);
             const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-            if (all(uv > 0.001) && all(uv < 0.999) && PointAt(int2(uv * float2(width, height))).z <= 0)
+            const float seenFar = PointAt(int2(clamp(uv, 0.0, 0.999) * float2(width, height))).z;
+            if (all(uv > 0.001) && all(uv < 0.999) && (seenFar <= 0 || seenFar > 20.0))
             {
                 const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
                 result = float4(uv, weight * edge.x * edge.y, (flags & 16) ? s : 1e4);
@@ -328,12 +347,17 @@ void main(uint2 id : SV_DispatchThreadID)
                 {
                     // le point touché doit être celui que l'image montre à cet endroit (sinon il est caché)
                     const float3 seen = PointAt(int2(uv * float2(width, height)));
-                    if (seen.z > 0 && abs(seen.z - h.z) < 0.03 * h.z + 0.05)
+                    why = seen.z > 0 && seen.z < h.z ? 0.6 : 0.8;
+                    // point lointain derrière d'autres objets lointains : le rayon réfléchi touche le feuillage en profondeur,
+                    // la caméra y voit celui de devant : même matière, même brume, la couleur de l'écran vaut pour lui. Sauf
+                    // derrière un objet nettement plus proche (personnage, herbes du premier plan)
+                    const bool behindFar = h.z > 8.0 && seen.z > 0.35 * h.z && seen.z < h.z;
+                    if (seen.z > 0 && (abs(seen.z - h.z) < 0.03 * h.z + 0.05 || behindFar))
                     {
                         // ancrage : point reflété à l'image précédente, symétrisé par le plan du miroir d'alors
                         uint hitId;
                         float3 prevHit, prevHitN;
-                        const bool hitKnown = Anchor(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
+                        const bool hitKnown = AnchorOf(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
                         anchorOut.z = hitId;
                         if (hitKnown && mirrorKnown)
                         {
@@ -354,7 +378,7 @@ void main(uint2 id : SV_DispatchThreadID)
             // caché ou hors de l'écran : la couleur que le cache de surfaces a retenue pour ce triangle (pas dans
             // les vues de diagnostic, qui lisent la 4e composante)
             float3 cached;
-            if (!onScreen && (flags & 24) == 0 && Cached(q.CommittedPrimitiveIndex(), cached))
+            if (!onScreen && (flags & 24) == 0 && q.CommittedInstanceID() == 0 && Cached(q.CommittedPrimitiveIndex(), cached))
             {
                 uint hitId;
                 float3 prevHit, prevHitN;
@@ -372,6 +396,17 @@ void main(uint2 id : SV_DispatchThreadID)
                 result = float4(-1.0 - cached.r, cached.g, weight, cached.b);
             }
         }
+        if ((flags & 8) && result.z <= 0)
+            result.w = why;
+        // diagnostic (reflect_diag=) : direction du rayon réfléchi, composante 1 : y, 2 : z, 3 : normale y, 4 : normale z
+        if (flags & 512)
+            result.w = 0.5 + 0.5 * r.y;
+        if (flags & 1024)
+            result.w = 0.5 + 0.5 * r.z;
+        if (flags & 2048)
+            result.w = 0.5 + 0.5 * n.y;
+        if (flags & 4096)
+            result.w = 0.5 + 0.5 * n.z;
     }
     reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(result));
     anchor.Store4(id.y * reflectPitch + id.x * 16, anchorOut);

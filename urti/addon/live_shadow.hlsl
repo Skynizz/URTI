@@ -443,7 +443,8 @@ void main(uint2 id : SV_DispatchThreadID)
             // la lumière du ciel retirée dans cette direction est remplacée par celle que renvoie l'obstacle (même
             // poids) ; obstacle jamais vu à l'écran : rien (le jeu garde son propre éclairage d'ambiance au loin)
             float3 hc;
-            if ((flags & (1u << 20)) && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && Cached(q.CommittedPrimitiveIndex(), hc))
+            // (exemplaire 0 : scène de l'image ; le cache de géométrie n'a pas de couleurs par triangle)
+            if ((flags & (1u << 20)) && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && q.CommittedInstanceID() == 0 && Cached(q.CommittedPrimitiveIndex(), hc))
                 bounceSum += hc * ((1.0 - t) * (1.0 - t) / float(aoRays));
         }
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;

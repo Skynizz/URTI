@@ -247,7 +247,8 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     if ((debugReflect & 0xFF) == 2)
     {
-        StoreLinear(px, rf.zzz);
+        // gris : poids du reflet ; rouge : surface miroir dont le point reflété est caché ou hors de l'écran
+        StoreLinear(px, rf.z >= 0 ? rf.zzz : float3(-rf.z, 0, 0));
         return;
     }
     if (showMask != 0)

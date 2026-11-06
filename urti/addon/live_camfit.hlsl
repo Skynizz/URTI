@@ -6,7 +6,8 @@
 // la matrice de corrélation), repris quatre fois en ne gardant que les paires proches de l'estimation précédente :
 // ce qui bouge pour de bon (personnages, animaux, feuillage au vent) est écarté.
 // Sortie (motion) : R (9 nombres, par lignes), t (3), validité, paires gardées, paires reçues, écart quadratique
-// moyen des paires gardées (m) ; octets 64 à 111 : l'estimation de l'image précédente (point de départ).
+// moyen des paires gardées (m) ; octets 64 à 111 : l'estimation de l'image précédente (point de départ) ; octets 128
+// à 175 : pose accumulée (R par lignes, t) du repère fixe du cache de géométrie vers la caméra de cette image.
 
 RWByteAddressBuffer motion : register(u0);
 RWByteAddressBuffer pairs : register(u1); // nombre de paires, puis par paire : p.xyz, q.xyz (float) ; compte remis à zéro
@@ -14,7 +15,7 @@ RWByteAddressBuffer pairs : register(u1); // nombre de paires, puis par paire : 
 cbuffer Constants : register(b0)
 {
     uint maxPairs;
-    uint pad0;
+    uint resetPose; // 1 : le repère du cache de géométrie repart de la caméra de cette image
     uint pad1;
     uint pad2;
 };
@@ -84,7 +85,8 @@ void main(uint ti : SV_GroupIndex)
             {
                 for (uint k = 0; k < 9; k++)
                     sR[k] = k % 4 == 0 ? 1.0 : 0.0;
-                sT[0] = sT[1] = sT[2] = 0, sTau = 2.0, sRel = 0.01;
+                // large : un quart de tour par seconde, c'est déjà plusieurs mètres par image pour un arbre à 50 m
+                sT[0] = sT[1] = sT[2] = 0, sTau = 5.0, sRel = 0.15;
             }
             GroupMemoryBarrierWithGroupSync();
             iter = ~0u; // la boucle reprend à 0
@@ -178,6 +180,23 @@ void main(uint ti : SV_GroupIndex)
         motion.Store(52, asuint(kept));
         motion.Store(56, asuint(float(n)));
         motion.Store(60, asuint(rms));
+        // pose accumulée : caméra = R repère + t ; mouvement non mesuré : la caméra est supposée immobile. Rotation
+        // remise d'équerre à chaque image (les erreurs d'arrondi s'ajouteraient). Le décalage sous-pixel du jeu (TAA)
+        // n'y laisse pas de dérive : il s'annule d'une image à l'autre dans la somme
+        float3 x0 = asfloat(motion.Load3(128)), x1 = asfloat(motion.Load3(140)), x2 = asfloat(motion.Load3(152)), xt = asfloat(motion.Load3(164));
+        if (resetPose != 0 || !all(isfinite(x0 + x1 + x2 + xt)) || dot(x0, x0) < 0.5)
+            x0 = float3(1, 0, 0), x1 = float3(0, 1, 0), x2 = float3(0, 0, 1), xt = 0;
+        else if (valid)
+        {
+            const float3 m0 = float3(sR[0], sR[1], sR[2]), m1 = float3(sR[3], sR[4], sR[5]), m2 = float3(sR[6], sR[7], sR[8]);
+            const float3 c0 = float3(x0.x, x1.x, x2.x), c1 = float3(x0.y, x1.y, x2.y), c2 = float3(x0.z, x1.z, x2.z);
+            const float3 n0 = float3(dot(m0, c0), dot(m0, c1), dot(m0, c2)), n1 = float3(dot(m1, c0), dot(m1, c1), dot(m1, c2));
+            xt = float3(dot(m0, xt), dot(m1, xt), dot(m2, xt)) + t;
+            x0 = normalize(n0);
+            x1 = normalize(n1 - x0 * dot(x0, n1));
+            x2 = cross(x0, x1);
+        }
+        motion.Store3(128, asuint(x0)), motion.Store3(140, asuint(x1)), motion.Store3(152, asuint(x2)), motion.Store3(164, asuint(xt));
         pairs.Store(0, 0);
     }
 }

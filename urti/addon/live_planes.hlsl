@@ -78,10 +78,23 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
     }
     const bool facingCamera = abs(dot(N, normalize(C))) > 0.97;
-    const bool flat = count >= 6 && A > 0 && coherence > 0.95 && gE[0] < 0.02 * size + 0.05 && size > 1.0 && !facingCamera;
+    // grande surface (lac, 150 m de large à un mètre près) : un maillage d'eau ondule, ses facettes ne sont pas alignées,
+    // mais tous ses sommets restent près du plan
+    // de l'eau, pas une plaque de brume ou un rayon de lumière (carrés plans, tournés n'importe comment) : au moins 10 m de
+    // large et à peu près horizontale (la caméra n'est jamais penchée de plus de 60°). Ces plaques se voyaient comme de
+    // grands rectangles sombres
+    const bool flat = count >= 6 && A > 0 && (coherence > 0.95 || (size > 20.0 && coherence > 0.5)) && gE[0] < 0.02 * size + 0.05 && size > 10.0 && abs(N.y) > 0.5 && !facingCamera;
     if (ti == 0)
     {
         uint dummy;
+        // bilan, 256 premiers dessins (24 octets) : sommets écrits et verdict, écart au plan et taille (cm), normale
+        if (group.x < 256)
+        {
+            stats.Store2(16 + group.x * 24, uint2(count | (flat ? 0x80000000u : 0u) | (uint(coherence > 0.95) << 30) | (uint(facingCamera) << 29),
+                                                  min(65535u, uint(gE[0] * 100.0)) | (min(65535u, uint(size * 100.0)) << 16)));
+            stats.Store3(16 + group.x * 24 + 8, asuint(N));
+            stats.Store(16 + group.x * 24 + 20, asuint(dot(N, C))); // distance signée de la caméra au plan
+        }
         stats.InterlockedAdd(8, 1, dummy);
         if (flat)
             stats.InterlockedAdd(0, 1, dummy), stats.InterlockedAdd(4, count / 3, dummy);
