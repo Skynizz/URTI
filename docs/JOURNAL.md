@@ -1532,3 +1532,45 @@ Pas encore vérifié : joueur qui marche ou court (le jeu ignore les touches inj
 essayée), voyage rapide et cinématiques (vidage du cache), plein jour (ombres du soleil), autres eaux (rivière, mer) ; le masque
 à 0 de la 5e cible n'est relevé que dans ce marais. Le reflet est un miroir plat : pas encore les vaguelettes de la normale du
 G-buffer. Réglages d'Horizon dans `urti.ini` : la reconnaissance automatique du masque d'eau reste à faire pour les autres jeux.
+
+## v76 — URTI : la caméra du jeu lue dans sa mémoire au lieu d'être déduite de la géométrie (Horizon : « tout saute », effet / pas effet)
+
+Retour de jeu après v75 : « tout saute dans tous les sens, effet / pas effet, ça tremble de partout ». Les essais de v75 n'avaient
+vu que la caméra immobile ou qui tourne en rafale ; le journal de la partie du joueur, lui, montre ce qui se passe quand on bouge :
+
+- **Mouvement mesuré sur les témoins** : valide sur 91 à 188 images sur 300, écart de 460 à 870 mm, 46 à 70 % des paires gardées ;
+  encore 320 mm à l'arrêt ensuite (les points de référence relevés pendant une pose fausse restent faux).
+- **Cache de géométrie vidé** une à deux fois par fenêtre de 300 présentations (« mouvement impossible à mesurer ») : effet / pas effet.
+- **Champ de vision « corrigé » huit fois en une minute**, de 39° à 58° (vrai : 43,0°) : à chaque fois, toute la géométrie changeait
+  d'échelle. La condition (assez de rotation) n'est jamais remplie caméra immobile : aucun essai ne pouvait le voir.
+
+Remède : ne plus deviner. Une recherche dans les tampons visibles du processeur (`urti_camscan.inl`, fichier `urti_camscan` à côté
+de l'add-on) a trouvé un tampon de constantes de 512 octets, écrit avant la création de sa vue, plusieurs fois par image :
+`+240` projection par colonnes (`p00 0 0 0`, `0 p11 0 0`, `jx jy a -1`, `0 0 b 0`, avec `jx`, `jy` le décalage sous-pixel du DLSS),
+`+304` caméra vers monde (droite, haut, arrière, position). `urti.ini` : `camera_cb=512` (réglage d'Horizon, lu au chargement) ;
+`camera=0` revient à l'ancienne mesure. Crochet sur `CreateConstantBufferView` : seules les vues de cette taille sont relues (environ
+45 par image). Le dessin capté retient le numéro de la caméra en cours, le calcul prend le plus récent de sa fenêtre.
+
+Pose, mouvement (vecteurs fabriqués), champ de vision et loi de profondeur viennent maintenant de cette caméra, à chaque image. Plus
+de témoins, de vidage pour mesure impossible ni de correction du champ. Le décalage sous-pixel est retiré des sommets mis en cache
+et remis dans la pose de chaque image. `motion_log=1` garde la mesure sur les témoins, à part, comme vérification indépendante.
+
+Le jeu accepte une touche maintenue, par code matériel (`hold_key.ps1`, seulement si le jeu est au premier plan) : les rafales
+`marche*` et `course*` font enfin avancer le personnage.
+
+Mesures, Horizon, marais de nuit, rythme réel, `motion_log=1` (écart de la caméra lue avec les témoins, médiane / 95 %) :
+
+| Phase | Correction | Rotation | Paires gardées | Images par seconde |
+|---|---|---|---|---|
+| Immobile | 0,18 / 0,64 cm | 0° | 95 % | 78 à 80 |
+| Rotation lente | 0,15 / 0,90 cm | 0° | 92 % | 60 à 77 |
+| Rotation rapide | 0,32 / 2,69 cm | 0° | 85 % | 55 à 64 |
+| Marche | 0,27 / 1,40 cm | 0° | 86 % | 51 à 68 |
+
+300 présentations sur 300 avec l'effet à chaque bilan de 300 présentations de ces phases, aucun vidage du cache, champ fixe à 43,00°, loi
+identique à celle stockée. Rafales (rythme ralenti, sans `motion_log`) : effet continu, immobile 23,5 à 28 %, rotation 22 à 33 %,
+marche 18 à 25 %, course 14 à 30 %.
+
+Reste à faire : les ombres passent de 4,4 ms à 8 à 15 ms quand on bouge (occultation doublée en mouvement, forêt dense, cache de 7 M
+triangles) ; le tampon reconnu est propre à Horizon (la recherche servira pour les autres jeux) ; course au rythme réel, voyage
+rapide, cinématiques, plein jour, autres eaux pas essayés. RDR2 : `camera_cb` absent, chemin inchangé, pas réessayé en jeu avec ce code.
