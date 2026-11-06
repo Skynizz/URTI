@@ -6,7 +6,8 @@
 # URTI_FORCE=1 : tout de suite, même si quelqu'un se sert du PC (accord de l'utilisateur), sans s'arrêter.
 # URTI_BURSTS : liste de rafales à la place de la liste habituelle, une par ligne : nom|réglages urti.ini (\n entre deux) ;
 # un nom qui commence par « tourne » : prise pendant que la caméra tourne ; par « ecran » : simple capture de la fenêtre,
-# qui ne ralentit pas le jeu (une rafale le gèle : ses images ne sont pas au rythme réel).
+# qui ne ralentit pas le jeu (une rafale le gèle : ses images ne sont pas au rythme réel) ; par « alttab » : vrai Alt+Tab,
+# aller et retour.
 # URTI_PASSES=1 : à la fin, relevé des passes (toutes les images de rendu d'une image du jeu) dans <dossier>/passes.
 #
 #   tools/reshade/urti_hfw_test.sh <dossier de sortie> [attente maximale en minutes, 240 par défaut]
@@ -39,7 +40,7 @@ while [ "$FORCE" = 0 ] && [ "$(idle)" -lt 180 ]; do
 done
 say "pause : lancement"
 # réglages de départ, sans ce qu'un essai interrompu aurait laissé ; toujours remis à la fin, même si l'essai est coupé
-grep -avE '^(debug_view|motion_log|trace_draw|ao|ao_radius|ao_rough|reflect_f0|geo|queue_sync)=' "$H/urti.ini" > "$OUT/urti.ini.base"
+grep -avE '^(debug_view|motion_log|trace_draw|reflect_diag|reflect_f0|geo|queue_sync)=' "$H/urti.ini" > "$OUT/urti.ini.base"
 trap 'cp "$OUT/urti.ini.base" "$H/urti.ini"' EXIT
 rm -rf -- "${H:?}"/urti_rafale_*
 powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/urti_hfw_rapide.ps1" -TimeoutMin 6 $([ "$FORCE" = 1 ] && echo -Force) >> "$LOG" 2>&1
@@ -64,6 +65,10 @@ burst() {
     { cat "$OUT/urti.ini.base"; printf '%b' "$extra"; } > "$H/urti.ini"
     pause_s 8
     abort_if_back
+    case "$name" in alttab*)
+        say "$name : le jeu tourne encore : $(powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/alt_tab.ps1" -Process HorizonForbiddenWest | tr -d '\r')"
+        return ;;
+    esac
     case "$name" in ecran*)
         powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/capture_fenetre.ps1" -Process HorizonForbiddenWest -Out "$(cygpath -w "$OUT/$name.png")" >/dev/null
         say "capture $name prise"

@@ -2,7 +2,7 @@
 # l'add-on (nombre de dessins des captures d'étalonnage : menu ~150, écran de chargement ~30, partie > 1000).
 # Clic sur « Histoire » dès que le menu est là, clics au centre tant que la partie n'est pas affichée.
 # Rend la main dès que la partie tourne (ou que le soleil est trouvé). Mode histoire uniquement.
-param([int]$TimeoutMin = 12)
+param([int]$TimeoutMin = 12, [switch]$Force)
 
 $game = 'F:\Red Dead Redemption 2'
 $log = Join-Path $game 'urti_log.txt'
@@ -19,7 +19,7 @@ function Draws {
 # « première image » n'en est pas un signe : elle s'écrit dès l'écran de démarrage
 function InGame { [bool](Fresh | Select-String -Pattern 'direct : soleil \(' -Quiet) }
 # pas de clic quand quelqu'un se sert du PC (souris ou clavier touchés dans la dernière minute)
-function Idle { [int](& (Join-Path $PSScriptRoot 'inactif.ps1')) -ge 60 }
+function Idle { $Force -or [int](& (Join-Path $PSScriptRoot 'inactif.ps1')) -ge 60 }
 
 $t0 = Get-Date
 if (-not (Get-Process RDR2 -ErrorAction SilentlyContinue)) { Start-Process -FilePath (Join-Path $game 'RDR2.exe') -WorkingDirectory $game }

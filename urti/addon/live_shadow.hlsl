@@ -388,7 +388,9 @@ void main(uint2 id : SV_DispatchThreadID)
     // surface rugueuse (bit 21) : herbe, fougères qui couvrent le sol ; l'occultation y part de la pente d'ensemble,
     // au-dessus des brins (sinon le pied des troncs et des rochers posés dans l'herbe n'en recevait aucune)
     const bool flatHere = Flatness(int2(id), p3) > 0.5;
-    const float3 macroN = (!flatHere && (flags & (1u << 21))) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
+    // (à moins de 20 m : au-delà, c'est du feuillage lointain, derrière la brume du jeu ; l'occultation y faisait un grain sombre
+    // par-dessus le brouillard)
+    const float3 macroN = (!flatHere && (flags & (1u << 21)) && w < 20.0) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
     const bool rough = any(macroN != 0);
     if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && (flatHere || rough) && !SeesThroughAround(int2(id), p3))
     {

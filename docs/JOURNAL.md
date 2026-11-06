@@ -1474,3 +1474,61 @@ Suite d'Horizon Forbidden West, vers un URTI qui découvre le fonctionnement de 
   par le nombre de lignes ; l'écran des sauvegardes est refusé (un clic de secours y avait ouvert la liste).
 - Pas encore vérifié : RDR2 avec la couche transparente (non réinstallé ; RDR2 garde la version vérifiée en v72),
   les blocs du reflet de l'eau.
+
+## v75 — URTI : cache de géométrie (toute la forêt d'Horizon dans la scène RT) ; reflet de l'eau au masque du jeu ; causes du « filtre / pas filtre »
+
+Essais faits dans le jeu, Horizon Forbidden West au feu de camp du marais (nuit, brume, DLSS + DLSS-G + HDR).
+
+- **Mauvaise profondeur choisie pour toujours (bogue de v74)** : les dessins des autres vues passaient en « transparents »
+  et ne comptaient plus pour choisir l'écran principal ; une mauvaise profondeur choisie juste après le menu le restait.
+  La scène RT tenait 15 objets au lieu de la forêt. Choix sur une moyenne glissante, tous les dessins comptés.
+- **Compteurs de capture effacés (cause d'objets vides au hasard)** : la remise à zéro des compteurs de la fenêtre suivante
+  s'exécutait à la fin du calcul, sur la file des présentations, pendant que le jeu dessinait déjà sur la sienne. Remise à
+  zéro une fenêtre à l'avance, quatre parties du flux au lieu de trois. Couche de surfaces : 13 % -> 97 % des fenêtres
+  complètes. Barrière GPU ajoutée entre la file du jeu et celle des présentations (`queue_sync=0` pour la couper).
+- **Cache de géométrie** : le budget par image ne tenait que 37 maillages sur 535 (14 M de sommets à l'écran, reconstruire
+  2,5 M coûte 5 ms). Chaque objet hors du budget, capté à son tour (500 000 sommets par image), a maintenant sa propre
+  structure, gardée dans une réserve de 1 Go (tampon circulaire) et posée dans la structure de tête par la pose de la
+  caméra. Environ 1 000 objets et 3 à 4 M de triangles dans la scène, 250 Mo. `geo=0` pour le couper, `geo_mb=` pour la réserve.
+- **Pose de la caméra sans dérive** : accumuler le mouvement image par image dérivait jusqu'à 0,9 m caméra immobile (chaque
+  image sans mesure perdait un morceau du décalage sous-pixel du jeu). Des témoins (petits objets immobiles, à plus de 4 m,
+  captés à chaque image) gardent seize points de référence dans le repère du cache (`live_refpairs`) ; la pose est recalée sur
+  eux. Immobile : stable à 3 cm près ; 96 témoins, environ 900 paires par image, mouvement mesuré sur 290 images sur 300.
+- **Reflet de l'eau au masque du jeu** : les pistes « couche transparente » (v74) et « nappe plane » étaient fausses : les
+  surfaces planes trouvées sont des tuiles de terrain (19 000 triangles, à 1,89 m sous la caméra), des plaques de brume (les
+  grands rectangles sombres vus à l'écran) et des dalles sous le terrain. Un recensement de tous les dessins montre qu'il n'y a
+  pas de dessin d'eau à part ; le relevé des passes montre que la 5e cible du G-buffer (format 28), à sa dernière écriture
+  (en calcul), vaut exactement 0 sur l'eau, contours de l'herbe compris. `urti.ini` d'Horizon : `material_slot=4`,
+  `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`. La copie du matériau se fait à la fin de la dernière écriture
+  en calcul, sinon la copie du G-buffer de l'image suivante l'écrase. Couche transparente coupée par défaut (`water=1` pour
+  la remettre) : elle coûtait du temps et faisait les faux reflets.
+- **Reflet accepté dans deux cas de plus** : rien de touché et l'écran montre du lointain (plus de 20 m : forêt noyée de brume) ;
+  point touché derrière un autre objet lointain (feuillage en profondeur : même matière, même brume). Le jeu seul fait ici
+  des pavés verts pixelisés ; avec URTI, un miroir continu.
+- **Causes du « filtre / pas filtre »** : (1) le reflet était coupé sur chaque image crue générée, une présentation sur deux ;
+  (2) la loi de profondeur mesurée à chaque image était fausse (0,08 à 0,13 au lieu de 0,19 : elle fait la moyenne de sommets
+  qui n'ont pas tous la même loi), le reflet décrochait sur tout le lac par séries d'images : une loi connue prime maintenant
+  (`depth_law_fixed=`) ; (3) le masque était coupé après 2 présentations sans calcul, le rebond après 1 (8 maintenant) ; (4) le
+  budget tombait de 105 à 27 objets quand une fenêtre contenait deux images du jeu (hausse limitée à 25 % par fenêtre).
+- **Occultation** : réglages d'Horizon `ao=1`, `ao_radius=2.5`, `ao_rough=1` (l'herbe reçoit l'occultation, pente d'ensemble ;
+  surfaces rugueuses à moins de 20 m : au-delà, un grain sombre par-dessus la brume).
+
+Mesures, Horizon, réglages finaux, trois rafales, caméra immobile : effet 23 à 26 % des pixels (ombres 18 à 20 %, reflets 5 à
+7 %), tremble 3,8 à 6,8 %, saute 0,3 à 1,3 % (encore loin de RDR2 : forêt au vent, personnage qui bouge, brume) ; 300 présentations
+sur 300 avec l'effet, reflet jamais coupé (0 sur 120 images relevées). Caméra qui tourne : effet qui suit le lac, sans coupure. Vrai Alt+Tab, aller et retour, deux fois : pas de plantage, effet stable juste
+après (15,4 / 15,5 / 15,5 %, sans `ao_rough`). GPU par image réelle : structure du cache 2,3 ms, structure de l'image et
+soleil 2,9, ombres 5,3, reflets 0,9, composition 1,6, soit 13 ms ; 137 -> environ 77 images présentées par seconde.
+
+RDR2 (mode histoire, quai au crépuscule, autre lumière que la mesure à 10,2 % de v72, donc effet non comparable) : effet 0,9 %,
+tremble 0,09 à 0,13 %, saute 0,04 à 0,06 %, 63,7 images par seconde (64,6 en v72), identique avec `geo=0`, pas d'artefact vu.
+Add-on installé, ancien gardé en `urti.addon64.avant_v75`.
+
+Outils : `urti_hfw_test.sh` : `URTI_FORCE`, `URTI_BURSTS`, `URTI_PASSES`, rafales `tourne*`, captures `ecran*` (au rythme réel, une
+rafale gèle le jeu), `alttab*` ; `urti.ini` toujours remis ; arrêt sans clic si Steam Cloud attend une réponse (une perte de
+connexion de Steam a bloqué un lancement sur « Jouer quand même ») ; `alt_tab.ps1`. Diagnostics : `motion_log=1` (mouvement,
+couche, recensement des dessins, planéité des objets), `reflect_diag=`, `trace_draw=`, vue 5 : rouge = point reflété caché.
+
+Pas encore vérifié : joueur qui marche ou court (le jeu ignore les touches injectées : seule la rotation de la caméra est
+essayée), voyage rapide et cinématiques (vidage du cache), plein jour (ombres du soleil), autres eaux (rivière, mer) ; le masque
+à 0 de la 5e cible n'est relevé que dans ce marais. Le reflet est un miroir plat : pas encore les vaguelettes de la normale du
+G-buffer. Réglages d'Horizon dans `urti.ini` : la reconnaissance automatique du masque d'eau reste à faire pour les autres jeux.
