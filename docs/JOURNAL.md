@@ -1574,3 +1574,66 @@ marche 18 à 25 %, course 14 à 30 %.
 Reste à faire : les ombres passent de 4,4 ms à 8 à 15 ms quand on bouge (occultation doublée en mouvement, forêt dense, cache de 7 M
 triangles) ; le tampon reconnu est propre à Horizon (la recherche servira pour les autres jeux) ; course au rythme réel, voyage
 rapide, cinématiques, plein jour, autres eaux pas essayés. RDR2 : `camera_cb` absent, chemin inchangé, pas réessayé en jeu avec ce code.
+
+## v77 : une image du jeu à la fois (le vrai « effet / pas effet »)
+
+Retour de l'utilisateur sur la v76 : « ça saute tout le temps, en pause on voit ombres et reflets apparaître et disparaître ». La v76 avait
+corrigé la caméra, et ses bilans (« 300 présentations sur 300 avec l'effet ») restaient parfaits : ils comptaient les présentations, pas ce
+que le calcul avait réellement vu. Deux outils ont tout changé :
+
+- **la pause du jeu comme banc d'essai** : l'image du jeu n'y bouge plus, tout ce qui varie vient d'URTI (`urti_pause_ana.py`) ; et une rafale
+  se déclenche par fichier, sans toucher au clavier ni à la souris ;
+- **une trace par présentation** (`urti.ini frame_trace=1`, `urti_trace_ana.py`) : dessins exécutés, zones, caméra, et une rangée de profondeur
+  et de masque relue à chaque calcul.
+
+Caméra immobile, jeu pas en pause, la profondeur moyenne de la rangée sautait de 0,0262 à 0,0188, et l'effet moyen de 0,71 à 0,83 ; en
+pause, rien (0,0208 à 0,0209).
+
+**Cause.** Avec DLSS-G, le jeu exécute ses listes sur une autre file que celle des présentations. La profondeur était copiée par ReShade à la
+présentation, à ce moment-là : le jeu avait parfois déjà commencé l'image suivante, la copie était à moitié dessinée. Le calcul n'était pas
+non plus calé sur les images : une fenêtre de capture contenait 0, une partie, une ou deux images du jeu (`princ 1672 3351 0 1 422 1658`).
+
+**Remède (`frame_sync`, avec la caméra du jeu seulement).** La profondeur principale est copiée dans la liste du jeu, à chaque fin d'écriture
+(barrière quittant `DEPTH_WRITE`), dans un anneau de 12 tampons en état commun (passent d'une file à l'autre sans barrière). Un repère dans la
+liste, relu à l'exécution, dit si cette copie a vu au moins 60 % des dessins de l'image précédente ; le premier qui le fait ferme la fenêtre, la
+suite attend le calcul suivant. Un calcul par image complète, plus aucun autre. Plus de repère depuis 16 présentations (menus) : ancienne règle.
+
+**Autres causes corrigées, vues au banc d'essai :**
+
+- décalage sous-pixel : mesuré sur les cascades, il n'existait que sur une image sur cinq dans Horizon (le reste du temps l'écart valait 0 et
+  l'absolu restait figé) : masque et reflets posés à côté de l'image, historique relu au mauvais endroit. Il vient maintenant de la caméra du jeu ;
+- scène RT instable au bord du budget : 6 à 7 maillages entraient ou sortaient par image, caméra immobile (le nombre de dessins varie avec le
+  décalage sous-pixel, cycle de 18 images). Un maillage garde sa place dans le budget + 20 %, deux entrées au plus par image, pas de retour
+  dans les deux secondes, et il passe au cache dès l'image suivante : 0,2 à 1,5 par image ;
+- maillages énormes (herbe, feuillage) captés par parts : chaque part écrasait dans le cache celle du tour d'avant (identité = rang parmi les
+  dessins captés). Chaque part a maintenant ses identités ;
+- places gardées sans être dessinées (3 images au plus) : leurs sommets restaient là où la caméra les voyait ; ils suivent maintenant la caméra.
+
+**Deux plantages en route (`DEVICE_REMOVED`), corrigés :**
+
+- `INVALID_CALL` : le jeu met sa profondeur en `COPY_SOURCE` (état 0x800), et ma transition allait d'un état vers lui-même ;
+- `DEVICE_HUNG` au chargement, une fois sur trois : l'étalonnage de vérification (capture complète de 512 Mo) tombait pendant que le jeu charge.
+  Inutile avec la caméra du jeu : retiré dans ce cas. Par prudence aussi : tampons retirés détruits après 120 présentations (trois ne font
+  qu'une image et demie avec la génération d'images), attente si une place d'anneau est reprise avant que le GPU l'ait lue (0 attente mesurée).
+  La cause exacte du blocage n'est pas prouvée : le test est passé de 1 plantage sur 3 à 0 sur 4.
+
+Mesures, Horizon, marais de nuit, rythme réel, génération d'images active ; sauts de plus de 8 % de l'effet moyen de la rangée d'un calcul au
+suivant :
+
+| Phase | Avant | Après |
+|---|---|---|
+| Immobile | 75 sur 412 calculs | 0 sur 510 |
+| Rotation | 36 sur 489 | 0 sur 536 |
+| Marche | 63 sur 322 | 1 sur 402 |
+| Course | 25 sur 320 | 3 sur 442 |
+| Rotation rapide | 22 sur 350 | 1 sur 451 |
+
+Calculs sur une rangée à plus de 5 % de ciel : 0 partout (0 à 2 par phase avant). Vue `debug_view=11` (bords de la profondeur en rouge sur
+l'image, capture à rythme réel, caméra qui tourne) : effet à 3 pixels de l'image au plus (écran de 2560, 29 pixels par image du jeu à cette vitesse). 4 lancements de suite sans
+plantage, deux Alt+Tab. Environ 77 images présentées par seconde à l'arrêt (78 à 80 en v76), 51 à 74 en bougeant, trace active.
+
+Reste à faire, vu pendant ces essais : **le HUD et le menu se reflètent dans l'eau** (« 0 / 14 » en double, texte du menu ; pas de photo d'avant
+l'interface dans Horizon, le jeu ne dessine pas dans l'image d'écran avec DLSS-G) : c'est une partie de « les reflets changent en pause », avec
+le menu du jeu qui assombrit et floute l'image d'où viennent les couleurs ; URTI assombrit aussi le texte du menu ; du grain fin reste sur les
+reflets ; 6,5 copies de profondeur par image, à réduire ; plein jour, voyage rapide, cinématiques pas essayés. RDR2 garde la v75 : les changements
+de budget et de parts le concernent, à revérifier avant de l'installer.

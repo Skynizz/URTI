@@ -24,9 +24,14 @@ cbuffer Constants : register(b0)
     uint vertexCount; // sommets à convertir (zones de l'image)
     uint regionCount;
     uint maxPairs;
-    uint pad0;
+    uint heldStep; // 1 : places gardées déplacées par le mouvement de la caméra ci-dessous
     uint pad1;
     uint pad2;
+    float4 step0;  // mouvement de la caméra depuis l'image précédente (espace vrai) : lignes de R, t
+    float4 step1;
+    float4 step2;
+    float2 shearPrev; // décalage sous-pixel (cisaillement) de l'image précédente et de celle-ci
+    float2 shearCur;
 };
 
 // zone qui contient l'octet (zones triées par début)
@@ -65,7 +70,22 @@ void main(uint id : SV_DispatchThreadID)
         const uint4 r = regions[lo];
         const bool inside = byte >= r.x && byte - r.x < r.y;
         if (inside && r.z == 0xFFFFFFFF)
-            return; // gardée : sa géométrie de la dernière image où elle a été dessinée
+        {
+            // gardée : sa géométrie de la dernière image où elle a été dessinée, qui suit la caméra
+            if (heldStep != 0)
+            {
+                const float3 o = asfloat(view.Load3(id * 12));
+                if (all(isfinite(o)) && any(o != 0))
+                {
+                    const float3 t = float3(o.x - shearPrev.x * o.z, o.y - shearPrev.y * o.z, o.z);
+                    const float3 n = float3(dot(step0.xyz, t) + step0.w, dot(step1.xyz, t) + step1.w, dot(step2.xyz, t) + step2.w);
+                    // (jamais à plus de 20 km : un seul sommet étire la boîte de toute la scène)
+                    if (all(abs(n) < 20000.0))
+                        view.Store3(id * 12, asuint(float3(n.x + shearCur.x * n.z, n.y + shearCur.y * n.z, n.z)));
+                }
+            }
+            return;
+        }
         if (!inside)
         {
             view.Store3(id * 12, asuint(v));

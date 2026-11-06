@@ -140,6 +140,14 @@ float MaskAt(int2 t)
     return (debugReflect & 0x100) ? 0.5 * (m + asfloat(prevMask.Load(t.y * maskPitch + t.x * 4))) : m;
 }
 
+// vue 11 (alignement) : distance de la profondeur du calcul, liée à la place de la normale
+float AlignW(int2 t, float2 law)
+{
+    t = clamp(t, int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+    const float d = float(gNormal.Load(t.y * normalPitch + t.x * 4) & 0xFFFFFF) / 16777215.0;
+    return law.y / (d - law.x);
+}
+
 // couleur bilinéaire de l'image à une position (0..1)
 float3 SampleLinear(float2 uv)
 {
@@ -249,6 +257,18 @@ void main(uint2 id : SV_DispatchThreadID)
     {
         // gris : poids du reflet ; rouge : surface miroir dont le point reflété est caché ou hors de l'écran
         StoreLinear(px, rf.z >= 0 ? rf.zzz : float3(-rf.z, 0, 0));
+        return;
+    }
+    if ((debugReflect & 0xFF) == 6)
+    {
+        // alignement : en rouge les bords de la profondeur du calcul, lue comme le masque ; en vert et bleu l'image du jeu.
+        // Sur une capture à vitesse réelle, l'écart entre les deux dit de combien l'effet est décalé de l'image
+        const float2 law = asfloat(sunBuf.Load2(36));
+        const int2 mp = int2(round(m));
+        const float wc = AlignW(mp, law);
+        const float edge = saturate(max(abs(AlignW(mp + int2(1, 0), law) - wc), abs(AlignW(mp + int2(0, 1), law) - wc)) / (0.03 * abs(wc) + 0.03));
+        const float l = saturate(sqrt(max(dot(c, float3(0.33, 0.34, 0.33)), 0.0)) * 0.8);
+        StoreLinear(px, float3(edge, l, l));
         return;
     }
     if (showMask != 0)

@@ -56,7 +56,7 @@ pause_s 20
 abort_if_back
 L=$(grep -n "appareil qui présente choisi" "$H/urti_log.txt" | tail -1 | cut -d: -f1)
 # vers le marais (+800 : un tiers de tour depuis le feu de camp)
-powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/mousemove.ps1" -Dx 20 -Dy 0 -Steps 40 -Delay 15 >/dev/null
+powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/mousemove.ps1" -Process HorizonForbiddenWest -Dx 20 -Dy 0 -Steps 40 -Delay 15 >/dev/null
 pause_s 10
 abort_if_back
 
@@ -76,7 +76,7 @@ burst() {
         return ;;
     esac
     c0=$(grep -c "rafale .* terminée" "$H/urti_log.txt")
-    case "$name" in tourne*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/mousemove.ps1" -Dx 4 -Dy 0 -Steps 150 -Delay 16 >/dev/null & ;; esac
+    case "$name" in tourne*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/mousemove.ps1" -Process HorizonForbiddenWest -Dx 4 -Dy 0 -Steps 150 -Delay 16 >/dev/null & ;; esac
     # le personnage marche (Z maintenu, code matériel) ou court (avec Maj) pendant la rafale, si le jeu est au premier plan
     case "$name" in marche*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/hold_key.ps1" -Process HorizonForbiddenWest -Scan 0x11 -Seconds 14 >/dev/null & ;; esac
     case "$name" in course*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/hold_key.ps1" -Process HorizonForbiddenWest -Scan 0x11 -Scan2 0x2A -Seconds 14 >/dev/null & ;; esac

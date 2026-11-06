@@ -140,6 +140,10 @@ struct LivePending
 {
     uint64_t rankKey = 0, key = 0, window = 0;
     uint32_t slot = 0, src = 0, capacity = 0, counter = 0, vertices = 0, sig = 0;
+    uint32_t part = 0; // maillage énorme capté par parts : numéro de la part + 1 (son identité ne prend pas la place des autres parts)
+    // repère de fin d'écriture de la profondeur principale (pas un dessin) : tampon de sa copie, dessins de la liste avant lui
+    int32_t depthMark = -1;
+    uint32_t mainBefore = 0, depthAfter = 0;
     bool screen = false, mainScreen = false, probe = false, sunMap = false, marked = false, indirect = false;
     // sommets dans le même ordre d'une image à l'autre : dessin direct d'un seul exemplaire (un ExecuteIndirect ou
     // des exemplaires choisis sur le GPU changent d'ordre et de nombre : leurs paires de sommets ne disent rien du
@@ -153,6 +157,26 @@ uint32_t g_liveCommitCam = 0; // caméra du jeu du dernier dessin de l'écran pr
 constexpr uint32_t kLiveAreas = 4;
 constexpr uint32_t kLiveAreaMaxAge = 3; // liste exécutée à partir de tant de fenêtres après son écriture : ignorée
 std::unordered_map<uint64_t, std::vector<LivePending>> g_livePending; // liste de commandes -> dessins captés pas encore exécutés
+// Une image du jeu à la fois (urti.ini frame_sync=, avec la caméra du jeu). Le jeu exécute ses listes sur une autre file que celle des
+// présentations : à une présentation, il peut avoir commencé l'image suivante. La profondeur copiée à ce moment est à moitié dessinée
+// (l'effet s'affaiblit d'un coup, une fois sur dix, caméra immobile), et une fenêtre de capture contient une image et demie ou deux.
+// La profondeur est donc copiée dans la liste du jeu, à la fin de son écriture ; ce repère, à l'exécution, ferme la fenêtre : la suite
+// (image suivante) attend le calcul suivant.
+struct LiveDeferred
+{
+    std::vector<LivePending> pending;
+    uint32_t listMain = 0, counted = 0;
+};
+bool g_liveFrameSync = false, g_liveTraceOn = false;
+bool g_liveWindowClosed = false;
+std::vector<LiveDeferred> g_liveDeferred;
+int32_t g_liveSnapDone = -1;   // tampon de la dernière profondeur complète
+uint64_t g_liveSnapSerial = 0; // nombre de profondeurs complètes
+uint32_t g_liveSnapNext = 0, g_liveMainSinceMark = 0, g_liveMainLast = 0, g_liveMarksRefused = 0;
+// dessins de la profondeur principale écrits, à la dernière copie : pas de nouvelle copie si rien n'a été écrit depuis (le jeu change
+// l'état de sa profondeur une dizaine de fois par image, et six copies de suite reprenaient le tampon de la bonne)
+uint64_t g_liveMainRecorded = 0, g_liveMainAtCopy = ~0ull;
+uint32_t g_liveSnapCopies = 0;
 uint64_t g_liveWindow = 0;                                // fenêtre de présentation (avancée par urti_live.inl)
 uint32_t g_liveAreaCursor[4][kLiveAreas] = {}, g_liveAreaProbe[4][kLiveAreas] = {}; // octets pris dans chaque partie (début, fin)
 uint32_t g_liveAreaCounters[kLiveAreas] = {};             // compteurs pris dans chaque partie
@@ -197,7 +221,7 @@ std::unordered_map<uint32_t, uint32_t> g_liveLearned;
 std::unordered_map<uint32_t, uint32_t> g_liveLearnedSig, g_liveIdSig; // signature -> sommets ; identité -> signature (cette image)
 uint64_t g_liveReserved = 0; // sommets réservés dans l'écran principal (bilan)
 uint64_t g_liveBudgetVertices = 0, g_liveProbeBudget = 0, g_liveProbeVerts = 0; // budget, zone de mesure (par image)
-std::unordered_map<uint32_t, uint32_t> g_liveProbeStride, g_liveProbeDraws; // maillage énorme : un dessin capté sur N à chaque tour
+std::unordered_map<uint32_t, uint32_t> g_liveProbeStride, g_liveProbeDraws, g_liveProbePhase; // maillage énorme : un dessin capté sur N à chaque tour, la part de ce tour
 std::unordered_set<uint32_t> g_liveStableNow; // maillages dont les sommets gardent leur ordre (dessin direct, une instance)
 std::unordered_set<uint64_t> g_liveExecQueues; // files où des dessins du jeu ont été exécutés depuis le dernier calcul
 // photos de l'écran au premier dessin de chaque liaison de l'image d'écran (urti_live.inl choisit celle
@@ -619,6 +643,7 @@ struct CommandListState
     uint64_t window = ~0ull;
     uint32_t draws = 0;
     uint64_t drewBackBuffer = 0; // image d'écran où cette liste a dessiné (image réelle ou générée : voir OnPresent)
+    uint32_t mainDraws = 0;      // dessins dans la profondeur principale écrits dans cette liste
 };
 
 enum class Phase
@@ -1026,6 +1051,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             uint64_t idKey = kind * 1000003ull;
             uint32_t mesh = 0;
             bool probe = false;
+            uint32_t part = 0;
             // surface transparente : seulement sur l'écran principal, sans identité ni budget par maillage, dans la
             // limite de la couche
             // sur une autre vue, ils comptent pour le choix de l'écran principal : sinon, une fois une mauvaise profondeur
@@ -1071,6 +1097,8 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             if (mainScreen && !transp)
             {
                 g_liveSeen[mesh] += uint32_t(vertices);
+                g.lists[uint64_t(list)].mainDraws++;
+                g_liveMainRecorded++;
                 if (g_liveBudget && !g_liveAdmit.count(mesh))
                 {
                     // hors des maillages choisis : un inconnu entre tant que la place du budget le permet ; sinon
@@ -1085,11 +1113,19 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
                             return;
                         }
                         // maillage énorme (herbe, feuillage : des milliers de dessins) : un dessin sur N à chaque tour, pas
-                        // toujours les mêmes
-                        if (const auto st = g_liveProbeStride.find(mesh); st != g_liveProbeStride.end() && (g_liveProbeDraws[mesh]++ + g_liveWindow) % st->second != 0)
+                        // toujours les mêmes. Chaque part a ses identités : avec le seul rang parmi les dessins captés, la part
+                        // de ce tour écrasait dans le cache celle du tour d'avant, herbe et feuillage y apparaissaient par
+                        // morceaux, sans cesse remplacés
+                        if (const auto st = g_liveProbeStride.find(mesh); st != g_liveProbeStride.end())
                         {
-                            g_liveOutOfBudget++;
-                            return;
+                            const auto ph = g_liveProbePhase.find(mesh);
+                            const uint32_t phase = ph != g_liveProbePhase.end() ? ph->second : 0u;
+                            if (g_liveProbeDraws[mesh]++ % st->second != phase)
+                            {
+                                g_liveOutOfBudget++;
+                                return;
+                            }
+                            part = phase + 1;
                         }
                         probe = true;
                         g_liveProbeVerts += vertices;
@@ -1139,6 +1175,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             pend.screen = screen, pend.mainScreen = mainScreen, pend.probe = probe, pend.sunMap = sunMap, pend.marked = marked, pend.indirect = kind == 2;
             pend.stableOrder = kind != 2 && params[1] <= 1;
             pend.transp = transp;
+            pend.part = part;
             pend.camSerial = g_liveCamSerialNow();
             std::memcpy(pend.viewport, state.viewport, sizeof(pend.viewport));
             if (mainScreen && !probe && !transp)
@@ -1255,16 +1292,43 @@ void OnResetCommandList(command_list* cmd)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (const auto it = g.lists.find(cmd->get_native()); it != g.lists.end())
-        it->second.draws = 0, it->second.window = ~0ull, it->second.drewBackBuffer = 0;
+        it->second.draws = 0, it->second.window = ~0ull, it->second.drewBackBuffer = 0, it->second.mainDraws = 0;
     g_livePending.erase(cmd->get_native());
 }
 
 // dessins captés d'une liste soumise à la file du jeu : ils appartiennent à la présentation en cours (rang,
 // identité, place dans la scène RT), quelle que soit la fenêtre où la liste a été écrite (appelé sous g_mutex)
-void LiveCommit(const std::vector<LivePending>& pending)
+void LiveCommit(const std::vector<LivePending>& pending, uint32_t listMain, uint32_t counted)
 {
-    for (const LivePending& p : pending)
+    for (size_t index = 0; index < pending.size(); index++)
     {
+        const LivePending& p = pending[index];
+        if (p.depthMark >= 0)
+        {
+            // fin d'écriture de la profondeur. Plusieurs par image possibles : seule compte celle qui a vu au moins 60 % des dessins
+            // de l'image précédente (sinon la profondeur n'est pas finie)
+            g_liveMainSinceMark += p.mainBefore - counted;
+            counted = p.mainBefore;
+            const bool complete = g_liveMainSinceMark >= 16 && uint64_t(g_liveMainSinceMark) * 10 >= uint64_t(g_liveMainLast) * 6;
+            if (g_liveTraceOn)
+                Log("REPERE tampon %d dessins %u (image d'avant %u) etat %x %s", p.depthMark, g_liveMainSinceMark, g_liveMainLast, p.depthAfter, complete ? "complet" : "refuse");
+            if (!complete)
+            {
+                g_liveMarksRefused++;
+                continue;
+            }
+            g_liveMainLast = g_liveMainSinceMark, g_liveMainSinceMark = 0;
+            g_liveSnapDone = p.depthMark, g_liveSnapSerial++;
+            g_liveWindowClosed = true;
+            if (index + 1 < pending.size() || listMain > counted)
+            {
+                LiveDeferred later;
+                later.pending.assign(pending.begin() + index + 1, pending.end());
+                later.listMain = listMain, later.counted = counted;
+                g_liveDeferred.push_back(std::move(later));
+            }
+            return;
+        }
         // partie du flux déjà reprise par des dessins plus récents (liste exécutée trois fenêtres après son
         // écriture) : ignoré
         if (g_liveWindow - p.window >= kLiveAreaMaxAge)
@@ -1289,7 +1353,7 @@ void LiveCommit(const std::vector<LivePending>& pending)
         if (p.screen)
         {
             // rang parmi les dessins de même signature, dans l'ordre d'exécution (le même d'une image à l'autre)
-            const uint64_t h = (p.rankKey ^ (p.rankKey >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[p.rankKey]++;
+            const uint64_t h = (p.rankKey ^ (p.rankKey >> 29)) * 0x9E3779B97F4A7C15ull + g_liveKeyRank[p.rankKey]++ + (uint64_t(p.part) << 24);
             id = uint32_t(h ^ (h >> 32)) | 1u; // 0 : pas d'identité
             if (p.indirect)
                 g_liveIdSig[id] = p.sig;
@@ -1366,16 +1430,35 @@ void LiveCommit(const std::vector<LivePending>& pending)
         g_liveRegions[p.slot].push_back({ dst, room, p.counter, id });
         g_liveRegionSrc[p.slot].push_back(p.src);
     }
+    g_liveMainSinceMark += listMain - counted;
 }
 
 // liste soumise à une file : ses dessins comptent pour la présentation en cours, pas pour celle où ils ont été écrits
 void OnExecuteCommandList(command_queue* queue, command_list* cmd)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (const auto pt = g_livePending.find(cmd->get_native()); pt != g_livePending.end())
     {
-        LiveCommit(pt->second);
-        g_livePending.erase(pt);
+        const auto st = g.lists.find(cmd->get_native());
+        const uint32_t listMain = st != g.lists.end() ? st->second.mainDraws : 0;
+        const auto pt = g_livePending.find(cmd->get_native());
+        if (g_liveWindowClosed)
+        {
+            // fenêtre fermée : cette liste appartient à l'image suivante
+            LiveDeferred later;
+            if (pt != g_livePending.end())
+                later.pending = std::move(pt->second);
+            later.listMain = listMain;
+            if (!later.pending.empty() || listMain)
+                g_liveDeferred.push_back(std::move(later));
+        }
+        else if (pt != g_livePending.end())
+            LiveCommit(pt->second, listMain, 0);
+        else
+            g_liveMainSinceMark += listMain;
+        if (pt != g_livePending.end())
+            g_livePending.erase(pt);
+        if (st != g.lists.end())
+            st->second.mainDraws = 0;
     }
     const auto it = g.lists.find(cmd->get_native());
     if (it == g.lists.end() || !it->second.draws)
