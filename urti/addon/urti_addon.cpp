@@ -632,6 +632,7 @@ struct Capture
     uint32_t captureDrawCount = 0, captureIndex = 0, presentsLeft = 0, depthWaits = 0;
     uint64_t slotDepth[kSlots] = {};
     std::atomic<uint32_t> slotDraws[kSlots];
+    float slotScore[kSlots] = {}; // dessins des images précédentes (moyenne glissante) : choix de l'écran principal
     std::atomic<uint32_t> offScreenDraws{ 0 };
     uint32_t screenW = 0, screenH = 0;
     std::unordered_map<uint64_t, int> screenLike; // 1 : profondeur de la taille de l'écran, 0 : autre, -1 : inutilisable
@@ -872,6 +873,7 @@ int SlotFor(uint64_t depth)
             if (g.slotDraws[s] < g.slotDraws[least])
                 least = s;
         g.slotDepth[least] = depth;
+        g.slotScore[least] = 0.0f;
         return int(least);
     }
     for (uint32_t s = 0; s < kSlots; s++)
@@ -975,6 +977,11 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             bool probe = false;
             // surface transparente : seulement sur l'écran principal, sans identité ni budget par maillage, dans la
             // limite de la couche
+            // sur une autre vue, ils comptent pour le choix de l'écran principal : sinon, une fois une mauvaise profondeur
+            // choisie (l'eau d'Horizon, 15 dessins, juste après le menu), la vraie, dont tous les dessins passent ici, ne
+            // reprenait jamais la main
+            if (transp && screen && state.depth != g_liveMainDepth)
+                g.slotDraws[slot]++;
             if (transp && (!screen || kind == 2 || g_liveTranspVerts + vertices > kLiveTranspVertices))
                 return;
             if (transp)
@@ -2041,7 +2048,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
             g.overflowDraws = 0;
             g.offScreenDraws = 0;
             for (uint32_t s = 0; s < kSlots; s++)
-                g.slotDepth[s] = 0, g.slotDraws[s] = 0;
+                g.slotDepth[s] = 0, g.slotDraws[s] = 0, g.slotScore[s] = 0.0f;
             g.presentsLeft = g.liveCalibration ? 2 : g_capturePresents;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);

@@ -3,6 +3,7 @@
 # plus touché depuis 3 minutes, lance le jeu (sauvegarde du feu de camp du marais), tourne la caméra vers l'eau, prend
 # des rafales (image normale, poids des reflets, occultation brute, occultation renforcée), ferme le jeu. Dès que
 # l'utilisateur revient (clavier ou souris touchés), le jeu est fermé et l'essai s'arrête.
+# URTI_FORCE=1 : tout de suite, même si quelqu'un se sert du PC (accord de l'utilisateur), sans s'arrêter.
 #
 #   tools/reshade/urti_hfw_test.sh <dossier de sortie> [attente maximale en minutes, 240 par défaut]
 set -u
@@ -22,19 +23,20 @@ close_game() {
     [ -f "$OUT/urti.ini.base" ] && cp "$OUT/urti.ini.base" "$H/urti.ini"
 }
 # l'utilisateur est revenu : on rend la main tout de suite
-back() { [ "$(idle)" -lt 20 ]; }
+FORCE=${URTI_FORCE:-0}
+back() { [ "$FORCE" = 0 ] && [ "$(idle)" -lt 20 ]; }
 abort_if_back() { if back; then say "utilisateur revenu : jeu fermé, essai arrêté"; close_game; exit 2; fi; }
 
 say "attente d'une pause (3 min sans clavier ni souris, $WAIT_MIN min au plus)"
 t=0
-while [ "$(idle)" -lt 180 ]; do
+while [ "$FORCE" = 0 ] && [ "$(idle)" -lt 180 ]; do
     t=$((t + 15)); pause_s 15
     [ $t -ge $((WAIT_MIN * 60)) ] && { say "pas de pause"; exit 1; }
 done
 say "pause : lancement"
 cp "$H/urti.ini" "$OUT/urti.ini.base"
 rm -rf -- "${H:?}"/urti_rafale_*
-powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/urti_hfw_rapide.ps1" -TimeoutMin 6 >> "$LOG" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/urti_hfw_rapide.ps1" -TimeoutMin 6 $([ "$FORCE" = 1 ] && echo -Force) >> "$LOG" 2>&1
 abort_if_back
 pause_s 20
 abort_if_back

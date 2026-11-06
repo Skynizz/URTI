@@ -217,6 +217,8 @@ struct LiveState
     double timeSum[8] = {};
     uint32_t timeFrames = 0;
     uint32_t lastPresentDraws = 1; // dessins du jeu exécutés avant cette présentation (0 : rien de neuf à calculer)
+    int lastMainSlot = -2;         // écran principal de la dernière image calculée (journal quand il change)
+    uint32_t lastDrawsThisFrame = 0;
     // présentations récentes où le jeu avait dessiné dans l'image présentée (bit 0 : celle-ci) ; image présentée
     // fabriquée par la génération d'images (pas par le jeu)
     uint32_t backBufferDrawn = 0, presentNoDraw = 0; // et présentations récentes sans dessin du jeu exécuté
@@ -1111,13 +1113,18 @@ void LiveTime(ID3D12GraphicsCommandList* list, uint32_t k)
         list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * 8 + k);
 }
 
+// écran principal : la profondeur de la taille de l'écran la plus dessinée, sur les dernières images (une fenêtre de
+// capture peut ne contenir qu'une partie d'une image du jeu : sans cette moyenne, une fenêtre sans dessin de la vraie
+// profondeur en choisissait une autre le temps d'une image, et le calcul partait de la mauvaise : plus aucun effet sur
+// cette image)
 int LiveMainSlot()
 {
     int best = -1;
-    uint32_t most = 0;
+    float most = 0.0f;
     for (uint32_t s = 0; s < kSlots; s++)
-        if (g.slotDepth[s] && g.screenLike[g.slotDepth[s]] == 1 && g.slotDraws[s] >= most)
-            most = g.slotDraws[s], best = int(s);
+        if (g.slotDepth[s] && g.screenLike[g.slotDepth[s]] == 1)
+            if (const float score = g.slotScore[s] + float(g.slotDraws[s]); score >= most)
+                most = score, best = int(s);
     return best;
 }
 
@@ -2804,7 +2811,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     zeroCounters(D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
     for (uint32_t s = 0; s < kSlots; s++)
+    {
+        g.slotScore[s] = 0.9f * g.slotScore[s] + float(g.slotDraws[s]);
         g.slotDraws[s] = 0;
+    }
+    if (slot != live.lastMainSlot)
+    {
+        const D3D12_RESOURCE_DESC md = slot >= 0 && g.slotDepth[slot] ? reinterpret_cast<ID3D12Resource*>(g.slotDepth[slot])->GetDesc() : D3D12_RESOURCE_DESC{};
+        Log("URTI direct : écran principal : flux %d, profondeur %llux%u (%u dessins dans cette image)", slot, (unsigned long long)md.Width, md.Height, drawsThisFrame);
+        live.lastMainSlot = slot;
+    }
+    live.lastDrawsThisFrame = drawsThisFrame;
 
     live.maskFrame = live.frame;
     if (active.handle)
@@ -2835,9 +2852,11 @@ void LiveComposite(effect_runtime* runtime)
         return; // F4 : avant (le calcul RT continue : le retour à « après » est immédiat)
     if (!live.enabled || !live.depthReady || !live.bound || !live.shadowBuf || !live.compositePso)
         return;
-    // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt
-    // que des ombres figées qui ne suivent plus la caméra
-    if (live.maskFrame == ~0ull || live.frame > live.maskFrame + 2)
+    // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt que des ombres
+    // figées qui ne suivent plus la caméra. Compté large : avec la génération d'images, plusieurs présentations de
+    // suite sans dessin du jeu arrivent en régime normal (« 00001 ») ; l'effet coupé sur l'une d'elles se voyait
+    // comme un clignotement
+    if (live.maskFrame == ~0ull || live.frame > live.maskFrame + 8)
         return;
     if (live.overlayOpen)
         return; // menu de ReShade ouvert : il doit rester lisible (la passe le recouvrirait)
@@ -3329,8 +3348,8 @@ void OnReshadePresent(effect_runtime* runtime)
             if (live.preUiBuf)
                 SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "gardee_" + std::to_string(live.burstIndex) + ".ppm", 2, live.preUiBuf.Get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
-                live.churnOut);
+            Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u dessins %u scene %u", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
+                live.churnOut, live.lastDrawsThisFrame, live.sceneCount);
             live.burstIndex++;
             if (--live.burst == 0)
                 Log("URTI direct : rafale %u terminée (%u paires d'images)", live.burstCount, live.burstIndex);
