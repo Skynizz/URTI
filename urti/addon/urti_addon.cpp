@@ -38,7 +38,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <fstream>
+#include <shared_mutex>
 #include <string>
+#include <thread>
+#include <emmintrin.h>
+#include <smmintrin.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -142,7 +147,9 @@ struct LivePending
     bool stableOrder = false;
     bool transp = false; // surface transparente (couche 2)
     float viewport[4] = {};
+    uint32_t camSerial = 0; // caméra du jeu en cours quand ce dessin a été écrit (urti_camscan.inl)
 };
+uint32_t g_liveCommitCam = 0; // caméra du jeu du dernier dessin de l'écran principal soumis
 constexpr uint32_t kLiveAreas = 4;
 constexpr uint32_t kLiveAreaMaxAge = 3; // liste exécutée à partir de tant de fenêtres après son écriture : ignorée
 std::unordered_map<uint64_t, std::vector<LivePending>> g_livePending; // liste de commandes -> dessins captés pas encore exécutés
@@ -702,12 +709,14 @@ bool OurDevice(device* dev)
     return dev->get_api() == device_api::d3d12 && g.device && dev->get_native() == reinterpret_cast<uint64_t>(g.device);
 }
 
+void CamReaderInstall(void* device); // urti_camscan.inl
 void OnInitDevice(device* dev)
 {
     if (dev->get_api() != device_api::d3d12)
         return;
     PatchVtable(reinterpret_cast<void*>(dev->get_native()), 16, reinterpret_cast<void*>(&HookCreateRootSignature),
                 reinterpret_cast<void**>(&g_createRootSignature), "CreateRootSignature");
+    CamReaderInstall(reinterpret_cast<void*>(dev->get_native()));
 }
 
 void NrdDestroy(); // urti_nrd.inl
@@ -788,9 +797,13 @@ void OnBindRenderTargets(command_list* cmd, uint32_t count, const resource_view*
 }
 
 
+#include "urti_camscan.inl"
+uint32_t g_liveCamSerialNow() { return g_camSerial.load(std::memory_order_acquire); }
+
 // état de départ des profondeurs (une carte d'ombres peut rester en écriture sans jamais de barrière)
 void OnInitResource(device*, const resource_desc& desc, const subresource_data*, resource_usage initialState, resource res)
 {
+    CamScanNoteResource(desc, res);
     if ((desc.usage & resource_usage::depth_stencil) == 0)
         return;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -1126,6 +1139,7 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
             pend.screen = screen, pend.mainScreen = mainScreen, pend.probe = probe, pend.sunMap = sunMap, pend.marked = marked, pend.indirect = kind == 2;
             pend.stableOrder = kind != 2 && params[1] <= 1;
             pend.transp = transp;
+            pend.camSerial = g_liveCamSerialNow();
             std::memcpy(pend.viewport, state.viewport, sizeof(pend.viewport));
             if (mainScreen && !probe && !transp)
                 g_liveReserved += vertices;
@@ -1258,6 +1272,8 @@ void LiveCommit(const std::vector<LivePending>& pending)
             g_liveStaleDraws++;
             continue;
         }
+        if (p.mainScreen && p.camSerial > g_liveCommitCam)
+            g_liveCommitCam = p.camSerial;
         if (p.transp)
         {
             const uint32_t room = (p.capacity + 47) / 48 * 48;
@@ -1882,6 +1898,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     if (!OurDevice(dev) || !g.list)
         return;
     g_presentIndex.fetch_add(1, std::memory_order_relaxed);
+    CamScanPresent();
     if (!g.screenW)
     {
         const resource back = swap->get_current_back_buffer();
@@ -2209,6 +2226,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (!reshade::register_addon(module))
             return FALSE;
         ReadSettings(module);
+        CamScanRegister();
         reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);

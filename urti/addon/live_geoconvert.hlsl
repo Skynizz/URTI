@@ -28,13 +28,14 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
     const uint first = r.x / 16, total = r.y / 16 / 3 * 3, filled = min(counters.Load(r.z * 8), r.y) / 16 / 3 * 3;
     const float3 r0 = asfloat(motion.Load3(128)), r1 = asfloat(motion.Load3(140)), r2 = asfloat(motion.Load3(152)), t = asfloat(motion.Load3(164));
     const float nan = asfloat(0x7FC00000);
+    const float2 shear = asfloat(motion.Load2(176)); // décalage sous-pixel du jeu dans cette image (caméra du jeu lue)
     for (uint i = ti; i < total; i += 64)
     {
         float3 v = float3(nan, nan, nan);
         if (i < filled)
         {
             const float4 c = clip[first + i];
-            const float3 cv = float3(c.x / p00, c.y / p11, c.w);
+            const float3 cv = float3(c.x / p00 - shear.x * c.w, c.y / p11 - shear.y * c.w, c.w);
             if (all(isfinite(cv)) && all(abs(cv) < 20000.0))
             {
                 const float3 d = cv - t;

@@ -43,7 +43,8 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
         gFresh = ((r.w >> 31) != 0 || refs.Load(base + 192) != n) ? 1u : 0u;
     GroupMemoryBarrierWithGroupSync();
     const float4 c = clip[r.x / 16 + ti * (n / S)];
-    const float3 q = float3(c.x / p00, c.y / p11, c.w);
+    const float2 shear = asfloat(motion.Load2(176)); // décalage sous-pixel du jeu (caméra du jeu lue ; 0 sinon)
+    const float3 q = float3(c.x / p00 - shear.x * c.w, c.y / p11 - shear.y * c.w, c.w);
     const bool ok = all(isfinite(q)) && all(abs(q) < 20000.0);
     float3 x0 = float3(1, 0, 0), x1 = float3(0, 1, 0), x2 = float3(0, 0, 1), xt = 0;
     if (identityPose == 0)

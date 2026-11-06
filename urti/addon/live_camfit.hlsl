@@ -197,6 +197,7 @@ void main(uint ti : SV_GroupIndex)
             x2 = cross(x0, x1);
         }
         motion.Store3(128, asuint(x0)), motion.Store3(140, asuint(x1)), motion.Store3(152, asuint(x2)), motion.Store3(164, asuint(xt));
+        motion.Store2(176, uint2(0, 0)); // pas de décalage sous-pixel connu (caméra du jeu non lue)
         pairs.Store(0, 0);
     }
 }

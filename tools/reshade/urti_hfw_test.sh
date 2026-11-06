@@ -5,7 +5,8 @@
 # l'utilisateur revient (clavier ou souris touchés), le jeu est fermé et l'essai s'arrête.
 # URTI_FORCE=1 : tout de suite, même si quelqu'un se sert du PC (accord de l'utilisateur), sans s'arrêter.
 # URTI_BURSTS : liste de rafales à la place de la liste habituelle, une par ligne : nom|réglages urti.ini (\n entre deux) ;
-# un nom qui commence par « tourne » : prise pendant que la caméra tourne ; par « ecran » : simple capture de la fenêtre,
+# un nom qui commence par « tourne » : prise pendant que la caméra tourne ; « marche », « course » : pendant que le personnage
+# avance (le jeu accepte une touche maintenue, pas une touche brève) ; par « ecran » : simple capture de la fenêtre,
 # qui ne ralentit pas le jeu (une rafale le gèle : ses images ne sont pas au rythme réel) ; par « alttab » : vrai Alt+Tab,
 # aller et retour.
 # URTI_PASSES=1 : à la fin, relevé des passes (toutes les images de rendu d'une image du jeu) dans <dossier>/passes.
@@ -76,6 +77,9 @@ burst() {
     esac
     c0=$(grep -c "rafale .* terminée" "$H/urti_log.txt")
     case "$name" in tourne*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/mousemove.ps1" -Dx 4 -Dy 0 -Steps 150 -Delay 16 >/dev/null & ;; esac
+    # le personnage marche (Z maintenu, code matériel) ou court (avec Maj) pendant la rafale, si le jeu est au premier plan
+    case "$name" in marche*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/hold_key.ps1" -Process HorizonForbiddenWest -Scan 0x11 -Seconds 14 >/dev/null & ;; esac
+    case "$name" in course*) powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/hold_key.ps1" -Process HorizonForbiddenWest -Scan 0x11 -Scan2 0x2A -Seconds 14 >/dev/null & ;; esac
     touch "$H/urti_rafale"
     n=0; while [ "$(grep -c "rafale .* terminée" "$H/urti_log.txt")" -le "$c0" ] && [ $n -lt 60 ]; do n=$((n + 1)); pause_s 1; done
     D=$(ls -td "$H"/urti_rafale_* | head -1)

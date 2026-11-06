@@ -171,6 +171,13 @@ struct LiveState
     ComPtr<ID3D12RootSignature> geoconvRs, geoinstRs;
     ComPtr<ID3D12PipelineState> geoconvPso, geoinstPso;
     bool geoOn = true, geoResetPose = true;
+    // caméra du jeu lue dans sa mémoire (urti_camscan.inl) : pose exacte, sans mesure sur la géométrie. camLive : au moins une
+    // caméra vue ; camCur : celle de l'image en cours de calcul ; camRef : celle du repère fixe du cache de géométrie
+    bool cameraOn = true, camLive = false, camHaveCur = false, camHaveRef = false;
+    uint32_t camSerialNow = 0, camSerialDone = 0, statCamFrames = 0, statCamNew = 0, statCamJumps = 0;
+    GameCamera camCur, camRef;
+    double statCamTrans = 0, statCamRot = 0, statCamTransMax = 0;
+    ComPtr<ID3D12Resource> camUpload[3], motionCheck;
     uint64_t geoHead = 0, geoPoolBytes = 0, geoWantBytes = 1000ull * 1048576, geoLastFlush = 0;
     uint64_t statGeoFrames = 0, statGeoBuilds = 0, statGeoVerts = 0, statGeoEvicted = 0;
     uint32_t statGeoFlushes = 0, statGeoBadFit = 0;
@@ -365,6 +372,7 @@ struct LiveState
     uint64_t imageBytes = 0;
     // bilan par 300 présentations : sans dessin du jeu, effets de ReShade, ombres appliquées
     uint32_t statPresents = 0, statNoDraw = 0, statEffects = 0, statComposited = 0;
+    uint32_t statNoDepth = 0, statMaskOld = 0, statGapMax = 0; // calculs sans profondeur, présentations au masque trop vieux, plus long écart entre deux calculs
     // rechargement à chaud : réglages (urti.ini) et shaders (urti_shaders\*.cso), sans relancer le jeu
     FILETIME iniTime = {}, shaderTime[5] = {};
     std::vector<ComPtr<ID3D12PipelineState>> retiredPso[3];
@@ -935,7 +943,7 @@ void LiveHotReload(ID3D12Device* device)
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
             float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
-            float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
+            float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             char line[256];
             while (std::fgets(line, sizeof(line), f))
@@ -958,7 +966,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("persist=", persist); // persist=0 : zones attribuées à la suite à chaque image (ancienne règle)
                 // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto),
-                value("geo=", geoIni), value("geo_mb=", geoMb), value("motion_log=", motionLogIni), value("queue_sync=", queueSyncIni), value("trace_draw=", traceDraw), value("reflect_diag=", reflectDiag), value("depth_law_fixed=", depthLawFixedIni);
+                value("camera=", cameraIni), value("geo=", geoIni), value("geo_mb=", geoMb), value("motion_log=", motionLogIni), value("queue_sync=", queueSyncIni), value("trace_draw=", traceDraw), value("reflect_diag=", reflectDiag), value("depth_law_fixed=", depthLawFixedIni);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
                 value("sun_measure=", sunMeasure), value("game_dilate=", gameDilate), value("game_min=", gameMin), value("ao=", ao), value("ao_radius=", aoRadius);
                 value("person_mask=", personMask), value("motion_source=", motionSource), value("render_area=", renderArea), value("water=", water), value("ao_rough=", aoRoughIni);
@@ -992,6 +1000,7 @@ void LiveHotReload(ID3D12Device* device)
             // cache de géométrie : la scène de l'image n'a plus à tout porter (objets proches et mobiles)
             live.geoOn = geoIni != 0;
             live.motionLog = motionLogIni != 0;
+            live.cameraOn = cameraIni != 0;
             g_liveCensusOn = live.motionLog;
             live.queueSyncOn = queueSyncIni != 0;
             g_liveTraceVertices = uint32_t(traceDraw);
@@ -1210,6 +1219,76 @@ void LiveTime(ID3D12GraphicsCommandList* list, uint32_t k)
 }
 
 // cache de géométrie vidé (coupure de la caméra, autre écran principal) : son repère ne vaut plus rien
+// Caméra du jeu de cette image -> pose du repère du cache vers la caméra et mouvement depuis l'image précédente, à écrire dans
+// motion (mêmes places que live_camfit ; octets 176 à 183 : décalage sous-pixel). Espace caméra d'URTI : x = droite . d,
+// y = haut . d, z = w = -arrière . d, d = point - position. Faux : pas de caméra du jeu, l'ancienne mesure continue.
+bool LiveCameraFrame(float* out)
+{
+    live.camLive = live.cameraOn && live.camSerialNow != 0;
+    if (!live.camLive)
+        return false;
+    const GameCamera prev = live.camCur;
+    const bool havePrev = live.camHaveCur;
+    if (live.camSerialNow != live.camSerialDone)
+    {
+        live.statCamNew += live.camSerialDone ? live.camSerialNow - live.camSerialDone : 0;
+        live.camCur = CamGet(live.camSerialNow), live.camSerialDone = live.camSerialNow, live.camHaveCur = true;
+    }
+    const GameCamera& c = live.camCur;
+    if (!live.camHaveCur || c.p00 <= 0)
+        return false;
+    live.p00 = c.p00, live.p11 = c.p11;
+    live.A = -c.a, live.B = c.b;
+    if (live.geoResetPose || !live.camHaveRef)
+        live.camRef = c, live.camHaveRef = true, live.geoResetPose = false;
+    const auto rows = [](const GameCamera& k, double m[3][3]) {
+        for (int i = 0; i < 3; i++)
+            m[0][i] = k.right[i], m[1][i] = k.up[i], m[2][i] = -double(k.back[i]);
+    };
+    // A = Rcur Ra^T, t = Rcur (posa - poscur) : point de l'espace caméra de a -> espace caméra de cette image
+    const auto relative = [&](const GameCamera& a, float* rOut, float* tOut, double* rotDeg, double* move) {
+        double rc[3][3], ra[3][3];
+        rows(c, rc), rows(a, ra);
+        double trace = 0;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+            {
+                double v = 0;
+                for (int k = 0; k < 3; k++)
+                    v += rc[i][k] * ra[j][k];
+                rOut[i * 3 + j] = float(v);
+                if (i == j)
+                    trace += v;
+            }
+        const double d[3] = { double(a.pos[0]) - c.pos[0], double(a.pos[1]) - c.pos[1], double(a.pos[2]) - c.pos[2] };
+        for (int i = 0; i < 3; i++)
+            tOut[i] = float(rc[i][0] * d[0] + rc[i][1] * d[1] + rc[i][2] * d[2]);
+        if (rotDeg)
+            *rotDeg = std::acos(std::clamp((trace - 1.0) * 0.5, -1.0, 1.0)) * 57.29578;
+        if (move)
+            *move = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    };
+    double rotDeg = 0, move = 0;
+    relative(havePrev ? prev : c, out + 0, out + 9, &rotDeg, &move);
+    out[12] = 1.0f; // valide
+    out[13] = out[14] = out[15] = 0.0f;
+    relative(live.camRef, out + 32, out + 41, nullptr, &live.geoPoseDistance);
+    // décalage sous-pixel : x de l'espace capté = x vrai - (jx / p00) w
+    out[44] = -c.jx / c.p00, out[45] = -c.jy / c.p11;
+    live.statCamFrames++, live.statCamTrans += move, live.statCamRot += rotDeg;
+    live.statCamTransMax = std::max(live.statCamTransMax, move);
+    if (move > 5.0)
+        live.statCamJumps++;
+    if (live.statCamFrames >= 300)
+    {
+        Log("URTI direct : caméra du jeu : %u images, %u nouvelles, %.2f cm et %.3f° par image en moyenne, %.1f cm au plus, %u sauts de plus de 5 m ; champ %.2f°, décalage (%.5f, %.5f), loi %.4g + %.5f / w ; %llu lues, %llu refusées",
+            live.statCamFrames, live.statCamNew, live.statCamTrans / live.statCamFrames * 100.0, live.statCamRot / live.statCamFrames, live.statCamTransMax * 100.0, live.statCamJumps,
+            2.0 * std::atan(1.0 / c.p11) * 57.29578, c.jx, c.jy, live.A, live.B, (unsigned long long)g_camProbes.load(), (unsigned long long)g_camRefused.load());
+        live.statCamFrames = live.statCamNew = live.statCamJumps = 0, live.statCamTrans = live.statCamRot = live.statCamTransMax = 0;
+    }
+    return true;
+}
+
 void LiveGeoFlush(const char* why)
 {
     if (!live.geo.empty())
@@ -1451,6 +1530,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 place.uniquePrev = r != g_liveKeyRank.end() && r->second == 1;
             }
         g_liveKeyRank.clear();
+        live.camSerialNow = g_liveCommitCam;
         if (slot >= 0)
             probesNow.swap(g_liveProbes[slot]);
         for (uint32_t s = 0; s < kSlots; s++)
@@ -1588,7 +1668,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             // témoins du mouvement de la caméra : dessinés une seule fois (sinon leur ordre d'une image à l'autre n'est pas
             // sûr), dessin direct, petits, à plus de 4 m (pas le personnage que la caméra suit) ; répartis en distance : les
             // lointains disent la rotation, les proches le déplacement ; gardés tant qu'ils restent à l'écran
-            if (live.geoOn)
+            if (live.geoOn && live.cameraOn && live.camSerialNow && !live.motionLog)
+                live.sentinels.clear(); // la pose vient de la caméra du jeu
+            else if (live.geoOn)
             {
                 auto single = [&](uint32_t mesh, const MeshInfo& mi) { return live.seenNow[mesh] <= mi.vertices + mi.vertices / 20 + 3; };
                 for (auto it = live.sentinels.begin(); it != live.sentinels.end();)
@@ -1727,7 +1809,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const double rot = std::acos(tr) * 180.0 / 3.14159265, move = std::sqrt(double(m[9]) * m[9] + double(m[10]) * m[10] + double(m[11]) * m[11]);
             live.motValid++, live.motRot += rot, live.motTrans += move;
             live.motKept += m[14] > 0 ? m[13] / m[14] : 0.0, live.motRms += m[15];
-            live.geoPoseDistance = std::sqrt(double(m[41]) * m[41] + double(m[42]) * m[42] + double(m[43]) * m[43]);
+            if (!live.camLive)
+                live.geoPoseDistance = std::sqrt(double(m[41]) * m[41] + double(m[42]) * m[42] + double(m[43]) * m[43]);
             // la caméra bouge (notre mesure) et les vecteurs du jeu ne se laissent toujours pas lire : ils ne
             // contiennent sans doute pas le mouvement de la caméra (seulement celui des personnages) ; trois secondes
             // ainsi et les nôtres les remplacent
@@ -1743,7 +1826,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         // assez de paires, et presque aucune n'accepte le moindre mouvement : coupure de la caméra (cinématique, voyage
         // rapide). Une coupure non vue n'est pas grave (le tour suivant remplace tout, et les rayons écartent ce que la
         // caméra voit à travers) ; un vidage de trop fait disparaître la moitié de l'effet pendant une seconde
-        const bool badFit = m[12] <= 0.5f && m[14] >= 256.0f && m[13] < 32.0f;
+        const bool badFit = !live.camLive && m[12] <= 0.5f && m[14] >= 256.0f && m[13] < 32.0f;
         live.motionReadback[live.frame % 3]->Unmap(0, nullptr);
         if (badFit)
         {
@@ -1836,7 +1919,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             // un espace caméra étiré, la normale du sol est fausse et le reflet décalé : il « flotte »)
             if (live.fovHold)
                 live.fovHold--;
-            else if (live.fovAuto && r[304] > 0 && r[305] > 0 && r[300] + r[302] > 4e-4f)
+            else if (live.fovAuto && !live.camLive && r[304] > 0 && r[305] > 0 && r[300] + r[302] > 4e-4f)
             {
                 const float k2 = (r[300] * r[304] + r[302] * r[305]) / (r[300] + r[302]);
                 if (std::fabs(k2 - 1.0f) > 0.03f)
@@ -1852,7 +1935,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             }
             if (live.sunFrames == 300)
             {
-                if (live.fovStretch > 0 && live.p11 > 0)
+                if (live.fovStretch > 0 && live.p11 > 0 && !live.camLive)
                     Log("URTI direct : champ de vision vertical du jeu mesuré : %.1f° (URTI suppose %.1f°)",
                         2.0 * std::atan(1.0 / (live.p11 * std::sqrt(double(live.fovStretch)))) * 180.0 / 3.14159265,
                         2.0 * std::atan(1.0 / double(live.p11)) * 180.0 / 3.14159265);
@@ -1968,6 +2051,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     if (slot < 0 || !depthCopy || !live.depthReady)
     {
+        live.statNoDepth++;
         if (active.handle)
             runtime->set_uniform_value_bool(active, false);
         zeroCounters(D3D12_RESOURCE_STATE_STREAM_OUT);
@@ -2227,14 +2311,28 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const uint32_t converted = std::max(3u, uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity)) / 3 * 3);
     // cache de géométrie : les paires viennent des points de référence des témoins (live_refpairs), pas d'une image à l'autre
     const bool refPose = live.geoOn && live.refpairsPso;
+    // caméra du jeu : pose, mouvement, projection, loi de profondeur de cette image, exacts
+    float camData[48] = {};
+    const bool trueCam = LiveCameraFrame(camData);
+    // motion_log=1 : la mesure sur les témoins continue, à part, pour vérifier la caméra lue
+    const bool camVerify = trueCam && live.motionLog && refPose;
     const struct { float p00, p11; uint32_t count, regionCount, maxPairs, pad0, pad1, pad2; } cc = {
-        live.p00, live.p11, converted, uint32_t(tableNow.size()), live.pairsBuf && !refPose ? kLiveMaxMotionPairs : 0u, 0, 0, 0 };
+        live.p00, live.p11, converted, uint32_t(tableNow.size()), live.pairsBuf && !refPose && !trueCam ? kLiveMaxMotionPairs : 0u, 0, 0, 0 };
     list->SetComputeRoot32BitConstants(6, 8, &cc, 0);
     list->Dispatch(UINT((converted + 255) / 256), 1, 1);
     // 1d. mouvement de la caméra depuis l'image précédente, mesuré sur les paires de sommets de la conversion
     if (live.camfitPso && live.pairsBuf && live.motionBuf && live.motionReadback[live.frame % 3])
     {
-        if (refPose)
+        if (trueCam)
+            if (ID3D12Resource* up = upload(live.camUpload[live.frame % 3], camData, sizeof(camData)))
+            {
+                Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                list->CopyBufferRegion(live.motionBuf.Get(), 0, up, 0, sizeof(camData));
+                Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+        if (camVerify && !live.motionCheck)
+            live.motionCheck = UavBuffer(g.device, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (refPose && (!trueCam || camVerify))
         {
             if (!live.sentRefs)
             {
@@ -2290,21 +2388,25 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 list->Dispatch(UINT(sentTable.size()), 1, 1);
             }
         }
-        D3D12_RESOURCE_BARRIER pb = {};
-        pb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        pb.UAV.pResource = live.pairsBuf.Get();
-        list->ResourceBarrier(1, &pb);
-        list->SetComputeRootSignature(live.camfitRs.Get());
-        list->SetPipelineState(live.camfitPso.Get());
-        list->SetComputeRootUnorderedAccessView(0, live.motionBuf->GetGPUVirtualAddress());
-        list->SetComputeRootUnorderedAccessView(1, live.pairsBuf->GetGPUVirtualAddress());
-        const uint32_t fc[4] = { kLiveMaxMotionPairs, live.geoResetPose ? 1u : 0u, 0, 0 };
-        live.geoResetPose = false;
-        list->SetComputeRoot32BitConstants(2, 4, fc, 0);
-        list->Dispatch(1, 1, 1);
-        Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyBufferRegion(live.motionReadback[live.frame % 3].Get(), 0, live.motionBuf.Get(), 0, 176);
-        Transition(list.Get(), live.motionBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12Resource* motionOut = camVerify && live.motionCheck ? live.motionCheck.Get() : live.motionBuf.Get();
+        if (!trueCam || (camVerify && live.motionCheck))
+        {
+            D3D12_RESOURCE_BARRIER pb = {};
+            pb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            pb.UAV.pResource = live.pairsBuf.Get();
+            list->ResourceBarrier(1, &pb);
+            list->SetComputeRootSignature(live.camfitRs.Get());
+            list->SetPipelineState(live.camfitPso.Get());
+            list->SetComputeRootUnorderedAccessView(0, motionOut->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(1, live.pairsBuf->GetGPUVirtualAddress());
+            const uint32_t fc[4] = { kLiveMaxMotionPairs, live.geoResetPose ? 1u : 0u, 0, 0 };
+            live.geoResetPose = false;
+            list->SetComputeRoot32BitConstants(2, 4, fc, 0);
+            list->Dispatch(1, 1, 1);
+        }
+        Transition(list.Get(), motionOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(live.motionReadback[live.frame % 3].Get(), 0, motionOut, 0, 176);
+        Transition(list.Get(), motionOut, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     // 1e. surfaces transparentes (eau, vitres) : leur couche convertie, puis seules les surfaces planes gardées
     // (fenêtre sans aucune, image du jeu coupée entre deux présentations : la dernière couche reste, le reflet de l'eau
@@ -3365,6 +3467,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     live.lastDrawsThisFrame = drawsThisFrame;
 
+    if (live.maskFrame != ~0ull)
+        live.statGapMax = std::max(live.statGapMax, uint32_t(live.frame - live.maskFrame));
     live.maskFrame = live.frame;
     if (active.handle)
         runtime->set_uniform_value_bool(active, true);
@@ -3399,7 +3503,10 @@ void LiveComposite(effect_runtime* runtime)
     // suite sans dessin du jeu arrivent en régime normal (« 00001 ») ; l'effet coupé sur l'une d'elles se voyait
     // comme un clignotement
     if (live.maskFrame == ~0ull || live.frame > live.maskFrame + 8)
+    {
+        live.statMaskOld++;
         return;
+    }
     if (live.overlayOpen)
         return; // menu de ReShade ouvert : il doit rester lisible (la passe le recouvrirait)
     if (live.fgMode == 1 && live.imageGenerated)
@@ -3908,8 +4015,9 @@ void OnReshadePresent(effect_runtime* runtime)
     }
     if (++live.statPresents == 300)
     {
-        Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées",
-            live.statNoDraw, live.statEffects, live.statComposited);
+        Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées ; %u calculs sans profondeur, %u au masque trop vieux, %u présentations au plus entre deux calculs",
+            live.statNoDraw, live.statEffects, live.statComposited, live.statNoDepth, live.statMaskOld, live.statGapMax);
+        live.statNoDepth = live.statMaskOld = live.statGapMax = 0;
         if (g_liveCensusOn)
         {
             std::lock_guard<std::mutex> lock(g_mutex);

@@ -19,7 +19,9 @@ void main(uint id : SV_DispatchThreadID)
     if (i >= count)
         return;
     const float3 r0 = asfloat(motion.Load3(128)), r1 = asfloat(motion.Load3(140)), r2 = asfloat(motion.Load3(152)), t = asfloat(motion.Load3(164));
-    instances.Store4(i * 64, asuint(float4(r0, t.x)));
-    instances.Store4(i * 64 + 16, asuint(float4(r1, t.y)));
+    // décalage sous-pixel du jeu dans cette image : les objets du cache tombent là où cette image les aurait captés
+    const float2 shear = asfloat(motion.Load2(176));
+    instances.Store4(i * 64, asuint(float4(r0 + shear.x * r2, t.x + shear.x * t.z)));
+    instances.Store4(i * 64 + 16, asuint(float4(r1 + shear.y * r2, t.y + shear.y * t.z)));
     instances.Store4(i * 64 + 32, asuint(float4(r2, t.z)));
 }
