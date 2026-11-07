@@ -175,6 +175,9 @@ struct LiveState
     // caméra vue ; camCur : celle de l'image en cours de calcul ; camRef : celle du repère fixe du cache de géométrie
     bool cameraOn = true, camLive = false, camHaveCur = false, camHaveRef = false;
     uint32_t camSerialNow = 0, camSerialDone = 0, statCamFrames = 0, statCamNew = 0, statCamJumps = 0;
+    uint32_t camSeenSerial = 0;
+    uint64_t camSeenFrame = 0;
+    bool camLost = false;
     GameCamera camCur, camRef;
     double statCamTrans = 0, statCamRot = 0, statCamTransMax = 0;
     ComPtr<ID3D12Resource> camUpload[3], motionCheck;
@@ -1381,9 +1384,27 @@ void LiveTime(ID3D12GraphicsCommandList* list, uint32_t k)
 // Caméra du jeu de cette image -> pose du repère du cache vers la caméra et mouvement depuis l'image précédente, à écrire dans
 // motion (mêmes places que live_camfit ; octets 176 à 183 : décalage sous-pixel). Espace caméra d'URTI : x = droite . d,
 // y = haut . d, z = w = -arrière . d, d = point - position. Faux : pas de caméra du jeu, l'ancienne mesure continue.
+void LiveGeoFlush(const char* why);
+
 bool LiveCameraFrame(float* out)
 {
     live.camLive = live.cameraOn && live.camSerialNow != 0;
+    // caméra perdue (le jeu ne l'écrit plus là, urti_camscan.inl en cherche une autre) : l'ancienne mesure prend le relais. Sinon la dernière caméra reste, figée
+    // alors que le joueur bouge : mouvement nul, historique relu au mauvais endroit, objets gardés mal placés (bouillie de pixels en courant)
+    {
+        const uint32_t latest = g_camSerial.load(std::memory_order_acquire);
+        if (latest != live.camSeenSerial)
+            live.camSeenSerial = latest, live.camSeenFrame = live.frame;
+        const bool lost = live.frame > live.camSeenFrame + 30;
+        if (lost != live.camLost)
+        {
+            live.camLost = lost;
+            Log("URTI direct : caméra du jeu %s", lost ? "perdue : mesure sur les témoins à la place" : "de nouveau lue");
+            LiveGeoFlush(lost ? "caméra du jeu perdue" : "caméra du jeu retrouvée");
+        }
+        if (lost)
+            live.camLive = false;
+    }
     if (!live.camLive)
         return false;
     const GameCamera prev = live.camCur;
@@ -1939,7 +1960,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             // témoins du mouvement de la caméra : dessinés une seule fois (sinon leur ordre d'une image à l'autre n'est pas
             // sûr), dessin direct, petits, à plus de 4 m (pas le personnage que la caméra suit) ; répartis en distance : les
             // lointains disent la rotation, les proches le déplacement ; gardés tant qu'ils restent à l'écran
-            if (live.geoOn && live.cameraOn && live.camSerialNow && !live.motionLog)
+            if (live.geoOn && live.cameraOn && live.camSerialNow && !live.motionLog && !live.camLost)
                 live.sentinels.clear(); // la pose vient de la caméra du jeu
             else if (live.geoOn)
             {

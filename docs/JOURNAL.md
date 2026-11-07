@@ -1683,3 +1683,30 @@ Reste à faire : le reflet du jeu lui-même, en gros blocs basse résolution (vi
 faible ; `reflect_f0` à 0,15 et 0,3 ne change presque rien à l'œil, gardé à 0,04 ; le texte du HUD et du menu se reflète toujours dans l'eau ; l'eau est un
 miroir plat, sans les vaguelettes (normale du G-buffer à essayer) ; les particules n'ont pas été testées à part. RDR2 garde la v75 : à revérifier avant de
 l'installer.
+
+## v79 : la caméra perdue quand les reflets du jeu sont coupés
+
+Retour de l'utilisateur : « j'ai désactivé les reflets du jeu, et quand je cours c'est une bouillie de pixels, le débruiteur fait mal son travail ». Le journal de sa partie dit autre
+chose : à l'instant où il change l'option, `caméra du jeu : 300 images, 0 nouvelles, 0.00 cm`, et toutes les lectures refusées, alors qu'il court. La dernière caméra restait figée :
+mouvement nul pour le lissage (historique relu au mauvais endroit, d'où la bouillie), objets gardés mal placés. Rien ne le signalait. Au lancement suivant, l'option gardée, le tampon de 512
+octets ne contient plus la caméra du tout : il sert au reflet du jeu lui-même.
+
+**Corrigé :**
+
+- caméra perdue (plus de valeur depuis 30 présentations) : l'ancienne mesure sur les témoins prend le relais, le cache est vidé, et de même à son retour. Plus de caméra figée ;
+- recherche d'une autre source tant qu'elle manque : vues créées et tampons liés à la racine, deux formes (projection + matrice caméra, vue-projection + vue). Adoption seulement si le décalage
+  sous-pixel change, si la source est vue à au moins 60 % des présentations pendant au moins 30, avec peu de valeurs par image, et sans téléportation (5 m). Ensuite, écartée si elle dépasse six
+  valeurs par présentation ou fait des sauts de plus de 10 m.
+
+**Pas résolu : aucune source sûre avec les reflets du jeu coupés.** Il ne reste que les tampons des dessins (monde-vue-projection + monde-vue). Les objets tournés y ont l'allure d'une caméra
+(faux candidats : 256, 768, 4608 octets, 70 000 « caméras » pour 300 images, sauts de centaines de mètres : c'est ce qui a imposé la règle de continuité). Essai de la valeur la plus fréquente de
+chaque image (les objets sans déplacement portent la vraie caméra) : médiane 0,44 cm contre les témoins mais 95 % à 172 cm ; elle alterne avec la caméra vue du repère d'Aloy, puis, ce repère écarté,
+avec celui de gros objets (60 % de continuité). Retirée : une caméra parfois fausse est pire que la mesure sur les témoins.
+
+Vérifié : avec les reflets du jeu coupés, 2 lancements et 2 Alt+Tab sans plantage, mesure sur les témoins active, scène RT pleine (800 000 à 900 000 sommets), environ 78 images par seconde à
+l'arrêt. Sur une capture en courant, le contour d'Aloy reste en pixels éparpillés dans ce mode ; pas su si cela vient d'URTI ou de la génération d'images (image générée au hasard de la capture).
+
+Pas vérifié : ce build avec les reflets du jeu activés (l'option se change dans le menu du jeu, l'essai automatique ne la touche pas) ; le chemin de lecture du tampon de 512 octets n'a changé que de
+forme (mêmes places, même contrôle). Ni que la bouillie disparaît avec eux : l'utilisateur l'a signalée juste après avoir coupé l'option.
+
+Reste à faire : une source sûre sans les reflets du jeu (passes d'écran qui restent : éclairage, brume, DLSS) ; ou masquer les blocs du reflet du jeu en le gardant actif.
