@@ -191,7 +191,7 @@ void main(uint2 id : SV_DispatchThreadID)
             uiMask.Store(m, isUi ? 1u : 0u);
         }
         else
-            isUi = uiMask.Load(m) != 0;
+            isUi = (uiMask.Load(m) & 1) != 0;
         if (isUi)
         {
             if (format == 3)

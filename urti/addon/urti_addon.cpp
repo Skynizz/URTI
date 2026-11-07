@@ -147,6 +147,10 @@ struct LivePending
     int32_t depthMark = -1;
     uint32_t mainBefore = 0, depthAfter = 0;
     int32_t materialMark = -1; // repère de fin d'écriture de l'image de matériau : tampon de sa copie
+    // fin d'écriture d'une image de la taille de l'écran en RGBA 16 bits flottants (candidate à l'image sans interface) : la ressource,
+    // et le tampon de sa copie si c'est l'image adoptée
+    uint64_t hudHandle = 0;
+    int32_t hudMark = -1;
     bool screen = false, mainScreen = false, probe = false, sunMap = false, marked = false, indirect = false;
     // sommets dans le même ordre d'une image à l'autre : dessin direct d'un seul exemplaire (un ExecuteIndirect ou
     // des exemplaires choisis sur le GPU changent d'ordre et de nombre : leurs paires de sommets ne disent rien du
@@ -185,6 +189,15 @@ uint64_t g_liveMainRecorded = 0, g_liveMainAtCopy = ~0ull;
 uint32_t g_liveMaterialNext = 0, g_liveMaterialSinceClose = 0;
 int32_t g_liveMaterialDone = -1, g_liveWindowMaterial = -1;
 uint32_t g_liveSnapCopies = 0;
+// image du jeu sans son interface (Horizon avec DLSS-G : la cible que reçoit la génération d'images, alpha = forme de l'interface).
+// Reconnue à l'exécution : la première image de la taille de l'écran en RGBA 16 bits flottants finie après le matériau de l'image
+// (après la profondeur sans matériau) ; adoptée quand c'est la même ressource au moins 8 fois sur 10. Puis copiée à chaque image
+uint64_t g_liveHudHandle = 0;
+std::unordered_map<uint64_t, uint32_t> g_liveHudVotes;
+uint32_t g_liveHudVoteCount = 0, g_liveHudNext = 0, g_liveHudW = 0, g_liveHudH = 0;
+bool g_liveHudArmed = false;
+int32_t g_liveHudDone = -1;
+uint64_t g_liveHudDonePresent = 0, g_liveHudSerial = 0; // présentation et numéro de la dernière copie exécutée
 uint64_t g_liveWindow = 0;                                // fenêtre de présentation (avancée par urti_live.inl)
 uint32_t g_liveAreaCursor[4][kLiveAreas] = {}, g_liveAreaProbe[4][kLiveAreas] = {}; // octets pris dans chaque partie (début, fin)
 uint32_t g_liveAreaCounters[kLiveAreas] = {};             // compteurs pris dans chaque partie
@@ -1311,11 +1324,27 @@ void LiveNoteMaterial(std::vector<LivePending>& pending)
 {
     for (auto it = pending.begin(); it != pending.end();)
     {
+        if (it->hudHandle)
+        {
+            // image de la taille de l'écran finie : la première après le matériau est l'image sans interface
+            if (g_liveHudArmed)
+            {
+                g_liveHudArmed = false;
+                g_liveHudVotes[it->hudHandle]++, g_liveHudVoteCount++;
+            }
+            if (it->hudMark >= 0)
+                g_liveHudDone = it->hudMark, g_liveHudDonePresent = g_presentIndex.load(std::memory_order_relaxed), g_liveHudSerial++;
+            if (g_liveTraceOn)
+                Log("SANSHUD %llx tampon %d", (unsigned long long)it->hudHandle, it->hudMark);
+            it = pending.erase(it);
+            continue;
+        }
         if (it->materialMark < 0)
         {
             ++it;
             continue;
         }
+        g_liveHudArmed = true;
         g_liveMaterialDone = it->materialMark;
         if (g_liveWindowClosed && g_liveWindowMaterial < 0)
             g_liveWindowMaterial = it->materialMark; // image fermée, son matériau vient après sa profondeur
@@ -1348,6 +1377,8 @@ void LiveCommit(const std::vector<LivePending>& pending, uint32_t listMain, uint
             }
             g_liveMainLast = g_liveMainSinceMark, g_liveMainSinceMark = 0;
             g_liveSnapDone = p.depthMark, g_liveSnapSerial++;
+            if (g_liveMaterialNext == 0)
+                g_liveHudArmed = true; // pas de matériau copié : l'image sans interface est la première finie après la profondeur
             g_liveWindowClosed = true;
             // matériau déjà passé dans cette image : c'est le sien ; sinon, le prochain
             g_liveWindowMaterial = g_liveMaterialSinceClose ? g_liveMaterialDone : -1;
@@ -1713,6 +1744,17 @@ void SaveBackBuffer(ID3D12CommandQueue* queue, ID3D12Resource* backBuffer, const
     if (FAILED(readback->Map(0, nullptr, (void**)&data)))
         return;
     const uint32_t w = (uint32_t)desc.Width / step, h = desc.Height / step;
+    // première image d'une rafale : texels bruts à côté (même pas d'échantillonnage), pour comparer les codages (image sans interface du jeu)
+    if (path.size() > 6 && path.compare(path.size() - 6, 6, "_0.ppm") == 0)
+        if (FILE* raw = std::fopen((path.substr(0, path.size() - 4) + ".raw").c_str(), "wb"))
+        {
+            const uint32_t texel = uint32_t(fp.Footprint.RowPitch / std::max<uint64_t>(1, desc.Width)) >= 8 ? 8u : 4u;
+            std::fprintf(raw, "URTIRAW %u %u %u %u\n", uint32_t(fp.Footprint.Format), w, h, texel);
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++)
+                    std::fwrite(data + fp.Offset + size_t(y * step) * fp.Footprint.RowPitch + size_t(x * step) * texel, 1, texel, raw);
+            std::fclose(raw);
+        }
     // HDR10 : PQ -> nits (table), BT.2020 -> BT.709, blanc de référence 203 nits, épaule douce, gamma 2.2
     static float pq[1024] = {};
     if (pq[1023] == 0.0f)

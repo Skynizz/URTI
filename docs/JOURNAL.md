@@ -1710,3 +1710,55 @@ Pas vérifié : ce build avec les reflets du jeu activés (l'option se change da
 forme (mêmes places, même contrôle). Ni que la bouillie disparaît avec eux : l'utilisateur l'a signalée juste après avoir coupé l'option.
 
 Reste à faire : une source sûre sans les reflets du jeu (passes d'écran qui restent : éclairage, brume, DLSS) ; ou masquer les blocs du reflet du jeu en le gardant actif.
+
+## v80 : reflets pris avant le HUD, interface laissée intacte, couleurs apprises des objets
+
+Retour de l'utilisateur : « on voit la barre d'affichage et les menus dans l'eau ; ce serait pas plus intelligent d'utiliser nos propres
+reflets qu'on apprend ? ». Les reflets d'URTI prenaient leurs couleurs dans l'image finale de l'écran, HUD et menus compris : aucune
+photo d'avant l'interface dans Horizon (`photos 0/0`), le jeu ne dessine jamais dans l'image d'écran avec DLSS-G. Et la composition
+assombrissait le HUD et le texte du menu comme le reste de l'image.
+
+**Image du jeu sans son interface.** Le relevé des passes (`urti_passes`) montre, à la fin de chaque image, une cible 2560×1440 en RGBA
+16 bits flottants que le jeu écrit avant de poser son HUD : celle que DLSS-G reçoit sans interface. Son alpha est exactement la forme de
+l'interface (5,3 % des pixels sur la capture : boussole, invites, santé ; la même que celle du calque d'interface écrit juste après).
+
+- reconnue à l'exécution, sans réglage : parmi les images de la taille de l'écran en RGBA 16 bits flottants à la fin de leur écriture,
+  la première finie après le masque de l'eau de l'image (après la profondeur si pas de masque). Adoptée quand c'est la même ressource au
+  moins 8 fois sur 10 (en jeu : 40 sur 40, une seule candidate, à chaque lancement) ;
+- copiée dans les listes du jeu à la fin de son écriture (anneau de 4, état commun, comme la profondeur), repère lu à l'exécution ;
+- remise dans la disposition de l'image d'écran (`live_hudless.hlsl`), une fois par nouvelle copie (les images générées reprennent la
+  dernière) : les reflets, le cache de surfaces et la mesure de la lumière y prennent leurs couleurs ;
+- masque d'interface de la composition (laissée intacte) : l'alpha (le HUD), plus les pixels immobiles (identiques dans la copie
+  précédente) nettement différents de l'image finale deux conversions de suite (le menu de pause, qui n'est pas dans l'alpha). Écart
+  toléré 0,06 + 15 % de la valeur. Un pixel qui bouge n'est pas comparé ;
+- `hudless=0` dans urti.ini revient à l'ancienne voie ; `hudless=2` fait la conversion sans s'en servir (mesure de son coût).
+
+**Piège : l'image d'écran n'est pas codée comme cette image.** Les valeurs de la cible correspondent à celles des autres cibles du jeu
+(PQ), mais l'image d'écran vaut environ deux fois la cible (codes PQ ; relevé brut d'une rafale : rapport constant, erreur médiane 1,3 %,
+bien mieux qu'une loi PQ ou une racine). Le jeu applique ce facteur après. Copiée telle quelle, la photo était quatre fois trop sombre dans
+les hautes lumières (les reflets assombrissaient l'eau), et la comparaison prenait 95 % de l'image pour de l'interface (plus d'effet du
+tout, caméra immobile). Le rapport est appris en continu sur le GPU (`live_hudgain.hlsl`) : médiane du rapport pixel par pixel sur les
+pixels immobiles hors interface (histogramme log2, 1,1 % par case), moyenne glissante. Il varie avec la scène : 2,05 à 2,14 au bord de
+l'eau, 1,37 à 1,78 au feu de camp et au chargement, 1,73 à 1,89 en pause (le jeu assombrit le fond derrière le menu). Premier essai avec
+une somme filtrée par le rapport déjà appris : un rapport faux pris au chargement écartait les bons pixels et restait faux (1,3 à 1,5) ;
+la médiane non filtrée ne se piège pas.
+
+**Couleurs apprises des objets du cache de géométrie.** Un reflet qui touche un objet caché ou hors de l'écran n'avait de couleur que
+pour la géométrie de l'image (cache de surfaces par triangle) ; sur un objet du cache, rien : le reflet bloqué du jeu se voyait dessous.
+Chaque objet du cache a maintenant une place dans une table de 256 couleurs (une par groupe de triangles voisins), apprises par le cache
+de surfaces quand l'objet est à l'écran ; l'identité de l'instance porte la place et sa génération, le champ du groupe de touche le
+nombre de triangles. Le reflet les reprend quand le point touché n'est pas visible. Pas de mesure séparée de son effet.
+
+**Mesuré en jeu** (marais, jour, caméra du jeu lue, rafales au rythme réel) :
+
+- texte du menu de pause : 97 à 98 % des pixels clairs laissés intacts (avant : assombri de 15 à 38 niveaux) ; HUD en jeu caméra immobile
+  64 à 88 % intact (avant : 24 %, assombri de 25 niveaux). La photo des reflets ne contient plus ni le menu ni le HUD ;
+- interface prise pour 0,0 à 0,2 % de l'écran en jeu, 1,8 % en pause ;
+- variation de l'effet d'une image à la suivante (pixels > 0,05), caméra immobile : 0,83 % (ancienne voie 0,70 % ; sans les deux
+  conversions de suite 1,38 %, les herbes faisaient clignoter le masque) ; en pause 0,18 % (ancienne voie 0,62 %) ;
+- points brillants ajoutés : 29 en pause, 86 immobile, 114 à 120 en mouvement (ancienne voie, autre vue : 240, 69, 133 à 488) ;
+- coût au même endroit, caméra immobile : composition 1,47 → 1,93 ms par présentation (conversion 0,25 ms, usage 0,25 ms), environ
+  73 au lieu de 75 images par seconde ;
+- une dizaine de lancements d'essai, puis 4 lancements de vérification et 4 Alt+Tab sur la version finale, sans plantage.
+
+Pas fait : le rebond de lumière ne reprend pas encore les couleurs apprises des objets ; masquer le reflet en blocs du jeu.

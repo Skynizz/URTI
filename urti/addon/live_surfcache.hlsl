@@ -13,6 +13,7 @@ ByteAddressBuffer depth : register(t2);         // profondeur de rendu (cette im
 ByteAddressBuffer sunBuf : register(t3);        // loi de profondeur (36 à 47), décalage sous-pixel (1184)
 StructuredBuffer<uint4> regions : register(t4); // par dessin de l'écran : début (octets), taille, compteur, identité
 RWByteAddressBuffer cache : register(u0);
+RWByteAddressBuffer geoColors : register(u1);   // objets du cache de géométrie : 256 couleurs par place (RGB9E5), génération et mesures
 
 cbuffer Constants : register(b0)
 {
@@ -29,7 +30,7 @@ cbuffer Constants : register(b0)
     uint regionCount;
     uint frameIndex;
     uint triangles;    // triangles que le cache peut tenir
-    uint pad0;
+    uint geoColorsOn;  // 1 : couleurs des objets du cache de géométrie apprises aussi
     float uiX0;        // zone d'interface fixe (uv), sautée ; quatre nombres : un float4 ici serait déplacé à la
     float uiY0;        // frontière de 16 octets suivante, plus loin que ce que l'add-on écrit
     float uiX1;
@@ -154,8 +155,26 @@ void main(uint2 id : SV_DispatchThreadID)
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT || abs(q.CommittedRayT() - length(p)) > 0.02 * length(p) + 0.05)
         return; // la caméra voit autre chose que la scène RT ici (objet hors budget, trou d'une plaque découpée)
-    if (q.CommittedInstanceID() != 0)
-        return; // objet du cache de géométrie : pas de couleurs par triangle
+    const uint inst = q.CommittedInstanceID();
+    if (inst != 0)
+    {
+        // objet du cache de géométrie (bit 23 : place, génération) : la couleur de son groupe de triangles (256 par objet, triangles voisins dans le maillage)
+        if ((inst & 0x800000u) == 0 || geoColorsOn == 0)
+            return;
+        float3 cg = SampleLinear(uv);
+        if (any(!isfinite(cg)))
+            return;
+        const uint slot = inst & 0x3FFFu, gen = (inst >> 14) & 255u;
+        const uint tris = max(1u, q.CommittedInstanceContributionToHitGroupIndex());
+        const uint bin = min(255u, uint(float(q.CommittedPrimitiveIndex()) / float(tris) * 256.0));
+        const uint at = (slot * 256u + bin) * 8u;
+        const uint2 was = geoColors.Load2(at);
+        const uint m = (was.y >> 8) == gen ? (was.y & 255u) : 0u;
+        if (m > 0)
+            cg = lerp(UnpackRgb9e5(was.x), cg, max(1.0 / float(m + 1), 0.2));
+        geoColors.Store2(at, uint2(PackRgb9e5(cg), (gen << 8) | min(m + 1, 255u)));
+        return;
+    }
     const uint prim = q.CommittedPrimitiveIndex();
     if (prim >= triangles)
         return;

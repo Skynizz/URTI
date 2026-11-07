@@ -20,6 +20,7 @@ ByteAddressBuffer viewCur : register(t6);  // sommets de cette image (float3, es
 ByteAddressBuffer viewPrev : register(t7); // sommets de l'image précédente (son espace caméra)
 ByteAddressBuffer surfCache : register(t8); // par triangle : couleur vue à l'écran (RGB9E5), identité et mesures (live_surfcache)
 ByteAddressBuffer viewT : register(t9);     // couche des surfaces transparentes planes (eau, vitres) : float3 par sommet
+ByteAddressBuffer geoColors : register(t10); // flags 16384 : couleurs apprises des objets du cache de géométrie (live_surfcache)
 RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé ; poids < 0 : surface
                                                // réfléchissante dont le point reflété est caché ou hors de
                                                // l'écran (couleur inconnue : la stabilisation garde l'historique) ;
@@ -93,6 +94,30 @@ bool Cached(uint prim, out float3 c)
             continue;
         const uint2 v = surfCache.Load2(uint(e) * 8);
         if ((v.y & 255) != 0 && (v.y >> 8) == ident)
+        {
+            c = float3(v.x & 511, (v.x >> 9) & 511, (v.x >> 18) & 511) * exp2(float(int(v.x >> 27) - 24));
+            return all(isfinite(c));
+        }
+    }
+    return false;
+}
+
+// objet du cache de géométrie (identité : bit 23, génération, place) : la couleur apprise de son groupe de triangles, ou d'un groupe voisin
+bool CachedGeo(uint inst, uint prim, uint tris, out float3 c)
+{
+    c = 0;
+    if ((flags & 16384) == 0 || (inst & 0x800000u) == 0)
+        return false;
+    const uint slot = inst & 0x3FFFu, gen = (inst >> 14) & 255u;
+    const int bin = int(min(255u, uint(float(prim) / float(max(tris, 1u)) * 256.0)));
+    static const int kNear[5] = { 0, -1, 1, -2, 2 };
+    for (uint k = 0; k < 5; k++)
+    {
+        const int b = bin + kNear[k];
+        if (b < 0 || b > 255)
+            continue;
+        const uint2 v = geoColors.Load2((slot * 256u + uint(b)) * 8u);
+        if ((v.y & 255u) != 0 && (v.y >> 8) == gen)
         {
             c = float3(v.x & 511, (v.x >> 9) & 511, (v.x >> 18) & 511) * exp2(float(int(v.x >> 27) - 24));
             return all(isfinite(c));
@@ -402,7 +427,10 @@ void main(uint2 id : SV_DispatchThreadID)
             // caché ou hors de l'écran : la couleur que le cache de surfaces a retenue pour ce triangle (pas dans
             // les vues de diagnostic, qui lisent la 4e composante)
             float3 cached;
-            if (!onScreen && (flags & 24) == 0 && q.CommittedInstanceID() == 0 && Cached(q.CommittedPrimitiveIndex(), cached))
+            if (!onScreen && (flags & 24) == 0 && q.CommittedInstanceID() != 0 &&
+                CachedGeo(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedInstanceContributionToHitGroupIndex(), cached))
+                result = float4(-1.0 - cached.r, cached.g, weight, cached.b); // objet du cache : sa couleur apprise
+            else if (!onScreen && (flags & 24) == 0 && q.CommittedInstanceID() == 0 && Cached(q.CommittedPrimitiveIndex(), cached))
             {
                 uint hitId;
                 float3 prevHit, prevHitN;
