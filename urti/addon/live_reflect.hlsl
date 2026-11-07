@@ -53,6 +53,7 @@ cbuffer Constants : register(b0)
     uint anchors;      // 1 : sommets de l'image précédente disponibles
     uint prevVertexCount; // sommets lisibles dans viewPrev (une lecture hors d'un tampon racine n'est pas bornée)
     uint cacheTriangles;  // triangles tenus par le cache de surfaces
+    float3 worldUp;       // flags 8192 : le haut du monde dans l'espace caméra de cette image (normale exacte de l'eau)
 };
 
 // dessin qui contient ce triangle (zones triées par début)
@@ -214,6 +215,20 @@ float Smoothness(int2 t)
     return (flags & 2) ? 1.0 - s : s;
 }
 
+// eau d'après le matériau : au moins trois de ses quatre voisins aussi, à peu près à la même distance (pas un point isolé sur un feuillage)
+bool WaterAround(int2 t, float3 p)
+{
+    uint count = 0;
+    for (uint j = 0; j < 4; j++)
+    {
+        const int2 o = t + (j == 0 ? int2(1, 0) : j == 1 ? int2(-1, 0) : j == 2 ? int2(0, 1) : int2(0, -1));
+        const float3 q = PointAt(o);
+        if (q.z > 0 && abs(q.z - p.z) < 0.1 * p.z + 0.05 && Smoothness(o) > 0.98)
+            count++;
+    }
+    return count >= 3;
+}
+
 [numthreads(8, 8, 1)]
 void main(uint2 id : SV_DispatchThreadID)
 {
@@ -260,14 +275,23 @@ void main(uint2 id : SV_DispatchThreadID)
     // deviennent lisses comme une rue après la pluie
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
-    const float3 n = water ? nWater : p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
+    float3 n = water ? nWater : p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
     // reflets RT seulement sur une surface plane (sol, flaque, vitre, eau) : sur un feuillage, des cheveux, un
     // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
     // gris) ; le jeu y garde ses propres reflets. Sol mouillé : en plus, tourné vers le haut
     const float flat = water ? 1.0 : p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
     // miroir parfait d'après le matériau (eau : Horizon Forbidden West y écrit exactement 0 dans sa 5e cible) : la surface est
     // lisse par définition, ses vagues n'y changent rien
-    const float material = Smoothness(int2(id));
+    float material = Smoothness(int2(id));
+    // caméra du jeu connue : miroir parfait d'après le matériau seulement sur une surface horizontale et étendue (l'eau), et avec sa normale exacte :
+    // tirée de la profondeur, elle change à chaque image avec le décalage sous-pixel, le reflet tremblait et ne se nettoyait qu'en s'accumulant, jeu en pause
+    if ((flags & 8192) && !water && p.z > 0 && material > 0.98)
+    {
+        if (dot(n, worldUp) > 0.7 && WaterAround(int2(id), p))
+            n = worldUp;
+        else
+            material = 0;
+    }
     const float s = water ? 1.0 : max(material * ((flags & 4) || material > 0.98 ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     const float nan = asfloat(0x7FC00000);

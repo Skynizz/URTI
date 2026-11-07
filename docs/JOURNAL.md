@@ -1637,3 +1637,49 @@ l'interface dans Horizon, le jeu ne dessine pas dans l'image d'écran avec DLSS-
 le menu du jeu qui assombrit et floute l'image d'où viennent les couleurs ; URTI assombrit aussi le texte du menu ; du grain fin reste sur les
 reflets ; 6,5 copies de profondeur par image, à réduire ; plein jour, voyage rapide, cinématiques pas essayés. RDR2 garde la v75 : les changements
 de budget et de parts le concernent, à revérifier avant de l'installer.
+
+## v78 : les éclats des reflets
+
+Retour de l'utilisateur sur la v77 : « en pause les reflets se calculent au fur et à mesure et deviennent parfaits, mais en jouant ils ne sont pas
+nickel, et des éclats bizarres restent à l'écran ».
+
+Rafales dans le jeu, chaque effet coupé à tour de rôle : sans les reflets, plus un seul point brillant ajouté par URTI. Tout venait des reflets, et
+surtout en bougeant (0,015 % de pixels éclaircis de plus de 5 % à l'arrêt, 0,37 % en marchant, sur le feuillage et les bords d'objets).
+
+**Causes et remèdes :**
+
+- **le masque de l'eau d'une autre image que la profondeur** : la cible de matériau est copiée à part, et la copie pouvait être de l'image d'avant
+  (et lue pendant que le jeu écrivait la suivante). En mouvement, un pixel de feuille gardait le matériau du ciel (0, comme l'eau) et recevait un reflet
+  parti au hasard. Copies dans un anneau de 4 tampons, avec un repère à l'exécution : le calcul prend celle de son image, et l'attend deux présentations
+  au plus ;
+- **la normale de l'eau tirée de la profondeur** : décalée à chaque image avec le sous-pixel, elle envoyait le reflet ailleurs à chaque image. D'où le grain
+  qui ne se nettoyait qu'en s'accumulant, jeu en pause. L'eau est plate et horizontale : sa normale est maintenant le haut du monde, lu dans la caméra
+  du jeu (`reflect_up=0` pour l'ancienne règle). Un pixel de matériau « eau » n'est un miroir que s'il regarde à peu près vers le haut et que trois de ses
+  quatre voisins sont aussi de l'eau à la même distance ;
+- **l'historique des reflets sur ce qui n'est pas de l'eau** : relu à côté en mouvement, il posait le reflet d'un pixel d'eau voisin sur les herbes et l'y
+  laissait s'éteindre lentement (ça reste à l'écran). Un pixel sans reflet n'en reçoit plus aucun, un pixel d'eau tout juste découvert prend le reflet tout
+  de suite, le voisinage du bornage ne compte que les pixels qui ont un reflet, et un point très clair (particule lue dans l'image) pèse peu dans
+  l'historique ;
+- **la rotation de la caméra pour reprojeter les reflets** venait des cascades, une image sur dix : elle vient de la caméra du jeu.
+
+**Bug trouvé en route, dans le `frame_sync` de la v77 :** après un gros à-coup, le retard sur le jeu ne se rattrapait jamais (un calcul par image), les zones
+du flux étaient reprises avant d'être lues, la scène de l'image restait vide (`3 sommets`), sans aucune erreur. Plusieurs images complètes en attente :
+seule la dernière est gardée. Le journal de la partie de l'utilisateur en v77 ne montre pas ce cas.
+
+Mesures, Horizon, rafales (rythme ralenti) ; pixels que les reflets éclaircissent de plus de 5 %, points brillants isolés ajoutés par image :
+
+| Où | Ancienne règle | Nouvelle |
+|---|---|---|
+| Forêt, en marchant (v77 / v78) | 0,37 %, 32 points | 0,02 %, 17 points |
+| Bord de l'eau, pas de côté (`reflect_up=0` / 1) | 6,65 %, 2228 points | 0,17 %, 18 points |
+| Bord de l'eau, caméra qui tourne | 1,07 %, 100 points | 0,49 %, 80 points |
+| Bord de l'eau, immobile | 0,34 %, 42 points | 0,93 %, 66 points |
+
+Les deux règles du bord de l'eau n'ont pas été prises au même endroit (le personnage a bougé entre les deux) : l'ordre de grandeur du pas de côté est
+net, la ligne « immobile » ne prouve rien (cadrage différent, plus de ciel clair reflété). 3 lancements de suite et 2 Alt+Tab sans plantage ; environ 81
+images par seconde à l'arrêt en forêt.
+
+Reste à faire : le reflet du jeu lui-même, en gros blocs basse résolution (visible sur l'image sans URTI), reste visible sous le reflet RT là où celui-ci est
+faible ; `reflect_f0` à 0,15 et 0,3 ne change presque rien à l'œil, gardé à 0,04 ; le texte du HUD et du menu se reflète toujours dans l'eau ; l'eau est un
+miroir plat, sans les vaguelettes (normale du G-buffer à essayer) ; les particules n'ont pas été testées à part. RDR2 garde la v75 : à revérifier avant de
+l'installer.

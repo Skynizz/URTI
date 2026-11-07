@@ -144,6 +144,7 @@ struct LivePending
     // repère de fin d'écriture de la profondeur principale (pas un dessin) : tampon de sa copie, dessins de la liste avant lui
     int32_t depthMark = -1;
     uint32_t mainBefore = 0, depthAfter = 0;
+    int32_t materialMark = -1; // repère de fin d'écriture de l'image de matériau : tampon de sa copie
     bool screen = false, mainScreen = false, probe = false, sunMap = false, marked = false, indirect = false;
     // sommets dans le même ordre d'une image à l'autre : dessin direct d'un seul exemplaire (un ExecuteIndirect ou
     // des exemplaires choisis sur le GPU changent d'ordre et de nombre : leurs paires de sommets ne disent rien du
@@ -176,6 +177,11 @@ uint32_t g_liveSnapNext = 0, g_liveMainSinceMark = 0, g_liveMainLast = 0, g_live
 // dessins de la profondeur principale écrits, à la dernière copie : pas de nouvelle copie si rien n'a été écrit depuis (le jeu change
 // l'état de sa profondeur une dizaine de fois par image, et six copies de suite reprenaient le tampon de la bonne)
 uint64_t g_liveMainRecorded = 0, g_liveMainAtCopy = ~0ull;
+// image de matériau (masque de l'eau) de la même image du jeu que la profondeur : copiée à part, un peu avant ou un peu après elle. Avec la
+// copie de l'image d'avant, en mouvement, une feuille passait pour de l'eau (matériau du ciel, profondeur de la feuille) : un reflet parti au
+// hasard, un point brillant, qui ne se voyait jamais jeu en pause
+uint32_t g_liveMaterialNext = 0, g_liveMaterialSinceClose = 0;
+int32_t g_liveMaterialDone = -1, g_liveWindowMaterial = -1;
 uint32_t g_liveSnapCopies = 0;
 uint64_t g_liveWindow = 0;                                // fenêtre de présentation (avancée par urti_live.inl)
 uint32_t g_liveAreaCursor[4][kLiveAreas] = {}, g_liveAreaProbe[4][kLiveAreas] = {}; // octets pris dans chaque partie (début, fin)
@@ -1298,6 +1304,27 @@ void OnResetCommandList(command_list* cmd)
 
 // dessins captés d'une liste soumise à la file du jeu : ils appartiennent à la présentation en cours (rang,
 // identité, place dans la scène RT), quelle que soit la fenêtre où la liste a été écrite (appelé sous g_mutex)
+// repères de matériau d'une liste : comptés dès son exécution, même si ses dessins attendent le calcul suivant (ils sont retirés de la liste)
+void LiveNoteMaterial(std::vector<LivePending>& pending)
+{
+    for (auto it = pending.begin(); it != pending.end();)
+    {
+        if (it->materialMark < 0)
+        {
+            ++it;
+            continue;
+        }
+        g_liveMaterialDone = it->materialMark;
+        if (g_liveWindowClosed && g_liveWindowMaterial < 0)
+            g_liveWindowMaterial = it->materialMark; // image fermée, son matériau vient après sa profondeur
+        else
+            g_liveMaterialSinceClose++;
+        if (g_liveTraceOn)
+            Log("MATIERE tampon %d fenetre fermee %d", it->materialMark, int(g_liveWindowClosed));
+        it = pending.erase(it);
+    }
+}
+
 void LiveCommit(const std::vector<LivePending>& pending, uint32_t listMain, uint32_t counted)
 {
     for (size_t index = 0; index < pending.size(); index++)
@@ -1320,6 +1347,9 @@ void LiveCommit(const std::vector<LivePending>& pending, uint32_t listMain, uint
             g_liveMainLast = g_liveMainSinceMark, g_liveMainSinceMark = 0;
             g_liveSnapDone = p.depthMark, g_liveSnapSerial++;
             g_liveWindowClosed = true;
+            // matériau déjà passé dans cette image : c'est le sien ; sinon, le prochain
+            g_liveWindowMaterial = g_liveMaterialSinceClose ? g_liveMaterialDone : -1;
+            g_liveMaterialSinceClose = 0;
             if (index + 1 < pending.size() || listMain > counted)
             {
                 LiveDeferred later;
@@ -1441,6 +1471,8 @@ void OnExecuteCommandList(command_queue* queue, command_list* cmd)
         const auto st = g.lists.find(cmd->get_native());
         const uint32_t listMain = st != g.lists.end() ? st->second.mainDraws : 0;
         const auto pt = g_livePending.find(cmd->get_native());
+        if (pt != g_livePending.end())
+            LiveNoteMaterial(pt->second);
         if (g_liveWindowClosed)
         {
             // fenêtre fermée : cette liste appartient à l'image suivante

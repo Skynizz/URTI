@@ -125,6 +125,13 @@ void main(uint2 id : SV_DispatchThreadID)
     // l'autre (c'était le « pop / dépop » : visible, caché, visible…)
     bool known;
     const float4 cur = Current(t, known);
+    // pas de reflet ici (pas de l'eau) : rien, jamais d'historique. Relu à côté en mouvement, il posait le reflet d'un pixel d'eau voisin sur les herbes et
+    // les bords des objets, et l'y laissait s'éteindre lentement (éclats qui restent à l'écran)
+    if (known && cur.a <= 0 && (flags & 4) == 0)
+    {
+        resolved.Store4(dst, asuint(float4(0, 0, 0, 0)));
+        return;
+    }
     float4 m1 = 0, m2 = 0;
     float count = 0;
     for (int dy = -1; dy <= 1; dy++)
@@ -132,7 +139,7 @@ void main(uint2 id : SV_DispatchThreadID)
         {
             bool nk = known;
             const float4 n = (dx == 0 && dy == 0) ? cur : Current(t + int2(dx, dy), nk);
-            if (nk)
+            if (nk && n.a > 0) // (seulement les pixels qui ont un reflet : un bord d'eau n'est pas tiré vers le noir)
                 m1 += n, m2 += n * n, count += 1;
         }
     const float4 mean = count > 0 ? m1 / count : 0, sigma = count > 0 ? sqrt(max(m2 / count - mean * mean, 0.0)) : 0;
@@ -219,7 +226,13 @@ void main(uint2 id : SV_DispatchThreadID)
                 // mélange adaptatif : beaucoup d'historique à l'arrêt, peu en mouvement rapide
                 const float motionPx = length(mvVirtual * float2(renderWidth, renderHeight));
                 const float a = lerp(alpha, alphaMax, saturate(motionPx / 8.0));
-                result = known ? lerp(clamp(hist, lo, hi), cur, a) : clamp(hist, lo, hi) * holdDecay;
+                const float4 kept = clamp(hist, lo, hi);
+                // poids selon la luminosité (comme les anticrénelages temporels) : un point très clair (particule, luciole lue dans l'image) ne marque pas
+                // l'historique ; et surface tout juste découverte (historique sans reflet) : le reflet tout de suite, pas un fondu
+                const float3 kLum = float3(0.2126, 0.7152, 0.0722);
+                const float wc = 1.0 / (1.0 + 10.0 * dot(cur.rgb, kLum) / max(cur.a, 1e-3)), wh = 1.0 / (1.0 + 10.0 * dot(kept.rgb, kLum) / max(kept.a, 1e-3));
+                const float ak = a * wc / max(a * wc + (1.0 - a) * wh, 1e-5);
+                result = !known ? kept * holdDecay : (hist.a < 0.25 * cur.a ? cur : lerp(kept, cur, ak));
                 if (flags & 4)
                 {
                     // confiance : part de l'historique gardée après bornage (blanc : stable, noir : rejeté)
