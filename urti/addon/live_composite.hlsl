@@ -15,6 +15,7 @@ ByteAddressBuffer uiCounts : register(t7);   // live_uiselect : choix de la phot
 ByteAddressBuffer bounceBuf : register(t8);  // rebond de lumière débruité : plans R, G, B (float, pas maskPitch, résolution de rendu)
 ByteAddressBuffer albedo : register(t9);     // couleur propre des surfaces (G-buffer du jeu, RGBA8 sRGB, résolution de rendu)
 ByteAddressBuffer gNormal : register(t10);   // normale du G-buffer (RGBA8) ; alpha : repère des personnages (RDR2)
+ByteAddressBuffer motionIn : register(t11);  // live_reflresolve : mouvement de la surface et du reflet (uv vers l'image précédente), float4 par pixel de rendu
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 RWByteAddressBuffer uiMask : register(u1);   // 1 par pixel d'interface, retenu de la dernière photo sûre
 
@@ -48,6 +49,8 @@ cbuffer Constants : register(b0)
     float giStrength;   // rebond de lumière ajouté (0 : coupé)
     uint albedoPitch;
     uint normalPitch;   // 0 : normale du G-buffer absente
+    float fgShift;      // image générée par DLSS-G : part du mouvement d'une image dont glissent l'ombre et le reflet du dernier calcul (0 : aucun)
+    uint motionPad;
 };
 
 // décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
@@ -218,7 +221,17 @@ void main(uint2 id : SV_DispatchThreadID)
     // masque et reflets calculés sur la profondeur décalée du jeu ; l'image présentée ne l'est pas (TAA) :
     // le point vu en (id) est dans le masque en (id) + décalage
     const float2 jitter = JitterPixels(asfloat(sunBuf.Load2(1184)), p00, p11, float2(maskWidth, maskHeight));
-    const float2 m = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5 + jitter;
+    // image générée : l'image a avancé depuis le dernier calcul ; le point vu ici était, au calcul, en « ici + part × mouvement » (vers
+    // l'image précédente) : la surface pour l'ombre, le point virtuel derrière le miroir pour le reflet
+    float2 shiftS = 0, shiftV = 0;
+    if (fgShift > 0)
+    {
+        const int2 mp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+        const float4 mo = asfloat(motionIn.Load4((uint(mp.y) * maskWidth + uint(mp.x)) * 16));
+        if (all(isfinite(mo)) && all(abs(mo) < 0.25))
+            shiftS = mo.xy * fgShift * float2(maskWidth, maskHeight), shiftV = mo.zw * fgShift * float2(maskWidth, maskHeight);
+    }
+    const float2 m = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5 + jitter + shiftS;
     const int2 b = int2(floor(m));
     const float2 f = m - b;
     float lit = 0, wsum = 0;
@@ -245,7 +258,7 @@ void main(uint2 id : SV_DispatchThreadID)
     float4 rf = float4(0, 0, 0, 0);
     if (reflStrength > 0 || (debugReflect & 0xFF) != 0)
     {
-        const int2 rp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) + jitter), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+        const int2 rp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) + jitter + shiftV), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
         rf = asfloat(reflection.Load4((uint(rp.y) * maskWidth + uint(rp.x)) * 16));
     }
     if ((debugReflect & 0xFF) == 1)
@@ -312,7 +325,7 @@ void main(uint2 id : SV_DispatchThreadID)
     if (reflStrength > 0 && (debugReflect & 0x200))
     {
         // reflet stabilisé, bilinéaire à la résolution de rendu (couleur prémultipliée par son poids)
-        const float2 q = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5 + jitter;
+        const float2 q = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5 + jitter + shiftV;
         const int2 b0 = int2(floor(q));
         const float2 f0 = q - b0;
         float4 r = 0;

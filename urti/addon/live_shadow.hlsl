@@ -433,20 +433,50 @@ void main(uint2 id : SV_DispatchThreadID)
             // du sol sans écrire la profondeur, faisaient des taches sombres à leur forme exacte
             ray.TMin = rough ? 0.25 : 0.06; // surface rugueuse : pas les brins eux-mêmes
             ray.TMax = aoRadius;
-            RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-            q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
-            while (q.Proceed())
-                if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-                    ((flags & 2048) == 0 || !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p3)))
-                    q.CommitNonOpaqueTriangleHit(); // le plus proche reste (les candidats plus loin sont écartés)
+            // rayon opaque d'abord (le matériel trouve seul le plus proche) ; recherche lente, triangle par triangle, seulement si ce point
+            // est un trou d'une plaque découpée (même résultat, sans examiner chaque triangle du sol et des rochers)
+            bool aoHit = false;
+            float aoT = 0;
+            uint aoInst = 0, aoPrim = 0;
+            // trou d'une feuille : rayon opaque suivant, juste après lui (jusqu'à six), avant la recherche lente
+            bool aoHole = false;
+            RayDesc stepRay = ray;
+            for (uint hop = 0; hop < 6; hop++)
+            {
+                RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qf;
+                qf.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, stepRay);
+                qf.Proceed();
+                aoHit = qf.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+                if (!aoHit)
+                    break;
+                aoT = qf.CommittedRayT(), aoInst = qf.CommittedInstanceID(), aoPrim = qf.CommittedPrimitiveIndex();
+                aoHole = (flags & 2048) && Hole(ray.Origin + ray.Direction * aoT, p3);
+                if (!aoHole)
+                    break;
+                stepRay.TMin = aoT + max(1e-3, 1e-4 * aoT);
+            }
+            // (flags bit 23 : ancienne règle, chaque triangle examiné, pour comparer)
+            if ((flags & 2048) && (aoHit && aoHole || (flags & (1u << 23))))
+            {
+                if ((flags & (1u << 23)) == 0)
+                    ray.TMin = stepRay.TMin;
+                RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+                q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
+                while (q.Proceed())
+                    if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p3))
+                        q.CommitNonOpaqueTriangleHit(); // le plus proche reste (les candidats plus loin sont écartés)
+                aoHit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+                if (aoHit)
+                    aoT = q.CommittedRayT(), aoInst = q.CommittedInstanceID(), aoPrim = q.CommittedPrimitiveIndex();
+            }
             // obstacle proche : occultation forte ; vers la portée, elle s'éteint en douceur
-            const float t = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() / aoRadius : 1.0;
+            const float t = aoHit ? aoT / aoRadius : 1.0;
             occlusion += (1.0 - t) * (1.0 - t) / float(aoRays) * (rough ? 0.75 : 1.0);
             // la lumière du ciel retirée dans cette direction est remplacée par celle que renvoie l'obstacle (même
             // poids) ; obstacle jamais vu à l'écran : rien (le jeu garde son propre éclairage d'ambiance au loin)
             float3 hc;
             // (exemplaire 0 : scène de l'image ; le cache de géométrie n'a pas de couleurs par triangle)
-            if ((flags & (1u << 20)) && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && q.CommittedInstanceID() == 0 && Cached(q.CommittedPrimitiveIndex(), hc))
+            if ((flags & (1u << 20)) && aoHit && aoInst == 0 && Cached(aoPrim, hc))
                 bounceSum += hc * ((1.0 - t) * (1.0 - t) / float(aoRays));
         }
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;

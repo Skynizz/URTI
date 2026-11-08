@@ -1762,3 +1762,57 @@ nombre de triangles. Le reflet les reprend quand le point touché n'est pas visi
 - une dizaine de lancements d'essai, puis 4 lancements de vérification et 4 Alt+Tab sur la version finale, sans plantage.
 
 Pas fait : le rebond de lumière ne reprend pas encore les couleurs apprises des objets ; masquer le reflet en blocs du jeu.
+
+## v81 : le reflet ne saccade plus avec DLSS-G, rayons plus rapides, mesure par film au rythme réel et ꟻLIP
+
+Retour de l'utilisateur sur v80 : « il faut corriger les fps, on perd trop ; à l'arrêt les reflets se calculent et deviennent bien, mais en
+mouvement ils se décalent, ne suivent pas, le personnage se décale, ça gigote dans l'eau, on dirait des couches au-dessus de l'eau ;
+il faut une analyse d'image qui montre si c'est bien ou non (le truc de NVIDIA) ».
+
+**Outils de mesure.**
+
+- Film au rythme réel (fichier `urti_film`) : 30 présentations de suite, générées comprises, avant et après URTI, à demi-résolution,
+  gardées en mémoire vidéo et écrites seulement à la fin (une rafale écrit chaque image : le jeu ralentit et seules les images calculées
+  y sont). Une ligne `FILM` par présentation (générée, calculée) ; à la fin, la profondeur et le masque de l'eau du dernier calcul
+  (`profondeur.bin`, `materiau.bin`, ligne `FILMCAM`).
+- `tools/reshade/urti_film_ana.py` : ꟻLIP (NVIDIA, flip-evaluator 1.7, déjà installé) entre chaque présentation et la suivante, sur l'image
+  du jeu et sur l'image avec URTI ; l'excédent est ce qu'URTI ajoute comme changement perçu (tremblement, saut). Aussi le décalage de
+  l'image et de la couche URTI d'une présentation à la suivante (corrélation de phase).
+- `tools/reshade/urti_eau_hauteur.py` : hauteur de chaque pixel d'eau d'après la profondeur du film.
+- Minutage GPU détaillé (journal « GPU détail ») : chaque étape du calcul et de la composition.
+
+**Cause du décalage en mouvement : la couche d'URTI figée sur les images générées.** Avec DLSS-G, une présentation sur deux ou trois n'a
+pas de calcul : URTI y reposait l'ombre et le reflet du dernier calcul tels quels. Film d'un pas de côté : l'image avance de 1 à 3 px à
+chaque présentation, la couche d'URTI reste à 0,01 px une fois sur trois puis rattrape d'un coup (9 présentations sur 29 figées).
+Corrigé : le résolveur des reflets garde, pour chaque pixel, le mouvement de la surface et celui du point virtuel derrière le miroir ;
+sur une image générée, la composition lit l'ombre et le reflet à « ici + 0,5 × mouvement » (`fg_shift=`, 0 : ancienne règle). Mesuré
+dans la même partie : 1 présentation figée sur 29 (au lieu de 9), la couche suit l'image à chaque présentation (rapport 1,1, constant).
+
+**Pas la cause :**
+
+- la hauteur du miroir : sur l'eau ouverte, la profondeur du jeu est un plan (−1,59 à −1,61 m sous la caméra) : c'est bien la surface ;
+- les taches sombres autour des jambes d'Aloy dans l'eau : elles sont dans l'image du jeu sans URTI (génération d'images sur des
+  jambes qui bougent vite). Mais des morceaux d'Aloy (équipement, cheveux) pouvaient entrer dans le cache de géométrie, où un objet est
+  supposé immobile : objets à moins de 6 m de la caméra exclus du cache (environ 300 écartés par tranche de 300 images).
+
+**Coût.** Sans URTI, au même endroit : 134 images par seconde ; avec v80 : 69 à 85. Détail par calcul (bord de l'eau) : cache de
+géométrie 1,9 ms, structure de l'image 1,8, occultation 2,2, débruitage 2,0, reflets 2,3 ; par présentation : image sans interface 0,35,
+reflets stabilisés 0,37, composition 0,5.
+
+- Rayons : chaque rayon d'occultation et de reflet examinait chaque triangle rencontré (sol, rochers, troncs) pour savoir si c'était un trou
+  de feuille. Maintenant un rayon opaque d'abord (le matériel trouve le plus proche) ; si c'est un trou vu à l'écran, rayon opaque suivant
+  juste après lui (jusqu'à six), la recherche lente seulement au-delà. Même résultat. Mesuré au même endroit (alterné, 30 s chacun) :
+  face à l'eau 80,5 au lieu de 71 images par seconde (reflets 2,2 au lieu de 3,9 ms, occultation 1,95 au lieu de 2,85), face à la forêt
+  86,3 au lieu de 79,5. `rayons_lents=1` revient à l'ancienne règle.
+- Débruitage : l'occultation n'est calculée que sur un pixel par bloc 2×2 à chaque image ; le flou 5×5 lisait 25 pixels pour n'en garder
+  que 4 à 9. Il ne lit plus que ceux-là (même résultat) : 2,0 → 1,4 à 1,6 ms.
+- Cache de géométrie : 80 objets et 400 000 sommets reconstruits à chaque image ; maintenant les nouveaux d'abord (300 000 sommets), les
+  objets déjà gardés remis à jour à 100 000 sommets par image (`geo_new=`, `geo_refresh=`) : 1,2 → 0,5 ms.
+- Occultation : plus de rayons supplémentaires là où l'image bouge (`ao_boost=1` pour les remettre).
+
+Au départ (feu de camp, immobile) : 81 → 92 images par seconde ; au bord de l'eau 69,5 → 80,5 (sans URTI : 134). Une dizaine de lancements
+d'essai, puis 2 lancements et 2 Alt+Tab de vérification sur la version finale, sans plantage.
+
+**Reste :** structure de l'image reconstruite à chaque calcul (2,2 ms), occultation et reflets dans le feuillage dense (jusqu'à 10 ms en
+marchant), composition à chaque présentation. Les reflets d'objets cachés ou hors de l'écran prennent des couleurs apprises par
+triangle ou par groupe de triangles : aplats (troncs reflétés en barres pâles), peut-être les « couches » que voit l'utilisateur.

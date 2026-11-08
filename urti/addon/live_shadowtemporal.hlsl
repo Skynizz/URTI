@@ -79,8 +79,29 @@ void main(uint2 id : SV_DispatchThreadID)
         float sum[3] = { 0, 0, 0 }, m1[3] = { 0, 0, 0 }, m2[3] = { 0, 0, 0 };
         float wsum = 0, taps = 0;
         const int r = int(clamp(blurRadius & 255, 1u, 2u));
-        for (int dy = -r; dy <= r; dy++)
-            for (int dx = -r; dx <= r; dx++)
+        // occultation au quart (un pixel par bloc 2×2 à chaque image) : seuls les pixels calculés à cette image comptent ; parcourus
+        // directement (quatre à neuf lectures au lieu de vingt-cinq, et trois plans pour le rebond), même résultat
+        int2 lattice = int2(-1, -1);
+        if (r == 2)
+        {
+            const bool c0 = Raw(t, 0) >= 0, cx = Raw(t + int2(1, 0), 0) >= 0;
+            if (!(c0 && cx))
+            {
+                if (c0)
+                    lattice = t & 1;
+                else if (cx)
+                    lattice = (t + int2(1, 0)) & 1;
+                else if (Raw(t + int2(0, 1), 0) >= 0)
+                    lattice = (t + int2(0, 1)) & 1;
+                else if (Raw(t + int2(1, 1), 0) >= 0)
+                    lattice = (t + int2(1, 1)) & 1;
+            }
+        }
+        const int stepL = lattice.x >= 0 ? 2 : 1;
+        const int x0 = lattice.x >= 0 ? ((((lattice.x - (t.x & 1)) & 1) == 0) ? -2 : -1) : -r;
+        const int y0 = lattice.y >= 0 ? ((((lattice.y - (t.y & 1)) & 1) == 0) ? -2 : -1) : -r;
+        for (int dy = y0; dy <= r; dy += stepL)
+            for (int dx = x0; dx <= r; dx += stepL)
             {
                 const int2 n = t + int2(dx, dy);
                 const float v0 = Raw(n, 0);

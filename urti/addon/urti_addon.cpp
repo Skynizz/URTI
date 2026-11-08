@@ -2212,6 +2212,15 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         live.burst = 30, live.burstIndex = 0;
         Log("URTI direct : rafale %u demandée (30 images avant / après URTI)", live.burstCount);
     }
+    // film au rythme réel (fichier déclencheur urti_film) : 30 présentations consécutives, générées comprises, gardées en mémoire vidéo
+    if (const std::string film = g_dir + "\\urti_film"; live.film == 0 && live.burst == 0 && g.frame % 30 == 0 && GetFileAttributesA(film.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        DeleteFileA(film.c_str());
+        live.filmFolder = g_dir + "\\urti_film_" + std::to_string(++live.filmCount);
+        CreateDirectoryA(live.filmFolder.c_str(), nullptr);
+        live.film = LiveState::kFilmFrames, live.filmIndex = 0;
+        Log("URTI direct : film %u demandé (%u présentations au rythme réel)", live.filmCount, LiveState::kFilmFrames);
+    }
     g_liveCapture = live.enabled && g.phase == Phase::Idle;
     // étalonnage complet (lourd : tout le flux relu) au départ, sur F6, ou quand le suivi du soleil
     // image par image est perdu ; sinon le soleil est suivi sur le GPU. Sans ombres RT du soleil (réglage par

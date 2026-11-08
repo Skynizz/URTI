@@ -17,6 +17,10 @@ ByteAddressBuffer sunBuf : register(t6);      // loi de profondeur (36 à 47), r
 ByteAddressBuffer anchorCur : register(t7);   // uint4 par pixel de rendu : position précédente du reflet, identités
 ByteAddressBuffer anchorPrev : register(t8);  // le même, de l'image précédente
 RWByteAddressBuffer resolved : register(u0);  // float4 par pixel de rendu : couleur linéaire, poids
+// float4 par pixel de rendu : mouvement de la surface, mouvement du reflet (uv vers l'image précédente). Les images générées par DLSS-G
+// (entre deux calculs) font glisser l'ombre et le reflet du dernier calcul de cette fraction de mouvement (live_composite) : sans cela,
+// la couche d'URTI restait figée une présentation sur deux puis rattrapait l'image d'un coup (reflet qui saccade et se décale)
+RWByteAddressBuffer motionOut : register(u1);
 
 cbuffer Constants : register(b0)
 {
@@ -100,6 +104,22 @@ float4 Current(int2 t, out bool known)
 // reflet caché : part de l'historique gardée à chaque image (0,9 : la moitié après 7 images)
 static const float holdDecay = 0.9;
 
+// vecteur de mouvement du jeu en uv (vers l'image précédente), 0 s'il n'est pas lisible
+float2 GameMotionUv(uint2 id)
+{
+    if (motionConvention >= 16)
+        return 0;
+    const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
+    float2 mv = float2(f16tof32(raw & 0xFFFF), f16tof32(raw >> 16));
+    const uint k = motionConvention;
+    mv = (k & 3) == 0 ? mv : (k & 3) == 1 ? mv * 0.5 : (k & 3) == 2 ? mv / float2(renderWidth, renderHeight) : mv * 2.0;
+    if (k & 4)
+        mv = -mv;
+    if (k & 8)
+        mv.y = -mv.y;
+    return all(isfinite(mv)) && all(abs(mv) < 0.25) ? mv : 0;
+}
+
 float ViewDepth(ByteAddressBuffer b, int2 t, float A, float B)
 {
     t = clamp(t, int2(0, 0), int2(renderWidth - 1, renderHeight - 1));
@@ -118,6 +138,8 @@ void main(uint2 id : SV_DispatchThreadID)
     gJitterUv = JitterPixels(asfloat(sunBuf.Load2(1184)), p00, p11, float2(renderWidth, renderHeight)) / float2(renderWidth, renderHeight);
     if (flags & 2)
         return; // image générée : le résultat de la dernière image réelle reste
+    const float2 mvSurface = GameMotionUv(id);
+    motionOut.Store4(dst, asuint(float4(mvSurface, mvSurface))); // reflet : remplacé plus bas par le mouvement de son point virtuel
 
     // courant (couleur prémultipliée par le poids) et statistiques du voisinage 3×3 (moyenne ± γ σ), sur les
     // pixels dont le reflet est connu. Reflet attendu mais point reflété caché (vitre, feuillage, bord de
@@ -214,6 +236,8 @@ void main(uint2 id : SV_DispatchThreadID)
         const float dist = w > 0 ? length(float3(ndc0.x * w / p00, ndc0.y * w / p11, w)) : 1;
         const float ratio = hitT >= 1e4 ? 0.0 : dist / (dist + max(hitT, 0.0));
         const float2 mvVirtual = mvRot + (mv - mvRot) * ratio;
+        if (all(isfinite(mvVirtual)) && all(abs(mvVirtual) < 0.25))
+            motionOut.Store2(dst + 8, asuint(mvVirtual));
         const float2 prevUv = uv + mvVirtual + JitterPixels(asfloat(sunBuf.Load2(628)), p00, p11, float2(renderWidth, renderHeight)) / float2(renderWidth, renderHeight);
         if (law.z > 0 && all(isfinite(mvVirtual)) && all(prevUv > 0) && all(prevUv < 1) && w > 0)
         {

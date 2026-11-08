@@ -360,17 +360,50 @@ void main(uint2 id : SV_DispatchThreadID)
         ray.Direction = r;
         ray.TMin = 0.05; // pas les décalques du jeu posés juste au-dessus de la surface
         ray.TMax = 500.0; // au-delà, la brume du jeu efface tout reflet
-        // chaque triangle rencontré est examiné : gardé sauf si c'est un trou que la caméra voit à travers
-        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
-        while (q.Proceed())
-            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && ((flags & 32) == 0 || !SeenThrough(ray.Origin + r * q.CandidateTriangleRayT())))
-                q.CommitNonOpaqueTriangleHit();
+        // d'abord un rayon opaque (le matériel trouve seul le plus proche) ; seulement si ce point est un trou que la caméra voit à travers
+        // (plaque découpée du feuillage), la recherche lente où chaque triangle rencontré est examiné. Même résultat : avant, chaque rayon
+        // examinait chaque triangle (sol, rochers, troncs compris)
+        bool hitNow = false;
+        float hitT = 0;
+        uint hitInst = 0, hitPrim = 0, hitContrib = 0;
+        float2 hitBary = 0;
+        // trou d'une feuille : rayon opaque suivant, juste après lui (jusqu'à six), avant la recherche lente
+        bool holeLeft = false;
+        RayDesc stepRay = ray;
+        for (uint hop = 0; hop < 6; hop++)
+        {
+            RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qf;
+            qf.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, stepRay);
+            qf.Proceed();
+            hitNow = qf.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+            if (!hitNow)
+                break;
+            hitT = qf.CommittedRayT(), hitInst = qf.CommittedInstanceID(), hitPrim = qf.CommittedPrimitiveIndex(),
+            hitContrib = qf.CommittedInstanceContributionToHitGroupIndex(), hitBary = qf.CommittedTriangleBarycentrics();
+            holeLeft = (flags & 32) && SeenThrough(ray.Origin + r * hitT);
+            if (!holeLeft)
+                break;
+            stepRay.TMin = hitT + max(1e-3, 1e-4 * hitT);
+        }
+        // (flags 32768 : ancienne règle, chaque triangle examiné, pour comparer)
+        if ((flags & 32) && (hitNow && holeLeft || (flags & 32768)))
+        {
+            ray.TMin = (flags & 32768) ? ray.TMin : stepRay.TMin;
+            RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+            q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
+            while (q.Proceed())
+                if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && !SeenThrough(ray.Origin + r * q.CandidateTriangleRayT()))
+                    q.CommitNonOpaqueTriangleHit();
+            hitNow = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+            if (hitNow)
+                hitT = q.CommittedRayT(), hitInst = q.CommittedInstanceID(), hitPrim = q.CommittedPrimitiveIndex(),
+                hitContrib = q.CommittedInstanceContributionToHitGroupIndex(), hitBary = q.CommittedTriangleBarycentrics();
+        }
         // diagnostic (flags 8, vue 7) : pourquoi pas de reflet. 0,1 rien touché et vers l'arrière ; 0,2 rien touché, pas de
         // ciel à cet endroit de l'écran ; 0,4 touché hors de l'écran ; 0,6 touché, l'écran y montre plus près (caché) ; 0,8
         // touché, l'écran y montre plus loin
-        float why = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.4 : (r.z > 1e-3 ? 0.2 : 0.1);
-        if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT && r.z > 1e-3)
+        float why = hitNow ? 0.4 : (r.z > 1e-3 ? 0.2 : 0.1);
+        if (!hitNow && r.z > 1e-3)
         {
             // rien touché : le rayon part au loin. Ce qui est à l'infini se reflète tel qu'il est vu dans cette direction : le
             // ciel, ou le lointain que l'écran y montre (forêt noyée de brume au-delà de la scène RT : presque tout le reflet
@@ -384,9 +417,9 @@ void main(uint2 id : SV_DispatchThreadID)
                 result = float4(uv, weight * edge.x * edge.y, (flags & 16) ? s : 1e4);
             }
         }
-        else if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && r.z > -0.999)
+        else if (hitNow && r.z > -0.999)
         {
-            const float3 h = ray.Origin + r * q.CommittedRayT();
+            const float3 h = ray.Origin + r * hitT;
             bool onScreen = false;
             if (h.z > 1e-3)
             {
@@ -406,7 +439,7 @@ void main(uint2 id : SV_DispatchThreadID)
                         // ancrage : point reflété à l'image précédente, symétrisé par le plan du miroir d'alors
                         uint hitId;
                         float3 prevHit, prevHitN;
-                        const bool hitKnown = AnchorOf(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
+                        const bool hitKnown = AnchorOf(hitInst, hitPrim, hitBary, hitId, prevHit, prevHitN);
                         anchorOut.z = hitId;
                         if (hitKnown && mirrorKnown)
                         {
@@ -419,7 +452,7 @@ void main(uint2 id : SV_DispatchThreadID)
                         }
                         // fondu vers les bords de l'écran (couleur inconnue au-delà)
                         const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
-                        result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(q.CommittedRayT() / 50.0) : (flags & 16) ? s : q.CommittedRayT());
+                        result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(hitT / 50.0) : (flags & 16) ? s : hitT);
                         onScreen = true;
                     }
                 }
@@ -427,14 +460,13 @@ void main(uint2 id : SV_DispatchThreadID)
             // caché ou hors de l'écran : la couleur que le cache de surfaces a retenue pour ce triangle (pas dans
             // les vues de diagnostic, qui lisent la 4e composante)
             float3 cached;
-            if (!onScreen && (flags & 24) == 0 && q.CommittedInstanceID() != 0 &&
-                CachedGeo(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedInstanceContributionToHitGroupIndex(), cached))
+            if (!onScreen && (flags & 24) == 0 && hitInst != 0 && CachedGeo(hitInst, hitPrim, hitContrib, cached))
                 result = float4(-1.0 - cached.r, cached.g, weight, cached.b); // objet du cache : sa couleur apprise
-            else if (!onScreen && (flags & 24) == 0 && q.CommittedInstanceID() == 0 && Cached(q.CommittedPrimitiveIndex(), cached))
+            else if (!onScreen && (flags & 24) == 0 && hitInst == 0 && Cached(hitPrim, cached))
             {
                 uint hitId;
                 float3 prevHit, prevHitN;
-                const bool hitKnown = Anchor(q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
+                const bool hitKnown = Anchor(hitPrim, hitBary, hitId, prevHit, prevHitN);
                 anchorOut.z = hitId;
                 if (hitKnown && mirrorKnown)
                 {
