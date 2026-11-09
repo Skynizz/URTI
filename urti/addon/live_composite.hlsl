@@ -347,7 +347,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const float a = saturate(r.a * reflStrength);
         c = c * (1.0 - a) + r.rgb * saturate(reflStrength);
     }
-    else if (reflStrength > 0 && rf.z > 0)
+    else if (reflStrength > 0 && rf.z > 0 && rf.x != -0.25)
     {
         const float3 reflected = rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy); // u < -0,5 : cache de surfaces
         if ((debugReflect & 0xFF) == 3)

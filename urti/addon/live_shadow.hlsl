@@ -49,6 +49,7 @@ cbuffer Constants : register(b0)
     uint aoMotion;         // convention des vecteurs de mouvement (live_mvcal) pour l'occultation ; 255 : inconnue
     uint cacheTriangles;   // triangles tenus par le cache de surfaces (rebond de lumière)
     uint regionCount;      // zones de la scène RT (regions)
+    float aoMaxDist;       // budget de temps : occultation calculée jusqu'à cette distance (mètres)
 };
 
 uint AoHash(uint x)
@@ -301,7 +302,24 @@ void main(uint2 id : SV_DispatchThreadID)
     float weight = 0.0;           // mode SIGMA : part de l'ombre gardée par les corrections (0 : aucune ombre RT)
     const float w = gB / (d - gA);
     float gameVis = 1.0; // soleil reçu selon la carte du jeu (occultation ambiante : part du ciel dans la lumière)
-    if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
+    // occultation seule (ombres du soleil coupées, flags 64) : un pixel sans rayon à cette image (3 sur 4), le ciel ou ce qui est au-delà de la portée sortent ici, sans normale,
+    // planéité ni carte du jeu (toute cette préparation coûtait plusieurs millisecondes, quel que soit le nombre de rayons)
+    const bool aoOnly = (flags & 64) != 0 && (flags & (8u | 4096u)) == 0 && debugMode == 0;
+    static const uint2 kQuarter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
+    const bool notThisFrame = (flags & 128) != 0 && any((id & 1u) != kQuarter[frameIndex & 3]);
+    if (aoOnly && (d == gClear || !(w > 0) || w >= aoMaxDist || aoAmount <= 0 || notThisFrame))
+    {
+        const bool later = notThisFrame && d != gClear && w > 0 && w < aoMaxDist && aoAmount > 0; // calculé à une autre image : -1, reconstruit par live_shadowtemporal
+        shadow.Store(id.y * shadowPitch + id.x * 4, asuint(later ? -1.0 : 1.0));
+        if (flags & (1u << 20))
+        {
+            const uint plane = shadowPitch * height, a0 = id.y * shadowPitch + id.x * 4;
+            const float v = later ? -1.0 : 0.0;
+            bounce.Store(a0, asuint(v)), bounce.Store(plane + a0, asuint(v)), bounce.Store(2 * plane + a0, asuint(v));
+        }
+        return;
+    }
+    if (!aoOnly && (flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
         const float2 ndc = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p = float3(ndc.x * w / p00, ndc.y * w / p11, w);
@@ -366,7 +384,7 @@ void main(uint2 id : SV_DispatchThreadID)
     // (N·L) ; le reste (lumière du ciel, rebonds) demeure. Le point éclairé reçoit ciel + soleil × N·L : la
     // part du soleil y est x N·L / (1 + x N·L), x = soleil / ciel mesuré dans l'image (live_sunlight) ;
     // midi : ombres franches, temps couvert : presque rien. Non mesuré : pente fixe (ancienne règle).
-    if ((flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
+    if (!aoOnly && (flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
         const float2 ndc2 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p2 = float3(ndc2.x * w / p00, ndc2.y * w / p11, w);
@@ -392,13 +410,9 @@ void main(uint2 id : SV_DispatchThreadID)
     // par-dessus le brouillard)
     const float3 macroN = (!flatHere && (flags & (1u << 21)) && w < 20.0) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
     const bool rough = any(macroN != 0);
-    if (aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && (flatHere || rough) && !SeesThroughAround(int2(id), p3))
-    {
-        // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
-        static const uint2 kQuarter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
-        aoSkipped = (flags & 128) && any((id & 1u) != kQuarter[frameIndex & 3]);
-    }
-    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < 50.0 && (flatHere || rough) &&
+    if (!aoOnly && aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough) && !SeesThroughAround(int2(id), p3))
+        aoSkipped = notThisFrame; // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
+    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough) &&
         !SeesThroughAround(int2(id), p3))
     {
         const float3 n = rough ? macroN : NormalAt(int2(id), p3);
@@ -438,10 +452,12 @@ void main(uint2 id : SV_DispatchThreadID)
             bool aoHit = false;
             float aoT = 0;
             uint aoInst = 0, aoPrim = 0;
-            // trou d'une feuille : rayon opaque suivant, juste après lui (jusqu'à six), avant la recherche lente
+            // trou d'une feuille : rayon opaque suivant, juste après lui, au plus quelques fois (budget, bits 24 à 26), puis pas d'obstacle. Le coût d'un rayon est borné :
+            // six sauts suivis d'une recherche sans limite faisaient 45 ms d'occultation dans l'herbe dense
             bool aoHole = false;
             RayDesc stepRay = ray;
-            for (uint hop = 0; hop < 6; hop++)
+            const uint maxHops = (flags >> 24) & 7;
+            for (uint hop = 0; hop <= maxHops; hop++)
             {
                 RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qf;
                 qf.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, stepRay);
@@ -456,10 +472,10 @@ void main(uint2 id : SV_DispatchThreadID)
                 stepRay.TMin = aoT + max(1e-3, 1e-4 * aoT);
             }
             // (flags bit 23 : ancienne règle, chaque triangle examiné, pour comparer)
-            if ((flags & 2048) && (aoHit && aoHole || (flags & (1u << 23))))
+            if (aoHit && aoHole && (flags & (1u << 23)) == 0)
+                aoHit = false;
+            if ((flags & 2048) && (flags & (1u << 23)))
             {
-                if ((flags & (1u << 23)) == 0)
-                    ray.TMin = stepRay.TMin;
                 RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
                 q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
                 while (q.Proceed())
@@ -479,9 +495,12 @@ void main(uint2 id : SV_DispatchThreadID)
             if ((flags & (1u << 20)) && aoHit && aoInst == 0 && Cached(aoPrim, hc))
                 bounceSum += hc * ((1.0 - t) * (1.0 - t) / float(aoRays));
         }
+        if (aoOnly && (flags & 17) == 1)
+            gameVis = dot(n, sun) > 0.08 ? GameLit(p3) : 0.0;
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;
         const float skyShare = sunSky > 0 ? 1.0 / (1.0 + sunSky * ndlSky) : 1.0 - 0.6 * ndlSky;
-        lit = max(0.0, lit - aoAmount * occlusion * skyShare);
+        // (le dernier tiers de la portée : effacée en douceur, la portée change avec le budget de temps)
+        lit = max(0.0, lit - aoAmount * occlusion * skyShare * saturate((aoMaxDist - w) / (0.3 * aoMaxDist)));
     }
     // au loin, le jeu noie le paysage dans la brume : une ombre RT pleine y fait des taches noires ; elle
     // s'efface entre 120 et 300 unités (mètres dans RDR2)

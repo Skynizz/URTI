@@ -25,6 +25,7 @@ RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids
                                                // réfléchissante dont le point reflété est caché ou hors de
                                                // l'écran (couleur inconnue : la stabilisation garde l'historique) ;
                                                // u < -0,5 : couleur tirée du cache de surfaces (-1 - r, g, poids, b)
+RWByteAddressBuffer rstats : register(u2);     // flags 131072 (reflect_stats=1) : pixels à reflet, dont l'eau, rayons lancés, pixels sautés, sauts au plafond
 RWByteAddressBuffer anchor : register(u1);     // uint4 par pixel : position précédente du reflet (u, v ; NaN si
                                                // inconnue), identité de l'objet reflété, identité du miroir
 
@@ -55,7 +56,17 @@ cbuffer Constants : register(b0)
     uint prevVertexCount; // sommets lisibles dans viewPrev (une lecture hors d'un tampon racine n'est pas bornée)
     uint cacheTriangles;  // triangles tenus par le cache de surfaces
     float3 worldUp;       // flags 8192 : le haut du monde dans l'espace caméra de cette image (normale exacte de l'eau)
+    uint budget;          // budget de temps (add-on) : bits 0 à 3 un pixel sur 1, 2 ou 4 reçoit un rayon, bits 4 à 7 sauts de trou en trou, bits 8 et plus numéro d'image
+    float tMaxNow;        // portée des rayons réfléchis (mètres)
 };
+
+static const float kSkipped = -0.25; // u d'un pixel à reflet qui n'a pas reçu de rayon à cette image (live_reflresolve prend la couleur de ses voisins)
+
+void Count(uint at)
+{
+    uint unused;
+    rstats.InterlockedAdd(at, 1, unused);
+}
 
 // dessin qui contient ce triangle (zones triées par début)
 uint RegionIndex(uint prim)
@@ -300,6 +311,15 @@ void main(uint2 id : SV_DispatchThreadID)
     // deviennent lisses comme une rue après la pluie
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
+    // matériau d'abord : hors de l'eau et des surfaces lisses (la plus grande partie de l'écran), plus rien à calculer (ni normale ni planéité)
+    float material = Smoothness(int2(id));
+    if (!water && wet <= 0 && (flags & 24) == 0 && (p.z <= 0 || material < sMin || ((flags & 65536) && material <= 0.98)))
+    {
+        reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(float4(0, 0, 0, 0)));
+        if (anchors != 0)
+            anchor.Store4(id.y * reflectPitch + id.x * 16, uint4(0x7FC00000, 0x7FC00000, 0, 0));
+        return;
+    }
     float3 n = water ? nWater : p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
     // reflets RT seulement sur une surface plane (sol, flaque, vitre, eau) : sur un feuillage, des cheveux, un
     // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
@@ -307,7 +327,6 @@ void main(uint2 id : SV_DispatchThreadID)
     const float flat = water ? 1.0 : p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
     // miroir parfait d'après le matériau (eau : Horizon Forbidden West y écrit exactement 0 dans sa 5e cible) : la surface est
     // lisse par définition, ses vagues n'y changent rien
-    float material = Smoothness(int2(id));
     // caméra du jeu connue : miroir parfait d'après le matériau seulement sur une surface horizontale et étendue (l'eau), et avec sa normale exacte :
     // tirée de la profondeur, elle change à chaque image avec le décalage sous-pixel, le reflet tremblait et ne se nettoyait qu'en s'accumulant, jeu en pause
     if ((flags & 8192) && !water && p.z > 0 && material > 0.98)
@@ -355,11 +374,32 @@ void main(uint2 id : SV_DispatchThreadID)
         // par défaut : reflet attendu, couleur inconnue (remplacé ci-dessous si le point reflété est visible)
         if (weight > 0)
             result.z = -weight;
+        if (flags & 131072)
+        {
+            Count(0);
+            if (material > 0.98 || water)
+                Count(4);
+        }
+        // budget de temps dépassé : un pixel sur deux ou sur quatre reçoit un rayon à cette image (le motif tourne), les autres prennent la couleur de leurs voisins
+        {
+            const uint stride = budget & 15, frameNo = budget >> 8;
+            static const uint2 kFour[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
+            const bool skipNow = stride == 2 ? ((id.x + id.y + frameNo) & 1) != 0 : stride >= 4 ? any((id & 1u) != kFour[frameNo & 3]) : false;
+            if (skipNow)
+            {
+                if (flags & 131072)
+                    Count(12);
+                reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(float4(kSkipped, 0, max(weight, 0.0), 0)));
+                if (anchors != 0)
+                    anchor.Store4(id.y * reflectPitch + id.x * 16, uint4(0x7FC00000, 0x7FC00000, 0, 0));
+                return;
+            }
+        }
         RayDesc ray;
         ray.Origin = p + n * (bias * p.z);
         ray.Direction = r;
         ray.TMin = 0.05; // pas les décalques du jeu posés juste au-dessus de la surface
-        ray.TMax = 500.0; // au-delà, la brume du jeu efface tout reflet
+        ray.TMax = tMaxNow > 0 ? tMaxNow : 500.0; // au-delà, la brume du jeu efface tout reflet
         // d'abord un rayon opaque (le matériel trouve seul le plus proche) ; seulement si ce point est un trou que la caméra voit à travers
         // (plaque découpée du feuillage), la recherche lente où chaque triangle rencontré est examiné. Même résultat : avant, chaque rayon
         // examinait chaque triangle (sol, rochers, troncs compris)
@@ -367,11 +407,15 @@ void main(uint2 id : SV_DispatchThreadID)
         float hitT = 0;
         uint hitInst = 0, hitPrim = 0, hitContrib = 0;
         float2 hitBary = 0;
-        // trou d'une feuille : rayon opaque suivant, juste après lui (jusqu'à six), avant la recherche lente
+        // trou d'une feuille : rayon opaque suivant, juste après lui, au plus quelques fois (budget) ; le dernier point touché est gardé (feuillage, qu'on le voie
+        // à travers ou non). Le coût d'un rayon est borné : six sauts suivis d'une recherche sans limite faisaient 20 ms de reflets dans la végétation dense
         bool holeLeft = false;
         RayDesc stepRay = ray;
-        for (uint hop = 0; hop < 6; hop++)
+        const uint maxHops = (budget >> 4) & 15;
+        for (uint hop = 0; hop <= maxHops; hop++)
         {
+            if (flags & 131072)
+                Count(8);
             RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qf;
             qf.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, stepRay);
             qf.Proceed();
@@ -383,12 +427,13 @@ void main(uint2 id : SV_DispatchThreadID)
             holeLeft = (flags & 32) && SeenThrough(ray.Origin + r * hitT);
             if (!holeLeft)
                 break;
+            if (hop == maxHops && (flags & 131072))
+                Count(16);
             stepRay.TMin = hitT + max(1e-3, 1e-4 * hitT);
         }
         // (flags 32768 : ancienne règle, chaque triangle examiné, pour comparer)
-        if ((flags & 32) && (hitNow && holeLeft || (flags & 32768)))
+        if ((flags & 32) && (flags & 32768))
         {
-            ray.TMin = (flags & 32768) ? ray.TMin : stepRay.TMin;
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
             while (q.Proceed())
@@ -493,5 +538,6 @@ void main(uint2 id : SV_DispatchThreadID)
             result.w = 0.5 + 0.5 * n.z;
     }
     reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(result));
-    anchor.Store4(id.y * reflectPitch + id.x * 16, anchorOut);
+    if (anchors != 0)
+        anchor.Store4(id.y * reflectPitch + id.x * 16, anchorOut);
 }

@@ -242,6 +242,20 @@ struct LiveState
     // occultation : plus de rayons là où l'image bouge (urti.ini ao_boost=1) ; coupé : en marchant, tout l'écran bouge et la passe coûtait
     // moitié plus
     bool aoBoost = false;
+    // budget de temps par passe, tenu image par image : le niveau monte dès que la passe dépasse sa cible (rayons, sauts, portée, pixels traités) et redescend lentement.
+    // urti.ini ao_ms= (occultation et débruitage), refl_ms= (reflets), 0 : pas de budget
+    int aoLevel = 0, reflLevel = 0;
+    uint32_t aoCool = 0, reflCool = 0;
+    float reflTarget = 2.5f;
+    double aoEma = 0, reflEma = 0, statAoMax = 0, statReflMax = 0;
+    uint32_t statAoSpikes = 0, statReflSpikes = 0, statAoLevelSum = 0, statReflLevelSum = 0;
+    float aoDistNow = 50.0f, reflTMaxNow = 500.0f;
+    uint32_t reflStrideNow = 1, reflHopsNow = 3, aoHopsNow = 2;
+    bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
+    bool reflStatsOn = false;  // urti.ini reflect_stats=1 : pixels à reflet et rayons comptés
+    ComPtr<ID3D12Resource> reflStats, reflStatsRb[3];
+    uint64_t statRs[5] = {};
+    uint32_t statRsFrames = 0;
     bool slowRays = false; // urti.ini rayons_lents=1 : chaque triangle rencontré examiné (ancienne règle, pour comparer le coût)
     ComPtr<ID3D12Resource> reflMotion; // live_reflresolve -> live_composite : mouvement de la surface et du reflet par pixel de rendu
     uint64_t reflMotionBytes = 0, reflMotionFrame = ~0ull;
@@ -304,7 +318,7 @@ struct LiveState
     bool aoQuarter = true; // urti.ini ao_quarter=0 : occultation calculée sur chaque pixel à chaque image
     // rayons d'occultation par pixel calculé (au quart), de 2 à 4, réglés toutes les 30 images sur le temps mesuré
     // de la passe des ombres (urti.ini ao_ms=, 0 : toujours 4)
-    float aoTarget = 2.5f;
+    float aoTarget = 4.0f;
     uint32_t aoRays = 4;
     double shadowMs = 0;
     // budget de géométrie réglé sur le coût mesuré de la reconstruction (urti.ini build_ms=, 0 : budget fixe) :
@@ -834,7 +848,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
            make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 29, 3) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 30, 3) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
@@ -848,7 +862,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_hudgain, sizeof(g_live_hudgain), 0, live.hudGainRs, live.hudGainPso, 4, 1) &&
            make(g_live_film, sizeof(g_live_film), 1, live.filmRs, live.filmPso, 8, 1) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 9, live.resolveRs, live.resolvePso, 20, 2) &&
-           make(g_live_reflect, sizeof(g_live_reflect), 11, live.reflectRs, live.reflectPso, 23, 2) &&
+           make(g_live_reflect, sizeof(g_live_reflect), 11, live.reflectRs, live.reflectPso, 25, 3) &&
            make(g_live_surfcache, sizeof(g_live_surfcache), 5, live.surfRs, live.surfPso, 18, 2) &&
            make(g_live_regionstats, sizeof(g_live_regionstats), 3, live.statsRs, live.statsPso, 4) &&
            make(g_live_depthfit, sizeof(g_live_depthfit), 3, live.depthfitRs, live.depthfitPso, 4);
@@ -1047,11 +1061,11 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.25f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 4.0f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 2.5f, reflectAllIni = 0, reflStatsIni = 0;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1088,7 +1102,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1101,6 +1115,7 @@ void LiveHotReload(ID3D12Device* device)
             live.fgShift = std::clamp(fgShiftIni, 0.0f, 1.0f);
             live.geoNewVerts = uint32_t(std::clamp(geoNewIni, 0.0f, float(kLiveGeoFrameVerts))), live.geoRefreshVerts = uint32_t(std::clamp(geoRefreshIni, 0.0f, float(kLiveGeoFrameVerts)));
             live.aoBoost = aoBoostIni != 0, live.slowRays = slowRaysIni != 0;
+            live.reflTarget = std::max(0.0f, reflMsIni), live.waterOnly = reflectAllIni == 0, live.reflStatsOn = reflStatsIni != 0;
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -2603,18 +2618,34 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             for (int k = 0; k < 5; k++)
                 live.timeSum[k] += double(t[k + 1] - t[k]) * 1000.0 / double(freq);
-            // rayons d'occultation : un de moins au-dessus de la cible (+15 %), un de plus bien en dessous
-            live.shadowMs += (std::min(50.0, double(t[3] - t[2]) * 1000.0 / double(freq)) - live.shadowMs) * 0.2;
-            if (live.aoTarget > 0 && live.frame % 30 == 0)
+            // budget de temps : la passe des ombres (occultation et débruitage, repères 3 à 4 : c'était 2 à 3, la copie de la carte du jeu, 0,02 ms : le régulateur croyait
+            // toujours avoir de la marge) et celle des reflets, à chaque image. Un dépassement monte le niveau tout de suite, le retour se fait lentement
             {
-                const uint32_t before = live.aoRays;
-                if (live.shadowMs > live.aoTarget * 1.15 && live.aoRays > 2)
-                    live.aoRays--;
-                else if (live.shadowMs < live.aoTarget * 0.6 && live.aoRays < 4)
-                    live.aoRays++;
-                if (live.aoRays != before)
-                    Log("URTI direct : occultation à %u rayons par pixel calculé (passe des ombres %.2f ms, cible %.2f)", live.aoRays, live.shadowMs,
-                        live.aoTarget);
+                const double aoNow = std::min(200.0, double(t[4] - t[3]) * 1000.0 / double(freq)), reflNow = std::min(200.0, double(t[5] - t[4]) * 1000.0 / double(freq));
+                live.shadowMs = aoNow;
+                live.statAoMax = std::max(live.statAoMax, aoNow), live.statReflMax = std::max(live.statReflMax, reflNow);
+                live.statAoSpikes += aoNow > 12.0 ? 1u : 0u, live.statReflSpikes += reflNow > 8.0 ? 1u : 0u;
+                auto regulate = [](int& level, double now, double& ema, float target, uint32_t& cool) {
+                    ema += (now - ema) * 0.25;
+                    if (cool)
+                        cool--;
+                    if (target <= 0)
+                    {
+                        level = 0;
+                        return;
+                    }
+                    if (cool == 0 && (now > target * 2.5 || ema > target * 1.3))
+                        level = std::min(4, level + (now > target * 2.5 ? 2 : 1)), cool = 4; // (le résultat se lit trois images plus tard)
+                    else if (cool == 0 && level > 0 && ema < target * 0.6)
+                        level--, cool = 40;
+                };
+                regulate(live.aoLevel, aoNow, live.aoEma, live.aoTarget, live.aoCool);
+                regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool);
+                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 1 }, kAoHops[5] = { 2, 2, 1, 1, 0 }, kRStride[5] = { 1, 1, 2, 2, 4 }, kRHops[5] = { 3, 2, 2, 1, 1 };
+                static const float kAoDist[5] = { 50.0f, 40.0f, 25.0f, 15.0f, 10.0f }, kRMax[5] = { 500.0f, 300.0f, 200.0f, 150.0f, 100.0f };
+                live.aoRays = kAoRays[live.aoLevel], live.aoHopsNow = kAoHops[live.aoLevel], live.aoDistNow = kAoDist[live.aoLevel];
+                live.reflStrideNow = kRStride[live.reflLevel], live.reflHopsNow = kRHops[live.reflLevel], live.reflTMaxNow = kRMax[live.reflLevel];
+                live.statAoLevelSum += uint32_t(live.aoLevel), live.statReflLevelSum += uint32_t(live.reflLevel);
             }
             if (const uint32_t s = uint32_t(live.frame % 3); live.slotBuilt[s])
             {
@@ -2650,6 +2681,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             if (++live.timeFrames == 300)
             {
                 const double n = live.timeFrames;
+                Log("URTI direct : budget de temps : occultation niveau moyen %.1f (pire image %.1f ms, %u images au-dessus de 12 ms, cible %.1f), reflets niveau moyen %.1f (pire image %.1f ms, %u images au-dessus de 8 ms, cible %.1f)",
+                    live.statAoLevelSum / n, live.statAoMax, live.statAoSpikes, live.aoTarget, live.statReflLevelSum / n, live.statReflMax, live.statReflSpikes, live.reflTarget);
+                live.statAoMax = live.statReflMax = 0, live.statAoSpikes = live.statReflSpikes = live.statAoLevelSum = live.statReflLevelSum = 0;
                 Log("URTI direct : GPU par image : structure %.2f ms, soleil et profondeur %.2f, copie carte du jeu %.2f, ombres (%u rayons) %.2f, "
                     "reflets %.2f, composition %.2f", live.timeSum[0] / n, live.timeSum[1] / n, live.timeSum[2] / n, live.shadowRays, live.timeSum[3] / n,
                     live.timeSum[4] / n, live.timeSum[5] / n);
@@ -3789,7 +3823,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                            (sunNow ? 0u : 16u) | (live.sunShadows ? 0u : 64u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) |
                            (nrdActive ? 4096u : 0u) |
                            (live.aoQuarter && !live.sunShadows && !nrdActive && live.shadowRawBuf && live.denoisePso ? 128u | (live.aoRays << 16) : 0u) |
-                           (giNow && !nrdActive ? 1u << 20 : 0u) | (live.aoRough ? 1u << 21 : 0u) | (live.slowRays ? 1u << 23 : 0u);
+                           (giNow && !nrdActive ? 1u << 20 : 0u) | (live.aoRough ? 1u << 21 : 0u) | (live.slowRays ? 1u << 23 : 0u) | (live.aoHopsNow << 24);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -3803,13 +3837,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t gameDilate, gameMin;
         float aoAmount, aoRadius;
         uint32_t aoMotion, cacheTriangles, regionCount;
+        float aoMaxDist;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
              live.aoAmount, live.aoRadius, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
-             giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u };
-    list->SetComputeRoot32BitConstants(12, 29, &sc, 0);
+             giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow };
+    list->SetComputeRoot32BitConstants(12, 30, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     LiveTimeD(list.Get(), 10);
     if (giNow)
@@ -3995,6 +4030,35 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const bool geoColorsRead = live.geoColors && live.geoOn;
             if (geoColorsRead)
                 Transition(list.Get(), live.geoColors.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+            // comptes (reflect_stats=1) : remis à zéro, relus trois images plus tard
+            const bool reflStatsNow = live.reflStatsOn;
+            if (reflStatsNow && !live.reflStats)
+            {
+                live.reflStats = UavBuffer(g.device, 64, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                for (auto& r : live.reflStatsRb)
+                    r = MakeBuffer(g.device, 64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            }
+            if (reflStatsNow)
+            {
+                if (const uint32_t* v = nullptr; live.reflStatsRb[live.frame % 3] && SUCCEEDED(live.reflStatsRb[live.frame % 3]->Map(0, nullptr, (void**)&v)) && v)
+                {
+                    for (int k = 0; k < 5; k++)
+                        live.statRs[k] += v[k];
+                    live.reflStatsRb[live.frame % 3]->Unmap(0, nullptr);
+                    if (++live.statRsFrames == 300)
+                    {
+                        const double f = 300.0, screen = double(live.width) * live.height;
+                        Log("URTI direct : reflets par image : %.1f %% de l'écran à reflet, dont %.1f %% d'eau ; %.0f rayons, %.0f pixels sautés, %.0f rayons arrêtés au plafond de sauts ; niveau %d",
+                            live.statRs[0] / f / screen * 100.0, live.statRs[1] / f / screen * 100.0, live.statRs[2] / f, live.statRs[3] / f, live.statRs[4] / f, live.reflLevel);
+                        for (auto& v2 : live.statRs)
+                            v2 = 0;
+                        live.statRsFrames = 0;
+                    }
+                }
+                Transition(list.Get(), live.reflStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                list->CopyBufferRegion(live.reflStats.Get(), 0, g.zeros.Get(), 0, 32);
+                Transition(list.Get(), live.reflStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
             list->SetComputeRootShaderResourceView(10, geoColorsRead ? live.geoColors->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(11, live.reflectBuf->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(12, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
@@ -4008,14 +4072,25 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 float f0;
                 uint32_t reflectPitch, regionCount, anchors, prevVertexCount, cacheTriangles;
                 float up[3];
+                uint32_t budget;
+                float tMaxNow;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
                      (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u) |
-                         (live.transpBuilt ? 256u : 0u) | (live.reflectDiag ? 256u << live.reflectDiag : 0u) | (trueCam && live.worldUpKnown && live.reflectUp ? 8192u : 0u) | (geoColorsRead ? 16384u : 0u) | (live.slowRays ? 32768u : 0u), live.f0, live.width * 16,
-                     uint32_t(tableNow.size()), live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity),
-                     surfRead ? uint32_t(live.surfTriangles) : 0u, { live.worldUp[0], live.worldUp[1], live.worldUp[2] } };
-            list->SetComputeRoot32BitConstants(13, 23, &rc, 0);
+                         (live.transpBuilt ? 256u : 0u) | (live.reflectDiag ? 256u << live.reflectDiag : 0u) | (trueCam && live.worldUpKnown && live.reflectUp ? 8192u : 0u) | (geoColorsRead ? 16384u : 0u) | (live.slowRays ? 32768u : 0u) |
+                         (trueCam && live.worldUpKnown && live.reflectUp && live.waterOnly ? 65536u : 0u) | (reflStatsNow ? 131072u : 0u), live.f0, live.width * 16,
+                     uint32_t(tableNow.size()), live.anchorAlpha > 0 && live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity),
+                     surfRead ? uint32_t(live.surfTriangles) : 0u, { live.worldUp[0], live.worldUp[1], live.worldUp[2] },
+                     live.reflStrideNow | (live.reflHopsNow << 4) | (uint32_t(live.frame) << 8), live.reflTMaxNow };
+            list->SetComputeRootUnorderedAccessView(13, reflStatsNow ? live.reflStats->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRoot32BitConstants(14, 25, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+            if (reflStatsNow && live.reflStatsRb[live.frame % 3])
+            {
+                Transition(list.Get(), live.reflStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->CopyBufferRegion(live.reflStatsRb[live.frame % 3].Get(), 0, live.reflStats.Get(), 0, 20);
+                Transition(list.Get(), live.reflStats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
             if (surfRead)
                 Transition(list.Get(), live.surfCache.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (geoColorsRead)

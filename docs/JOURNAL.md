@@ -1816,3 +1816,45 @@ d'essai, puis 2 lancements et 2 Alt+Tab de vérification sur la version finale, 
 **Reste :** structure de l'image reconstruite à chaque calcul (2,2 ms), occultation et reflets dans le feuillage dense (jusqu'à 10 ms en
 marchant), composition à chaque présentation. Les reflets d'objets cachés ou hors de l'écran prennent des couleurs apprises par
 triangle ou par groupe de triangles : aplats (troncs reflétés en barres pâles), peut-être les « couches » que voit l'utilisateur.
+
+## v82 : un budget de temps sur l'occultation et les reflets, plus de travail inutile hors de l'eau
+
+Retour de l'utilisateur sur v81 : « il faut optimiser l'eau, on descend à 15 fps, tout se calcule tout le temps, les reflets mettent parfois du temps à se calculer,
+énormément de zones sont calculées en trop ».
+
+**Ce que dit le journal de sa partie.** Par moments, en moyenne sur 300 images : occultation 45 ms, reflets 20 ms (course, 50 cm et 1,5° par image, végétation dense, cache de 2400 objets).
+Avant v81 le maximum était de 15 à 20 ms : **v81 avait aggravé le pire cas**. Le saut de trou en trou (jusqu'à six rayons opaques) était suivi d'une recherche sans limite si le dernier point
+était encore un trou : dans l'herbe dense, jusqu'à sept traversées par rayon. Il n'avait été mesuré que caméra immobile.
+
+**Bugs trouvés :**
+
+- le régulateur des rayons d'occultation lisait le mauvais intervalle (repères 2 à 3 : la copie de la carte du jeu, 0,02 ms, au lieu de 3 à 4) depuis qu'un repère avait été ajouté : il croyait toujours
+  avoir de la marge, l'occultation restait à quatre rayons quel que soit son coût ;
+- un rayon de plus par pixel d'eau pour l'ancrage des reflets, alors que l'ancrage est coupé (`anchor_alpha=0`) ;
+- les reflets calculaient normale et planéité sur tout l'écran avant de lire le matériau ;
+- l'occultation seule (ombres du soleil coupées) calculait deux normales et lisait la carte du jeu sur tous les pixels, et la planéité plus un voisinage de 8 points (deux fois) même sur les 3 pixels sur 4 sans rayon à cette image.
+
+**Corrigé :**
+
+- rayons bornés : quelques sauts au plus (occultation 0 à 2, reflets 1 à 3), jamais de recherche sans limite (`rayons_lents=1` pour comparer). Au bout des sauts : occultation sans obstacle, reflet sur le dernier point touché ;
+- matériau d'abord : hors de l'eau, un reflet coûte une lecture ; caméra connue : reflets sur l'eau seulement (`reflect_all=1` pour les autres surfaces lisses) ;
+- occultation : les pixels sans rayon sortent tout de suite ;
+- budget de temps par passe, tenu à chaque image, cibles `ao_ms=4` (occultation et débruitage) et `refl_ms=2,5` (0 : pas de budget). Le niveau (0 à 4) monte dès que la passe dépasse sa cible et redescend lentement.
+  Occultation : rayons 4 à 1, sauts 2 à 0, portée 50 à 10 m (effacée en douceur). Reflets : sauts 3 à 1, portée 500 à 100 m, un pixel sur 1, 2 ou 4 reçoit un rayon (le motif tourne), les autres prennent la couleur de leurs voisins (`live_reflresolve`).
+
+**Mesuré en jeu,** même parcours (course aller-retour dans la végétation et au bord de l'eau, deux tours alternés, journal « budget de temps ») :
+
+| | sans budget | avec budget |
+|---|---|---|
+| passage le plus lourd | 39 à 46 images par seconde (occultation 12 à 17 ms, reflets jusqu'à 12 ms) | 74 à 82 (3,6 ms, 2,7 ms) |
+| pire image, occultation | 32 ms | 5 à 7 ms, un pic à 16 ms en entrant dans la zone |
+| pire image, reflets | 27 ms | 6 ms |
+
+Toutes les zones à reflet sont de l'eau (`reflect_stats=1` : 8 à 25 % de l'écran, 80 000 à 600 000 rayons par image). Film au bord de l'eau avec le budget : image propre (pas de damier ni de blocs), ꟻLIP du même ordre qu'avant.
+
+Reflets qui mettent du temps : à l'arrêt, le reflet ne prenait que 10 % de la nouvelle valeur par image ; passé à 25 % (`refl_alpha_min=`). Mesuré avec ꟻLIP (alterné, deux fois) : à l'arrêt, pas plus de tremblement
+(excédent 0,0060 et 0,0044 au lieu de 0,0058 et 0,0053) ; après un mouvement de caméra, moins de changement parasite (0,0156 et 0,0148 au lieu de 0,0214 et 0,0294).
+
+Une dizaine de lancements d'essai, puis 2 lancements et 2 Alt+Tab de vérification sur la version finale, sans plantage ; 92 à 94 images par seconde à l'arrêt au feu de camp.
+
+Pas vérifié : la mer, les grands lacs, la nuit. L'image aux niveaux les plus bas du budget (un rayon d'occultation à moins de 10 m, un pixel de reflet sur quatre) n'a été regardée que sur les films du marais.

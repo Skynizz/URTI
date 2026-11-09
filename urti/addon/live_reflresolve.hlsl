@@ -86,15 +86,52 @@ static float2 gJitterUv; // décalage absolu de cette image, en uv (le point ref
 
 // reflet courant d'un pixel de rendu : couleur plafonnée × poids, poids ; known = false si la surface
 // réfléchit mais que le point reflété est caché ou hors de l'écran (donnée manquante, pas un zéro)
-float4 Current(int2 t, out bool known)
+static const float kSkipped = -0.25; // live_reflect : pixel à reflet sans rayon à cette image (budget de temps)
+static float gSkippedHitT = -1.0;   // distance du reflet d'un pixel sauté, d'après ses voisins
+
+// u < -0,5 : couleur du cache de surfaces (point reflété caché ou hors de l'écran) ; sinon lue dans l'image (l'image présentée n'est pas décalée : TAA)
+float3 RayColor(float4 rf) { return rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy - gJitterUv); }
+
+float4 Current(int2 t, out bool known, bool center)
 {
     t = clamp(t, int2(0, 0), int2(renderWidth - 1, renderHeight - 1));
     const float4 rf = asfloat(reflection.Load4((uint(t.y) * renderWidth + uint(t.x)) * 16));
     known = rf.z >= 0;
     if (rf.z <= 0)
         return float4(0, 0, 0, 0);
-    // u < -0,5 : couleur du cache de surfaces (point reflété caché ou hors de l'écran) ; sinon lue dans l'image
-    float3 c = rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy - gJitterUv); // l'image présentée n'est pas décalée (TAA)
+    float3 c;
+    if (rf.x == kSkipped)
+    {
+        // pas de rayon ici à cette image : voisin des statistiques, ignoré ; pixel lui-même, la moyenne des voisins qui en ont reçu un
+        if (!center)
+        {
+            known = false;
+            return float4(0, 0, 0, 0);
+        }
+        float3 sum = 0;
+        float n = 0, hit = 0, hn = 0;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                const int2 q = clamp(t + int2(dx, dy), int2(0, 0), int2(renderWidth - 1, renderHeight - 1));
+                const float4 rn = asfloat(reflection.Load4((uint(q.y) * renderWidth + uint(q.x)) * 16));
+                if (rn.z > 0 && rn.x != kSkipped)
+                {
+                    sum += RayColor(rn), n += 1;
+                    if (rn.x >= -0.5)
+                        hit += rn.w, hn += 1;
+                }
+            }
+        if (n == 0)
+        {
+            known = false;
+            return float4(0, 0, 0, 0);
+        }
+        c = sum / n;
+        gSkippedHitT = hn > 0 ? hit / hn : 20.0;
+    }
+    else
+        c = RayColor(rf);
     const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     if (lum > maxLuminance)
         c *= maxLuminance / lum;
@@ -146,7 +183,7 @@ void main(uint2 id : SV_DispatchThreadID)
     // l'écran) : l'historique est gardé et s'estompe doucement au lieu de tomber à zéro d'une image à
     // l'autre (c'était le « pop / dépop » : visible, caché, visible…)
     bool known;
-    const float4 cur = Current(t, known);
+    const float4 cur = Current(t, known, true);
     // pas de reflet ici (pas de l'eau) : rien, jamais d'historique. Relu à côté en mouvement, il posait le reflet d'un pixel d'eau voisin sur les herbes et
     // les bords des objets, et l'y laissait s'éteindre lentement (éclats qui restent à l'écran)
     if (known && cur.a <= 0 && (flags & 4) == 0)
@@ -160,7 +197,7 @@ void main(uint2 id : SV_DispatchThreadID)
         for (int dx = -1; dx <= 1; dx++)
         {
             bool nk = known;
-            const float4 n = (dx == 0 && dy == 0) ? cur : Current(t + int2(dx, dy), nk);
+            const float4 n = (dx == 0 && dy == 0) ? cur : Current(t + int2(dx, dy), nk, false);
             if (nk && n.a > 0) // (seulement les pixels qui ont un reflet : un bord d'eau n'est pas tiré vers le noir)
                 m1 += n, m2 += n * n, count += 1;
         }
@@ -231,7 +268,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (pr.z > 1e-3)
                 mvRot = float2(pr.x * p00 / pr.z * 0.5 + 0.5, 0.5 - pr.y * p11 / pr.z * 0.5) - uv;
         }
-        const float hitT = asfloat(reflection.Load((id.y * renderWidth + id.x) * 16 + 12));
+        const float hitT = gSkippedHitT >= 0 ? gSkippedHitT : asfloat(reflection.Load((id.y * renderWidth + id.x) * 16 + 12));
         const float2 ndc0 = float2(uv.x * 2 - 1, 1 - uv.y * 2);
         const float dist = w > 0 ? length(float3(ndc0.x * w / p00, ndc0.y * w / p11, w)) : 1;
         const float ratio = hitT >= 1e4 ? 0.0 : dist / (dist + max(hitT, 0.0));
