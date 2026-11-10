@@ -21,3 +21,6 @@ results/ref_vitrine*/
 
 # dépendances externes téléchargées (NRD de NVIDIA : licence RTX SDK, pas dans le dépôt)
 urti/third_party/NRD/
+
+__pycache__/
+.vscode/
