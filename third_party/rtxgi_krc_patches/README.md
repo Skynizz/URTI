@@ -1,6 +1,5 @@
-# Branche `krc` du SDK RTXGI de NVIDIA
+# `krc` branch of NVIDIA's RTXGI SDK
 
-Patches à appliquer sur le SDK RTXGI (dépôt NVIDIA-RTX/RTXGI, `main`) : `git am *.patch` à la
-racine du SDK, puis `git am donut/*.patch` dans `External/Donut`. Ils ajoutent le banc de mesure
-(`KrcBench.cpp`), KRC-A, le guidage (résultat négatif), le rééclairage exact et la bibliothèque
-`Libraries/Krc`. Outils de mesure : `tools/rtxgi/`.
+Patches to apply on the RTXGI SDK (NVIDIA-RTX/RTXGI repository, `main`): `git am *.patch` at the SDK root, then
+`git am donut/*.patch` in `External/Donut`. They add the measurement bench (`KrcBench.cpp`), KRC-A, guiding (negative
+result), exact relighting and the `Libraries/Krc` library. Measurement tools: `tools/rtxgi/`.

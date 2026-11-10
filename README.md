@@ -1,110 +1,127 @@
 # URTI — Universal Ray Tracing Injector
 
-URTI ajoute du ray tracing en temps réel à des jeux DirectX 12 qui n'en ont pas, sans modifier leurs
-fichiers ni leurs shaders. C'est un add-on [ReShade](https://reshade.me) : il observe le rendu du jeu,
-reconstruit la scène de son côté et y lance de vrais rayons (DXR 1.1).
+URTI adds real-time ray tracing to DirectX 12 games that do not have it, without modifying their files or shaders.
+It is a [ReShade](https://reshade.me) add-on: it watches the game's rendering, rebuilds the scene on its side and
+casts real rays into it (DXR 1.1).
 
-## Ce que ça ajoute
+| Without URTI | With URTI |
+|---|---|
+| ![Horizon Forbidden West, water without URTI](docs/images/hfw_water_before.jpg) | ![Horizon Forbidden West, water with URTI](docs/images/hfw_water_after.jpg) |
+| ![Horizon Forbidden West, forest without URTI](docs/images/hfw_forest_before.jpg) | ![Horizon Forbidden West, forest with URTI](docs/images/hfw_forest_after.jpg) |
+| ![Red Dead Redemption 2, without URTI](docs/images/rdr2_before.jpg) | ![Red Dead Redemption 2, with URTI](docs/images/rdr2_after.jpg) |
 
-- **Occultation ambiante** en ray tracing, dans la vraie géométrie de la scène, hors écran compris.
-- **Rebond de lumière** diffus, à partir des couleurs déjà vues à l'écran.
-- **Reflets** sur l'eau et les surfaces mouillées, stabilisés dans le temps.
+Horizon Forbidden West, water: the game's own low-resolution reflection (green, in blocks) is replaced by a ray-traced
+mirror of the forest. Forest: ray-traced ambient occlusion and light bounce. Red Dead Redemption 2: light bounced by the
+sunlit ground reaches the shaded fountain and walls.
 
-## Comment ça marche
+## What it adds
 
-1. **Capture de la géométrie.** Chaque dessin du jeu est rejoué par sortie de flux : URTI récupère les
-   triangles tels que les vertex shaders les ont transformés (animation et instanciation comprises),
-   sans rien décoder.
-2. **Scène RT.** Une structure d'accélération par image pour le proche et le mobile, plus un cache
-   d'objets pour tout le reste, repositionné grâce à la caméra du jeu.
-3. **Rayons.** Passes de calcul en ray queries : occultation, rebond, reflets. Chaque passe a un budget
-   de temps tenu à chaque image.
-4. **Composition.** Le résultat, débruité et stabilisé, est posé dans l'image du jeu. L'interface reste
-   intacte quand le jeu fournit une image sans interface.
+- **Ray-traced ambient occlusion**, in the real geometry of the scene, off-screen included.
+- **Diffuse light bounce**, from colours already seen on screen.
+- **Reflections** on water and wet surfaces, stabilised over time.
 
-L'historique détaillé des essais et des mesures est dans [docs/JOURNAL.md](docs/JOURNAL.md).
+## How it works
 
-## Jeux testés
+1. **Geometry capture.** Every draw of the game is replayed through stream output: URTI gets the triangles as the
+   vertex shaders transformed them (animation and instancing included), with nothing to decode.
+2. **RT scene.** One acceleration structure per frame for what is near and moving, plus an object cache for
+   everything else, placed with the game's camera.
+3. **Rays.** Compute passes with inline ray queries: occlusion, bounce, reflections. Each pass has a time budget
+   enforced every frame.
+4. **Composition.** The denoised and stabilised result is applied to the game image. The UI stays untouched when
+   the game provides an image without its UI.
 
-| Jeu | Effets | Réglages (`urti.ini`) |
+The detailed log of experiments and measurements is in [docs/JOURNAL.md](docs/JOURNAL.md) (in French).
+
+## Tested games
+
+| Game | Effects | Settings (`urti.ini`) |
 |---|---|---|
-| Red Dead Redemption 2 | occultation, rebond, reflets sur surfaces mouillées | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `shadow_rays=2` |
-| Horizon Forbidden West (Complete Edition) | occultation, rebond, reflets sur l'eau | `camera_cb=512`, `material_slot=4`, `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`, `ao_rough=1`, `person_mask=0` |
+| Red Dead Redemption 2 | occlusion, bounce, reflections on wet surfaces | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `shadow_rays=2` |
+| Horizon Forbidden West (Complete Edition) | occlusion, bounce, water reflections | `camera_cb=512`, `material_slot=4`, `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`, `ao_rough=1`, `person_mask=0` |
 
-Dans Horizon Forbidden West, en 2560×1440 avec DLSS et génération d'images sur RTX 4070 : 134 images par
-seconde sans URTI, 74 à 94 avec, selon la scène.
+In Horizon Forbidden West, the in-game Reflections option must stay on: URTI reads the game's camera from that
+pass.
 
-**Mode histoire uniquement.** URTI s'injecte dans le rendu du jeu : ne l'utilisez jamais en ligne.
+**Story mode only.** URTI injects itself into the game's rendering: never use it online.
 
 ## Installation
 
-Il faut une carte graphique compatible DXR 1.1 et [ReShade](https://reshade.me) 6.8 **avec prise en charge
-des add-ons**.
+You need a DXR 1.1 capable GPU and [ReShade](https://reshade.me) 6.8 **with add-on support**.
 
-1. Installez ReShade dans le dossier du jeu (ou avec `tools/reshade/install.py`, réversible avec `--remove`).
-2. Copiez `urti.addon64` à côté de l'exécutable du jeu.
-3. Créez `urti.ini` au même endroit, avec `live=1`, `ao=1`, `reflect=1` et les réglages du jeu (tableau ci-dessus).
+1. Install ReShade into the game folder (or use `tools/reshade/install.py`, reversible with `--remove`).
+2. Copy `urti.addon64` next to the game executable.
+3. Create `urti.ini` in the same place, with `live=1`, `ao=1`, `reflect=1` and the game's settings (table above).
 
-| Touche | Effet |
+| Key | Action |
 |---|---|
-| F7 | active ou coupe URTI |
-| F5 | écran partagé, sans et avec URTI |
+| F7 | turn URTI on or off |
+| F5 | split screen, without and with URTI |
+| F8 | measurement burst: 30 frames saved without and with URTI |
 
-## Compilation
+## Building
 
-Prérequis : Windows 10 ou 11, Visual Studio 2022 (C++), CMake 3.20 ou plus récent, et
+Requirements: Windows 10 or 11, Visual Studio 2022 (C++), CMake 3.20 or newer, and
 [dxc](https://github.com/microsoft/DirectXShaderCompiler).
 
 ```sh
-cmake -S urti -B urti/build -DURTI_DXC="C:/chemin/vers/dxc.exe"
+cmake -S urti -B urti/build -DURTI_DXC="C:/path/to/dxc.exe"
 cmake --build urti/build --config Release
 ```
 
-L'add-on est produit dans `urti/build/Release/urti.addon64`.
+The add-on is written to `urti/build/Release/urti.addon64`.
 
-## Réglages utiles
+## Useful settings
 
-| Clé | Rôle | Défaut |
+| Key | Role | Default |
 |---|---|---|
-| `ao_ms` | temps visé pour l'occultation et son débruitage (ms, 0 : pas de budget) | 4 |
-| `refl_ms` | temps visé pour les reflets (ms, 0 : pas de budget) | 2.5 |
-| `ao_radius` | portée de l'occultation (m) | selon le jeu |
-| `fg_shift` | déplacement des effets sur les images générées (0 : figés) | 0.5 |
-| `hudless` | image sans interface fournie par le jeu (0 : ignorée) | 1 |
-| `reflect_all` | reflets aussi hors de l'eau (si la caméra du jeu est connue) | 0 |
+| `ao_ms` | target time for occlusion and its denoising (ms, 0: no budget) | 4 |
+| `refl_ms` | target time for reflections (ms, 0: no budget) | 3.5 |
+| `ao_radius` | occlusion range (m) | per game |
+| `water_gain` | weight of the reflection on water, relative to Fresnel | 3 |
+| `water_base` | smooth the game's own water reflection under URTI's (0: off) | 1 |
+| `fg_shift` | shift of the effects on generated frames (0: frozen) | 0.5 |
+| `hudless` | use the UI-free image provided by the game (0: ignore it) | 1 |
+| `reflect_all` | reflections outside water too (when the game camera is known) | 0 |
 
-## Contenu du dépôt
+## Measuring
 
-| Dossier | Contenu |
+`tools/reshade/` holds automated in-game tests (launch, walk, bursts, real-pace films kept in GPU memory) and their
+analysis, including the perceptual difference between consecutive frames with NVIDIA's
+[FLIP](https://github.com/NVlabs/flip): what URTI adds as shimmer or jumps on top of what the game itself changes.
+
+## Repository layout
+
+| Folder | Content |
 |---|---|
-| `urti/` | l'add-on (C++, HLSL) et son banc d'essai |
-| `reshade/` | effets ReShade associés |
-| `tools/reshade/` | installation, essais automatisés en jeu, analyse d'images ([ꟻLIP](https://github.com/NVlabs/flip)) |
-| `docs/` | journal, feuille de route, résultats, état de l'art |
-| `src/`, `krc_sdk/` | KRC, le cache de radiance étudié en amont |
-| `third_party/` | SHaRC et correctifs pour Quake II RTX, RTGL1 et RTXGI |
-| `results/` | mesures et captures d'écran |
+| `urti/` | the add-on (C++, HLSL) and its test bench |
+| `reshade/` | related ReShade effects |
+| `tools/reshade/` | installation, in-game automated tests, image analysis |
+| `docs/` | journal, roadmap, results, state of the art (in French) |
+| `src/`, `krc_sdk/` | KRC, the radiance cache studied first |
+| `third_party/` | SHaRC and patches for Quake II RTX, RTGL1 and RTXGI |
+| `results/` | measurements and captures |
 
 ## KRC — Knowledge Radiance Cache
 
-Le dépôt contient aussi le prototype de recherche à l'origine du projet : un cache spatial de radiance
-où chaque cellule connaît son incertitude, et où les rayons vont là où l'on doute. Protocole dans
-[docs/HYPOTHESE.md](docs/HYPOTHESE.md), mesures dans [docs/RESULTATS.md](docs/RESULTATS.md).
+The repository also contains the research prototype behind the project: a spatial radiance cache where each cell
+knows its own uncertainty, and rays go where the doubt is. Protocol in [docs/HYPOTHESE.md](docs/HYPOTHESE.md),
+measurements in [docs/RESULTATS.md](docs/RESULTATS.md).
 
 ```sh
-cargo run --release -- all      # références et toutes les méthodes
+cargo run --release -- all      # references and every method
 cargo run --release -- sponza 480
 ```
 
-## Limites
+## Limits
 
-- Chaque jeu demande un petit profil de réglages : le masque de l'eau et la caméra se trouvent par relevé.
-- Les dessins par mesh shaders et la tessellation ne sont pas captés.
-- Sans image sans interface fournie par le jeu, seule une zone fixe de l'écran est protégée.
+- Each game needs a small settings profile: the water mask and the camera are found through a pass survey.
+- Mesh-shader and tessellated draws are not captured.
+- Without a UI-free image from the game, only a fixed screen area is protected.
 
-## Licence
+## License
 
-Le code d'URTI et de KRC est sous licence [MIT](LICENSE). Le code tiers garde la licence de son projet
-d'origine : `third_party/`, `urti/third_party/` (ReShade, Dear ImGui), `reshade/ReShade*.fxh`.
+URTI and KRC code is under the [MIT](LICENSE) license. Third-party code keeps the license of its original project:
+`third_party/`, `urti/third_party/` (ReShade, Dear ImGui), `reshade/ReShade*.fxh`.
 
-Ce projet n'est affilié ni à Rockstar Games, ni à Guerrilla Games, ni à Sony, ni à NVIDIA, ni à ReShade.
+This project is not affiliated with Rockstar Games, Guerrilla Games, Sony, NVIDIA or ReShade.

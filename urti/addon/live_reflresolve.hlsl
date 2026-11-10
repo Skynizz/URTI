@@ -87,6 +87,7 @@ static float2 gJitterUv; // décalage absolu de cette image, en uv (le point ref
 // reflet courant d'un pixel de rendu : couleur plafonnée × poids, poids ; known = false si la surface
 // réfléchit mais que le point reflété est caché ou hors de l'écran (donnée manquante, pas un zéro)
 static const float kSkipped = -0.25; // live_reflect : pixel à reflet sans rayon à cette image (budget de temps)
+static bool gCenterSkipped = false;  // this pixel received no ray this frame: mostly its (clamped) history, the neighbours' average only corrects it
 static float gSkippedHitT = -1.0;   // distance du reflet d'un pixel sauté, d'après ses voisins
 
 // u < -0,5 : couleur du cache de surfaces (point reflété caché ou hors de l'écran) ; sinon lue dans l'image (l'image présentée n'est pas décalée : TAA)
@@ -128,6 +129,7 @@ float4 Current(int2 t, out bool known, bool center)
             return float4(0, 0, 0, 0);
         }
         c = sum / n;
+        gCenterSkipped = true;
         gSkippedHitT = hn > 0 ? hit / hn : 20.0;
     }
     else
@@ -286,7 +288,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 // historique borné par le voisinage courant (un reflet qui a bougé ne laisse pas de trace) ;
                 // mélange adaptatif : beaucoup d'historique à l'arrêt, peu en mouvement rapide
                 const float motionPx = length(mvVirtual * float2(renderWidth, renderHeight));
-                const float a = lerp(alpha, alphaMax, saturate(motionPx / 8.0));
+                const float a = lerp(alpha, alphaMax, saturate(motionPx / 8.0)) * (gCenterSkipped ? 0.5 : 1.0);
                 const float4 kept = clamp(hist, lo, hi);
                 // poids selon la luminosité (comme les anticrénelages temporels) : un point très clair (particule, luciole lue dans l'image) ne marque pas
                 // l'historique ; et surface tout juste découverte (historique sans reflet) : le reflet tout de suite, pas un fondu

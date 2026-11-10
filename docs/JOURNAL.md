@@ -1858,3 +1858,37 @@ Reflets qui mettent du temps : à l'arrêt, le reflet ne prenait que 10 % de la 
 Une dizaine de lancements d'essai, puis 2 lancements et 2 Alt+Tab de vérification sur la version finale, sans plantage ; 92 à 94 images par seconde à l'arrêt au feu de camp.
 
 Pas vérifié : la mer, les grands lacs, la nuit. L'image aux niveaux les plus bas du budget (un rayon d'occultation à moins de 10 m, un pixel de reflet sur quatre) n'a été regardée que sur les films du marais.
+
+## v83 : le vert du marais, les blocs du reflet du jeu, Red Dead mis à jour
+
+Retour de l'utilisateur sur v82 : « dans Horizon c'est full bug, le vert du marais partout c'est dégueulasse ; sur Red Dead c'est clean ; on a des fps mais c'est full bug,
+les reflets bug ; sur Red Dead, en ville quand tu marches il y a des traits d'ombres qui apparaissent ».
+
+**Mesuré d'abord : URTI n'ajoute pas de vert.** Films au marais, chaque effet coupé à tour de rôle : part du vert dans l'image 0,343 sans URTI, 0,341 avec ; ni le rebond, ni
+l'occultation, ni les reflets n'en ajoutent. Le vert est la couleur de l'eau du jeu.
+
+**Ce qui le rendait visible partout : le budget de v82.** Budget des reflets forcé au plus bas (`refl_ms=0,4`) : la moitié droite de l'eau devient vert vif. La portée des rayons
+réfléchis descendait de 500 à 100 m : le reflet sombre des arbres lointains disparaissait et laissait voir le vert du jeu. Dans sa partie, le niveau des reflets était souvent à 2 ou 3.
+Corrigé : la portée ne baisse plus jamais ; le budget joue sur les sauts, et sur un pixel sur deux au plus (plus un sur quatre) ; un pixel sans rayon à cette image garde surtout
+son historique (borné par ses voisins), la moyenne des voisins ne fait que le corriger. Occultation : la portée descend au plus à 25 m (10 m avant), et au loin un ou deux rayons
+suffisent (au-delà de 25 m, un seul). Cible des reflets 3,5 ms.
+
+**Les « couches » : le reflet du jeu sous celui d'URTI.** Le jeu dessine dans l'eau son propre reflet, en gros blocs basse résolution ; à travers le reflet net d'URTI (poids de
+Fresnel seul), ces blocs restaient visibles : deux reflets qui ne coïncident pas. Corrigé (`live_waterbase.hlsl`, caméra du jeu connue) : couleur de l'eau du jeu lissée (moyenne des
+pixels d'eau par bloc de 8 pixels de rendu, flou 7×7 pondéré par la part d'eau), qui remplace la couleur du jeu là où le reflet compte. Le reflet du jeu est bien plus fort que le
+seul Fresnel : lissée sans plus, l'eau devenait terne. Le reflet d'URTI pèse maintenant 3 fois Fresnel sur l'eau (`water_gain=`, 2 à 4 essayés) : l'eau reflète la forêt en sombre,
+le vert vif disparaît, les cailloux du premier plan restent visibles. `water_base=0` revient à l'ancienne composition.
+
+**Red Dead.** Traits d'ombre : pas retrouvés. Rafales en marchant dans la cour de Saint-Denis (avec et sans les places gardées, `persist=0`), version installée puis nouvelle version :
+0 trait fixe, au plus un trait fugitif par image. Les longues ombres fines des fils (tram, télégraphe) sont dans l'image du jeu sans URTI (capture v50 en écran partagé). Nouvelle
+version installée dans Red Dead (l'ancienne gardée, `urti.addon64.avant_v83`) : 76 à 78 images par seconde au lieu de 71 à 76 au même endroit, occultation 1,8 → 1,4 ms,
+composition 0,9 → 0,6 ms, pas de plantage. Le reflet y garde l'ancien lissage (10 % par image) : sans caméra du jeu, sa normale vient de la profondeur.
+
+**Mesures de la version finale (Horizon, marais) :** saccades : 2 présentations figées sur 29 en pas de côté (9 avant v81). Avec un reflet trois fois plus présent, l'excédent ꟻLIP
+d'URTI monte en mouvement (pas de côté 0,030, marche 0,018) : sa parallaxe se voit davantage ; à l'arrêt 0,008, surtout sur les bords des arbres reflétés. `refl_alpha_min` 0,12
+essayé contre 0,25 (alterné, deux fois) : pas mieux (0,0086 et 0,0083 contre 0,0080 et 0,0079) : 0,25 gardé. Sans URTI 124 images par seconde au même endroit, avec 77 à 87.
+2 lancements et 2 Alt+Tab sans plantage dans Horizon, un lancement dans Red Dead, même version installée dans les deux jeux.
+
+Images avant / après du README (`docs/images/`) tirées des films de cette version.
+
+Pas vérifié : les reflets sur sol mouillé de Red Dead avec cette version (temps sec), la mer, la nuit.

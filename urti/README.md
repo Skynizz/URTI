@@ -1,48 +1,47 @@
-# URTI — Universal Ray Tracing Injector
+# URTI add-on
 
-Couche intermédiaire qui observe un jeu DirectX 12, fabrique une scène parallèle et y lance des
-rayons, sans modifier ses shaders. Plan complet et avis de faisabilité : docs/URTI.md.
+The ReShade add-on and its test bench. It observes a DirectX 12 game, builds a parallel scene and casts rays
+into it, without modifying the game's shaders. Feasibility notes: [docs/URTI.md](../docs/URTI.md) (in French).
 
-## État
+## Status
 
-| Étape | Contenu | État |
+| Step | Content | State |
 |---|---|---|
-| 0 | Banc : application DX12 en rastérisation à géométrie connue (`testapp/`), fenêtre cachée | fait |
-| 1 | Capture de la géométrie par sortie de flux, test de couverture | **99,80 %** sur le banc ; **97,5 à 97,6 % dans Red Dead Redemption 2** (DX12, DLSS + génération d'images, 3 captures) |
-| 2a | Caméra estimée par auto-étalonnage (`tools/analyse.py`) | banc : 60,15° pour 60,16° ; RDR2 : 36,5 à 37° quand la caméra tourne |
-| 2b | Géométrie persistante en espace monde, BVH, ombres RT du soleil | à faire |
-| 3 | Cache de lumière en espace monde (KRC), reflets et éclairage indirect | à faire |
+| 0 | Bench: rasterised DX12 app with known geometry (`testapp/`), hidden window | done |
+| 1 | Geometry capture through stream output, coverage test | **99.80 %** on the bench; **97.5 to 97.6 % in Red Dead Redemption 2** (DX12, DLSS + frame generation, 3 captures) |
+| 2a | Camera estimated by self-calibration (`tools/analyse.py`) | bench: 60.15 degrees for 60.16; RDR2: 36.5 to 37 degrees while the camera turns |
+| 2b | Persistent world-space geometry, BVH, RT sun shadows | done |
+| 3 | Radiance cache, reflections and indirect lighting | done |
 
-## Principe de la capture (add-on ReShade, `addon/urti_addon.cpp`)
+## How the capture works (ReShade add-on, `addon/urti_addon.cpp`)
 
-- Chaque pipeline graphique du jeu reçoit un pipeline « ombre » : même vertex shader et même
-  signature racine, sortie de flux de `SV_Position`, sans rastérisation ni pixel shader.
-- Pendant la frame capturée, chaque dessin est rejoué une fois avec ce pipeline, puis l'état du jeu
-  est remis : rien ne change à l'écran. On obtient les triangles tels que le jeu les a transformés
-  (animation sur GPU, instanciation, sommets compressés compris), sans rien décoder.
-- D3D12 exige `ALLOW_STREAM_OUTPUT` dans la signature racine : l'add-on l'ajoute à celles du jeu à
-  leur création (`ID3D12Device::CreateRootSignature`).
-- Test de couverture : les triangles captés, rastérisés à nouveau, doivent reproduire la profondeur
-  du jeu. Aucune caméra n'est nécessaire pour ce test.
+- Each graphics pipeline of the game gets a "shadow" pipeline: same vertex shader and root signature, stream
+  output of `SV_Position`, no rasterisation or pixel shader.
+- During a captured frame, each draw is replayed once with this pipeline, then the game's state is restored:
+  nothing changes on screen. This yields triangles as the game transformed them (GPU animation, instancing,
+  compressed vertices included), with nothing to decode.
+- D3D12 requires `ALLOW_STREAM_OUTPUT` in the root signature: the add-on adds it to the game's root signatures
+  at creation (`ID3D12Device::CreateRootSignature`).
+- Coverage test: the captured triangles, rasterised again, must reproduce the game's depth. No camera is needed
+  for this test.
 
-Ce qu'il a fallu pour un vrai jeu (RDR2) :
-- n'utiliser que l'appareil D3D12 qui présente l'image (le jeu en crée plusieurs : plantage sinon) ;
-- un flux partagé par profondeur de la taille de l'écran, les dessins s'y rangeant à la suite (barrière
-  sur le compteur entre deux dessins, sinon ils s'écrasent) ; cartes d'ombres laissées de côté ;
-- lire la profondeur dans la copie que fait ReShade (effet invisible `reshade/urti_depth.fx`) : RDR2
-  ne l'efface ni par `ClearDepthStencilView` ni par une passe de rendu ;
-- capture sur 4 présentations (avec la génération d'images, une sur deux n'a aucun dessin du jeu) ;
-- ne comparer que les pipelines qui écrivent la profondeur (les passes d'éclairage plein écran la lisent).
+What a real game (RDR2) required:
+- only use the D3D12 device that presents the image (the game creates several: crash otherwise);
+- one shared stream per screen-sized depth, draws stored one after the other (barrier on the counter between
+  two draws, otherwise they overwrite each other); shadow maps left aside;
+- read depth from ReShade's copy (invisible `reshade/urti_depth.fx` effect): RDR2 neither clears it with
+  `ClearDepthStencilView` nor through a render pass;
+- capture over 4 presents (with frame generation, one out of two has no game draw);
+- only compare pipelines that write depth (full-screen lighting passes read it).
 
-Limites : dessins indirects (`ExecuteIndirect`) comptés mais pas capturés ;
-pipelines avec geometry / tessellation / mesh shaders ignorés ; triangles qui traversent le plan
-proche ignorés dans le test.
+Limits: pipelines with geometry / tessellation / mesh shaders are ignored; triangles crossing the near plane are
+ignored in the coverage test.
 
-## Construire et tester
+## Build and test
 
     cmake -S urti -B urti/build -A x64 && cmake --build urti/build --config Release
-    # dans urti/build/Release : ReShade 6.8.0 « Addon » renommé dxgi.dll, ReShade.ini, urti.addon64
-    URTI_FRAMES=90 URTI_CAPTURE_FRAME=60 ./urti_testapp.exe   # journal : urti_log.txt
+    # in urti/build/Release: ReShade 6.8.0 "Addon" renamed dxgi.dll, ReShade.ini, urti.addon64
+    URTI_FRAMES=90 URTI_CAPTURE_FRAME=60 ./urti_testapp.exe   # log: urti_log.txt
 
-En-têtes tiers : `third_party/reshade` (API d'add-ons de ReShade 6.8.0, BSD-3), `third_party/imgui`.
-Jeux : mode solo uniquement (la version « Addon » de ReShade est refusée en ligne).
+Third-party headers: `third_party/reshade` (ReShade 6.8.0 add-on API, BSD-3), `third_party/imgui`.
+Games: single player only (the "Addon" build of ReShade is refused online).

@@ -1,14 +1,12 @@
-# SHaRC (NVIDIA RTXGI) — source du portage
+# SHaRC (NVIDIA RTXGI): source of the port
 
-`src/sharc.wgsl` est un portage WGSL, fonction par fonction, de
-`include/HashGridCommon.h` et `include/SharcCommon.h` du SDK SHaRC de NVIDIA,
-version 1.8.3 (https://github.com/NVIDIA-RTX/SHARC, commit 4e21b58).
+`src/sharc.wgsl` is a function-by-function WGSL port of `include/HashGridCommon.h` and `include/SharcCommon.h` from
+NVIDIA's SHaRC SDK, version 1.8.3 (https://github.com/NVIDIA-RTX/SHARC, commit 4e21b58).
 
 This software contains source code provided by NVIDIA Corporation.
 
-Licence : NVIDIA RTX SDKs License, copiée dans `License.md`.
+License: NVIDIA RTX SDKs License, copied in `License.md`.
 
-Paramètres par défaut repris de l'exemple Pathtracer du dépôt RTXGI
-(https://github.com/NVIDIA-RTX/RTXGI, `Samples/Pathtracer/UI.h` et `Pathtracer.cpp`) :
-sceneScale 50, accumulation 20 frames, éviction après 60 frames sans échantillon,
-mise à jour d'un pixel par bloc 5×5, 2^22 entrées.
+Default parameters taken from the Pathtracer sample of the RTXGI repository (https://github.com/NVIDIA-RTX/RTXGI,
+`Samples/Pathtracer/UI.h` and `Pathtracer.cpp`): sceneScale 50, 20-frame accumulation, eviction after 60 frames
+without samples, update of one pixel per 5x5 block, 2^22 entries.

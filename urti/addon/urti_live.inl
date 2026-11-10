@@ -26,6 +26,7 @@
 #include "live_hudless_cs.h" // g_live_hudless
 #include "live_hudgain_cs.h" // g_live_hudgain
 #include "live_film_cs.h"    // g_live_film
+#include "live_waterbase_cs.h" // g_live_waterbase
 #include "live_sunlight_cs.h" // g_live_sunlight
 #include "live_counts_cs.h" // g_live_counts
 #include "live_surfcache_cs.h" // g_live_surfcache
@@ -246,7 +247,14 @@ struct LiveState
     // urti.ini ao_ms= (occultation et débruitage), refl_ms= (reflets), 0 : pas de budget
     int aoLevel = 0, reflLevel = 0;
     uint32_t aoCool = 0, reflCool = 0;
-    float reflTarget = 2.5f;
+    float reflTarget = 3.5f;
+    // smoothed water colour under the reflection (urti.ini water_base=0: off), only with the game camera (Horizon: its low-resolution reflection is in the water)
+    float waterBaseOn = 1.0f, waterGain = 3.0f; // urti.ini water_gain=: weight of the reflection on the water
+    ComPtr<ID3D12Resource> waterBase[2];
+    ComPtr<ID3D12RootSignature> waterBaseRs;
+    ComPtr<ID3D12PipelineState> waterBasePso;
+    uint32_t waterBaseW = 0, waterBaseH = 0;
+    uint64_t waterBaseFrame = ~0ull;
     double aoEma = 0, reflEma = 0, statAoMax = 0, statReflMax = 0;
     uint32_t statAoSpikes = 0, statReflSpikes = 0, statAoLevelSum = 0, statReflLevelSum = 0;
     float aoDistNow = 50.0f, reflTMaxNow = 500.0f;
@@ -853,7 +861,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
-           make(g_live_composite, sizeof(g_live_composite), 12, live.compositeRs, live.compositePso, 27, 2) &&
+           make(g_live_composite, sizeof(g_live_composite), 13, live.compositeRs, live.compositePso, 29, 2) &&
+           make(g_live_waterbase, sizeof(g_live_waterbase), 3, live.waterBaseRs, live.waterBasePso, 12, 1) &&
            make(g_live_sunlight, sizeof(g_live_sunlight), 3, live.sunlightRs, live.sunlightPso, 20) &&
            make(g_live_counts, sizeof(g_live_counts), 2, live.countsRs, live.countsPso, 4) &&
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
@@ -1065,7 +1074,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 2.5f, reflectAllIni = 0, reflStatsIni = 0;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 1, waterGainIni = 3.0f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1102,7 +1111,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1116,6 +1125,7 @@ void LiveHotReload(ID3D12Device* device)
             live.geoNewVerts = uint32_t(std::clamp(geoNewIni, 0.0f, float(kLiveGeoFrameVerts))), live.geoRefreshVerts = uint32_t(std::clamp(geoRefreshIni, 0.0f, float(kLiveGeoFrameVerts)));
             live.aoBoost = aoBoostIni != 0, live.slowRays = slowRaysIni != 0;
             live.reflTarget = std::max(0.0f, reflMsIni), live.waterOnly = reflectAllIni == 0, live.reflStatsOn = reflStatsIni != 0;
+            live.waterBaseOn = std::clamp(waterBaseIni, 0.0f, 1.0f), live.waterGain = std::clamp(waterGainIni, 1.0f, 8.0f);
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -2641,8 +2651,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 };
                 regulate(live.aoLevel, aoNow, live.aoEma, live.aoTarget, live.aoCool);
                 regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool);
-                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 1 }, kAoHops[5] = { 2, 2, 1, 1, 0 }, kRStride[5] = { 1, 1, 2, 2, 4 }, kRHops[5] = { 3, 2, 2, 1, 1 };
-                static const float kAoDist[5] = { 50.0f, 40.0f, 25.0f, 15.0f, 10.0f }, kRMax[5] = { 500.0f, 300.0f, 200.0f, 150.0f, 100.0f };
+                // (the reach of reflections never shrinks: without the far trees the water turned bright green; and occlusion is never limited to the very near)
+                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 1 }, kAoHops[5] = { 2, 2, 1, 1, 1 }, kRStride[5] = { 1, 1, 2, 2, 2 }, kRHops[5] = { 3, 2, 2, 1, 1 };
+                static const float kAoDist[5] = { 50.0f, 45.0f, 35.0f, 30.0f, 25.0f }, kRMax[5] = { 500.0f, 500.0f, 500.0f, 500.0f, 500.0f };
                 live.aoRays = kAoRays[live.aoLevel], live.aoHopsNow = kAoHops[live.aoLevel], live.aoDistNow = kAoDist[live.aoLevel];
                 live.reflStrideNow = kRStride[live.reflLevel], live.reflHopsNow = kRHops[live.reflLevel], live.reflTMaxNow = kRMax[live.reflLevel];
                 live.statAoLevelSum += uint32_t(live.aoLevel), live.statReflLevelSum += uint32_t(live.reflLevel);
@@ -4620,7 +4631,9 @@ void LiveComposite(effect_runtime* runtime)
                     float p00, p11;
                     float alphaMax, gamma, depthTol, anchorAlpha, anchorGamma;
                 } rc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.mvPitch,
-                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u, live.reflAlphaMin, 4.0f,
+                         motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u,
+                         // (faster settling only where the water normal is exact, game camera known; RDR2's normals come from depth and are noisier)
+                         live.camLive && live.worldUpKnown ? live.reflAlphaMin : std::min(live.reflAlphaMin, 0.1f), 4.0f,
                          (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u) | (anchored && live.anchorPrevOk ? 8u : 0u), live.p00, live.p11,
                          live.reflAlphaMax, live.reflGamma, live.reflDepthTol, live.anchorAlpha, live.anchorGamma };
                 list->SetComputeRoot32BitConstants(11, 20, &rc, 0);
@@ -4701,6 +4714,42 @@ void LiveComposite(effect_runtime* runtime)
         }
         if (reflHistOut >= 0)
             Transition(list.Get(), live.reflHist[reflHistOut].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+        // smoothed colour of the water (once per computed frame)
+        if (reflHistOut >= 0 && !isGenerated && live.waterBaseOn > 0 && live.waterBasePso && live.camLive && live.worldUpKnown && live.reflectUp)
+        {
+            const uint32_t lw = (live.width + 7) / 8, lh = (live.height + 7) / 8;
+            const uint64_t lowBytes = uint64_t(lw) * lh * 16;
+            if (!live.waterBase[0] || live.waterBaseW != lw || live.waterBaseH != lh)
+            {
+                for (auto& b : live.waterBase)
+                    Retire(b), b = UavBuffer(g.device, lowBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                live.waterBaseW = lw, live.waterBaseH = lh;
+            }
+            if (live.waterBase[0] && live.waterBase[1])
+            {
+                list->SetComputeRootSignature(live.waterBaseRs.Get());
+                list->SetPipelineState(live.waterBasePso.Get());
+                list->SetComputeRootShaderResourceView(0, preUi ? preUi->GetGPUVirtualAddress() : live.imageIn->GetGPUVirtualAddress());
+                list->SetComputeRootShaderResourceView(1, live.reflHist[reflHistOut]->GetGPUVirtualAddress());
+                uint32_t wc[12] = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, lw, lh, 0, 0, 0, 0 };
+                list->SetComputeRootShaderResourceView(2, live.reflHist[reflHistOut]->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(3, live.waterBase[0]->GetGPUVirtualAddress());
+                list->SetComputeRoot32BitConstants(4, 12, wc, 0);
+                list->Dispatch((lw + 7) / 8, (lh + 7) / 8, 1);
+                Transition(list.Get(), live.waterBase[0].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+                wc[8] = 1;
+                list->SetComputeRootShaderResourceView(2, live.waterBase[0]->GetGPUVirtualAddress());
+                list->SetComputeRootUnorderedAccessView(3, live.waterBase[1]->GetGPUVirtualAddress());
+                list->SetComputeRoot32BitConstants(4, 12, wc, 0);
+                list->Dispatch((lw + 7) / 8, (lh + 7) / 8, 1);
+                Transition(list.Get(), live.waterBase[0].Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                D3D12_RESOURCE_BARRIER wb = {};
+                wb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                wb.UAV.pResource = live.waterBase[1].Get();
+                list->ResourceBarrier(1, &wb);
+                live.waterBaseFrame = live.frame;
+            }
+        }
     }
     LiveTimeD(list.Get(), 14);
     // part du soleil dans l'image du jeu (live_sunlight) : points d'une même surface que le jeu éclaire et ombre
@@ -4787,8 +4836,12 @@ void LiveComposite(effect_runtime* runtime)
     if (live.reflMotion)
         Transition(list.Get(), live.reflMotion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(11, live.reflMotion ? live.reflMotion->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(12, live.imageOut->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(13, live.uiMaskBuf ? live.uiMaskBuf->GetGPUVirtualAddress() : live.imageOut->GetGPUVirtualAddress());
+    const bool waterBaseUse = live.waterBaseOn > 0 && live.waterBase[1] && live.waterBaseFrame != ~0ull && live.frame <= live.waterBaseFrame + 8 && live.camLive;
+    if (waterBaseUse)
+        Transition(list.Get(), live.waterBase[1].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    list->SetComputeRootShaderResourceView(12, waterBaseUse ? live.waterBase[1]->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(13, live.imageOut->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(14, live.uiMaskBuf ? live.uiMaskBuf->GetGPUVirtualAddress() : live.imageOut->GetGPUVirtualAddress());
     const bool tinted = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] > 0.01f; // teinte des ombres mesurée
     const struct
     {
@@ -4804,7 +4857,8 @@ void LiveComposite(effect_runtime* runtime)
         float giStrength;
         uint32_t albedoPitch, normalPitch;
         float fgShift;
-        uint32_t motionPad;
+        uint32_t waterBaseSize;
+        float waterBaseOn, waterGain;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u,
              // (image générée aussi : le dernier reflet stabilisé. Coupé sur elles, il s'éteignait une présentation sur deux)
@@ -4814,9 +4868,11 @@ void LiveComposite(effect_runtime* runtime)
              { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f },
              uint32_t((live.uiFrame - 1) & 1), { live.uiZone[0], live.uiZone[1], live.uiZone[2], live.uiZone[3] },
              giUse ? live.giStrength : 0.0f, live.albedoPitch, alignView ? live.depthPitch : normalUse ? live.normalPitch : 0u,
-             shiftNow ? live.fgShift : 0.0f, 0u };
-    list->SetComputeRoot32BitConstants(14, 27, &cc, 0);
+             shiftNow ? live.fgShift : 0.0f, waterBaseUse ? (live.waterBaseW | (live.waterBaseH << 16)) : 0u, waterBaseUse ? live.waterBaseOn : 0.0f, live.waterGain };
+    list->SetComputeRoot32BitConstants(15, 29, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
+    if (waterBaseUse)
+        Transition(list.Get(), live.waterBase[1].Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (live.reflMotion)
         Transition(list.Get(), live.reflMotion.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.statShifted += shiftNow ? 1u : 0u;

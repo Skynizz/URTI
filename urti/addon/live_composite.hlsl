@@ -16,6 +16,7 @@ ByteAddressBuffer bounceBuf : register(t8);  // rebond de lumière débruité : 
 ByteAddressBuffer albedo : register(t9);     // couleur propre des surfaces (G-buffer du jeu, RGBA8 sRGB, résolution de rendu)
 ByteAddressBuffer gNormal : register(t10);   // normale du G-buffer (RGBA8) ; alpha : repère des personnages (RDR2)
 ByteAddressBuffer motionIn : register(t11);  // live_reflresolve : mouvement de la surface et du reflet (uv vers l'image précédente), float4 par pixel de rendu
+ByteAddressBuffer waterBase : register(t12); // live_waterbase: smoothed colour of the water, float4 per block of 8 render pixels (colour, share of water)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 RWByteAddressBuffer uiMask : register(u1);   // 1 par pixel d'interface, retenu de la dernière photo sûre
 
@@ -50,7 +51,9 @@ cbuffer Constants : register(b0)
     uint albedoPitch;
     uint normalPitch;   // 0 : normale du G-buffer absente
     float fgShift;      // image générée par DLSS-G : part du mouvement d'une image dont glissent l'ombre et le reflet du dernier calcul (0 : aucun)
-    uint motionPad;
+    uint waterBaseSize; // size in blocks of waterBase (width | height << 16), 0: none
+    float waterBaseOn;  // how much the smoothed water colour replaces the game's where the reflection matters
+    float waterGain;    // weight of URTI's reflection on the water, relative to Fresnel alone (the game's own reflection is much stronger than Fresnel)
 };
 
 // décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
@@ -345,7 +348,30 @@ void main(uint2 id : SV_DispatchThreadID)
             return;
         }
         const float a = saturate(r.a * reflStrength);
-        c = c * (1.0 - a) + r.rgb * saturate(reflStrength);
+        float gain = 1.0;
+        // the game's own low-resolution reflection is in c: where URTI's reflection matters, its blocks are replaced by the smoothed colour of the water
+        if (waterBaseOn > 0 && waterBaseSize != 0 && r.a > 0)
+        {
+            const uint lw = waterBaseSize & 0xFFFF, lh = waterBaseSize >> 16;
+            const float2 qw = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) / 8.0 - 0.5;
+            const int2 bw = int2(floor(qw));
+            const float2 fw = qw - bw;
+            float3 wb = 0;
+            float wn = 0;
+            for (int j = 0; j < 4; j++)
+            {
+                const int2 t = clamp(bw + int2(j & 1, j >> 1), int2(0, 0), int2(lw - 1, lh - 1));
+                const float4 v = asfloat(waterBase.Load4((uint(t.y) * lw + uint(t.x)) * 16));
+                const float g = ((j & 1) ? fw.x : 1 - fw.x) * ((j >> 1) ? fw.y : 1 - fw.y) * v.a;
+                wb += v.rgb * g, wn += g;
+            }
+            if (wn > 1e-4)
+            {
+                c = lerp(c, wb / wn, waterBaseOn * smoothstep(0.06, 0.22, a));
+                gain = a > 1e-4 ? min(waterGain, 0.92 / a) : 1.0;
+            }
+        }
+        c = c * (1.0 - saturate(a * gain)) + r.rgb * saturate(reflStrength) * gain;
     }
     else if (reflStrength > 0 && rf.z > 0 && rf.x != -0.25)
     {

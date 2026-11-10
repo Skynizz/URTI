@@ -426,6 +426,11 @@ void main(uint2 id : SV_DispatchThreadID)
         // et le coût de la passe, proportionnel aux rayons, triplait (5,5 ms dans RDR2)
         const uint aoRest = (flags >> 16) & 7;
         uint aoRays = aoRest ? aoRest : 2 * aoBase;
+        // far away the occlusion is smooth and accumulated over many frames: fewer rays cost nothing visible
+        if (w > 25.0)
+            aoRays = 1;
+        else if (w > 12.0)
+            aoRays = min(aoRays, 2u);
         if (aoMotion < 16)
         {
             const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
