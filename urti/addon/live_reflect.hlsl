@@ -60,6 +60,18 @@ cbuffer Constants : register(b0)
     float tMaxNow;        // portée des rayons réfléchis (mètres)
 };
 
+// flags 262144 : cache de radiance du monde (caméra du jeu connue). Un point reflété caché ou hors de l'écran prend la couleur vue là
+// (table de hachage spatiale), un rayon qui ne touche rien celle du ciel dans sa direction (carte du ciel) ; le rayon traverse les
+// feuillages selon leur part pleine apprise. Sortie en plus (mixOut) : couleur déjà connue (rgb) et part à lire dans l'image en (u, v) (a)
+ByteAddressBuffer radHash : register(t11);
+ByteAddressBuffer envMap : register(t12);
+ByteAddressBuffer radParams : register(t13);
+RWByteAddressBuffer mixOut : register(u3);
+#define RAD_BUF radHash
+#define RAD_ENV envMap
+#define RAD_PARAMS radParams
+#include "live_radhash.hlsli"
+
 static const float kSkipped = -0.25; // u d'un pixel à reflet qui n'a pas reçu de rayon à cette image (live_reflresolve prend la couleur de ses voisins)
 
 void Count(uint at)
@@ -135,6 +147,23 @@ bool CachedGeo(uint inst, uint prim, uint tris, out float3 c)
         }
     }
     return false;
+}
+
+// couleur et part pleine d'un point touché que l'écran ne montre pas : ce que le cache de radiance du monde a vu là, sinon la couleur
+// apprise de son objet (plus grossière)
+// 0 : jamais vu ; 1 : couleur et part pleine ; 2 : que des trous à cet endroit (le rayon passe)
+uint Remembered(float3 h, float path, uint inst, uint prim, uint contrib, out float3 c, out float alpha)
+{
+    const uint found = RadLookup(RadWorld(h), RadLevel(path), c, alpha);
+    if (found != 0)
+        return found;
+    float3 g;
+    if (inst != 0 ? CachedGeo(inst, prim, contrib, g) : Cached(prim, g))
+    {
+        c = g;
+        return 1;
+    }
+    return 0;
 }
 
 // identité de l'objet du triangle ; position et normale du même point à l'image précédente si connues
@@ -338,6 +367,8 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     const float s = water ? 1.0 : max(material * ((flags & 4) || material > 0.98 ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
+    float4 mixResult = float4(0, 0, 0, 1);
+    const bool useRad = (flags & 262144) != 0 && (flags & 24) == 0;
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
     // pas de rayon là où le reflet serait presque invisible (surface vue de face : Fresnel ~4 %) : moins de 3 %
@@ -400,6 +431,169 @@ void main(uint2 id : SV_DispatchThreadID)
         ray.Direction = r;
         ray.TMin = 0.05; // pas les décalques du jeu posés juste au-dessus de la surface
         ray.TMax = tMaxNow > 0 ? tMaxNow : 500.0; // au-delà, la brume du jeu efface tout reflet
+        if (useRad)
+        {
+            // le rayon avance de triangle en triangle (au plus quelques-uns : budget). À l'écran, la profondeur de l'image tranche : point visible
+            // (sa couleur est dans l'image), trou d'une plaque découpée (la caméra voit plus loin : le rayon continue), ou caché. Caché ou hors de
+            // l'écran : la couleur et la part pleine que le cache du monde a retenues là ; le reste du rayon continue derrière. Rien touché : le ciel
+            RadLoadParams();
+            const float eyeDist = length(p);
+            float3 acc = 0;
+            float T = 1.0, share = 0, tOut = -1.0;
+            float2 uvOut = 0;
+            bool unknown = false;
+            RayDesc stepRay = ray;
+            const uint maxHops = (budget >> 4) & 15;
+            for (uint hop = 0; hop <= maxHops; hop++)
+            {
+                if (flags & 131072)
+                    Count(8);
+                RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qf;
+                qf.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, stepRay);
+                qf.Proceed();
+                if (qf.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                    break;
+                const float th = qf.CommittedRayT();
+                const uint inst = qf.CommittedInstanceID(), prim = qf.CommittedPrimitiveIndex(), contrib = qf.CommittedInstanceContributionToHitGroupIndex();
+                const float3 h = ray.Origin + r * th;
+                const bool last = hop == maxHops;
+                uint state = 0; // 0 hors de l'écran, 1 visible, 2 trou (vu à travers), 3 caché
+                float2 uv = 0;
+                float seenZ = 0;
+                if (h.z > 1e-3)
+                {
+                    const float2 ndc = float2(h.x * p00 / h.z, h.y * p11 / h.z);
+                    uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                    if (all(uv > 0.001) && all(uv < 0.999))
+                    {
+                        seenZ = PointAt(int2(uv * float2(width, height))).z;
+                        state = seenZ > 0 && abs(seenZ - h.z) < 0.03 * h.z + 0.05 ? 1u : (seenZ <= 0 || seenZ > h.z) ? 2u : 3u;
+                    }
+                }
+                if (state == 1)
+                {
+                    // vers les bords de l'écran, la couleur de l'image laisse la place à celle du cache (pas de coupure au bord)
+                    const float2 e2 = saturate(min(uv, 1.0 - uv) * 12.0);
+                    float edge = e2.x * e2.y;
+                    float3 c = 0;
+                    float a1 = 1;
+                    if (edge < 1.0 && Remembered(h, eyeDist + th, inst, prim, contrib, c, a1) != 1)
+                        edge = 1.0;
+                    acc += T * (1.0 - edge) * c;
+                    share = T * edge, uvOut = uv, T = 0;
+                    if (tOut < 0)
+                        tOut = th;
+                    if (hop == 0)
+                    {
+                        // ancrage : point reflété à l'image précédente, symétrisé par le plan du miroir d'alors
+                        uint hitId;
+                        float3 prevHit, prevHitN;
+                        const bool hitKnown = AnchorOf(inst, prim, qf.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
+                        anchorOut.z = hitId;
+                        if (hitKnown && mirrorKnown)
+                        {
+                            const float3 virt = prevHit - 2.0 * dot(prevHit - prevMirror, prevMirrorN) * prevMirrorN;
+                            if (virt.z > 1e-3)
+                            {
+                                const float2 pn = float2(virt.x * p00 / virt.z, virt.y * p11 / virt.z);
+                                anchorOut.xy = asuint(float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5));
+                            }
+                        }
+                    }
+                    break;
+                }
+                if (state == 2 && (flags & 32) && !last)
+                {
+                    stepRay.TMin = th + max(1e-3, 1e-4 * th);
+                    continue;
+                }
+                float3 c;
+                float alpha;
+                const uint found = Remembered(h, eyeDist + th, inst, prim, contrib, c, alpha);
+                if (found == 2)
+                {
+                    // que des trous ici : le rayon passe (au dernier saut : le ciel derrière)
+                    stepRay.TMin = th + max(1e-3, 1e-4 * th);
+                    continue;
+                }
+                if (found == 0)
+                {
+                    if (state == 2)
+                        break; // trou jamais vu de près : le ciel derrière
+                    // jamais vu, loin derrière d'autres objets lointains : même matière, même brume, la couleur de l'écran vaut pour lui
+                    if (state == 3 && h.z > 8.0 && seenZ > 0.35 * h.z)
+                    {
+                        share = T, uvOut = uv, T = 0;
+                        if (tOut < 0)
+                            tOut = th;
+                        break;
+                    }
+                    unknown = true;
+                    break;
+                }
+                if (flags & 131072)
+                    Count(20);
+                if (last)
+                    alpha = 1.0;
+                acc += T * alpha * c;
+                T *= 1.0 - alpha;
+                if (tOut < 0 && alpha > 0.3)
+                    tOut = th;
+                if (T < 0.04)
+                {
+                    T = 0;
+                    break;
+                }
+                stepRay.TMin = th + max(1e-3, 1e-4 * th);
+            }
+            if (!unknown && T > 0)
+            {
+                // ce qui reste du rayon part au loin : le ciel, ou le lointain, tel que l'écran le montre dans cette direction (plus net) quand il
+                // y est, sinon tel que la carte du ciel l'a retenu
+                float3 env;
+                const bool envKnown = RadEnv(RadWorldDir(r), env);
+                bool onScreen = false;
+                float2 uv = 0;
+                if (r.z > 1e-3)
+                {
+                    const float2 ndc = float2(r.x * p00 / r.z, r.y * p11 / r.z);
+                    uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                    if (all(uv > 0.001) && all(uv < 0.999))
+                    {
+                        const float seenFar = PointAt(int2(uv * float2(width, height))).z;
+                        onScreen = seenFar <= 0 || seenFar > 20.0;
+                    }
+                }
+                if (onScreen)
+                {
+                    const float2 e2 = saturate(min(uv, 1.0 - uv) * 12.0);
+                    const float edge = envKnown ? e2.x * e2.y : 1.0;
+                    acc += T * (1.0 - edge) * env;
+                    share = T * edge, uvOut = uv, T = 0;
+                }
+                else if (envKnown)
+                {
+                    acc += T * env, T = 0;
+                    if (flags & 131072)
+                        Count(24);
+                }
+                else
+                    unknown = true;
+                if (tOut < 0)
+                    tOut = 1e4;
+            }
+            // une petite part inconnue : le reste du rayon vaut pour elle ; presque tout inconnu : reflet attendu, couleur inconnue (comme avant)
+            if (!(unknown && T > 0.5))
+            {
+                const float k = 1.0 / max(1.0 - T, 1e-3);
+                result = float4(uvOut, weight, tOut < 0 ? 20.0 : tOut);
+                mixResult = float4(acc * k, share * k);
+            }
+            else if (flags & 131072)
+                Count(28);
+        }
+        else
+        {
         // d'abord un rayon opaque (le matériel trouve seul le plus proche) ; seulement si ce point est un trou que la caméra voit à travers
         // (plaque découpée du feuillage), la recherche lente où chaque triangle rencontré est examiné. Même résultat : avant, chaque rayon
         // examinait chaque triangle (sol, rochers, troncs compris)
@@ -527,6 +721,7 @@ void main(uint2 id : SV_DispatchThreadID)
         }
         if ((flags & 8) && result.z <= 0)
             result.w = why;
+        }
         // diagnostic (reflect_diag=) : direction du rayon réfléchi, composante 1 : y, 2 : z, 3 : normale y, 4 : normale z
         if (flags & 512)
             result.w = 0.5 + 0.5 * r.y;
@@ -538,6 +733,8 @@ void main(uint2 id : SV_DispatchThreadID)
             result.w = 0.5 + 0.5 * n.z;
     }
     reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(result));
+    if (useRad)
+        mixOut.Store4(id.y * reflectPitch + id.x * 16, asuint(mixResult));
     if (anchors != 0)
         anchor.Store4(id.y * reflectPitch + id.x * 16, anchorOut);
 }

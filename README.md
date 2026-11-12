@@ -18,7 +18,9 @@ sunlit ground reaches the shaded fountain and walls.
 
 - **Ray-traced ambient occlusion**, in the real geometry of the scene, off-screen included.
 - **Diffuse light bounce**, from colours already seen on screen.
-- **Reflections** on water and wet surfaces, stabilised over time.
+- **Reflections** on water and wet surfaces, stabilised over time. Reflected points that are hidden or off screen take
+  their colour from a world-space radiance cache (a spatial hash, after NVIDIA's SHaRC) filled from what the screen
+  has shown; rays that leave the scene read a learned sky map.
 
 ## How it works
 
@@ -78,7 +80,9 @@ The add-on is written to `urti/build/Release/urti.addon64`.
 | `ao_ms` | target time for occlusion and its denoising (ms, 0: no budget) | 4 |
 | `refl_ms` | target time for reflections (ms, 0: no budget) | 3.5 |
 | `ao_radius` | occlusion range (m) | per game |
-| `water_gain` | weight of the reflection on water, relative to Fresnel | 3 |
+| `water_gain` | weight of the reflection on water, relative to Fresnel | 1.5 |
+| `radcache` | world radiance cache: colours of hidden and off-screen reflected points, sky map (0: per-object colours) | 1 |
+| `lag` | shift the effects onto the frame actually displayed (frame generation shows older frames; 0: off) | 1 |
 | `water_base` | smooth the game's own water reflection under URTI's (0: off) | 1 |
 | `fg_shift` | shift of the effects on generated frames (0: frozen) | 0.5 |
 | `hudless` | use the UI-free image provided by the game (0: ignore it) | 1 |

@@ -16,6 +16,7 @@ ByteAddressBuffer depthPrev : register(t5);   // profondeur de rendu (image pré
 ByteAddressBuffer sunBuf : register(t6);      // loi de profondeur (36 à 47), rotation de la caméra (576 à 627)
 ByteAddressBuffer anchorCur : register(t7);   // uint4 par pixel de rendu : position précédente du reflet, identités
 ByteAddressBuffer anchorPrev : register(t8);  // le même, de l'image précédente
+ByteAddressBuffer mixIn : register(t9);       // flags 16 (cache de radiance du monde) : couleur déjà connue du reflet (rgb), part à lire dans l'image en (u, v) (a)
 RWByteAddressBuffer resolved : register(u0);  // float4 par pixel de rendu : couleur linéaire, poids
 // float4 par pixel de rendu : mouvement de la surface, mouvement du reflet (uv vers l'image précédente). Les images générées par DLSS-G
 // (entre deux calculs) font glisser l'ombre et le reflet du dernier calcul de cette fraction de mouvement (live_composite) : sans cela,
@@ -37,7 +38,7 @@ cbuffer Constants : register(b0)
     float alpha;         // part de l'image courante à l'arrêt
     float maxLuminance;  // plafond de la couleur reflétée (lumière linéaire, 1 = blanc de référence)
     uint flags;          // 1 : historique valide ; 2 : image générée (pas de mise à jour) ; 4 : diagnostic, confiance ;
-                         // 8 : ancrages de cette image et de la précédente disponibles
+                         // 8 : ancrages de cette image et de la précédente disponibles ; 16 : mixIn
     float p00;           // projection supposée (espace caméra de l'add-on)
     float p11;
     float alphaMax;      // part de l'image courante en mouvement rapide
@@ -91,7 +92,15 @@ static bool gCenterSkipped = false;  // this pixel received no ray this frame: m
 static float gSkippedHitT = -1.0;   // distance du reflet d'un pixel sauté, d'après ses voisins
 
 // u < -0,5 : couleur du cache de surfaces (point reflété caché ou hors de l'écran) ; sinon lue dans l'image (l'image présentée n'est pas décalée : TAA)
-float3 RayColor(float4 rf) { return rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy - gJitterUv); }
+float3 RayColor(float4 rf, int2 at)
+{
+    if (flags & 16)
+    {
+        const float4 m = asfloat(mixIn.Load4((uint(at.y) * renderWidth + uint(at.x)) * 16));
+        return m.a > 0 ? m.rgb + m.a * SampleLinear(rf.xy - gJitterUv) : m.rgb;
+    }
+    return rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy - gJitterUv);
+}
 
 float4 Current(int2 t, out bool known, bool center)
 {
@@ -118,7 +127,7 @@ float4 Current(int2 t, out bool known, bool center)
                 const float4 rn = asfloat(reflection.Load4((uint(q.y) * renderWidth + uint(q.x)) * 16));
                 if (rn.z > 0 && rn.x != kSkipped)
                 {
-                    sum += RayColor(rn), n += 1;
+                    sum += RayColor(rn, q), n += 1;
                     if (rn.x >= -0.5)
                         hit += rn.w, hn += 1;
                 }
@@ -133,7 +142,7 @@ float4 Current(int2 t, out bool known, bool center)
         gSkippedHitT = hn > 0 ? hit / hn : 20.0;
     }
     else
-        c = RayColor(rf);
+        c = RayColor(rf, t);
     const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     if (lum > maxLuminance)
         c *= maxLuminance / lum;

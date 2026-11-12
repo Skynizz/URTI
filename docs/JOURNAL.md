@@ -1892,3 +1892,40 @@ essayé contre 0,25 (alterné, deux fois) : pas mieux (0,0086 et 0,0083 contre 0
 Images avant / après du README (`docs/images/`) tirées des films de cette version.
 
 Pas vérifié : les reflets sur sol mouillé de Red Dead avec cette version (temps sec), la mer, la nuit.
+
+## v84 : cache de radiance du monde, calque recalé sur l'image affichée, HUD protégé en mouvement
+
+Retour de l'utilisateur sur v83 : « les reflets sont cassés dans Horizon ; il nous faut du vrai ray tracing, on possède les informations, il faut juste tout injecter
+comme il faut ; utilise des techniques de NVIDIA ».
+
+**Ce que montraient les films (jeu à gauche, URTI à droite).** L'eau d'URTI était terne et grise, le ciel ne s'y reflétait presque plus, et en marchant le reflet se
+morcelait en éclats de couleur plate et en taches vertes. Cause : un point reflété caché ou hors de l'écran recevait une seule couleur par 256e d'objet (un arbre de
+200 000 triangles : 800 triangles par couleur), et un rayon parti vers le ciel hors de l'écran ne recevait rien (l'eau du jeu réapparaissait).
+
+**Cache de radiance du monde** (`live_radcache.hlsl`, `live_radhash.hlsli`, d'après SHaRC de NVIDIA ; caméra du jeu connue). Table de hachage spatiale de 2^23 cases
+(128 Mo) dans le repère du monde : à chaque image calculée, un pixel sur quatre dépose la couleur que l'image montre dans la case où il se trouve, à trois niveaux (case
+de 0,5 % de la distance, soit quelques pixels, et deux plus grossières). Un reflet qui touche un point caché ou hors de l'écran y relit la couleur vue là, mêlée sur les
+huit cases voisines. Chaque case retient aussi sa part pleine : un pixel sur seize relance le rayon de la caméra dans la scène RT, chaque triangle traversé avant la
+surface visible est un trou (plaque découpée du feuillage) ; hors de l'écran, le rayon réfléchi traverse les feuillages selon cette part apprise. Carte du ciel et du
+lointain (octaèdre 512 × 512, par direction du monde) : un rayon qui ne touche rien y prend sa couleur ; les directions jamais vues se remplissent de proche en proche.
+Sortie en plus par pixel (`reflMix`) : couleur déjà connue et part à lire dans l'image. `radcache=0` revient aux couleurs par objet. Comptes avec `reflect_stats=1`.
+Premier essai : table de 2^22 pleine en moins d'une minute (397 000 dépôts refusés par image) ; avec 2^23 et une case reprise après 2 s sans usage : 2 000 à 14 000.
+
+**Le calque d'URTI avait deux images du jeu d'avance sur l'écran.** Trouvé en refaisant le masque du HUD : avec DLSS-G, l'image finale d'une présentation n'est pas
+celle de la dernière copie de l'image sans interface, mais d'une copie plus ancienne (comparaison sur un pixel sur 64 : la plus ancienne des trois dernières le plus
+souvent). Vue 11 en tournant : bords de la profondeur du calcul à 27 à 37 pixels (demi-résolution) de ceux de l'image, pour 8 à 9 pixels de mouvement par présentation.
+Corrigé : `live_hudgain` suit quelle image du jeu chaque présentation montre et écrit l'avance du calque (1,4 à 1,7 image du jeu en moyenne) ; `live_composite` fait
+glisser l'ombre et le reflet d'autant le long du mouvement (remplace le demi-pas des images générées de v81). Même rotation après : 0 à 1 pixel sur la plupart des
+présentations. `lag=0` : ancienne règle ; `lag_bias=` : correction.
+
+**HUD.** L'alpha de l'image sans interface vaut 0 partout dans la partie (il ne couvre que certains écrans) : le masque ne tenait que sur fond immobile (v80), le
+reflet passait sur le HUD au-dessus de l'eau. Refait : masque = écart entre l'image finale et la copie qui lui correspond, part d'interface de 0 à 1, refait seulement
+aux présentations où une copie concorde à 96 % (150 à 290 sur 300). La loi entre les deux images n'est pas un rapport : final = k × (sans interface)^1,13 à 1,25 par
+canal (mesuré), apprise en continu (médianes des pixels sombres et des pixels clairs).
+
+**Composition.** Avec le vrai ciel dans le reflet, le poids de 3 × Fresnel de v83 faisait un miroir laiteux qui cachait le fond de l'eau : 1,5 par défaut (1 à 3
+comparés au même endroit), et l'eau du jeu n'est lissée que là où le reflet d'URTI domine.
+
+**Mesures (marais, RTX 4070, DLSS + DLSS-G).** 88 à 92 images par seconde à l'arrêt au bord de l'eau, 65 à 80 en mouvement (v83 : 92, 70 à 84) ; cache du monde
+environ 0,4 ms par présentation. Deux lancements, course, deux Alt+Tab : pas de plantage. Reste : taches claires ou blocs par endroits dans le reflet (cases grossières,
+feuillages), bande au bord de l'écran sans recalage en mouvement, eau parfaitement plate (pas de vaguelettes), Red Dead pas encore essayé avec cette version (v83 y reste).

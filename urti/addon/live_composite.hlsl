@@ -17,6 +17,7 @@ ByteAddressBuffer albedo : register(t9);     // couleur propre des surfaces (G-b
 ByteAddressBuffer gNormal : register(t10);   // normale du G-buffer (RGBA8) ; alpha : repère des personnages (RDR2)
 ByteAddressBuffer motionIn : register(t11);  // live_reflresolve : mouvement de la surface et du reflet (uv vers l'image précédente), float4 par pixel de rendu
 ByteAddressBuffer waterBase : register(t12); // live_waterbase: smoothed colour of the water, float4 per block of 8 render pixels (colour, share of water)
+ByteAddressBuffer hudState : register(t13);  // live_hudgain : avance du dernier calcul sur l'image de cette présentation (bit 12 de debugReflect)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 RWByteAddressBuffer uiMask : register(u1);   // 1 par pixel d'interface, retenu de la dernière photo sûre
 
@@ -169,6 +170,7 @@ void main(uint2 id : SV_DispatchThreadID)
     if (id.x >= width || id.y >= height)
         return;
     const int2 px = int2(id);
+    float uiSoft = 0; // part d'interface du pixel (bord d'un élément du HUD, élément translucide) : l'effet s'y applique d'autant moins
     // zone d'interface fixe (urti.ini ui_zone=, ex. la mini-carte de RDR2, dont l'écran ne reçoit jamais d'image
     // sans interface) : laissée telle quelle
     if (uiX1 > uiX0 && all(float2(id) >= float2(uiX0, uiY0) * float2(width, height)) && all(float2(id) < float2(uiX1, uiY1) * float2(width, height)))
@@ -197,7 +199,26 @@ void main(uint2 id : SV_DispatchThreadID)
             uiMask.Store(m, isUi ? 1u : 0u);
         }
         else
-            isUi = (uiMask.Load(m) & 1) != 0;
+        {
+            // (live_hudless : part d'interface dans les bits 8 à 15 ; sinon le bit 0 seul)
+            const uint mv = uiMask.Load(m);
+            const uint a8 = (mv >> 8) & 255;
+            uiSoft = a8 != 0 ? float(a8) / 255.0 : float(mv & 1);
+            isUi = uiSoft >= 0.98;
+        }
+        if ((debugReflect & 0xFF) == 8)
+        {
+            // diagnostic : l'image sans interface telle qu'elle est remise dans la disposition de l'écran (à comparer à l'image finale)
+            gPre = true;
+            StoreLinear(px, LoadLinear(px));
+            return;
+        }
+        if ((debugReflect & 0xFF) == 7)
+        {
+            // diagnostic : part d'interface en rouge, alpha de l'image sans interface en vert
+            StoreLinear(px, float3(isUi ? 1.0 : uiSoft, float((uiMask.Load(m) >> 16) & 255) / 255.0, 0));
+            return;
+        }
         if (isUi)
         {
             if (format == 3)
@@ -214,6 +235,7 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     }
     float3 c = LoadLinear(px);
+    const float3 cGame = c;
     if (split != 0 && id.x < width / 2)
     {
         StoreLinear(px, c);
@@ -226,13 +248,30 @@ void main(uint2 id : SV_DispatchThreadID)
     const float2 jitter = JitterPixels(asfloat(sunBuf.Load2(1184)), p00, p11, float2(maskWidth, maskHeight));
     // image générée : l'image a avancé depuis le dernier calcul ; le point vu ici était, au calcul, en « ici + part × mouvement » (vers
     // l'image précédente) : la surface pour l'ombre, le point virtuel derrière le miroir pour le reflet
+    // Image en retard sur le calcul (DLSS-G : le jeu a une à deux images d'avance sur l'écran, mesuré par live_hudless) : le point vu ici est, dans
+    // le calque, en « ici - avance × mouvement »
     float2 shiftS = 0, shiftV = 0;
-    if (fgShift > 0)
+    const float shiftPart = (debugReflect & 0x1000) ? -asfloat(hudState.Load(16 + 256 * 4 + 44)) : fgShift;
+    if (shiftPart != 0)
     {
-        const int2 mp = clamp(int2((float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
-        const float4 mo = asfloat(motionIn.Load4((uint(mp.y) * maskWidth + uint(mp.x)) * 16));
+        const float2 mq = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight);
+        const int2 mp = clamp(int2(mq), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+        float4 mo = asfloat(motionIn.Load4((uint(mp.y) * maskWidth + uint(mp.x)) * 16));
         if (all(isfinite(mo)) && all(abs(mo) < 0.25))
-            shiftS = mo.xy * fgShift * float2(maskWidth, maskHeight), shiftV = mo.zw * fgShift * float2(maskWidth, maskHeight);
+        {
+            // (le mouvement est celui du calque : relu à l'endroit où le point s'y trouve)
+            const int2 m2 = clamp(int2(mq + mo.xy * shiftPart * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+            const float4 mo2 = asfloat(motionIn.Load4((uint(m2.y) * maskWidth + uint(m2.x)) * 16));
+            if (all(isfinite(mo2)) && all(abs(mo2) < 0.25))
+                mo = mo2;
+            shiftS = mo.xy * shiftPart * float2(maskWidth, maskHeight), shiftV = mo.zw * shiftPart * float2(maskWidth, maskHeight);
+            // le point n'était pas à l'écran au moment du calcul (bord, en avançant ou en tournant) : calque posé tel quel, pas étiré depuis le bord
+            const float2 lim = float2(maskWidth, maskHeight) - 1.0;
+            if (any(mq + shiftS < 0.0) || any(mq + shiftS > lim))
+                shiftS = 0;
+            if (any(mq + shiftV < 0.0) || any(mq + shiftV > lim))
+                shiftV = 0;
+        }
     }
     const float2 m = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight) - 0.5 + jitter + shiftS;
     const int2 b = int2(floor(m));
@@ -282,7 +321,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const float2 law = asfloat(sunBuf.Load2(36));
         const int2 mp = int2(round(m));
         const float wc = AlignW(mp, law);
-        const float edge = saturate(max(abs(AlignW(mp + int2(1, 0), law) - wc), abs(AlignW(mp + int2(0, 1), law) - wc)) / (0.03 * abs(wc) + 0.03));
+        const float edge = abs(AlignW(mp + int2(1, 0), law) - wc) > 0.25 * abs(wc) + 0.3 ? 1.0 : 0.0; // (silhouettes franches seulement : bords verticaux)
         const float l = saturate(sqrt(max(dot(c, float3(0.33, 0.34, 0.33)), 0.0)) * 0.8);
         StoreLinear(px, float3(edge, l, l));
         return;
@@ -367,8 +406,9 @@ void main(uint2 id : SV_DispatchThreadID)
             }
             if (wn > 1e-4)
             {
-                c = lerp(c, wb / wn, waterBaseOn * smoothstep(0.06, 0.22, a));
+                // (seulement là où le reflet d'URTI domine : vue de haut, l'eau du jeu garde son fond et ses détails)
                 gain = a > 1e-4 ? min(waterGain, 0.92 / a) : 1.0;
+                c = lerp(c, wb / wn, waterBaseOn * smoothstep(0.3, 0.65, a * gain));
             }
         }
         c = c * (1.0 - saturate(a * gain)) + r.rgb * saturate(reflStrength) * gain;
@@ -383,5 +423,5 @@ void main(uint2 id : SV_DispatchThreadID)
         }
         c = lerp(c, reflected, saturate(rf.z * reflStrength));
     }
-    StoreLinear(px, c);
+    StoreLinear(px, uiSoft > 0 ? lerp(c, cGame, uiSoft) : c);
 }
