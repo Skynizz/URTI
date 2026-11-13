@@ -151,6 +151,7 @@ struct LivePending
     // et le tampon de sa copie si c'est l'image adoptée
     uint64_t hudHandle = 0;
     int32_t hudMark = -1;
+    uint64_t hudSerialMark = 0; // copie de l'image sans interface exécutée (son numéro) : repère laissé dans l'ordre des dessins, pour savoir de quelle image du jeu elle est
     bool screen = false, mainScreen = false, probe = false, sunMap = false, marked = false, indirect = false;
     // sommets dans le même ordre d'une image à l'autre : dessin direct d'un seul exemplaire (un ExecuteIndirect ou
     // des exemplaires choisis sur le GPU changent d'ordre et de nombre : leurs paires de sommets ne disent rien du
@@ -198,6 +199,7 @@ uint32_t g_liveHudVoteCount = 0, g_liveHudNext = 0, g_liveHudW = 0, g_liveHudH =
 bool g_liveHudArmed = false;
 int32_t g_liveHudDone = -1;
 uint64_t g_liveHudDonePresent = 0, g_liveHudSerial = 0; // présentation et numéro de la dernière copie exécutée
+uint64_t g_livePairSnap = 0, g_livePairHud = 0;         // dernière paire connue : profondeur complète (numéro) et copie sans interface de la même image du jeu
 uint64_t g_liveWindow = 0;                                // fenêtre de présentation (avancée par urti_live.inl)
 uint32_t g_liveAreaCursor[4][kLiveAreas] = {}, g_liveAreaProbe[4][kLiveAreas] = {}; // octets pris dans chaque partie (début, fin)
 uint32_t g_liveAreaCounters[kLiveAreas] = {};             // compteurs pris dans chaque partie
@@ -1336,6 +1338,13 @@ void LiveNoteMaterial(std::vector<LivePending>& pending)
                 g_liveHudDone = it->hudMark, g_liveHudDonePresent = g_presentIndex.load(std::memory_order_relaxed), g_liveHudSerial++;
             if (g_liveTraceOn)
                 Log("SANSHUD %llx tampon %d", (unsigned long long)it->hudHandle, it->hudMark);
+            if (it->hudMark >= 0)
+            {
+                // le repère reste à sa place : lu dans l'ordre d'exécution avec les fins de profondeur (LiveCommit), même si la liste attend le calcul suivant
+                it->hudSerialMark = g_liveHudSerial, it->hudHandle = 0, it->hudMark = -1;
+                ++it;
+                continue;
+            }
             it = pending.erase(it);
             continue;
         }
@@ -1391,6 +1400,12 @@ void LiveCommit(const std::vector<LivePending>& pending, uint32_t listMain, uint
                 g_liveDeferred.push_back(std::move(later));
             }
             return;
+        }
+        if (p.hudSerialMark)
+        {
+            // copie de l'image sans interface : celle de l'image du jeu dont la profondeur vient d'être complète
+            g_livePairSnap = g_liveSnapSerial, g_livePairHud = p.hudSerialMark;
+            continue;
         }
         // partie du flux déjà reprise par des dessins plus récents (liste exécutée trois fenêtres après son
         // écriture) : ignoré

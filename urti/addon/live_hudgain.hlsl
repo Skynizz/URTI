@@ -73,6 +73,7 @@ void main(uint k : SV_GroupIndex)
     const uint2 shown = gain.Load2(kShown);
     const uint age = presentIdx - shown.y;
     gain.Store(kLead, asuint(age <= 6 ? float(int(layerSerial - shown.x)) - 0.5 * float(age) + leadBias : 0.0));
+    gain.Store(kLead + 4, layerSerial); // (live_composite : numéro de l'image du jeu du dernier calcul)
     uint n0 = 0, n1 = 0;
     for (uint i = 0; i < 128; i++)
         n0 += counts[i], n1 += counts[128 + i];

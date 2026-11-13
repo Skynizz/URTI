@@ -18,6 +18,7 @@ ByteAddressBuffer gNormal : register(t10);   // normale du G-buffer (RGBA8) ; al
 ByteAddressBuffer motionIn : register(t11);  // live_reflresolve : mouvement de la surface et du reflet (uv vers l'image précédente), float4 par pixel de rendu
 ByteAddressBuffer waterBase : register(t12); // live_waterbase: smoothed colour of the water, float4 per block of 8 render pixels (colour, share of water)
 ByteAddressBuffer hudState : register(t13);  // live_hudgain : avance du dernier calcul sur l'image de cette présentation (bit 12 de debugReflect)
+ByteAddressBuffer ring : register(t14);      // live_delay : calques des trois dernières images calculées (bit 13 de debugReflect)
 RWByteAddressBuffer output : register(u0);   // même disposition que image
 RWByteAddressBuffer uiMask : register(u1);   // 1 par pixel d'interface, retenu de la dernière photo sûre
 
@@ -139,9 +140,20 @@ void StoreLinear(int2 px, float3 c)
     output.Store(a, q.x | (q.y << 8) | (q.z << 16) | (keep & 0xFF000000));
 }
 
+// file d'attente des calques : tranche choisie pour cette présentation (celle de l'image du jeu qu'elle montre)
+static bool gRing = false;
+static uint gRingBase = 0;
+
+float4 RingUnpack(uint2 v) { return float4(f16tof32(v.x & 0xFFFF), f16tof32(v.x >> 16), f16tof32(v.y & 0xFFFF), f16tof32(v.y >> 16)); }
+uint RingAt(int2 t) { return gRingBase + (uint(t.y) * maskWidth + uint(t.x)) * 20; }
+float4 MotionAt(int2 t) { return gRing ? RingUnpack(ring.Load2(RingAt(t) + 12)) : asfloat(motionIn.Load4((uint(t.y) * maskWidth + uint(t.x)) * 16)); }
+float4 ResolvedAt(int2 t) { return gRing ? RingUnpack(ring.Load2(RingAt(t) + 4)) : asfloat(resolvedRefl.Load4((uint(t.y) * maskWidth + uint(t.x)) * 16)); }
+
 float MaskAt(int2 t)
 {
     t = clamp(t, int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
+    if (gRing)
+        return f16tof32(ring.Load(RingAt(t)) & 0xFFFF);
     const float m = asfloat(mask.Load(t.y * maskPitch + t.x * 4));
     // image générée (à mi-chemin entre deux images réelles) : moyenne des deux derniers masques
     return (debugReflect & 0x100) ? 0.5 * (m + asfloat(prevMask.Load(t.y * maskPitch + t.x * 4))) : m;
@@ -245,23 +257,43 @@ void main(uint2 id : SV_DispatchThreadID)
     // masque d'ombres : bilinéaire à la résolution de rendu, adouci par une tente (bords moins durs)
     // masque et reflets calculés sur la profondeur décalée du jeu ; l'image présentée ne l'est pas (TAA) :
     // le point vu en (id) est dans le masque en (id) + décalage
-    const float2 jitter = JitterPixels(asfloat(sunBuf.Load2(1184)), p00, p11, float2(maskWidth, maskHeight));
+    float2 jitterAb = asfloat(sunBuf.Load2(1184));
+    float shiftPart = (debugReflect & 0x1000) ? -asfloat(hudState.Load(16 + 256 * 4 + 44)) : fgShift;
+    if (debugReflect & 0x2000)
+    {
+        // le calque de l'image du jeu que montre cette présentation : numéro visé = celui du dernier calcul - son avance ; la tranche la plus proche,
+        // et seulement le reste (une demi-image au plus, images fabriquées par DLSS-G) rattrapé le long du mouvement
+        const float lead = asfloat(hudState.Load(16 + 256 * 4 + 44));
+        const uint layer = hudState.Load(16 + 256 * 4 + 48);
+        float best = 1e9;
+        for (uint s = 0; s < 3; s++)
+        {
+            const uint4 h = ring.Load4(s * 16);
+            const float d = float(int(h.x - layer)) + lead;
+            if (h.w != 0 && abs(d) < abs(best))
+                best = d, gRingBase = 64 + s * (maskWidth * maskHeight * 20), jitterAb = asfloat(h.yz);
+        }
+        if (abs(best) < 3.0)
+            gRing = true, shiftPart = -best;
+        else
+            jitterAb = asfloat(sunBuf.Load2(1184));
+    }
+    const float2 jitter = JitterPixels(jitterAb, p00, p11, float2(maskWidth, maskHeight));
     // image générée : l'image a avancé depuis le dernier calcul ; le point vu ici était, au calcul, en « ici + part × mouvement » (vers
     // l'image précédente) : la surface pour l'ombre, le point virtuel derrière le miroir pour le reflet
     // Image en retard sur le calcul (DLSS-G : le jeu a une à deux images d'avance sur l'écran, mesuré par live_hudless) : le point vu ici est, dans
     // le calque, en « ici - avance × mouvement »
     float2 shiftS = 0, shiftV = 0;
-    const float shiftPart = (debugReflect & 0x1000) ? -asfloat(hudState.Load(16 + 256 * 4 + 44)) : fgShift;
     if (shiftPart != 0)
     {
         const float2 mq = (float2(id) + 0.5) / float2(width, height) * float2(maskWidth, maskHeight);
         const int2 mp = clamp(int2(mq), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
-        float4 mo = asfloat(motionIn.Load4((uint(mp.y) * maskWidth + uint(mp.x)) * 16));
+        float4 mo = MotionAt(mp);
         if (all(isfinite(mo)) && all(abs(mo) < 0.25))
         {
             // (le mouvement est celui du calque : relu à l'endroit où le point s'y trouve)
             const int2 m2 = clamp(int2(mq + mo.xy * shiftPart * float2(maskWidth, maskHeight)), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
-            const float4 mo2 = asfloat(motionIn.Load4((uint(m2.y) * maskWidth + uint(m2.x)) * 16));
+            const float4 mo2 = MotionAt(m2);
             if (all(isfinite(mo2)) && all(abs(mo2) < 0.25))
                 mo = mo2;
             shiftS = mo.xy * shiftPart * float2(maskWidth, maskHeight), shiftV = mo.zw * shiftPart * float2(maskWidth, maskHeight);
@@ -374,7 +406,7 @@ void main(uint2 id : SV_DispatchThreadID)
         for (int j = 0; j < 4; j++)
         {
             const int2 t = clamp(b0 + int2(j & 1, j >> 1), int2(0, 0), int2(maskWidth - 1, maskHeight - 1));
-            r += asfloat(resolvedRefl.Load4((uint(t.y) * maskWidth + uint(t.x)) * 16)) * (((j & 1) ? f0.x : 1 - f0.x) * ((j >> 1) ? f0.y : 1 - f0.y));
+            r += ResolvedAt(t) * (((j & 1) ? f0.x : 1 - f0.x) * ((j >> 1) ? f0.y : 1 - f0.y));
         }
         if ((debugReflect & 0xFF) == 3)
         {

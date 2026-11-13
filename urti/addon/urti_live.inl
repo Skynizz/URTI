@@ -28,6 +28,7 @@
 #include "live_film_cs.h"    // g_live_film
 #include "live_waterbase_cs.h" // g_live_waterbase
 #include "live_radcache_cs.h" // g_live_radcache
+#include "live_delay_cs.h" // g_live_delay
 #include "live_sunlight_cs.h" // g_live_sunlight
 #include "live_counts_cs.h" // g_live_counts
 #include "live_surfcache_cs.h" // g_live_surfcache
@@ -80,7 +81,12 @@ struct LiveState
     uint64_t hudBytes = 0;
     uint32_t hudPitch = 0, hudWidth = 0, hudHeight = 0, statHudless = 0, statHudConverted = 0, statShifted = 0, statHudMatched = 0;
     double statHudMatchSum = 0;
-    uint32_t statHudLag[3] = {};
+    uint32_t statHudLag[3] = {}, statHudConvBack[4] = {};
+    // file d'attente des calques (live_delay) : trois tranches, celle de chaque image calculée rangée avec son numéro
+    ComPtr<ID3D12Resource> delayRing;
+    ComPtr<ID3D12RootSignature> delayRs;
+    ComPtr<ID3D12PipelineState> delayPso;
+    uint32_t delayW = 0, delayH = 0;
     uint64_t layerHudSerial = 0;   // numéro de la dernière copie de l'image sans interface au moment du dernier calcul
     float lagBias = 0;             // urti.ini lag_bias= : correction de l'avance du calque (images du jeu)
     bool lagOn = true, hudLeadNow = false; // urti.ini lag=0 : calque posé tel quel (ancienne règle)
@@ -257,7 +263,7 @@ struct LiveState
     uint32_t aoCool = 0, reflCool = 0;
     float reflTarget = 3.5f;
     // smoothed water colour under the reflection (urti.ini water_base=0: off), only with the game camera (Horizon: its low-resolution reflection is in the water)
-    float waterBaseOn = 1.0f, waterGain = 1.5f; // urti.ini water_gain=: weight of the reflection on the water
+    float waterBaseOn = 0.0f, waterGain = 1.5f; // urti.ini water_gain=: weight of the reflection on the water
     ComPtr<ID3D12Resource> waterBase[2];
     ComPtr<ID3D12RootSignature> waterBaseRs;
     ComPtr<ID3D12PipelineState> waterBasePso;
@@ -884,7 +890,8 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
-           make(g_live_composite, sizeof(g_live_composite), 14, live.compositeRs, live.compositePso, 29, 2) &&
+           make(g_live_composite, sizeof(g_live_composite), 15, live.compositeRs, live.compositePso, 29, 2) &&
+           make(g_live_delay, sizeof(g_live_delay), 4, live.delayRs, live.delayPso, 8, 1) &&
            make(g_live_waterbase, sizeof(g_live_waterbase), 3, live.waterBaseRs, live.waterBasePso, 12, 1) &&
            make(g_live_sunlight, sizeof(g_live_sunlight), 3, live.sunlightRs, live.sunlightPso, 20) &&
            make(g_live_counts, sizeof(g_live_counts), 2, live.countsRs, live.countsPso, 4) &&
@@ -1098,7 +1105,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 1, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1813,11 +1820,6 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         return;
     }
     live.presentComputed = true;
-    {
-        // image du jeu de ce calcul : la dernière copie de l'image sans interface exécutée (le calque est recalé sur l'image affichée, live_hudgain)
-        std::lock_guard<std::mutex> lock(g_mutex);
-        live.layerHudSerial = g_liveHudSerial;
-    }
     // tampons d'envoi et de relecture en anneau, par frame % 3 : si le GPU a plus de trois présentations de retard, la place de cet
     // anneau est encore en lecture : la réécrire donnerait au GPU des tables de zones fausses (lectures hors des tampons, GPU perdu)
     if (const uint64_t need = live.slotDone[live.frame % 3]; need && live.slotEvent && live.slotFence->GetCompletedValue() < need)
@@ -1983,6 +1985,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         // profondeur de cette fenêtre ; les listes déjà exécutées de l'image suivante entrent dans la nouvelle fenêtre (qui peut déjà se
         // fermer : un calcul de plus à la présentation suivante)
         live.snapIndexNow = g_liveSnapDone, live.snapSerialUsed = g_liveSnapSerial;
+        // copie de l'image sans interface de cette image du jeu : une par image, dans l'ordre ; la dernière paire connue donne le numéro (la copie
+        // elle-même peut ne pas être encore exécutée). Le calque est recalé sur l'image affichée d'après ce numéro (live_hudgain)
+        live.layerHudSerial = g_livePairHud + (g_liveSnapSerial - g_livePairSnap);
         live.statMaterialLate += live.syncNow && g_liveWindowMaterial < 0 ? 1 : 0;
         live.materialIndexNow = g_liveWindowMaterial >= 0 ? g_liveWindowMaterial : g_liveMaterialDone;
         g_liveWindowMaterial = -1;
@@ -4181,7 +4186,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                      (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u) |
                          (live.transpBuilt ? 256u : 0u) | (live.reflectDiag ? 256u << live.reflectDiag : 0u) | (trueCam && live.worldUpKnown && live.reflectUp ? 8192u : 0u) | (geoColorsRead ? 16384u : 0u) | (live.slowRays ? 32768u : 0u) |
                          (trueCam && live.worldUpKnown && live.reflectUp && live.waterOnly ? 65536u : 0u) | (reflStatsNow ? 131072u : 0u) | (radNow ? 262144u : 0u), live.f0, live.width * 16,
-                     uint32_t(tableNow.size()), live.anchorAlpha > 0 && live.viewPrev && live.prevValid ? 1u : 0u, uint32_t(live.capacity),
+                     uint32_t(tableNow.size()), live.anchorAlpha > 0 && live.viewPrev && live.prevValid && !radNow ? 1u : 0u, uint32_t(live.capacity),
                      surfRead ? uint32_t(live.surfTriangles) : 0u, { live.worldUp[0], live.worldUp[1], live.worldUp[2] },
                      live.reflStrideNow | (live.reflHopsNow << 4) | (uint32_t(live.frame) << 8), live.reflTMaxNow };
             list->SetComputeRootUnorderedAccessView(16, reflStatsNow ? live.reflStats->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
@@ -4556,10 +4561,17 @@ void LiveComposite(effect_runtime* runtime)
     // l'image de la copie ? avec DLSS-G, une sur deux est fabriquée entre deux images du jeu) ; si oui, masque d'interface de tous les pixels
     if (hudSlot >= 0 && live.hudPso && live.hudGainPso && live.preUiBuf && live.uiCounts && live.uiMaskBuf && live.hudGain)
     {
-        const bool fresh = hudSerialNow != live.hudConverted;
+        // les trois dernières copies : l'image finale d'une présentation est celle d'une copie plus ancienne (le jeu a de l'avance)
+        const uint32_t copies = hudPrev2Slot >= 0 ? 3u : hudPrevSlot >= 0 ? 2u : 1u;
+        // copie convertie : celle de l'image du jeu du dernier calcul (ses couleurs vont avec sa profondeur), si elle est encore dans les trois dernières
+        const uint64_t convSerial = live.layerHudSerial <= hudSerialNow && hudSerialNow - live.layerHudSerial < copies ? live.layerHudSerial : hudSerialNow;
+        const uint32_t convBack = uint32_t(hudSerialNow - convSerial);
+        live.statHudConvBack[std::min<uint64_t>(live.layerHudSerial > hudSerialNow ? 3 : hudSerialNow - live.layerHudSerial, 3)]++;
+        const bool fresh = convSerial != live.hudConverted;
+        const int32_t convSlot = convBack == 0 ? hudSlot : convBack == 1 ? hudPrevSlot : hudPrev2Slot;
         if (fresh)
         {
-            live.hudConverted = hudSerialNow, live.statHudConverted++;
+            live.hudConverted = convSerial, live.statHudConverted++;
             // pas de choix de photo (octets 64 et 68 à zéro) : live_composite prend le masque d'interface écrit ici et les couleurs de l'image finale
             Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyBufferRegion(live.uiCounts.Get(), 0, g.zeros.Get(), 0, 72);
@@ -4572,8 +4584,6 @@ void LiveComposite(effect_runtime* runtime)
             uint32_t mode;
             float diffUi;
         } hc = { uint32_t(bd.Width), bd.Height, hudPitch, fp.Footprint.RowPitch, format, 0.02f, 1u, 0.025f };
-        // les trois dernières copies : l'image finale d'une présentation est celle d'une copie plus ancienne (le jeu a de l'avance)
-        const uint32_t copies = hudPrev2Slot >= 0 ? 3u : hudPrevSlot >= 0 ? 2u : 1u;
         const auto bindHud = [&]() {
             list->SetComputeRootSignature(live.hudRs.Get());
             list->SetPipelineState(live.hudPso.Get());
@@ -4590,8 +4600,10 @@ void LiveComposite(effect_runtime* runtime)
         ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         if (fresh)
         {
+            list->SetComputeRootShaderResourceView(0, live.hudSnap[convSlot >= 0 ? convSlot : hudSlot]->GetGPUVirtualAddress());
             list->SetComputeRoot32BitConstants(7, 8, &hc, 0);
             list->Dispatch((hc.width + 7) / 8, (hc.height + 7) / 8, 1);
+            list->SetComputeRootShaderResourceView(0, live.hudSnap[hudSlot]->GetGPUVirtualAddress());
         }
         hc.mode = 2u | ((copies - 1) << 8);
         list->SetComputeRoot32BitConstants(7, 8, &hc, 0);
@@ -4987,6 +4999,44 @@ void LiveComposite(effect_runtime* runtime)
         ub.UAV.pResource = live.sunBuf.Get();
         list->ResourceBarrier(1, &ub);
     }
+    // file d'attente des calques : celui de cette image calculée rangé avec son numéro ; la composition prend celui de l'image que l'écran montre
+    bool ringUse = false;
+    if (hudLead && live.delayPso && live.hudGain && live.shadowBuf && live.syncNow)
+    {
+        const uint64_t sliceBytes = uint64_t(live.width) * live.height * 20;
+        if (!live.delayRing || live.delayW != live.width || live.delayH != live.height)
+        {
+            Retire(live.delayRing);
+            live.delayRing = UavBuffer(g.device, 64 + 3 * sliceBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // à zéro : aucune tranche garnie
+            live.delayW = live.width, live.delayH = live.height;
+        }
+        if (live.delayRing && live.presentComputed)
+        {
+            const bool motionHere = live.reflMotion && live.reflMotionFrame == live.frame;
+            Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+            if (motionHere)
+                Transition(list.Get(), live.reflMotion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+            list->SetComputeRootSignature(live.delayRs.Get());
+            list->SetPipelineState(live.delayPso.Get());
+            list->SetComputeRootShaderResourceView(0, live.shadowBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(1, reflHistOut >= 0 ? live.reflHist[reflHistOut]->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(2, motionHere ? live.reflMotion->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+            list->SetComputeRootShaderResourceView(3, live.sunBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(4, live.delayRing->GetGPUVirtualAddress());
+            const uint32_t dc[8] = { live.width, live.height, live.shadowPitch, uint32_t(live.layerHudSerial % 3), uint32_t(live.layerHudSerial),
+                                     (reflHistOut >= 0 ? 1u : 0u) | (motionHere ? 2u : 0u), 0, 0 };
+            list->SetComputeRoot32BitConstants(5, 8, dc, 0);
+            list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+            D3D12_RESOURCE_BARRIER rb = {};
+            rb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            rb.UAV.pResource = live.delayRing.Get();
+            list->ResourceBarrier(1, &rb);
+            if (motionHere)
+                Transition(list.Get(), live.reflMotion.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        ringUse = live.delayRing != nullptr;
+    }
     LiveTimeD(list.Get(), 15);
     list->SetComputeRootSignature(live.compositeRs.Get());
     list->SetPipelineState(live.compositePso.Get());
@@ -5043,12 +5093,15 @@ void LiveComposite(effect_runtime* runtime)
     if (waterBaseUse)
         Transition(list.Get(), live.waterBase[1].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(12, waterBaseUse ? live.waterBase[1]->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    const bool leadUse = hudLead && live.hudGain && live.reflMotion && live.reflMotionFrame != ~0ull && live.frame <= live.reflMotionFrame + 3;
+    const bool leadUse = ringUse || (hudLead && live.hudGain && live.reflMotion && live.reflMotionFrame != ~0ull && live.frame <= live.reflMotionFrame + 3);
     if (leadUse)
         Transition(list.Get(), live.hudGain.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(13, leadUse ? live.hudGain->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(14, live.imageOut->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(15, live.uiMaskBuf ? live.uiMaskBuf->GetGPUVirtualAddress() : live.imageOut->GetGPUVirtualAddress());
+    if (ringUse)
+        Transition(list.Get(), live.delayRing.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+    list->SetComputeRootShaderResourceView(14, ringUse ? live.delayRing->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(15, live.imageOut->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(16, live.uiMaskBuf ? live.uiMaskBuf->GetGPUVirtualAddress() : live.imageOut->GetGPUVirtualAddress());
     const bool tinted = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] > 0.01f; // teinte des ombres mesurée
     const struct
     {
@@ -5071,13 +5124,15 @@ void LiveComposite(effect_runtime* runtime)
              // (image générée aussi : le dernier reflet stabilisé. Coupé sur elles, il s'éteignait une présentation sur deux)
              reflections ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
              (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u) |
-             (live.sunShadows ? 0u : 0x800u) | (leadUse ? 0x1000u : 0u), live.p00, live.p11,
+             (live.sunShadows ? 0u : 0x800u) | (leadUse && !ringUse ? 0x1000u : 0u) | (ringUse ? 0x2000u : 0u), live.p00, live.p11,
              { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f },
              uint32_t((live.uiFrame - 1) & 1), { live.uiZone[0], live.uiZone[1], live.uiZone[2], live.uiZone[3] },
              giUse ? live.giStrength : 0.0f, live.albedoPitch, alignView ? live.depthPitch : normalUse ? live.normalPitch : 0u,
              shiftNow ? live.fgShift : 0.0f, waterBaseUse ? (live.waterBaseW | (live.waterBaseH << 16)) : 0u, waterBaseUse ? live.waterBaseOn : 0.0f, live.waterGain };
-    list->SetComputeRoot32BitConstants(16, 29, &cc, 0);
+    list->SetComputeRoot32BitConstants(17, 29, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
+    if (ringUse)
+        Transition(list.Get(), live.delayRing.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (leadUse)
         Transition(list.Get(), live.hudGain.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (waterBaseUse)
@@ -5316,9 +5371,11 @@ void OnReshadePresent(effect_runtime* runtime)
         if (live.statHudless || g_liveHudHandle)
             Log("URTI direct : image du jeu sans son interface prise %u fois sur 300 présentations (%u conversions) ; image d'écran = %.3f × image sans interface ; "
                 "pente %.3f ; interface %.1f %% de l'écran ; %u présentations montrent l'image d'une copie (masque refait : %u la dernière, %u celle d'avant, %u encore avant), concordance moyenne %.2f ; "
-                "avance moyenne du calque sur l'image %.2f images du jeu (%s)",
+                "avance moyenne du calque sur l'image %.2f images du jeu (%s) ; copie du calcul : %u la dernière, %u celle d'avant, %u encore avant, %u pas encore là",
                 live.statHudless, live.statHudConverted, hudGainNow, live.hudSlopeNow, hudUiNow * 100.0f, live.statHudMatched, live.statHudLag[0], live.statHudLag[1], live.statHudLag[2],
-                live.statHudless ? live.statHudMatchSum / live.statHudless : 0.0, live.statHudless ? live.statLeadSum / live.statHudless : 0.0, live.lagOn ? "rattrapée" : "laissée");
+                live.statHudless ? live.statHudMatchSum / live.statHudless : 0.0, live.statHudless ? live.statLeadSum / live.statHudless : 0.0, live.lagOn ? "rattrapée" : "laissée",
+                live.statHudConvBack[0], live.statHudConvBack[1], live.statHudConvBack[2], live.statHudConvBack[3]);
+        live.statHudConvBack[0] = live.statHudConvBack[1] = live.statHudConvBack[2] = live.statHudConvBack[3] = 0;
         live.statHudConverted = 0, live.statHudMatched = 0, live.statHudMatchSum = 0, live.statLeadSum = 0;
         live.statHudLag[0] = live.statHudLag[1] = live.statHudLag[2] = 0;
         live.statHudless = 0;

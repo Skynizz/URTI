@@ -1929,3 +1929,23 @@ comparés au même endroit), et l'eau du jeu n'est lissée que là où le reflet
 **Mesures (marais, RTX 4070, DLSS + DLSS-G).** 88 à 92 images par seconde à l'arrêt au bord de l'eau, 65 à 80 en mouvement (v83 : 92, 70 à 84) ; cache du monde
 environ 0,4 ms par présentation. Deux lancements, course, deux Alt+Tab : pas de plantage. Reste : taches claires ou blocs par endroits dans le reflet (cases grossières,
 feuillages), bande au bord de l'écran sans recalage en mouvement, eau parfaitement plate (pas de vaguelettes), Red Dead pas encore essayé avec cette version (v83 y reste).
+
+## v85 : file d'attente des calques (plus d'à-coups), eau du jeu laissée vivante
+
+Retour de l'utilisateur sur v84 : « les reflets sont magnifiques mais ça saccade dans tous les sens, le personnage lag et même le sol ; près de l'eau la mousse pop et
+dépop, l'eau se fige par moments, et on perd énormément de fps ».
+
+**À-coups.** v84 faisait glisser le dernier calque de l'avance mesurée (1,5 à 2 images du jeu) le long du mouvement : juste en moyenne, faux dès que le rythme du jeu
+varie (film en rotation : image immobile, calque à -3,8 puis -7,4 puis 0 pixel d'une présentation à l'autre). L'appariement exact du calcul et de sa copie sans
+interface (repère laissé dans l'ordre d'exécution des listes) n'y changeait rien : la copie du calcul est la dernière 96 % du temps. Corrigé par une file d'attente
+(`live_delay.hlsl`) : le calque de chaque image calculée (ombre, reflet stabilisé, mouvement, décalage sous-pixel) est rangé dans une de trois tranches avec le numéro
+de son image du jeu ; `live_composite` pose sur chaque présentation la tranche de l'image du jeu qu'elle montre, et ne rattrape le long du mouvement que le reste (une
+demi-image, images fabriquées par DLSS-G). Même film après : image -4,70 / -12,73 / -5,19 pixels, calque -4,10 / -10,15 / -4,71. Variation du calque d'une présentation
+à l'autre en marchant : 16 et 12 niveaux -> 7,4 et 5,9 ; excédent ꟻLIP d'URTI : 24 % de ce que le jeu change lui-même -> 15 % (marche), 22 % -> 11 % (rotation).
+
+**Eau.** L'eau du jeu lissée sous le reflet (v83) n'était refaite qu'aux images calculées et effaçait la mousse là où le reflet passait un seuil : eau figée par
+moments, mousse qui apparaît et disparaît. `water_base=0` par défaut : l'eau du jeu reste telle quelle sous le reflet. Rayon d'ancrage (un rayon de plus par pixel
+d'eau, sans effet sur les objets du cache de géométrie) supprimé avec le cache du monde.
+
+Reste : coût des reflets près d'une grande étendue d'eau (3 à 5 ms, budget au plus bas dans la partie du joueur), reflets hors de l'eau (`reflect_all=1`) à valider,
+taches de couleur grossières par endroits dans le reflet.

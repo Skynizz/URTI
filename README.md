@@ -83,7 +83,7 @@ The add-on is written to `urti/build/Release/urti.addon64`.
 | `water_gain` | weight of the reflection on water, relative to Fresnel | 1.5 |
 | `radcache` | world radiance cache: colours of hidden and off-screen reflected points, sky map (0: per-object colours) | 1 |
 | `lag` | shift the effects onto the frame actually displayed (frame generation shows older frames; 0: off) | 1 |
-| `water_base` | smooth the game's own water reflection under URTI's (0: off) | 1 |
+| `water_base` | smooth the game's own water reflection under URTI's (0: off) | 0 |
 | `fg_shift` | shift of the effects on generated frames (0: frozen) | 0.5 |
 | `hudless` | use the UI-free image provided by the game (0: ignore it) | 1 |
 | `reflect_all` | reflections outside water too (when the game camera is known) | 0 |
