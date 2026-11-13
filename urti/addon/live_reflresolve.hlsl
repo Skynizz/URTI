@@ -297,7 +297,9 @@ void main(uint2 id : SV_DispatchThreadID)
                 // historique borné par le voisinage courant (un reflet qui a bougé ne laisse pas de trace) ;
                 // mélange adaptatif : beaucoup d'historique à l'arrêt, peu en mouvement rapide
                 const float motionPx = length(mvVirtual * float2(renderWidth, renderHeight));
-                const float a = lerp(alpha, alphaMax, saturate(motionPx / 8.0)) * (gCenterSkipped ? 0.5 : 1.0);
+                // pixel sans rayon à cette image (un sur deux, à tour de rôle) : son historique seul, il a reçu un vrai rayon à l'image d'avant. La moyenne
+                // de ses voisins, mêlée une image sur deux, faisait scintiller les objets fins du reflet
+                const float a = gCenterSkipped ? 0.0 : lerp(alpha, alphaMax, saturate(motionPx / 8.0));
                 const float4 kept = clamp(hist, lo, hi);
                 // poids selon la luminosité (comme les anticrénelages temporels) : un point très clair (particule, luciole lue dans l'image) ne marque pas
                 // l'historique ; et surface tout juste découverte (historique sans reflet) : le reflet tout de suite, pas un fondu

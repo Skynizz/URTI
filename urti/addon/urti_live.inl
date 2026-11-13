@@ -272,7 +272,8 @@ struct LiveState
     double aoEma = 0, reflEma = 0, statAoMax = 0, statReflMax = 0;
     uint32_t statAoSpikes = 0, statReflSpikes = 0, statAoLevelSum = 0, statReflLevelSum = 0;
     float aoDistNow = 50.0f, reflTMaxNow = 500.0f;
-    uint32_t reflStrideNow = 1, reflHopsNow = 3, aoHopsNow = 2;
+    uint32_t reflStrideNow = 2, reflHopsNow = 3, aoHopsNow = 2;
+    bool reflFull = false; // urti.ini refl_full=1 : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
     bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
     bool reflStatsOn = false;  // urti.ini reflect_stats=1 : pixels à reflet et rayons comptés
     ComPtr<ID3D12Resource> reflStats, reflStatsRb[3];
@@ -1105,7 +1106,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1142,7 +1143,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1159,6 +1160,7 @@ void LiveHotReload(ID3D12Device* device)
             live.waterBaseOn = std::clamp(waterBaseIni, 0.0f, 1.0f), live.waterGain = std::clamp(waterGainIni, 1.0f, 8.0f);
             live.radOn = radIni != 0, live.radVoxel = std::clamp(radVoxelIni, 0.001f, 0.05f);
             live.lagOn = lagIni != 0, live.lagBias = std::clamp(lagBiasIni, -4.0f, 4.0f);
+            live.reflFull = reflFullIni != 0;
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -2691,10 +2693,15 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 regulate(live.aoLevel, aoNow, live.aoEma, live.aoTarget, live.aoCool);
                 regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool);
                 // (the reach of reflections never shrinks: without the far trees the water turned bright green; and occlusion is never limited to the very near)
-                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 1 }, kAoHops[5] = { 2, 2, 1, 1, 1 }, kRStride[5] = { 1, 1, 2, 2, 2 }, kRHops[5] = { 3, 2, 2, 1, 1 };
-                static const float kAoDist[5] = { 50.0f, 45.0f, 35.0f, 30.0f, 25.0f }, kRMax[5] = { 500.0f, 500.0f, 500.0f, 500.0f, 500.0f };
+                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 2 }, kAoHops[5] = { 2, 2, 1, 1, 1 }, kRStride[5] = { 2, 2, 2, 2, 2 }, kRHops[5] = { 3, 3, 2, 2, 1 };
+                // (reflets : un pixel sur deux à tout niveau, l'autre garde son historique ; avec le cache du monde, un rayon plus court finit sur la carte du
+                // ciel et du lointain, plus sur l'eau verte du jeu : la portée peut baisser. Occultation : jamais un seul rayon (bruit), la portée baisse)
+                static const float kAoDist[5] = { 50.0f, 40.0f, 28.0f, 18.0f, 12.0f }, kRMaxRad[5] = { 500.0f, 300.0f, 200.0f, 140.0f, 90.0f };
+                static const float kRMax[5] = { 500.0f, 500.0f, 500.0f, 500.0f, 500.0f };
                 live.aoRays = kAoRays[live.aoLevel], live.aoHopsNow = kAoHops[live.aoLevel], live.aoDistNow = kAoDist[live.aoLevel];
-                live.reflStrideNow = kRStride[live.reflLevel], live.reflHopsNow = kRHops[live.reflLevel], live.reflTMaxNow = kRMax[live.reflLevel];
+                live.reflStrideNow = kRStride[live.reflLevel], live.reflHopsNow = kRHops[live.reflLevel], live.reflTMaxNow = live.reflMixValid ? kRMaxRad[live.reflLevel] : kRMax[live.reflLevel];
+                if (live.reflFull && live.reflLevel == 0)
+                    live.reflStrideNow = 1;
                 live.statAoLevelSum += uint32_t(live.aoLevel), live.statReflLevelSum += uint32_t(live.reflLevel);
             }
             if (const uint32_t s = uint32_t(live.frame % 3); live.slotBuilt[s])
@@ -4622,7 +4629,7 @@ void LiveComposite(effect_runtime* runtime)
         list->Dispatch(1, 1, 1);
         list->ResourceBarrier(1, &ub);
         hudLead = live.lagOn && format != 3;
-        if (format != 3)
+        if (format != 3 && (live.uiFrame & 3) == 0)
         {
             hc.mode = 4u | ((copies - 1) << 8);
             bindHud();
@@ -4846,7 +4853,7 @@ void LiveComposite(effect_runtime* runtime)
                     }
                 }
                 // cache de radiance du monde : ce que l'image montre, déposé là où c'est dans le monde (live_radcache) ; puis la carte du ciel s'étend
-                if (mixed && live.radPso && live.radParamsNow && live.radHash && live.radEnv && live.radStats)
+                if (mixed && live.radPso && live.radParamsNow && live.radHash && live.radEnv && live.radStats && (live.frame & 1) == 0)
                 {
                     const bool sceneOk = live.tlas && live.sceneStamp + 1 == live.frame;
                     const bool stats = live.reflStatsOn;

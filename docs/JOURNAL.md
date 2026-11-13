@@ -1949,3 +1949,23 @@ d'eau, sans effet sur les objets du cache de géométrie) supprimé avec le cach
 
 Reste : coût des reflets près d'une grande étendue d'eau (3 à 5 ms, budget au plus bas dans la partie du joueur), reflets hors de l'eau (`reflect_all=1`) à valider,
 taches de couleur grossières par endroits dans le reflet.
+
+## v86 : moitié moins de rayons de reflet sans scintillement, et où part vraiment le temps
+
+Retour de l'utilisateur sur v85 : « c'est beaucoup mieux mais il y a encore pas mal de bruit ; il faut de bonnes performances ». Journal de sa partie : occultation et
+reflets au niveau 4 en permanence, 6 ms chacun quand même, 48 à 55 images par seconde.
+
+**Bruit.** Au-delà du niveau 2, un pixel d'eau sur deux n'avait pas de rayon et prenait pour moitié la moyenne de ses voisins : une image sur deux un vrai rayon, la
+suivante une moyenne, les objets fins du reflet scintillaient. Un pixel sans rayon garde maintenant son seul historique (il a reçu un rayon à l'image d'avant) ; du
+coup un pixel sur deux à tout niveau (`refl_full=1` : ancienne règle). Occultation : plus jamais un seul rayon, c'est la portée qui baisse (50 à 12 m). Portée des
+reflets réduite quand le budget est dépassé (500 à 90 m) : avec le cache du monde, un rayon plus court finit sur la carte du ciel et du lointain, plus sur l'eau verte.
+Cache du monde rempli une image calculée sur deux, masque du HUD refait une présentation sur quatre.
+
+**Mesures au bord de l'eau.** Reflets 2,8 à 3,7 ms -> 2,0 à 2,6 ; composition 1,9 à 2,75 -> 1,4 à 1,6. Excédent ꟻLIP à l'arrêt 0,0099 -> 0,0067 ; en marche et en
+course inchangé (0,019 / 0,021 ; 0,023 / 0,018).
+
+**Où part le temps (chaque effet coupé à tour de rôle, à l'arrêt).** Jeu seul 131 images par seconde ; URTI avec occultation, rebond et reflets coupés : 98 ; reflets
+seuls coupés : 93 ; tout actif : 84 à 90. Les effets ne coûtent que 5 images par seconde chacun : le gros est fixe, par image du jeu : structure de l'image 2,1 ms,
+débruitage 1,2 ms (même occultation coupée), cache de géométrie 0,55, structure de la scène 0,3. Baisser les budgets ne change presque rien (occultation 3,4 ms au
+niveau 4 contre 3,9 au niveau 0). `blas_refit=1`, `geo_new=100000`, `vertex_budget=200000` : structure de l'image 2,05 -> 1,24 ms, 1 à 2 images par seconde.
+Prochaine piste : ne plus tout refaire à chaque image du jeu (la file d'attente des calques permet de servir deux images avec un calcul).

@@ -219,7 +219,7 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     // un pixel par bloc 2×2, à tour de rôle
     static const uint2 kFour[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
-    const int2 t = int2(id * 2 + kFour[gRadFrame & 3]);
+    const int2 t = int2(id * 2 + kFour[(gRadFrame >> 1) & 3]);
     if (t.x >= int(renderWidth) || t.y >= int(renderHeight))
         return;
     const float3 law = asfloat(sunBuf.Load3(36));
@@ -269,7 +269,7 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     const float dist = length(p);
     bool solid = false;
-    if ((flags & 1) && ((id.x & 1) | ((id.y & 1) << 1)) == ((gRadFrame >> 2) & 3))
+    if ((flags & 1) && ((id.x & 1) | ((id.y & 1) << 1)) == ((gRadFrame >> 3) & 3))
     {
         RayDesc eye;
         eye.Origin = 0;
