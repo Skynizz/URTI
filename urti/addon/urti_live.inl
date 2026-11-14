@@ -1103,7 +1103,7 @@ void LiveHotReload(ID3D12Device* device)
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
             float reflAlphaMin = 0.25f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 4.0f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
-            float vertexBudget = 6000000, probeBudget = 500000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
+            float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
             float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0;
@@ -3272,8 +3272,42 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             if (const auto e = live.geo.find(r.id); e != live.geo.end())
                 keepSlot = e->second.slot;
             geoErase(r.id);
-            if (live.geoHead + size > live.geoPoolBytes)
-                live.geoHead = 0;
+            // la tête du tampon circulaire saute les objets captés récemment (encore à l'écran ou tout près) : en mouvement, elle faisait le tour de la
+            // réserve en quelques secondes et chassait au passage des objets visibles, qui manquaient aux reflets jusqu'à leur prochaine capture.
+            // Seuls les objets pas recaptés depuis longtemps laissent la place ; un tour complet sans place : l'ancienne règle
+            {
+                bool wrapped = false;
+                for (uint32_t guard = 0; guard < 256; guard++)
+                {
+                    if (live.geoHead + size > live.geoPoolBytes)
+                    {
+                        if (wrapped)
+                        {
+                            live.geoHead = 0;
+                            break;
+                        }
+                        live.geoHead = 0, wrapped = true;
+                    }
+                    const uint64_t a = live.geoHead, b = a + size;
+                    auto jt = live.geoByOffset.upper_bound(a);
+                    if (jt != live.geoByOffset.begin())
+                    {
+                        auto before = std::prev(jt);
+                        if (const auto e = live.geo.find(before->second); e != live.geo.end() && before->first + e->second.size > a)
+                            jt = before;
+                    }
+                    uint64_t skipTo = 0;
+                    for (; jt != live.geoByOffset.end() && jt->first < b; ++jt)
+                        if (const auto e = live.geo.find(jt->second); e != live.geo.end() && e->second.frame + 600 > live.frame)
+                        {
+                            skipTo = jt->first + e->second.size;
+                            break;
+                        }
+                    if (!skipTo)
+                        break;
+                    live.geoHead = skipTo;
+                }
+            }
             const uint64_t lo = live.geoHead, hi = lo + size;
             auto it = live.geoByOffset.upper_bound(lo);
             if (it != live.geoByOffset.begin())

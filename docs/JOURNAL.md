@@ -1969,3 +1969,16 @@ seuls coupés : 93 ; tout actif : 84 à 90. Les effets ne coûtent que 5 images 
 débruitage 1,2 ms (même occultation coupée), cache de géométrie 0,55, structure de la scène 0,3. Baisser les budgets ne change presque rien (occultation 3,4 ms au
 niveau 4 contre 3,9 au niveau 0). `blas_refit=1`, `geo_new=100000`, `vertex_budget=200000` : structure de l'image 2,05 -> 1,24 ms, 1 à 2 images par seconde.
 Prochaine piste : ne plus tout refaire à chaque image du jeu (la file d'attente des calques permet de servir deux images avec un calcul).
+
+## v87 : objets qui disparaissaient des reflets, Red Dead vérifié
+
+**Red Dead Redemption 2 avec v86** (jamais essayée là) : deux lancements, marche, rotation, rafales : image correcte, mini-carte intacte, 70 à 77 images par seconde
+(v83 : 76 à 78), pas de plantage. Installée (ancienne : `urti.addon64.avant_v86`). Le film au rythme réel (`urti_film`, outil de mesure fait pour Horizon) y fait
+perdre le périphérique (DXGI_ERROR_INVALID_CALL) : ne pas l'y déclencher.
+
+**Objets qui apparaissent et disparaissent (Horizon).** Journal du joueur : 975 objets chassés de la réserve du cache de géométrie en 300 présentations, réserve à
+moitié vide. La réserve est un tampon circulaire : en mouvement (300 000 sommets nouveaux par image) sa tête en fait le tour en quelques secondes et chassait ce
+qu'elle rencontrait, objets visibles compris, qui manquaient aux reflets et à l'occultation jusqu'à leur prochaine capture. La tête saute maintenant les objets captés
+depuis moins de 600 images. Même course : 315 à 333 chassés (les anciens). Sommets mesurés par image : 500 000 -> 250 000.
+
+`reflect_all=1` en forêt : aucune différence visible (pas de surface lisse hors de l'eau à cet endroit), 0,4 ms : laissé coupé.
