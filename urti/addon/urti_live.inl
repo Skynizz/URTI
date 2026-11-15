@@ -87,6 +87,11 @@ struct LiveState
     ComPtr<ID3D12RootSignature> delayRs;
     ComPtr<ID3D12PipelineState> delayPso;
     uint32_t delayW = 0, delayH = 0;
+    LARGE_INTEGER lastPresentTime = {};
+    double presentMs = 0;
+    uint32_t suspectLeft = 0;
+    bool layerSuspect = false;
+    uint32_t statSuspect = 0;
     uint64_t layerHudSerial = 0;   // numéro de la dernière copie de l'image sans interface au moment du dernier calcul
     float lagBias = 0;             // urti.ini lag_bias= : correction de l'avance du calque (images du jeu)
     bool lagOn = true, hudLeadNow = false; // urti.ini lag=0 : calque posé tel quel (ancienne règle)
@@ -273,6 +278,11 @@ struct LiveState
     uint32_t statAoSpikes = 0, statReflSpikes = 0, statAoLevelSum = 0, statReflLevelSum = 0;
     float aoDistNow = 50.0f, reflTMaxNow = 500.0f;
     uint32_t reflStrideNow = 2, reflHopsNow = 3, aoHopsNow = 2;
+    ComPtr<ID3D12Resource> denoiseLen[2]; // longueur d'historique par pixel (live_shadowtemporal), une image sur deux chacun
+    uint32_t denoiseLenNext = 0;
+    float reflSpatial = 0.5f; // urti.ini refl_spatial= : part de la moyenne des voisins dans le reflet courant (0 : ancienne règle)
+    float reflSoft = 1.0f;    // urti.ini refl_soft= : rayon (pixels) de la zone où la couleur reflétée est lue (0 : un point, ancienne règle)
+    bool denoiseLenOn = true; // urti.ini denoise_len=0 : ancienne règle (pas de longueur d'historique)
     bool reflFull = false; // urti.ini refl_full=1 : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
     bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
     bool reflStatsOn = false;  // urti.ini reflect_stats=1 : pixels à reflet et rayons comptés
@@ -888,7 +898,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
            make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 30, 3) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
-           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 6, live.denoiseRs, live.denoisePso, 14) &&
+           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 7, live.denoiseRs, live.denoisePso, 14, 2) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
            make(g_live_composite, sizeof(g_live_composite), 15, live.compositeRs, live.compositePso, 29, 2) &&
@@ -901,7 +911,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_hudless, sizeof(g_live_hudless), 4, live.hudRs, live.hudPso, 8, 3) &&
            make(g_live_hudgain, sizeof(g_live_hudgain), 0, live.hudGainRs, live.hudGainPso, 8, 1) &&
            make(g_live_film, sizeof(g_live_film), 1, live.filmRs, live.filmPso, 8, 1) &&
-           make(g_live_reflresolve, sizeof(g_live_reflresolve), 10, live.resolveRs, live.resolvePso, 20, 2) &&
+           make(g_live_reflresolve, sizeof(g_live_reflresolve), 10, live.resolveRs, live.resolvePso, 22, 2) &&
            make(g_live_reflect, sizeof(g_live_reflect), 14, live.reflectRs, live.reflectPso, 25, 4) &&
            make(g_live_radcache, sizeof(g_live_radcache), 6, live.radRs, live.radPso, 17, 3) &&
            make(g_live_surfcache, sizeof(g_live_surfcache), 5, live.surfRs, live.surfPso, 18, 2) &&
@@ -1029,6 +1039,8 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     live.prevShadowBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_COPY_DEST);
     Retire(live.shadowRawBuf);
     live.shadowRawBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    for (auto& b : live.denoiseLen) // longueur d'historique du débruiteur (à zéro : rien d'accumulé)
+        Retire(b), b = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Retire(live.giRaw), Retire(live.giBuf), Retire(live.giPrev);
     live.giRaw = UavBuffer(device, 3ull * live.shadowPitch * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     live.giBuf = UavBuffer(device, 3ull * live.shadowPitch * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1106,7 +1118,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1143,7 +1155,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1161,6 +1173,9 @@ void LiveHotReload(ID3D12Device* device)
             live.radOn = radIni != 0, live.radVoxel = std::clamp(radVoxelIni, 0.001f, 0.05f);
             live.lagOn = lagIni != 0, live.lagBias = std::clamp(lagBiasIni, -4.0f, 4.0f);
             live.reflFull = reflFullIni != 0;
+            live.denoiseLenOn = denoiseLenIni != 0;
+            live.reflSoft = std::clamp(reflSoftIni, 0.0f, 4.0f);
+            live.reflSpatial = std::clamp(reflSpatialIni, 0.0f, 1.0f);
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -1810,6 +1825,19 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             snapNew = false, live.statMaterialWait++;
     }
     live.presentComputed = false;
+    {
+        // à-coup du jeu : une présentation qui arrive plus de 2,2 fois plus tard que d'habitude ; les trois calculs suivants sont des rattrapages
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now), QueryPerformanceFrequency(&freq);
+        const double dt = live.lastPresentTime.QuadPart ? double(now.QuadPart - live.lastPresentTime.QuadPart) * 1000.0 / double(freq.QuadPart) : 0.0;
+        live.lastPresentTime = now;
+        if (dt > 0 && dt < 500.0)
+        {
+            if (live.presentMs > 0 && dt > 2.2 * live.presentMs)
+                live.suspectLeft = 3;
+            live.presentMs = live.presentMs > 0 ? live.presentMs + (std::min(dt, 3.0 * live.presentMs) - live.presentMs) * 0.05 : dt;
+        }
+    }
     if ((live.syncNow ? !snapNew : live.lastPresentDraws == 0) && live.bound)
     {
         // aucun dessin du jeu exécuté depuis la présentation précédente (image générée par DLSS-G ou FSR3, ou jeu
@@ -1822,6 +1850,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         return;
     }
     live.presentComputed = true;
+    {
+        // calcul de rattrapage (juste après un à-coup du jeu : plusieurs images complètes en attente) : son calque n'est pas montré (file d'attente des calques)
+        live.layerSuspect = live.suspectLeft > 0;
+        if (live.suspectLeft > 0)
+            live.suspectLeft--;
+        live.statSuspect += live.layerSuspect ? 1u : 0u;
+    }
     // tampons d'envoi et de relecture en anneau, par frame % 3 : si le GPU a plus de trois présentations de retard, la place de cet
     // anneau est encore en lecture : la réécrire donnerait au GPU des tables de zones fausses (lectures hors des tampons, GPU perdu)
     if (const uint64_t need = live.slotDone[live.frame % 3]; need && live.slotEvent && live.slotFence->GetCompletedValue() < need)
@@ -3965,7 +4000,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->SetComputeRootShaderResourceView(3, motionOk ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(4, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(5, live.sunBuf->GetGPUVirtualAddress());
-        list->SetComputeRootUnorderedAccessView(6, live.shadowBuf->GetGPUVirtualAddress());
+        // longueur d'historique : celle de l'image précédente lue, celle de cette image écrite dans l'autre tampon
+        const bool lenNow = live.denoiseLenOn && live.denoiseLen[0] && live.denoiseLen[1];
+        const uint32_t lenOut = live.denoiseLenNext & 1;
+        if (lenNow)
+        {
+            Transition(list.Get(), live.denoiseLen[1 - lenOut].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
+            live.denoiseLenNext++;
+        }
+        list->SetComputeRootShaderResourceView(6, lenNow ? live.denoiseLen[1 - lenOut]->GetGPUVirtualAddress() : live.sunBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(7, live.shadowBuf->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(8, lenNow ? live.denoiseLen[lenOut]->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
         const struct
         {
             uint32_t width, height, depthPitch, shadowPitch, motionPitch, motionConvention, depth24, debugMode;
@@ -3976,9 +4021,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
                  // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
                  // accumulées et un bornage plus large (moins de grain qui tremble)
-                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f, live.sunShadows ? 1u : 2u,
+                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
                  live.p00, live.p11 };
-        list->SetComputeRoot32BitConstants(7, 14, &dn, 0);
+        list->SetComputeRoot32BitConstants(9, 14, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
         Transition(list.Get(), live.shadowRawBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (giNow && !nrdActive)
@@ -3988,12 +4033,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 Transition(list.Get(), live.giPrev.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
             list->SetComputeRootShaderResourceView(0, live.giRaw->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(1, live.giValid ? live.giPrev->GetGPUVirtualAddress() : live.giRaw->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(6, live.giBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(7, live.giBuf->GetGPUVirtualAddress());
             auto gn = dn;
             gn.motionConvention = motionOk && live.giValid ? live.mvConvention : 255u;
             gn.debugMode = 0;
-            gn.blurRadius = 2u | 256u | 512u; // 5×5, jamais calculé -> 0, trois plans
-            list->SetComputeRoot32BitConstants(7, 14, &gn, 0);
+            gn.blurRadius = 2u | 256u | 512u | (lenNow ? 2048u | 1024u : 0u); // 5×5, jamais calculé -> 0, trois plans ; longueur lue (la même que l'occultation), pas écrite
+            list->SetComputeRoot32BitConstants(9, 14, &gn, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.giRaw.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (live.giValid)
@@ -4002,6 +4047,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             gb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             gb.UAV.pResource = live.giBuf.Get();
             list->ResourceBarrier(1, &gb);
+        }
+        if (lenNow)
+        {
+            Transition(list.Get(), live.denoiseLen[1 - lenOut].Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            D3D12_RESOURCE_BARRIER lb = {};
+            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            lb.UAV.pResource = live.denoiseLen[lenOut].Get();
+            list->ResourceBarrier(1, &lb);
         }
     }
     live.giValid = giNow && !nrdActive && !nrdDone && live.shadowRawBuf && live.denoisePso;
@@ -4820,14 +4873,14 @@ void LiveComposite(effect_runtime* runtime)
                     float alpha, maxLuminance;
                     uint32_t flags;
                     float p00, p11;
-                    float alphaMax, gamma, depthTol, anchorAlpha, anchorGamma;
+                    float alphaMax, gamma, depthTol, anchorAlpha, anchorGamma, softPx, spatialMix;
                 } rc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.mvPitch,
                          motionOk ? live.mvConvention : 255u, live.depthPitch, d24r ? 1u : 0u,
                          // (faster settling only where the water normal is exact, game camera known; RDR2's normals come from depth and are noisier)
                          live.camLive && live.worldUpKnown ? live.reflAlphaMin : std::min(live.reflAlphaMin, 0.1f), 4.0f,
                          (motionOk ? 1u : 0u) | (live.debugView == 8 ? 4u : 0u) | (anchored && live.anchorPrevOk ? 8u : 0u) | (mixed ? 16u : 0u), live.p00, live.p11,
-                         live.reflAlphaMax, live.reflGamma, live.reflDepthTol, live.anchorAlpha, live.anchorGamma };
-                list->SetComputeRoot32BitConstants(12, 20, &rc, 0);
+                         live.reflAlphaMax, live.reflGamma, live.reflDepthTol, live.anchorAlpha, live.anchorGamma, live.reflSoft, live.reflSpatial };
+                list->SetComputeRoot32BitConstants(12, 22, &rc, 0);
                 list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
                 if (mixed)
                     Transition(list.Get(), live.reflMix.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -5051,7 +5104,7 @@ void LiveComposite(effect_runtime* runtime)
             live.delayRing = UavBuffer(g.device, 64 + 3 * sliceBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // à zéro : aucune tranche garnie
             live.delayW = live.width, live.delayH = live.height;
         }
-        if (live.delayRing && live.presentComputed)
+        if (live.delayRing && live.presentComputed && !live.layerSuspect)
         {
             const bool motionHere = live.reflMotion && live.reflMotionFrame == live.frame;
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
@@ -5412,11 +5465,11 @@ void OnReshadePresent(effect_runtime* runtime)
         if (live.statHudless || g_liveHudHandle)
             Log("URTI direct : image du jeu sans son interface prise %u fois sur 300 présentations (%u conversions) ; image d'écran = %.3f × image sans interface ; "
                 "pente %.3f ; interface %.1f %% de l'écran ; %u présentations montrent l'image d'une copie (masque refait : %u la dernière, %u celle d'avant, %u encore avant), concordance moyenne %.2f ; "
-                "avance moyenne du calque sur l'image %.2f images du jeu (%s) ; copie du calcul : %u la dernière, %u celle d'avant, %u encore avant, %u pas encore là",
+                "avance moyenne du calque sur l'image %.2f images du jeu (%s) ; %u calques de rattrapage écartés ; copie du calcul : %u la dernière, %u celle d'avant, %u encore avant, %u pas encore là",
                 live.statHudless, live.statHudConverted, hudGainNow, live.hudSlopeNow, hudUiNow * 100.0f, live.statHudMatched, live.statHudLag[0], live.statHudLag[1], live.statHudLag[2],
-                live.statHudless ? live.statHudMatchSum / live.statHudless : 0.0, live.statHudless ? live.statLeadSum / live.statHudless : 0.0, live.lagOn ? "rattrapée" : "laissée",
+                live.statHudless ? live.statHudMatchSum / live.statHudless : 0.0, live.statHudless ? live.statLeadSum / live.statHudless : 0.0, live.lagOn ? "rattrapée" : "laissée", live.statSuspect,
                 live.statHudConvBack[0], live.statHudConvBack[1], live.statHudConvBack[2], live.statHudConvBack[3]);
-        live.statHudConvBack[0] = live.statHudConvBack[1] = live.statHudConvBack[2] = live.statHudConvBack[3] = 0;
+        live.statHudConvBack[0] = live.statHudConvBack[1] = live.statHudConvBack[2] = live.statHudConvBack[3] = 0, live.statSuspect = 0;
         live.statHudConverted = 0, live.statHudMatched = 0, live.statHudMatchSum = 0, live.statLeadSum = 0;
         live.statHudLag[0] = live.statHudLag[1] = live.statHudLag[2] = 0;
         live.statHudless = 0;

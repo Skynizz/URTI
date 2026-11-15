@@ -273,7 +273,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (h.w != 0 && abs(d) < abs(best))
                 best = d, gRingBase = 64 + s * (maskWidth * maskHeight * 20), jitterAb = asfloat(h.yz);
         }
-        if (abs(best) < 3.0)
+        if (abs(best) < 5.0) // (jusqu'à quatre images d'écart : calques de rattrapage écartés après un à-coup)
             gRing = true, shiftPart = -best;
         else
             jitterAb = asfloat(sunBuf.Load2(1184));

@@ -1982,3 +1982,29 @@ qu'elle rencontrait, objets visibles compris, qui manquaient aux reflets et à l
 depuis moins de 600 images. Même course : 315 à 333 chassés (les anciens). Sommets mesurés par image : 500 000 -> 250 000.
 
 `reflect_all=1` en forêt : aucune différence visible (pas de surface lisse hors de l'eau à cet endroit), 0,4 ms : laissé coupé.
+
+## v88 : flashs de toute la couche après un à-coup, reflets des objets fins, essais du débruiteur
+
+Retour de l'utilisateur : « du bruit sur les objets fins dans les deux jeux, il faut bien gérer le débruiteur ».
+
+**Où est le bruit (mesuré).** Red Dead, rafale à l'arrêt : l'excédent d'URTI d'une image à l'autre est sur 0,3 % des pixels. Horizon, film à l'arrêt : presque tout
+dans le reflet de l'eau, sur les objets fins reflétés et la ligne de la berge. Les moyennes par film variaient du simple au triple pour un même réglage : un événement
+intermittent dominait.
+
+**Flashs de toute la couche.** Trois films sur dix à l'arrêt contenaient un saut : pendant une présentation, tout le calque change (reflet absent ou d'une autre
+teinte, occultation du personnage), puis revient. Trace : chaque fois après un à-coup du jeu (présentation à 37 ms au lieu de 12), URTI enchaîne trois calculs de
+rattrapage dont les calques diffèrent des autres, montrés deux images plus tard par la file d'attente. Un calque calculé dans les trois calculs qui suivent une
+présentation plus de 2,2 fois plus longue que d'habitude n'est plus rangé dans la file : le précédent reste, recalé sur le mouvement (jusqu'à quatre images d'écart).
+Seize films à l'arrêt ensuite : aucun saut au-dessus de 0,05 (avant : 0,10 à 0,16), moyenne 0,005 à 0,008 (avant 0,007 à 0,018). Première règle essayée (calcul sur
+la présentation qui suit un calcul) : écartait jusqu'à 80 calques sur 300 présentations en mouvement, le calque ne suivait plus l'image en rotation ; abandonnée.
+
+**Reflets.** Couleur reflétée lue sur une petite zone (quatre lectures, grille tournée, 1 pixel : `refl_soft=`) au lieu d'un point : avec le décalage sous-pixel de
+chaque image, un miroir parfait tombait tantôt sur une branche, tantôt à côté. Pire saut à l'arrêt 0,06 à 0,13 -> 0,016 à 0,034. Pré-filtre spatial avant
+l'accumulation (`refl_spatial=0.5` : le pixel mêlé à la moyenne de ses voisins à reflet) : petit gain.
+
+**Débruiteur de l'occultation.** Longueur d'historique par pixel (`denoise_len=`) : un pixel découvert fait la moyenne vraie de ses premiers échantillons. Gain non
+mesurable sur les films ; gardé (sans coût). Flou élargi tant que l'historique est court : +2 ms, retiré. Objets fins remplis avec l'occultation de leur voisinage :
+huit fois plus de bruit dans le feuillage de Red Dead (2,8 % des pixels au lieu de 0,3 %), retiré.
+
+**Vérifié.** Horizon : deux lancements, course, deux Alt+Tab, pas de plantage ; 88 à 94 images par seconde à l'arrêt. Red Dead : marche, rotation, rafales, pas de
+plantage, 67 à 71 images par seconde, bruit inchangé (0,34 % des pixels). Installée dans les deux jeux.

@@ -46,6 +46,8 @@ cbuffer Constants : register(b0)
     float depthTol;      // historique gardé si la profondeur diffère de moins de depthTol × profondeur
     float anchorAlpha;   // historique ancré : part de l'image courante (0 : ancrage coupé)
     float anchorGamma;   // historique ancré : bornage plus large (moyenne ± anchorGamma σ)
+    float softPx;        // rayon (pixels de l'image présentée) de la zone où la couleur reflétée est lue (0 : un point)
+    float spatialMix;    // part de la moyenne des voisins dans la valeur courante d'un pixel (0 : le pixel seul)
 };
 
 float3 SrgbToLinear(float3 c) { return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4)); }
@@ -69,6 +71,20 @@ float3 LoadLinear(int2 px)
         return PqToNits(float3(raw & 1023, (raw >> 10) & 1023, (raw >> 20) & 1023) / 1023.0) / 203.0;
     const float3 c = float3(raw & 255, (raw >> 8) & 255, (raw >> 16) & 255) / 255.0;
     return SrgbToLinear(format == 1 ? c.bgr : c);
+}
+
+float3 SampleLinear(float2 uv);
+
+// couleur reflétée lue sur une petite zone (grille tournée de quatre lectures) : un miroir parfait lu en un seul point tombait, avec le décalage
+// sous-pixel de chaque image, tantôt sur une branche fine tantôt à côté (le reflet des objets fins scintillait) ; une eau réelle n'est jamais un
+// miroir au pixel près
+float3 SampleSoft(float2 uv)
+{
+    if (softPx <= 0)
+        return SampleLinear(uv);
+    const float2 px = softPx / float2(width, height);
+    return 0.25 * (SampleLinear(uv + float2(0.5, 1.0) * px) + SampleLinear(uv + float2(-1.0, 0.5) * px) +
+                   SampleLinear(uv + float2(-0.5, -1.0) * px) + SampleLinear(uv + float2(1.0, -0.5) * px));
 }
 
 float3 SampleLinear(float2 uv)
@@ -97,9 +113,9 @@ float3 RayColor(float4 rf, int2 at)
     if (flags & 16)
     {
         const float4 m = asfloat(mixIn.Load4((uint(at.y) * renderWidth + uint(at.x)) * 16));
-        return m.a > 0 ? m.rgb + m.a * SampleLinear(rf.xy - gJitterUv) : m.rgb;
+        return m.a > 0 ? m.rgb + m.a * SampleSoft(rf.xy - gJitterUv) : m.rgb;
     }
-    return rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy - gJitterUv);
+    return rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleSoft(rf.xy - gJitterUv);
 }
 
 float4 Current(int2 t, out bool known, bool center)
@@ -194,7 +210,7 @@ void main(uint2 id : SV_DispatchThreadID)
     // l'écran) : l'historique est gardé et s'estompe doucement au lieu de tomber à zéro d'une image à
     // l'autre (c'était le « pop / dépop » : visible, caché, visible…)
     bool known;
-    const float4 cur = Current(t, known, true);
+    float4 cur = Current(t, known, true);
     // pas de reflet ici (pas de l'eau) : rien, jamais d'historique. Relu à côté en mouvement, il posait le reflet d'un pixel d'eau voisin sur les herbes et
     // les bords des objets, et l'y laissait s'éteindre lentement (éclats qui restent à l'écran)
     if (known && cur.a <= 0 && (flags & 4) == 0)
@@ -214,6 +230,10 @@ void main(uint2 id : SV_DispatchThreadID)
         }
     const float4 mean = count > 0 ? m1 / count : 0, sigma = count > 0 ? sqrt(max(m2 / count - mean * mean, 0.0)) : 0;
     const float4 lo = count > 0 ? mean - gamma * sigma : -1e9, hi = count > 0 ? mean + gamma * sigma : 1e9;
+    // pré-filtre spatial (comme les débruiteurs de reflets de NVIDIA avant leur accumulation) : la valeur courante mêle le pixel et la moyenne de ses
+    // voisins à reflet ; un pixel isolé ne s'allume plus à chaque calcul
+    if (known && count >= 4 && cur.a > 0)
+        cur = lerp(cur, mean, spatialMix);
 
     float4 result = cur;
     bool done = false;
