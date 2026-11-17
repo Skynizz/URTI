@@ -2008,3 +2008,17 @@ huit fois plus de bruit dans le feuillage de Red Dead (2,8 % des pixels au lieu 
 
 **Vérifié.** Horizon : deux lancements, course, deux Alt+Tab, pas de plantage ; 88 à 94 images par seconde à l'arrêt. Red Dead : marche, rotation, rafales, pas de
 plantage, 67 à 71 images par seconde, bruit inchangé (0,34 % des pixels). Installée dans les deux jeux.
+
+## v89 : scènes lourdes, relecture du cache du monde à une case
+
+Journal de la partie du joueur (v88) : à un endroit chargé, occultation et reflets au palier d'économie maximal en permanence, et quand même jusqu'à 14,5 et
+17,4 ms (142 images sur 300 au-dessus de 8 ms pour les reflets), 41 à 71 images par seconde. Deux causes : la relecture du cache du monde lisait les huit cases
+voisines (jusqu'à quarante lectures en mémoire par point, à chaque traversée de feuillage) ; le dernier palier ne descendait pas assez.
+
+Relecture à une seule case, à une position tirée au hasard dans un voisinage de la taille d'une case, nouvelle à chaque image (comme SHaRC de NVIDIA) : le lissage
+se fait par l'accumulation des reflets. Dernier palier : reflets un pixel sur quatre et sans saut de feuillage, occultation sans saut. Au bord de l'eau, même endroit,
+contre v88 : reflets stabilisés 1,2 -> 0,9 ms ; palier maximal forcé : reflets 0,55-0,9 -> 0,26-0,69 ms. Scintillement inchangé (à l'arrêt 0,0055-0,0071 contre
+0,0061-0,0069 ; en marchant 0,0155 contre 0,0160). Pas pu retourner à l'endroit lourd du joueur (la partie repart au feu de camp).
+
+Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead marche, rotation, rafales, 62 à 70 images par seconde, bruit inchangé (0,35 % des pixels).
+Installée dans les deux jeux.

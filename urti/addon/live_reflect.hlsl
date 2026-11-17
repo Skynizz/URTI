@@ -152,9 +152,17 @@ bool CachedGeo(uint inst, uint prim, uint tris, out float3 c)
 // couleur et part pleine d'un point touché que l'écran ne montre pas : ce que le cache de radiance du monde a vu là, sinon la couleur
 // apprise de son objet (plus grossière)
 // 0 : jamais vu ; 1 : couleur et part pleine ; 2 : que des trous à cet endroit (le rayon passe)
+static uint gRng = 1u;
+float Rand01()
+{
+    gRng = gRng * 747796405u + 2891336453u;
+    uint x = ((gRng >> ((gRng >> 28u) + 4u)) ^ gRng) * 277803737u;
+    return float((x >> 22u) ^ x) * (1.0 / 4294967296.0);
+}
+
 uint Remembered(float3 h, float path, uint inst, uint prim, uint contrib, out float3 c, out float alpha)
 {
-    const uint found = RadLookup(RadWorld(h), RadLevel(path), c, alpha);
+    const uint found = RadLookup(RadWorld(h), RadLevel(path), float3(Rand01(), Rand01(), Rand01()), c, alpha);
     if (found != 0)
         return found;
     float3 g;
@@ -437,6 +445,7 @@ void main(uint2 id : SV_DispatchThreadID)
             // (sa couleur est dans l'image), trou d'une plaque découpée (la caméra voit plus loin : le rayon continue), ou caché. Caché ou hors de
             // l'écran : la couleur et la part pleine que le cache du monde a retenues là ; le reste du rayon continue derrière. Rien touché : le ciel
             RadLoadParams();
+            gRng = (id.x * 1973u + id.y * 9277u) ^ ((budget >> 8) * 26699u) ^ 0x9E3779B9u;
             const float eyeDist = length(p);
             float3 acc = 0;
             float T = 1.0, share = 0, tOut = -1.0;

@@ -2728,7 +2728,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 regulate(live.aoLevel, aoNow, live.aoEma, live.aoTarget, live.aoCool);
                 regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool);
                 // (the reach of reflections never shrinks: without the far trees the water turned bright green; and occlusion is never limited to the very near)
-                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 2 }, kAoHops[5] = { 2, 2, 1, 1, 1 }, kRStride[5] = { 2, 2, 2, 2, 2 }, kRHops[5] = { 3, 3, 2, 2, 1 };
+                static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 2 }, kAoHops[5] = { 2, 2, 1, 1, 0 }, kRStride[5] = { 2, 2, 2, 2, 4 }, kRHops[5] = { 3, 3, 2, 1, 0 };
                 // (reflets : un pixel sur deux à tout niveau, l'autre garde son historique ; avec le cache du monde, un rayon plus court finit sur la carte du
                 // ciel et du lointain, plus sur l'eau verte du jeu : la portée peut baisser. Occultation : jamais un seul rayon (bruit), la portée baisse)
                 static const float kAoDist[5] = { 50.0f, 40.0f, 28.0f, 18.0f, 12.0f }, kRMaxRad[5] = { 500.0f, 300.0f, 200.0f, 140.0f, 90.0f };

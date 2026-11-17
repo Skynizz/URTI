@@ -81,9 +81,11 @@ bool RadRead(float3 world, uint level, out RadEntry e)
 }
 
 // couleur et part pleine retenues en ce point : à ce niveau, puis plus grossier (le point a été vu de plus loin), puis un cran plus fin.
-// Au niveau trouvé, mélange des huit cases qui entourent le point (pas de blocs dans le reflet).
+// Une seule case lue, à une position tirée au hasard dans un voisinage de la taille d'une case (jitter, de 0 à 1 par axe, nouveau à chaque image) :
+// le lissage entre cases se fait par l'accumulation dans le temps des reflets (comme SHaRC de NVIDIA). Lire les huit cases voisines coûtait jusqu'à
+// quarante lectures en mémoire par point, à chaque traversée de feuillage (17 ms de reflets dans les scènes chargées)
 // 0 : jamais vu (alpha vaut quand même si la part pleine est connue) ; 1 : couleur et part pleine ; 2 : que des trous ici (pas de couleur)
-uint RadLookup(float3 world, uint level, out float3 c, out float alpha)
+uint RadLookup(float3 world, uint level, float3 jitter, out float3 c, out float alpha)
 {
     static const int kTry[4] = { 0, 1, 2, -1 };
     bool haveAlpha = false;
@@ -93,33 +95,15 @@ uint RadLookup(float3 world, uint level, out float3 c, out float alpha)
         const int l = int(level) + kTry[k];
         if (l < 0 || l >= int(kRadLevels))
             continue;
+        const float size = gVoxel0 * exp2(float(l));
         RadEntry e;
-        if (!RadRead(world, uint(l), e))
+        if (!RadRead(world + (jitter - 0.5) * size, uint(l), e) && !RadRead(world, uint(l), e))
             continue;
         if (!haveAlpha && e.nA > 0)
             alpha = e.alpha, haveAlpha = true;
         if (e.nC > 0 && all(isfinite(e.c)))
         {
-            const float size = gVoxel0 * exp2(float(l));
-            const float3 q = world / size - 0.5;
-            const float3 b = floor(q), f = q - b;
-            float3 sc = 0;
-            float wc = 0, sa = 0, wa = 0;
-            for (uint j = 0; j < 8; j++)
-            {
-                const float3 o = float3(j & 1, (j >> 1) & 1, j >> 2);
-                const float w = (o.x > 0 ? f.x : 1 - f.x) * (o.y > 0 ? f.y : 1 - f.y) * (o.z > 0 ? f.z : 1 - f.z);
-                RadEntry n;
-                if (w < 0.02 || !RadRead((b + o + 0.5) * size, uint(l), n))
-                    continue;
-                if (n.nC > 0 && all(isfinite(n.c)))
-                    sc += n.c * w, wc += w;
-                if (n.nA > 0)
-                    sa += n.alpha * w, wa += w;
-            }
-            c = wc > 0 ? sc / wc : e.c;
-            if (wa > 0)
-                alpha = sa / wa;
+            c = e.c;
             return 1;
         }
         if (haveAlpha && alpha < 0.1)
