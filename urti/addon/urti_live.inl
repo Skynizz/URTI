@@ -90,6 +90,7 @@ struct LiveState
     LARGE_INTEGER lastPresentTime = {};
     double presentMs = 0;
     uint32_t suspectLeft = 0;
+    double presentDrawsAvg = 0;
     bool layerSuspect = false;
     uint32_t statSuspect = 0;
     uint64_t layerHudSerial = 0;   // numéro de la dernière copie de l'image sans interface au moment du dernier calcul
@@ -281,6 +282,7 @@ struct LiveState
     ComPtr<ID3D12Resource> denoiseLen[2]; // longueur d'historique par pixel (live_shadowtemporal), une image sur deux chacun
     uint32_t denoiseLenNext = 0;
     float reflSpatial = 0.5f; // urti.ini refl_spatial= : part de la moyenne des voisins dans le reflet courant (0 : ancienne règle)
+    bool reflCoherent = true; // urti.ini refl_coherent=0 : reflets aussi sur les pixels lisses isolés (ancienne règle)
     float reflSoft = 1.0f;    // urti.ini refl_soft= : rayon (pixels) de la zone où la couleur reflétée est lue (0 : un point, ancienne règle)
     bool denoiseLenOn = true; // urti.ini denoise_len=0 : ancienne règle (pas de longueur d'historique)
     bool reflFull = false; // urti.ini refl_full=1 : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
@@ -1118,7 +1120,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1155,7 +1157,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1176,6 +1178,7 @@ void LiveHotReload(ID3D12Device* device)
             live.denoiseLenOn = denoiseLenIni != 0;
             live.reflSoft = std::clamp(reflSoftIni, 0.0f, 4.0f);
             live.reflSpatial = std::clamp(reflSpatialIni, 0.0f, 1.0f);
+            live.reflCoherent = reflCoherentIni != 0;
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -1852,7 +1855,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     live.presentComputed = true;
     {
         // calcul de rattrapage (juste après un à-coup du jeu : plusieurs images complètes en attente) : son calque n'est pas montré (file d'attente des calques)
-        live.layerSuspect = live.suspectLeft > 0;
+        // calcul dont l'image n'a presque aucun dessin du jeu exécuté avant cette présentation (moins d'un dixième de d'habitude : les listes du jeu sont
+        // passées dans la fenêtre d'avant) : son calque différait des autres (reflet en partie absent) et s'affichait le temps d'une présentation
+        const double pd = double(live.lastPresentDraws);
+        const bool starved = live.presentDrawsAvg > 200.0 && pd < 0.1 * live.presentDrawsAvg;
+        if (!starved)
+            live.presentDrawsAvg = live.presentDrawsAvg > 0 ? live.presentDrawsAvg + (pd - live.presentDrawsAvg) * 0.05 : pd;
+        live.layerSuspect = live.suspectLeft > 0 || starved;
         if (live.suspectLeft > 0)
             live.suspectLeft--;
         live.statSuspect += live.layerSuspect ? 1u : 0u;
@@ -4279,7 +4288,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
                      (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u) |
                          (live.transpBuilt ? 256u : 0u) | (live.reflectDiag ? 256u << live.reflectDiag : 0u) | (trueCam && live.worldUpKnown && live.reflectUp ? 8192u : 0u) | (geoColorsRead ? 16384u : 0u) | (live.slowRays ? 32768u : 0u) |
-                         (trueCam && live.worldUpKnown && live.reflectUp && live.waterOnly ? 65536u : 0u) | (reflStatsNow ? 131072u : 0u) | (radNow ? 262144u : 0u), live.f0, live.width * 16,
+                         (trueCam && live.worldUpKnown && live.reflectUp && live.waterOnly ? 65536u : 0u) | (reflStatsNow ? 131072u : 0u) | (radNow ? 262144u : 0u) | (live.reflCoherent ? 524288u : 0u), live.f0, live.width * 16,
                      uint32_t(tableNow.size()), live.anchorAlpha > 0 && live.viewPrev && live.prevValid && !radNow ? 1u : 0u, uint32_t(live.capacity),
                      surfRead ? uint32_t(live.surfTriangles) : 0u, { live.worldUp[0], live.worldUp[1], live.worldUp[2] },
                      live.reflStrideNow | (live.reflHopsNow << 4) | (uint32_t(live.frame) << 8), live.reflTMaxNow };

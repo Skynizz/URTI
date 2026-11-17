@@ -374,6 +374,21 @@ void main(uint2 id : SV_DispatchThreadID)
             material = 0;
     }
     const float s = water ? 1.0 : max(material * ((flags & 4) || material > 0.98 ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
+    // (flags 524288) surface lisse étendue seulement : au moins 5 de ses 8 voisins à 2 pixels lisses aussi et sur la même surface. Un rail, un bord de pavé, une
+    // arête lisse isolée recevait un reflet dont la direction (tirée de la profondeur) changeait à chaque image : traits qui s'allumaient et s'éteignaient
+    if ((flags & 524288) && !water && (flags & 4) == 0 && wet <= 0 && s >= sMin && p.z > 0)
+    {
+        uint ok = 0;
+        for (uint j = 0; j < 8; j++)
+        {
+            static const int2 kRing[8] = { int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2), int2(2, 2), int2(-2, 2), int2(2, -2), int2(-2, -2) };
+            const int2 o = int2(id) + kRing[j];
+            const float3 q = PointAt(o);
+            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= sMin)
+                ok++;
+        }
+        waterFade *= saturate((float(ok) - 4.0) / 3.0);
+    }
     float4 result = float4(0, 0, 0, (flags & 16) ? s : 0.0);
     float4 mixResult = float4(0, 0, 0, 1);
     const bool useRad = (flags & 262144) != 0 && (flags & 24) == 0;

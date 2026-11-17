@@ -2022,3 +2022,18 @@ contre v88 : reflets stabilisés 1,2 -> 0,9 ms ; palier maximal forcé : reflets
 
 Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead marche, rotation, rafales, 62 à 70 images par seconde, bruit inchangé (0,35 % des pixels).
 Installée dans les deux jeux.
+
+## v90 : traits qui scintillent dans les rues de Red Dead, calques d'images presque vides
+
+**Red Dead, « traits » en ville.** Rafales à l'arrêt sur le balcon de Saint-Denis, chaque effet coupé à tour de rôle : pixels qui scintillent (plus de 3 niveaux
+d'une image à l'autre, en plus du jeu) 0,46 % tout actif, 0,11 % sans les reflets, 0,38 % sans le rebond, 0,38 % sans l'occultation. Les reflets en font l'essentiel,
+et la carte montre des traits en diagonale dans la rue : rails du tram, bords de pavés, trottoirs. Un pixel lisse isolé recevait un reflet dont la direction, tirée de
+la profondeur (pas de caméra du jeu dans Red Dead), changeait à chaque image. Reflet maintenant seulement sur une surface lisse étendue : au moins 5 des 8 voisins à
+2 pixels lisses aussi et sur la même surface (`refl_coherent=0` : ancienne règle). Même endroit, deux fois chacun : 0,19-0,20 % -> 0,06 %.
+
+**Horizon, flashs restants.** Un film à l'arrêt montrait encore deux sauts forts (0,10-0,12) : un calcul dont l'image n'avait que 13 dessins du jeu exécutés avant
+la présentation (d'habitude 3 800 ; les listes du jeu étaient passées dans la fenêtre d'avant), sans à-coup assez long pour la règle de v88. Un calcul avec moins
+d'un dixième des dessins habituels n'est plus rangé dans la file d'attente des calques. Seize films à l'arrêt : plus aucun saut au-dessus de 0,06 ; trois petits
+(0,05-0,06, couche 7 niveaux au lieu de 15 à 28).
+
+Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead marche, rotation, rafales, 67 à 72 images par seconde. Installée dans les deux jeux.
