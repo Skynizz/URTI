@@ -2037,3 +2037,20 @@ d'un dixième des dessins habituels n'est plus rangé dans la file d'attente des
 (0,05-0,06, couche 7 niveaux au lieu de 15 à 28).
 
 Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead marche, rotation, rafales, 67 à 72 images par seconde. Installée dans les deux jeux.
+
+## v91 : reflets qui tremblent, régulateur du budget qui suivait les pics
+
+Retour de l'utilisateur : « énormément de bruit sur les textures, scintillement sur les endroits fins, les reflets tremblent ; ça bug beaucoup sur Horizon ».
+
+**Qui fait le bruit dans Horizon.** Même aller-retour au bord de l'eau, chaque effet coupé (excédent ꟻLIP moyen, à l'arrêt / en marchant) : tout 0,0091 / 0,0180 ;
+sans occultation ni rebond 0,0104 / 0,0230 ; sans rebond 0,0093 / 0,0191 ; sans reflets 0,0057 / 0,0120 ; occultation sans l'herbe 0,0082 / 0,0180. Les reflets.
+
+**Reflets.** À l'arrêt, deux fois chacun : base 0,0069 et 0,0059 ; 10 % de neuf par image (au lieu de 25) 0,0045 et 0,0053 ; un rayon par pixel 0,0044 ; les deux
+0,0040. En marchant, pas de différence (0,010-0,011). Gardés les deux (`refl_alpha_min` 0,1, `refl_full=1` : un pixel sur deux seulement quand le budget le demande).
+Coût des reflets au bord de l'eau 2,4 -> jusqu'à 3,5 ms (le budget s'en charge).
+
+**Régulateur.** Journal du joueur : pics d'« occultation » de 25 à 50 ms (le jeu prend la file au même moment), un pic montait le palier de deux, la qualité ne
+revenait qu'un palier toutes les 40 images : occultation au palier 2 à 3,7 en moyenne, donc moins de rayons et de portée, plus de bruit. Décision maintenant sur la
+médiane des 9 dernières images (montée d'un palier si elle dépasse la cible de 25 %, retour si elle est sous 65 %, toutes les 30 images).
+
+Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead rafales, 67 à 70 images par seconde, bruit 0,10 % des pixels. Installée dans les deux jeux.

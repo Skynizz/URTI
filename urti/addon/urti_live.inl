@@ -276,6 +276,8 @@ struct LiveState
     uint32_t waterBaseW = 0, waterBaseH = 0;
     uint64_t waterBaseFrame = ~0ull;
     double aoEma = 0, reflEma = 0, statAoMax = 0, statReflMax = 0;
+    double aoHist[9] = {}, reflHist9[9] = {};
+    uint32_t aoHistN = 0, reflHistN = 0;
     uint32_t statAoSpikes = 0, statReflSpikes = 0, statAoLevelSum = 0, statReflLevelSum = 0;
     float aoDistNow = 50.0f, reflTMaxNow = 500.0f;
     uint32_t reflStrideNow = 2, reflHopsNow = 3, aoHopsNow = 2;
@@ -285,7 +287,7 @@ struct LiveState
     bool reflCoherent = true; // urti.ini refl_coherent=0 : reflets aussi sur les pixels lisses isolés (ancienne règle)
     float reflSoft = 1.0f;    // urti.ini refl_soft= : rayon (pixels) de la zone où la couleur reflétée est lue (0 : un point, ancienne règle)
     bool denoiseLenOn = true; // urti.ini denoise_len=0 : ancienne règle (pas de longueur d'historique)
-    bool reflFull = false; // urti.ini refl_full=1 : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
+    bool reflFull = true;  // urti.ini refl_full=0 : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
     bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
     bool reflStatsOn = false;  // urti.ini reflect_stats=1 : pixels à reflet et rayons comptés
     ComPtr<ID3D12Resource> reflStats, reflStatsRb[3];
@@ -1116,11 +1118,11 @@ void LiveHotReload(ID3D12Device* device)
             // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
-            float reflAlphaMin = 0.25f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 4.0f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
+            float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 0.8f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 4.0f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 0, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -2720,8 +2722,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.shadowMs = aoNow;
                 live.statAoMax = std::max(live.statAoMax, aoNow), live.statReflMax = std::max(live.statReflMax, reflNow);
                 live.statAoSpikes += aoNow > 12.0 ? 1u : 0u, live.statReflSpikes += reflNow > 8.0 ? 1u : 0u;
-                auto regulate = [](int& level, double now, double& ema, float target, uint32_t& cool) {
+                // décision sur la médiane des 9 dernières images : un pic isolé (souvent le jeu lui-même, qui prend la file au même moment : 25 à 50 ms
+                // d'« occultation » relevés dans la partie du joueur) faisait monter de deux paliers, et la qualité ne revenait qu'un palier toutes les 40
+                // images : en permanence au plus bas, l'image la plus bruitée
+                auto regulate = [](int& level, double now, double& ema, float target, uint32_t& cool, double* hist, uint32_t& n) {
                     ema += (now - ema) * 0.25;
+                    hist[n++ % 9] = now;
                     if (cool)
                         cool--;
                     if (target <= 0)
@@ -2729,13 +2735,18 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                         level = 0;
                         return;
                     }
-                    if (cool == 0 && (now > target * 2.5 || ema > target * 1.3))
-                        level = std::min(4, level + (now > target * 2.5 ? 2 : 1)), cool = 4; // (le résultat se lit trois images plus tard)
-                    else if (cool == 0 && level > 0 && ema < target * 0.6)
-                        level--, cool = 40;
+                    const uint32_t m = std::min<uint32_t>(n, 9);
+                    double s[9];
+                    std::copy(hist, hist + m, s);
+                    std::nth_element(s, s + m / 2, s + m);
+                    const double med = s[m / 2];
+                    if (cool == 0 && med > target * 1.25)
+                        level = std::min(4, level + 1), cool = 6; // (le résultat se lit trois images plus tard)
+                    else if (cool == 0 && level > 0 && med < target * 0.65)
+                        level--, cool = 30;
                 };
-                regulate(live.aoLevel, aoNow, live.aoEma, live.aoTarget, live.aoCool);
-                regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool);
+                regulate(live.aoLevel, aoNow, live.aoEma, live.aoTarget, live.aoCool, live.aoHist, live.aoHistN);
+                regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool, live.reflHist9, live.reflHistN);
                 // (the reach of reflections never shrinks: without the far trees the water turned bright green; and occlusion is never limited to the very near)
                 static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 2 }, kAoHops[5] = { 2, 2, 1, 1, 0 }, kRStride[5] = { 2, 2, 2, 2, 4 }, kRHops[5] = { 3, 3, 2, 1, 0 };
                 // (reflets : un pixel sur deux à tout niveau, l'autre garde son historique ; avec le cache du monde, un rayon plus court finit sur la carte du
