@@ -85,6 +85,10 @@ bool g_liveCapture = false;
 std::atomic<uint32_t> g_presentDraws{ 0 }; // dessins du jeu depuis la dernière présentation (0 : image générée)
 // dessins exécutés par la file du jeu : écrits dans la même fenêtre de présentation, ou dans une précédente
 std::atomic<uint64_t> g_presentIndex{ 0 };
+// coût de la capture (journal) : temps processeur dans CaptureDraw (unités QueryPerformanceCounter), dessins vus, dessins rejoués et leurs sommets
+// (dont la zone de mesure)
+std::atomic<uint64_t> g_capTicks{ 0 }, g_capCalls{ 0 }, g_capReplayed{ 0 }, g_capReplayVerts{ 0 }, g_capProbeReplayed{ 0 }, g_capProbeVerts{ 0 };
+std::atomic<uint64_t> g_capSunVerts{ 0 }, g_capTranspVerts{ 0 }, g_capMainVerts{ 0 }, g_capOtherVerts{ 0 }; // sommets rejoués : carte du soleil, surfaces transparentes, écran principal (hors mesure), autres écrans
 std::atomic<uint32_t> g_execOnTime{ 0 }, g_execLate{ 0 }, g_execLists{ 0 }, g_execLateLists{ 0 };
 std::atomic<uint32_t> g_presentExecDraws{ 0 }; // dessins exécutés depuis la dernière présentation (0 : image générée)
 // diagnostic de la génération d'images : par file, présentations et présentations précédées de dessins exécutés ;
@@ -309,6 +313,7 @@ uint64_t g_liveSunDepth = 0; // profondeur de la carte d'ombres du soleil (trouv
 uint32_t g_liveSunMapDesc[3] = {}; // largeur, hauteur, format de cette carte (étalonnage stocké)
 
 uint32_t g_liveSunMarked = 0;
+bool g_liveSunEighth = false; // ombres du soleil coupées : carte du soleil captée par huitièmes
 constexpr uint32_t kLiveMaxSunMarks = 1024, kLiveMaxMarks = 4096;
 bool g_liveShowMask = false;     // urti.ini show_mask=1 : l'effet montre les ombres RT seules      // le mode direct capte la profondeur de l'écran à chaque image
 
@@ -965,7 +970,19 @@ int SlotFor(uint64_t depth)
 }
 
 // rejoue le dessin avec le pipeline ombre ; le dessin du jeu a lieu ensuite, inchangé
+void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t (&params)[5], const std::function<void(ID3D12GraphicsCommandList*)>& issue);
+
 void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t (&params)[5], const std::function<void(ID3D12GraphicsCommandList*)>& issue)
+{
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    CaptureDrawImpl(list, kind, params, issue);
+    QueryPerformanceCounter(&t1);
+    g_capTicks.fetch_add(uint64_t(t1.QuadPart - t0.QuadPart), std::memory_order_relaxed);
+    g_capCalls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t (&params)[5], const std::function<void(ID3D12GraphicsCommandList*)>& issue)
 {
     g.frameDraws++;
     CommandListState state;
@@ -1056,12 +1073,16 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         // mode direct : tout le flux de l'écran (structure d'accélération) ; de la carte d'ombres du
         // soleil, seulement des dessins marqués ; à l'écran, marqués ceux qui ont un pendant dans la carte
         const bool screen = noDepth || g.screenLike[state.depth] == 1;
-        const bool sunMap = g_liveSunDepth && state.depth == g_liveSunDepth;
+        bool sunMap = g_liveSunDepth && state.depth == g_liveSunDepth;
         if (!screen && !sunMap)
             return;
         uint64_t key = kind * 1000003ull;
         for (uint32_t p : params)
             key = key * 1315423911ull + p;
+        // ombres du soleil coupées (Horizon : occultation seule) : la carte du soleil ne sert qu'à mesurer la direction du soleil, qui change lentement ;
+        // un huitième de ses dessins à chaque image, à tour de rôle (elle faisait 70 % des sommets rejoués : 1 million par présentation)
+        if (sunMap && !screen && g_liveSunEighth && ((key * 0x9E3779B97F4A7C15ull) >> 61) != (g_liveWindow & 7))
+            return;
         // taille de la zone : sommets connus du dessin (listes de triangles) ; indirect : budget fixe
         // arrondie à trois sommets : la structure d'accélération forme les triangles par triplets depuis le
         // début du flux ; une zone d'un autre multiple décalerait toutes les suivantes (triangles géants
@@ -1213,6 +1234,11 @@ void CaptureDraw(ID3D12GraphicsCommandList* list, uint32_t kind, const uint32_t 
         const D3D12_STREAM_OUTPUT_BUFFER_VIEW none = {};
         list->SOSetTargets(0, 1, &none);
         list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pipeline));
+        g_capReplayed.fetch_add(1, std::memory_order_relaxed), g_capReplayVerts.fetch_add(pend.vertices, std::memory_order_relaxed);
+        if (pend.probe)
+            g_capProbeReplayed.fetch_add(1, std::memory_order_relaxed), g_capProbeVerts.fetch_add(pend.vertices, std::memory_order_relaxed);
+        else
+            (pend.sunMap ? g_capSunVerts : pend.transp ? g_capTranspVerts : pend.mainScreen ? g_capMainVerts : g_capOtherVerts).fetch_add(pend.vertices, std::memory_order_relaxed);
         return;
     }
     const uint32_t index = g.drawCount++;
@@ -2093,19 +2119,31 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
         static LARGE_INTEGER last = {}, freq = {};
         static double sum = 0;
         static uint32_t count = 0;
+        static double gaps[300];
         static bool lastState = false;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         if (!freq.QuadPart)
             QueryPerformanceFrequency(&freq);
         if (last.QuadPart && lastState == live.enabled)
-            sum += double(now.QuadPart - last.QuadPart) / freq.QuadPart, count++;
+            gaps[count] = double(now.QuadPart - last.QuadPart) / freq.QuadPart, sum += gaps[count], count++;
         else
             sum = 0, count = 0;
         last = now, lastState = live.enabled;
         if (count == 300)
         {
             Log("URTI : %.1f images par seconde (ombres RT %s)", count / sum, live.enabled ? "actives" : "coupées");
+            // temps entre présentations : médiane et pics (P95, P99), et coût de la capture sur ces 300 présentations
+            std::sort(gaps, gaps + count);
+            const double tick = 1000.0 / double(freq.QuadPart);
+            Log("URTI : présentations en ms : médiane %.2f, P95 %.2f, P99 %.2f, pire %.2f ; capture : %.2f ms de processeur par présentation, %.0f dessins vus, "
+                "%.0f rejoués (%.0f k sommets), dont zone de mesure %.0f (%.0f k sommets)",
+                gaps[count / 2] * 1000.0, gaps[count * 95 / 100] * 1000.0, gaps[count * 99 / 100] * 1000.0, gaps[count - 1] * 1000.0,
+                double(g_capTicks.exchange(0)) * tick / count, double(g_capCalls.exchange(0)) / count, double(g_capReplayed.exchange(0)) / count,
+                double(g_capReplayVerts.exchange(0)) / count / 1000.0, double(g_capProbeReplayed.exchange(0)) / count, double(g_capProbeVerts.exchange(0)) / count / 1000.0);
+            Log("URTI : sommets rejoués par présentation (k) : écran principal %.0f, carte du soleil %.0f, transparents %.0f, autres écrans %.0f",
+                double(g_capMainVerts.exchange(0)) / count / 1000.0, double(g_capSunVerts.exchange(0)) / count / 1000.0, double(g_capTranspVerts.exchange(0)) / count / 1000.0,
+                double(g_capOtherVerts.exchange(0)) / count / 1000.0);
             sum = 0, count = 0;
         }
     }

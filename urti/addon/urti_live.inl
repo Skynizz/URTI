@@ -287,7 +287,9 @@ struct LiveState
     bool reflCoherent = true; // urti.ini refl_coherent=0 : reflets aussi sur les pixels lisses isolés (ancienne règle)
     float reflSoft = 1.0f;    // urti.ini refl_soft= : rayon (pixels) de la zone où la couleur reflétée est lue (0 : un point, ancienne règle)
     bool denoiseLenOn = true; // urti.ini denoise_len=0 : ancienne règle (pas de longueur d'historique)
-    bool reflFull = true;  // urti.ini refl_full=0 : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
+    bool reflFull = true;  // urti.ini refl_full=0
+    bool sunEighth = false; // urti.ini sun_eighth=1 : carte du soleil captée par huitièmes quand les ombres du soleil sont coupées (essai : 1,4 -> 0,6 M sommets rejoués, gain non mesurable)
+    uint64_t geoProbe = 2000000; // urti.ini geo_probe= : plafond par image de la zone de mesure quand le cache de géométrie est actif (sommets rejoués) : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
     bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
     bool reflStatsOn = false;  // urti.ini reflect_stats=1 : pixels à reflet et rayons comptés
     ComPtr<ID3D12Resource> reflStats, reflStatsRb[3];
@@ -1122,7 +1124,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1159,7 +1161,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1181,6 +1183,8 @@ void LiveHotReload(ID3D12Device* device)
             live.reflSoft = std::clamp(reflSoftIni, 0.0f, 4.0f);
             live.reflSpatial = std::clamp(reflSpatialIni, 0.0f, 1.0f);
             live.reflCoherent = reflCoherentIni != 0;
+            live.geoProbe = uint64_t(std::clamp(geoProbeIni, 0.0f, 8000000.0f));
+            live.sunEighth = sunEighthIni != 0;
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -2128,6 +2132,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             g_livePrevSunKeys.swap(g_liveSunKeys);
         g_liveSunKeys.clear();
         g_liveSunMarked = 0;
+        g_liveSunEighth = !live.sunShadows && live.sunEighth;
     }
     // compteurs remis à zéro dans la liste de cette image (avant toute liste écrite dans la fenêtre suivante) : ceux
     // des emplacements (étalonnage) et ceux de la partie du flux de la fenêtre suivante, après leur dernière lecture
@@ -2345,7 +2350,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         g_liveBudget = live.vertexBudget > 0;
         // (cache de géométrie : la limite par image a été respectée au choix ; ici, seulement une limite dure, les dessins
         // d'un maillage énorme n'ont pas tous la même taille)
-        g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.geoOn ? std::max<uint64_t>(live.probeBudget, kLiveGeoFrameVerts) : live.probeBudget;
+        g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.geoOn ? std::max<uint64_t>(live.probeBudget, live.geoProbe) : live.probeBudget;
         g_liveSlotLimit = live.slotLimit;
         g_liveMainDepth = slot >= 0 ? g.slotDepth[slot] : 0;
         g_liveMainSlotIndex = slot;

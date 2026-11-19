@@ -2054,3 +2054,23 @@ revenait qu'un palier toutes les 40 images : occultation au palier 2 à 3,7 en m
 médiane des 9 dernières images (montée d'un palier si elle dépasse la cible de 25 %, retour si elle est sous 65 %, toutes les 30 images).
 
 Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead rafales, 67 à 70 images par seconde, bruit 0,10 % des pixels. Installée dans les deux jeux.
+
+## v92 : où part le coût fixe (mesures), compteurs au journal
+
+Nouvelles lignes du journal toutes les 300 présentations : durée des présentations (médiane, P95, P99, pire), temps processeur passé à intercepter les dessins,
+dessins et sommets rejoués par sorte (écran principal, carte du soleil, transparents, autres écrans, zone de mesure).
+
+**Horizon, au bord de l'eau, à l'arrêt** (durée médiane d'une présentation) : URTI coupé 7,5 ms (131 images par seconde) ; URTI sans effets, presque rien rejoué
+9,2-9,3 ms (108) ; sans effets 10,1-10,5 ms (98-101) ; tout actif 13,0-14,3 ms (74-80).
+
+- Interception des dessins : 3,2 à 4,5 ms de processeur par présentation (~2 µs par dessin, ~2 000 dessins). Supprimer le verrou global des événements de
+  liaison (état de chaque liste lu sans verrou) n'a rien changé : ni le temps de capture ni les images par seconde. Retiré.
+- Sommets rejoués : 1,4 million par présentation, dont 1 million pour la carte du soleil, inutile dans Horizon (ombres du soleil coupées, et direction du soleil
+  mesurée sur 0 % des images). Rejouée par huitièmes (`sun_eighth=1`) : 0,6 million, gain dans le bruit de mesure (± 3 images par seconde). Laissé coupé par défaut.
+- Le coût fixe s'explique par le travail GPU chronométré : par image du jeu, scène de l'image ~2 ms, passe d'ombres et débruiteur ~1,2 ms (même occultation
+  coupée), composition ~0,45 ms par présentation, structure 0,6 ms : ~5,2 ms, l'écart mesuré (98 contre 131 images par seconde).
+- Scène de l'image : 822 000 sommets -> 2,0 ms ; budget 250 000 -> 533 000 sommets, 1,56 ms, ~80 images par seconde ; budget 120 000 -> 241 000 sommets, 1,30 ms mais
+  66 images par seconde (occultation et composition plus chères) ; mise à jour au lieu de reconstruction : la scène change presque à chaque image, gain nul. Environ
+  1,1 ms de la reconstruction ne dépend pas de la taille.
+
+Red Dead : 70 à 71 images par seconde, 3 800 dessins vus par présentation, 5,1 ms de processeur à les intercepter, 1,55 million de sommets rejoués (écran principal).
