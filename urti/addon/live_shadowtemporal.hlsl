@@ -34,6 +34,7 @@ cbuffer Constants : register(b0)
                            // bit 11 : longueur d'historique disponible (sinon l'ancienne règle)
     float p00;             // projection supposée (décalage sous-pixel en pixels)
     float p11;
+    float farSkip;         // occultation seule : au-delà de cette distance (portée de l'occultation), rien à débruiter (0 : pas de saut)
 };
 
 // décalage sous-pixel du jeu (jitter, DLSS / TAA), mesuré par live_sunvote dans l'espace caméra d'URTI
@@ -78,6 +79,15 @@ void main(uint2 id : SV_DispatchThreadID)
         center[c] = c < planes ? Raw(t, c) : 0.0, outValue[c] = center[c];
     float lenNew = 1.0;
     const float w = law.z > 0 ? ViewDepth(depth, t) : -1;
+    // au-delà de la portée de l'occultation : la passe des rayons y écrit « rien » (1, rebond 0) ; rien à filtrer ni à accumuler
+    if (w > 0 && farSkip > 0 && w > farSkip && (blurRadius & 255) == 2 && debugMode == 0)
+    {
+        for (uint c = 0; c < planes; c++)
+            result.Store(c * gPlane + id.y * shadowPitch + id.x * 4, asuint(unknown));
+        if (lenOn && (blurRadius & 1024) == 0)
+            lenOut.Store(id.y * shadowPitch + id.x * 4, asuint(1.0));
+        return;
+    }
     if (w > 0)
     {
         // 1. historique reprojeté (avant le flou : sa longueur décide de la largeur du flou)

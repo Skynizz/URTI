@@ -288,6 +288,7 @@ struct LiveState
     float reflSoft = 1.0f;    // urti.ini refl_soft= : rayon (pixels) de la zone où la couleur reflétée est lue (0 : un point, ancienne règle)
     bool denoiseLenOn = true; // urti.ini denoise_len=0 : ancienne règle (pas de longueur d'historique)
     bool reflFull = true;  // urti.ini refl_full=0
+    bool denoiseFarSkip = true; // urti.ini denoise_far=0 : débruiteur sur tous les pixels (ancienne règle)
     bool sunEighth = false; // urti.ini sun_eighth=1 : carte du soleil captée par huitièmes quand les ombres du soleil sont coupées (essai : 1,4 -> 0,6 M sommets rejoués, gain non mesurable)
     uint64_t geoProbe = 2000000; // urti.ini geo_probe= : plafond par image de la zone de mesure quand le cache de géométrie est actif (sommets rejoués) : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
     bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
@@ -904,7 +905,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
            make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 30, 3) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
-           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 7, live.denoiseRs, live.denoisePso, 14, 2) &&
+           make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 7, live.denoiseRs, live.denoisePso, 15, 2) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
            make(g_live_sunvote, sizeof(g_live_sunvote), 1, live.voteRs, live.votePso, 8) &&
            make(g_live_composite, sizeof(g_live_composite), 15, live.compositeRs, live.compositePso, 29, 2) &&
@@ -1124,7 +1125,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1161,7 +1162,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1185,6 +1186,7 @@ void LiveHotReload(ID3D12Device* device)
             live.reflCoherent = reflCoherentIni != 0;
             live.geoProbe = uint64_t(std::clamp(geoProbeIni, 0.0f, 8000000.0f));
             live.sunEighth = sunEighthIni != 0;
+            live.denoiseFarSkip = denoiseFarIni != 0;
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -4041,14 +4043,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             uint32_t width, height, depthPitch, shadowPitch, motionPitch, motionConvention, depth24, debugMode;
             float alphaMin, alphaMax, gamma;
             uint32_t blurRadius;
-            float p00, p11;
+            float p00, p11, farSkip;
         } dn = { live.width, live.height, live.depthPitch, live.shadowPitch, live.mvPitch,
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
                  // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
                  // accumulées et un bornage plus large (moins de grain qui tremble)
                  live.sunShadows ? 0.1f : 0.06f, live.sunShadows ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
-                 live.p00, live.p11 };
-        list->SetComputeRoot32BitConstants(9, 14, &dn, 0);
+                 live.p00, live.p11, live.sunShadows || !live.denoiseFarSkip ? 0.0f : live.aoDistNow * 1.02f + 0.5f };
+        list->SetComputeRoot32BitConstants(9, 15, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
         Transition(list.Get(), live.shadowRawBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (giNow && !nrdActive)
@@ -4063,7 +4065,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             gn.motionConvention = motionOk && live.giValid ? live.mvConvention : 255u;
             gn.debugMode = 0;
             gn.blurRadius = 2u | 256u | 512u | (lenNow ? 2048u | 1024u : 0u); // 5×5, jamais calculé -> 0, trois plans ; longueur lue (la même que l'occultation), pas écrite
-            list->SetComputeRoot32BitConstants(9, 14, &gn, 0);
+            list->SetComputeRoot32BitConstants(9, 15, &gn, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.giRaw.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (live.giValid)

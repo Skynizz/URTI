@@ -2074,3 +2074,16 @@ dessins et sommets rejoués par sorte (écran principal, carte du soleil, transp
   1,1 ms de la reconstruction ne dépend pas de la taille.
 
 Red Dead : 70 à 71 images par seconde, 3 800 dessins vus par présentation, 5,1 ms de processeur à les intercepter, 1,55 million de sommets rejoués (écran principal).
+
+## v93 : débruiteur hors de portée sauté ; deux pistes fermées
+
+- Débruiteur de l'occultation et du rebond : les pixels au-delà de la portée de l'occultation (la passe des rayons y écrit « rien ») ne sont plus filtrés
+  (`denoise_far=0` : ancienne règle). 1,18-1,26 -> 0,94-1,05 ms par image du jeu, image inchangée.
+- Essayé et retiré : sommets inutilisés de la scène de l'image marqués inactifs (NaN) au lieu de triangles plats. Reconstruction 2,1 -> 1,9 ms, mais rayons un peu
+  plus lents (occultation 1,54 -> 1,64-1,80 ms, reflets 2,36 -> 2,67-2,95) : rien de gagné.
+
+Bilan du coût d'URTI dans Horizon (tout actif, par image du jeu, ~10,5 ms, deux présentations par image avec DLSS-G) : scène de l'image ~2 ms, occultation ~1,5 ms,
+débruiteur ~1 ms, reflets 2,3-2,7 ms, composition et reflets stabilisés ~2,1 ms, structure 0,65 ms. Pas de gros gaspillage isolé : la suite passe par moins de
+travail par image (effets calculés à tour de rôle) plutôt que par des économies de 0,2 ms.
+
+Vérifié : Horizon deux lancements, deux Alt+Tab ; Red Dead 71 images par seconde, bruit 0,17 % des pixels. Installée dans les deux jeux.
