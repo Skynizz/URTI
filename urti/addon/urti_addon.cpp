@@ -314,6 +314,7 @@ uint32_t g_liveSunMapDesc[3] = {}; // largeur, hauteur, format de cette carte (�
 
 uint32_t g_liveSunMarked = 0;
 bool g_liveSunEighth = false; // ombres du soleil coupées : carte du soleil captée par huitièmes
+bool g_liveSunUnused = false; // ni ombres du soleil, ni occultation, ni rebond (menu) : la carte du soleil n'est plus rejouée, le soleil plus cherché
 constexpr uint32_t kLiveMaxSunMarks = 1024, kLiveMaxMarks = 4096;
 bool g_liveShowMask = false;     // urti.ini show_mask=1 : l'effet montre les ombres RT seules      // le mode direct capte la profondeur de l'écran à chaque image
 
@@ -1073,7 +1074,7 @@ void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint3
         // mode direct : tout le flux de l'écran (structure d'accélération) ; de la carte d'ombres du
         // soleil, seulement des dessins marqués ; à l'écran, marqués ceux qui ont un pendant dans la carte
         const bool screen = noDepth || g.screenLike[state.depth] == 1;
-        bool sunMap = g_liveSunDepth && state.depth == g_liveSunDepth;
+        bool sunMap = g_liveSunDepth && state.depth == g_liveSunDepth && !g_liveSunUnused;
         if (!screen && !sunMap)
             return;
         uint64_t key = kind * 1000003ull;
@@ -2285,7 +2286,7 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     // (seulement en partie : une scène RT d'au moins 20 dessins calculée il y a moins de 2 secondes. Au menu, une recherche toutes les 120 images
     // ne trouvait jamais d'écran, recommençait sans fin et menait Red Dead à « mémoire saturée »)
     const bool inGame = live.sceneStamp != ~0ull && live.frame < live.sceneStamp + 120 && live.sceneCount >= 20;
-    const bool sunLost = g_camCbvSize == 0 && live.framesSinceSun >= 300 && inGame;
+    const bool sunLost = g_camCbvSize == 0 && live.framesSinceSun >= 300 && inGame && !g_liveSunUnused;
     const bool calibrationUseful = live.sunShadows || !live.depthReady || sunLost;
     if (live.enabled && g.phase == Phase::Idle && g.nextCapture == ~0ull &&
         (live.forceCalibration || ((!live.calibrated || sunLost) && calibrationUseful && g.frame >= live.nextCalibration)))

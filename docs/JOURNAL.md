@@ -2144,3 +2144,12 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   profondeur reste proche (sol, murs, troncs, rochers, personnages) ; branches, brindilles, bords de feuillage écartés.
 - Mesures (Red Dead, rafales) : 14-19 % des pixels assombris de plus de 5 %, 4,5-6,2 % de plus de 15 % (v95 au même endroit : 8,4 / 1,8 %) ;
   scintillement ajouté 0,01-0,16 % à l'arrêt, 0,01 % en tournant. Passe d'occultation 2,7 ms.
+
+## v98 : occultation et rebond décochés par défaut, carte du soleil plus rejouée sans emploi
+
+- Verdict du joueur sur la v97 : l'occultation laisse des **traînées partout** (son accumulation dans le temps ne suit pas le mouvement), le résultat
+  « vraiment pas ouf » ; seuls les reflets sont bons. Les rafales mesuraient le scintillement, pas ces traînées en mouvement : le chiffre ne les voyait pas.
+- Cases « Occultation » et « Rebond » décochées par défaut dans urti.fx et dans les préréglages des deux jeux (copies `ReShadePreset.ini.avant_v98`).
+- Sans occultation, sans rebond et sans ombres du soleil, **la carte du soleil n'est plus rejouée** et le soleil plus cherché (il revient dès qu'une case
+  est recochée) : Red Dead 3,8 -> 1,7 millions de sommets rejoués par présentation, capture 5,9 -> 4,8 ms de processeur ; passe d'ombres 0,3 ms.
+- Horizon : scintillement ajouté 0,34 -> 0,05 % des pixels (l'occultation en était aussi la source), 66 images par seconde.
