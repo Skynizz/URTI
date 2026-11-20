@@ -53,6 +53,8 @@ cbuffer Constants : register(b0)
     uint gnMode;           // normales du G-buffer : bits 0-1 encodage (1 octaèdre RG16 en repère caméra, 2 RGB8 * 2 - 1), bits 8-10 signes (x, y, z inversés),
                            // bit 12 : l'occultation les prend, bit 13 : comparaison à la normale de la profondeur (journal)
     uint gnPitch;          // octets par ligne de la copie
+    float skyAmount;       // visibilité du ciel à grande portée : part de la lumière du ciel retirée quand un obstacle la cache (0 : coupée)
+    float skyRange;        // portée de ces rayons (mètres)
 };
 
 uint AoHash(uint x)
@@ -99,6 +101,22 @@ float3 GNormal(int2 t, uint signs)
         n.z = -n.z;
     const float l = length(n);
     return l > 1e-3 && all(isfinite(n)) ? n / l : 0;
+}
+
+// normale du G-buffer dans l'espace caméra d'URTI, prête pour les rayons : celle de Red Dead (repère du monde) tournée par l'orientation de la caméra
+// que live_rotfit a résolue (image précédente : sunBuf 2048 à 2095, valide en 2092) ; 0 si absente ou pas encore résolue
+float3 GNormalCam(int2 t)
+{
+    float3 n = GNormal(int2(t), (gnMode >> 8) & 7);
+    if ((gnMode & 3) == 2)
+    {
+        if (sunBuf.Load(2092) == 0)
+            return 0;
+        n = float3(dot(asfloat(sunBuf.Load3(2048)), n), dot(asfloat(sunBuf.Load3(2060)), n), dot(asfloat(sunBuf.Load3(2072)), n));
+        const float l = length(n);
+        n = l > 1e-3 && all(isfinite(n)) ? n / l : 0;
+    }
+    return n;
 }
 
 // rebond de lumière (éclairage indirect, bit 20 de flags) : les rayons d'occultation qui touchent un triangle y
@@ -442,14 +460,24 @@ void main(uint2 id : SV_DispatchThreadID)
     // par-dessus le brouillard)
     const float3 macroN = (!flatHere && (flags & (1u << 21)) && w < 20.0) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
     const bool rough = any(macroN != 0);
-    if (!aoOnly && aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough) && !SeesThroughAround(int2(id), p3))
+    // normale exacte du jeu (gnMode bit 12) : l'occultation vaut aussi pour les surfaces qui ne sont pas planes (troncs, rochers, objets,
+    // personnages), où celle de la profondeur n'était que du bruit ; elle regarde la caméra
+    float3 gnHere = 0;
+    if ((gnMode & 0x1000) && !rough && w > 0 && w < aoMaxDist)
+    {
+        gnHere = GNormalCam(int2(id));
+        if (dot(gnHere, -normalize(p3)) <= 0.05)
+            gnHere = 0;
+    }
+    const bool gnOk = any(gnHere != 0);
+    if (!aoOnly && aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) && !SeesThroughAround(int2(id), p3))
         aoSkipped = notThisFrame; // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
-    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough) &&
+    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) &&
         !SeesThroughAround(int2(id), p3))
     {
         float3 n = rough ? macroN : NormalAt(int2(id), p3);
         // comparaison des normales du G-buffer à celle de la profondeur (surface plane, un pixel sur 64) : le bon décodage est celui qui colle
-        if ((gnMode & 0x2000) && !rough && (id.x & 7) == 0 && (id.y & 7) == 0)
+        if ((gnMode & 0x2000) && !rough && flatHere && (id.x & 7) == 0 && (id.y & 7) == 0)
             for (uint sv = 0; sv < 8; sv++)
             {
                 const float3 g = GNormal(int2(id), sv);
@@ -460,7 +488,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 nstats.InterlockedAdd(sv * 8 + 4, 1, unused);
             }
         // orientation de la caméra (normales du monde, gnMode bit 14) : sommes de la normale du monde par celle de la caméra (live_rotfit)
-        if ((gnMode & 0x4000) && !rough && (id.x & 6) == 0 && (id.y & 6) == 0) // (au quart : un des quatre pixels du bloc à chaque image)
+        if ((gnMode & 0x4000) && !rough && flatHere && (id.x & 6) == 0 && (id.y & 6) == 0) // (au quart : un des quatre pixels du bloc à chaque image)
         {
             const float3 a = GNormal(int2(id), 0);
             if (any(a != 0))
@@ -473,12 +501,8 @@ void main(uint2 id : SV_DispatchThreadID)
             }
         }
         // normale exacte du jeu (surface plane : la profondeur ne fait que la deviner, avec le grain du décalage sous-pixel)
-        if ((gnMode & 0x1000) && !rough)
-        {
-            const float3 g = GNormal(int2(id), (gnMode >> 8) & 7);
-            if (any(g != 0) && dot(g, -normalize(p3)) > 0.0)
-                n = g;
-        }
+        if (gnOk)
+            n = gnHere;
         const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
         const float3 b2 = cross(n, b1);
         // deux rayons (strates en azimut) ; quatre là où l'image bouge de plus d'un pixel et demi : l'historique y
@@ -562,6 +586,60 @@ void main(uint2 id : SV_DispatchThreadID)
             // (exemplaire 0 : scène de l'image ; le cache de géométrie n'a pas de couleurs par triangle)
             if ((flags & (1u << 20)) && aoHit && aoInst == 0 && Cached(aoPrim, hc))
                 bounceSum += hc * ((1.0 - t) * (1.0 - t) / float(aoRays));
+        }
+        // visibilité du ciel à grande portée : un ou deux rayons longs (skyRange, 12 m par défaut) disent si un obstacle cache le ciel dans
+        // cette direction : canopée au-dessus du sous-bois, auvent profond, falaise, ruelle étroite. Ils ne retirent que la lumière du ciel,
+        // comme l'occultation de contact ; un obstacle lointain compte moins (1 - t / portée). Les trous des feuilles laissent passer le rayon
+        // (même règle que l'occultation). Approximation nommée : le ciel est supposé uniforme (pas de direction privilégiée de la lumière d'ambiance)
+        // Seules les directions au-dessus de l'horizon portent la lumière du ciel : un rayon qui descend touche le sol, ce qui n'en cache aucune
+        // (le jeu éclaire déjà moins une face verticale). Il est renvoyé au-dessus de l'horizon (symétrie par le plan horizontal) et pondéré par sa
+        // hauteur dans le ciel. Le haut du monde vient de l'orientation de la caméra (Red Dead : normales du monde, live_rotfit) ; inconnu : pas de rayons longs
+        float skyOcc = 0, skyW = 0;
+        float3 upCam = 0;
+        if ((gnMode & 3) == 2 && sunBuf.Load(2092) != 0)
+            upCam = float3(asfloat(sunBuf.Load(2056)), asfloat(sunBuf.Load(2068)), asfloat(sunBuf.Load(2080)));
+        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5)
+        {
+            upCam = normalize(upCam);
+            const uint skyRays = w > 25.0 ? 1u : 2u;
+            uint hs = AoHash(id.x * 7919u + id.y * 104729u + frameIndex * 15485863u + 17u);
+            for (uint ks = 0; ks < skyRays; ks++, hs = AoHash(hs))
+            {
+                const float s1 = float(hs & 0xFFFF) / 65536.0, s2 = (float(hs >> 16) / 65536.0 + float(ks)) / float(skyRays);
+                const float rr = sqrt(s1), ph = 6.2831853 * s2;
+                RayDesc sr;
+                sr.Origin = p3 + n * max(0.01, 0.002 * length(p3));
+                sr.Direction = normalize(b1 * (rr * cos(ph)) + b2 * (rr * sin(ph)) + n * sqrt(max(0.0, 1.0 - s1)));
+                float upDot = dot(sr.Direction, upCam);
+                if (upDot < 0)
+                    sr.Direction -= 2.0 * upDot * upCam, upDot = -upDot;
+                if (upDot < 0.02 || dot(sr.Direction, n) < 0.02)
+                    continue;
+                skyW += upDot;
+                sr.TMin = 0.06;
+                sr.TMax = skyRange;
+                bool skyHit = false;
+                float skyT = 0;
+                const uint maxHopsSky = (flags >> 24) & 7;
+                for (uint hop2 = 0; hop2 <= maxHopsSky; hop2++)
+                {
+                    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> qs;
+                    qs.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, sr);
+                    qs.Proceed();
+                    skyHit = qs.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+                    if (!skyHit)
+                        break;
+                    skyT = qs.CommittedRayT();
+                    if (!((flags & 2048) && Hole(sr.Origin + sr.Direction * skyT, p3)))
+                        break;
+                    skyHit = false;
+                    sr.TMin = skyT + max(1e-3, 1e-4 * skyT);
+                }
+                if (skyHit)
+                    skyOcc += upDot * (1.0 - skyT / skyRange);
+            }
+            skyOcc = skyW > 0 ? skyOcc / skyW : 0.0;
+            occlusion = 1.0 - (1.0 - saturate(occlusion)) * (1.0 - skyAmount * skyOcc);
         }
         if (aoOnly && (flags & 17) == 1)
             gameVis = dot(n, sun) > 0.08 ? GameLit(p3) : 0.0;

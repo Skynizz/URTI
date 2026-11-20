@@ -448,6 +448,8 @@ struct LiveState
     // cases et curseurs du menu de ReShade (urti.fx), relus à chaque présentation : multiplient les réglages d'urti.ini
     bool menuRefl = true, menuAo = true, menuGi = true;
     float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (portée 0 : celle d'urti.ini)
+    float menuSky = 1.0f;                                               // (multiplie ao_sky=)
+    float skyAmount = 0.6f, skyRange = 12.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
     bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
     ComPtr<ID3D12Resource> giRaw, giBuf, giPrev;
     bool giValid = false;       // giBuf écrit à la dernière image (sinon pas d'historique, pas de pose)
@@ -924,7 +926,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
            make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 10, live.shadowRs, live.shadowPso, 32, 4) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 10, live.shadowRs, live.shadowPso, 34, 4) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 7, live.denoiseRs, live.denoisePso, 15, 2) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
@@ -1147,7 +1149,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, skyIni = 0.6f, skyRangeIni = 12.0f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1184,7 +1186,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni), value("ao_sky=", skyIni), value("ao_sky_range=", skyRangeIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1211,6 +1213,7 @@ void LiveHotReload(ID3D12Device* device)
             live.denoiseFarSkip = denoiseFarIni != 0;
             live.gnSlot = int(gnSlotIni), live.gnMode = uint32_t(std::clamp(gnModeIni, 0.0f, 2.0f)), live.gnSigns = uint32_t(gnSignsIni) & 7;
             live.gnUse = gnUseIni != 0, live.gnCompare = gnCompareIni != 0, live.gnReflect = gnReflectIni != 0;
+            live.skyAmount = std::clamp(skyIni, 0.0f, 1.0f), live.skyRange = std::clamp(skyRangeIni, 1.0f, 40.0f);
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -4075,14 +4078,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint32_t aoMotion, cacheTriangles, regionCount;
         float aoMaxDist;
         uint32_t gnMode, gnPitch;
+        float skyAmount, skyRange;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
              aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
              giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
-             gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, gnNow ? live.gnPitch : 0u };
-    list->SetComputeRoot32BitConstants(14, 32, &sc, 0);
+             gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, gnNow ? live.gnPitch : 0u,
+             aoEff > 0 ? live.skyAmount * live.menuSky : 0.0f, live.skyRange };
+    list->SetComputeRoot32BitConstants(14, 34, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     live.gnNowFrame = gnNow; // (sans anneau : gardée lisible jusqu'après les reflets)
     // comparaison des normales : relue toutes les 300 images (copiée, remise à zéro ; lue trois images plus tard)
@@ -5500,7 +5505,7 @@ void OnReshadePresent(effect_runtime* runtime)
         };
         readBool("UrtiReflets", live.menuRefl), readBool("UrtiOcclusion", live.menuAo), readBool("UrtiRebond", live.menuGi);
         readFloat("UrtiOcclusionForce", live.menuAoForce, 0.0f, 2.0f), readFloat("UrtiOcclusionPortee", live.menuAoRadius, 0.5f, 5.0f);
-        readFloat("UrtiRebondForce", live.menuGiForce, 0.0f, 3.0f);
+        readFloat("UrtiRebondForce", live.menuGiForce, 0.0f, 3.0f), readFloat("UrtiCiel", live.menuSky, 0.0f, 1.6f);
     }
     LiveComposite(runtime);
     // film : cette présentation (calculée ou générée), avant et après URTI, rangée dans l'anneau en mémoire vidéo

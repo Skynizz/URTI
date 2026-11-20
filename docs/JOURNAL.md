@@ -2118,3 +2118,19 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   garde ses rayons même si l'occultation est décochée. Pas encore de case pour les ombres du soleil (le mode actuel coupe le rebond).
 - Constat (rafale, même image avant / après) : URTI assombrit 3,5 % des pixels de plus de 5 % (lierre, coins du mur, pied du mur), 0,3 % de plus de 15 % ;
   le rebond n'éclaircit rien de visible. Point de départ de l'audit pour un vrai éclairage RT.
+
+## v96 : occultation RT sur toutes les surfaces et visibilité du ciel à grande portée
+
+- **Normales exactes du jeu pour l'occultation** (`gnormal_use=1`) : dans Red Dead, celles du G-buffer (repère du monde) tournées par l'orientation de la
+  caméra résolue à l'image précédente (live_rotfit). L'occultation vaut maintenant aussi pour les surfaces qui ne sont pas planes (troncs, rochers,
+  objets, personnages), où la normale tirée de la profondeur n'était que du bruit. Le feuillage vu à travers reste exclu. La comparaison et la rotation
+  ne se mesurent que sur les surfaces planes (sinon le bruit de la profondeur les fausserait).
+- **Visibilité du ciel à grande portée** (`ao_sky=0.6`, `ao_sky_range=12` m ; curseur « Ombre d'ambiance à grande portée » dans ReShade) : un ou deux
+  rayons longs par pixel calculé disent si la canopée, un toit, une falaise cache le ciel ; ne retirent que la lumière du ciel. **Seules les directions
+  au-dessus de l'horizon comptent** (renvoyées par symétrie, pondérées par leur hauteur) : un premier essai comptait le sol sous les faces verticales comme
+  du ciel caché et assombrissait en bloc murs et personnages (26,7 % des pixels de plus de 5 %, mur uniformément gris). Le haut du monde vient de
+  l'orientation de la caméra : sans elle (Horizon pour l'instant), pas de rayons longs.
+- Mesures dans Red Dead (rafales, même image avant / après, part des pixels assombris de plus de 5 % / 15 %) : v95 4,2 / 0,4 % ; contact avec les
+  normales du jeu 6,6 / 0,5 % ; avec le ciel 13,2 / 3,1 % (pied du mur, dessous de la charrette, arbres, sol abrité). Scintillement ajouté 0,11 % des
+  pixels à l'arrêt, 0,00 % en tournant la caméra. Passe d'occultation 1,2 -> 2,5 ms. Horizon vérifié (pas de plantage, 62-67 images par seconde).
+- Réglages de Red Dead ajoutés : `gnormal_slot=1`, `gnormal=2`, `gnormal_use=1`, `gnormal_reflect=0` (urti.ini d'avant gardé en `urti.ini.avant_v96`).
