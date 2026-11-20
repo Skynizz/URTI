@@ -2087,3 +2087,20 @@ débruiteur ~1 ms, reflets 2,3-2,7 ms, composition et reflets stabilisés ~2,1 m
 travail par image (effets calculés à tour de rôle) plutôt que par des économies de 0,2 ms.
 
 Vérifié : Horizon deux lancements, deux Alt+Tab ; Red Dead 71 images par seconde, bruit 0,17 % des pixels. Installée dans les deux jeux.
+
+## v94 : normales du G-buffer pour les reflets ; orientation de la caméra de Red Dead
+
+- Normales exactes du jeu lues dans le G-buffer (`gnormal_slot=`, `gnormal=`, `gnormal_signs=`) : Horizon les range en octaèdre RG16, repère de la caméra, z inversé
+  (`gnormal_slot=2`, `gnormal=1`, `gnormal_signs=4`, accord 0,73-0,84 avec la normale tirée de la profondeur) ; Red Dead en RGB8 dans le repère du monde (`gnormal_slot=1`, `gnormal=2`).
+- Red Dead : la caméra du jeu n'est pas lue, l'orientation est donc résolue à chaque image sur la carte graphique (`live_rotfit`, méthode de Horn) à partir de
+  ~13 000 pixels plans : elle suit la souris, le haut de la caméra retombe sur le Z du monde. Accord 0,46-0,82 selon la scène (le relief des textures est dans
+  ces normales) ; la mauvaise rotation donnerait ~0 : seuil 0,35. Un échantillonnage tombait une image sur quatre (occultation au quart) : corrigé.
+- Reflets : la normale du jeu remplace celle de la profondeur quand elle regarde la caméra et s'accorde à peu près avec elle (`gnormal_reflect=1`, actif dès que
+  `gnormal=` est réglé).
+- Mesuré (rafales, part des pixels à plus de 3 niveaux) : Red Dead 0,09 / 0,04 / 0,04 % avec contre 0,04 / 0,05 % sans, rien de gagné (le relief des pavés bouge
+  avec le décalage sous-pixel) ; Horizon : résultats mêlés (0,22 contre 1,16 % à l'arrêt, puis 4,64 contre 2,72 %). Laissé coupé par défaut dans les deux jeux.
+- Bruit d'URTI dans Red Dead, effet par effet (rafales à l'arrêt et en tournant la caméra) : 0,00 à 0,06 % des pixels, alors que l'image du jeu varie elle-même de
+  2 à 5,5 niveaux par image (vent dans le feuillage, lissage temporel du jeu). Dans Horizon en marchant, l'excédent est surtout sur l'eau (reflets nets qui défilent,
+  à départager du vrai scintillement).
+
+Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Social Club), Horizon un lancement. Installée dans les deux jeux (réglages par défaut : comme v93).

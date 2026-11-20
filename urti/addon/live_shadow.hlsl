@@ -50,6 +50,9 @@ cbuffer Constants : register(b0)
     uint cacheTriangles;   // triangles tenus par le cache de surfaces (rebond de lumière)
     uint regionCount;      // zones de la scène RT (regions)
     float aoMaxDist;       // budget de temps : occultation calculée jusqu'à cette distance (mètres)
+    uint gnMode;           // normales du G-buffer : bits 0-1 encodage (1 octaèdre RG16 en repère caméra, 2 RGB8 * 2 - 1), bits 8-10 signes (x, y, z inversés),
+                           // bit 12 : l'occultation les prend, bit 13 : comparaison à la normale de la profondeur (journal)
+    uint gnPitch;          // octets par ligne de la copie
 };
 
 uint AoHash(uint x)
@@ -68,6 +71,35 @@ float PackPenumbra(float distanceToOccluder, float tanOfLightAngularRadius)
     return distanceToOccluder >= kFp16Max ? kFp16Max : min(distanceToOccluder * tanOfLightAngularRadius * 0.5, 32768.0);
 }
 RWByteAddressBuffer penumbra : register(u1); // float par pixel (pas : shadowPitch), mode SIGMA
+ByteAddressBuffer gnormal : register(t9);     // copie de la cible des normales du G-buffer (gnMode)
+RWByteAddressBuffer nstats : register(u3);    // comparaison : par combinaison de signes, somme des produits scalaires (×1000) et nombre de pixels
+
+// normale du G-buffer en espace caméra d'URTI (x droite, y haut, z vers la scène), selon l'encodage et les signes ; 0 si absente
+float3 GNormal(int2 t, uint signs)
+{
+    const uint enc = gnMode & 3;
+    if (enc == 0 || gnPitch == 0)
+        return 0;
+    const uint v = gnormal.Load(t.y * gnPitch + t.x * 4);
+    float3 n;
+    if (enc == 1)
+    {
+        const float2 e = float2(v & 0xFFFF, v >> 16) / 65535.0 * 2.0 - 1.0;
+        n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+        if (n.z < 0)
+            n.xy = (1.0 - abs(n.yx)) * float2(n.x >= 0 ? 1.0 : -1.0, n.y >= 0 ? 1.0 : -1.0);
+    }
+    else
+        n = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0 * 2.0 - 1.0;
+    if (signs & 1)
+        n.x = -n.x;
+    if (signs & 2)
+        n.y = -n.y;
+    if (signs & 4)
+        n.z = -n.z;
+    const float l = length(n);
+    return l > 1e-3 && all(isfinite(n)) ? n / l : 0;
+}
 
 // rebond de lumière (éclairage indirect, bit 20 de flags) : les rayons d'occultation qui touchent un triangle y
 // prennent la couleur que le cache de surfaces a retenue (live_surfcache) : la lumière que cette surface renvoie.
@@ -415,7 +447,38 @@ void main(uint2 id : SV_DispatchThreadID)
     if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough) &&
         !SeesThroughAround(int2(id), p3))
     {
-        const float3 n = rough ? macroN : NormalAt(int2(id), p3);
+        float3 n = rough ? macroN : NormalAt(int2(id), p3);
+        // comparaison des normales du G-buffer à celle de la profondeur (surface plane, un pixel sur 64) : le bon décodage est celui qui colle
+        if ((gnMode & 0x2000) && !rough && (id.x & 7) == 0 && (id.y & 7) == 0)
+            for (uint sv = 0; sv < 8; sv++)
+            {
+                const float3 g = GNormal(int2(id), sv);
+                if (all(g == 0))
+                    continue;
+                uint unused;
+                nstats.InterlockedAdd(sv * 8, uint(int(round(dot(g, n) * 1000.0))), unused);
+                nstats.InterlockedAdd(sv * 8 + 4, 1, unused);
+            }
+        // orientation de la caméra (normales du monde, gnMode bit 14) : sommes de la normale du monde par celle de la caméra (live_rotfit)
+        if ((gnMode & 0x4000) && !rough && (id.x & 6) == 0 && (id.y & 6) == 0) // (au quart : un des quatre pixels du bloc à chaque image)
+        {
+            const float3 a = GNormal(int2(id), 0);
+            if (any(a != 0))
+            {
+                uint unused;
+                for (uint ai = 0; ai < 3; ai++)
+                    for (uint bj = 0; bj < 3; bj++)
+                        nstats.InterlockedAdd(64 + (ai * 3 + bj) * 4, uint(int(round(a[ai] * n[bj] * 1000.0))), unused);
+                nstats.InterlockedAdd(100, 1, unused);
+            }
+        }
+        // normale exacte du jeu (surface plane : la profondeur ne fait que la deviner, avec le grain du décalage sous-pixel)
+        if ((gnMode & 0x1000) && !rough)
+        {
+            const float3 g = GNormal(int2(id), (gnMode >> 8) & 7);
+            if (any(g != 0) && dot(g, -normalize(p3)) > 0.0)
+                n = g;
+        }
         const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
         const float3 b2 = cross(n, b1);
         // deux rayons (strates en azimut) ; quatre là où l'image bouge de plus d'un pixel et demi : l'historique y

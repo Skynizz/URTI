@@ -27,6 +27,7 @@
 #include "live_hudgain_cs.h" // g_live_hudgain
 #include "live_film_cs.h"    // g_live_film
 #include "live_waterbase_cs.h" // g_live_waterbase
+#include "live_rotfit_cs.h" // g_live_rotfit
 #include "live_radcache_cs.h" // g_live_radcache
 #include "live_delay_cs.h" // g_live_delay
 #include "live_sunlight_cs.h" // g_live_sunlight
@@ -526,6 +527,18 @@ struct LiveState
     // copies de l'image de matériau (même principe), celle de ce calcul
     static constexpr uint32_t kMaterialSnaps = 4;
     ComPtr<ID3D12Resource> materialSnap[kMaterialSnaps];
+    // normales du G-buffer (gnormal_slot=, gnormal=) : anneau des copies comme le matériau (avec frame_sync), sinon une copie ; comparaison (journal)
+    ComPtr<ID3D12Resource> gnSnap[kMaterialSnaps], gnBuf, gnStats, gnStatsRb;
+    uint64_t gnBytes = 0, gnFrame = ~0ull;
+    uint32_t gnPitch = 0, gnWidth = 0, gnHeight = 0, gnFormat = 0;
+    int gnSlot = -1;
+    uint32_t gnMode = 0, gnSigns = 0;
+    bool gnUse = false, gnCompare = true, gnReflect = true;
+    ID3D12Resource* gnNowFrame = nullptr; // copie des normales de l'image en cours (lue par les ombres puis les reflets)
+    ComPtr<ID3D12RootSignature> rotfitRs;
+    ComPtr<ID3D12PipelineState> rotfitPso;
+    uint32_t rotLogFrames = 0;
+    double rotSum[4] = {};
     int32_t materialIndexNow = -1;
     uint32_t statMaterialWait = 0, statMaterialLate = 0, statFramesSkipped = 0;
     // axe vertical du monde (d'après la caméra), et ce même axe dans l'espace caméra de cette image : la normale de l'eau
@@ -553,7 +566,7 @@ constexpr uint32_t kLiveMaxPairs = 256;
 // soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
 // l'image précédente (640)
 constexpr uint32_t kLiveMaxMotionPairs = 32768; // paires de sommets pour le mouvement de la caméra (live_camfit)
-constexpr uint32_t kLiveSunBytes = 2048; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
+constexpr uint32_t kLiveSunBytes = 2176; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
                                                              // part du soleil dans l'image (1232 : paires, 1248 : histogrammes, 1888 à 2047 : contrôle, live_sunlight)
 
 // ------------------------------------------------------------------------------------------------
@@ -903,7 +916,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
            make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 9, live.shadowRs, live.shadowPso, 30, 3) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 10, live.shadowRs, live.shadowPso, 32, 4) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 7, live.denoiseRs, live.denoisePso, 15, 2) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
@@ -911,6 +924,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_composite, sizeof(g_live_composite), 15, live.compositeRs, live.compositePso, 29, 2) &&
            make(g_live_delay, sizeof(g_live_delay), 4, live.delayRs, live.delayPso, 8, 1) &&
            make(g_live_waterbase, sizeof(g_live_waterbase), 3, live.waterBaseRs, live.waterBasePso, 12, 1) &&
+           make(g_live_rotfit, sizeof(g_live_rotfit), 0, live.rotfitRs, live.rotfitPso, 4, 2) &&
            make(g_live_sunlight, sizeof(g_live_sunlight), 3, live.sunlightRs, live.sunlightPso, 20) &&
            make(g_live_counts, sizeof(g_live_counts), 2, live.countsRs, live.countsPso, 4) &&
            make(g_live_uicompare, sizeof(g_live_uicompare), 6, live.uiRs, live.uiPso, 8) &&
@@ -919,7 +933,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_hudgain, sizeof(g_live_hudgain), 0, live.hudGainRs, live.hudGainPso, 8, 1) &&
            make(g_live_film, sizeof(g_live_film), 1, live.filmRs, live.filmPso, 8, 1) &&
            make(g_live_reflresolve, sizeof(g_live_reflresolve), 10, live.resolveRs, live.resolvePso, 22, 2) &&
-           make(g_live_reflect, sizeof(g_live_reflect), 14, live.reflectRs, live.reflectPso, 25, 4) &&
+           make(g_live_reflect, sizeof(g_live_reflect), 15, live.reflectRs, live.reflectPso, 26, 4) &&
            make(g_live_radcache, sizeof(g_live_radcache), 6, live.radRs, live.radPso, 17, 3) &&
            make(g_live_surfcache, sizeof(g_live_surfcache), 5, live.surfRs, live.surfPso, 18, 2) &&
            make(g_live_regionstats, sizeof(g_live_regionstats), 3, live.statsRs, live.statsPso, 4) &&
@@ -1125,7 +1139,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1162,7 +1176,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1187,6 +1201,8 @@ void LiveHotReload(ID3D12Device* device)
             live.geoProbe = uint64_t(std::clamp(geoProbeIni, 0.0f, 8000000.0f));
             live.sunEighth = sunEighthIni != 0;
             live.denoiseFarSkip = denoiseFarIni != 0;
+            live.gnSlot = int(gnSlotIni), live.gnMode = uint32_t(std::clamp(gnModeIni, 0.0f, 2.0f)), live.gnSigns = uint32_t(gnSignsIni) & 7;
+            live.gnUse = gnUseIni != 0, live.gnCompare = gnCompareIni != 0, live.gnReflect = gnReflectIni != 0;
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
@@ -1504,9 +1520,11 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
             g_livePending[uint64_t(l)].push_back(mark);
         }
     }
-    uint64_t target = 0, motionTarget = 0, albedoTarget = 0, normalTarget = 0;
+    uint64_t target = 0, motionTarget = 0, albedoTarget = 0, normalTarget = 0, gnTarget = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        if (live.gnMode && live.gnSlot >= 0 && uint32_t(live.gnSlot) < g_liveGbufferCount)
+            gnTarget = g_liveGbuffer[live.gnSlot];
         if (live.materialSlot < g_liveGbufferCount && live.reflStrength > 0)
             target = g_liveGbuffer[live.materialSlot];
         // couleur propre des surfaces (première cible du G-buffer) : rebond de lumière
@@ -1584,6 +1602,21 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
     else if (target)
         LiveCopyGbuffer(cmd, target, count, resources, oldStates, newStates, live.materialBuf, live.materialBytes, live.materialPitch,
                         live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "matériau (cible 2)", &live.materialAfterCompute);
+    // normales du G-buffer : à la fin de leur écriture ; avec frame_sync, dans la case de l'anneau que prendra le matériau de la même image
+    if (gnTarget && live.frameSync)
+    {
+        uint32_t k = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            k = g_liveMaterialNext % LiveState::kMaterialSnaps;
+        }
+        int32_t gnCopied = 0;
+        LiveCopyGbuffer(cmd, gnTarget, count, resources, oldStates, newStates, live.gnSnap[k], live.gnBytes, live.gnPitch,
+                        live.gnWidth, live.gnHeight, live.gnFormat, live.gnFrame, "normales (réglage gnormal_slot)", nullptr, &gnCopied);
+    }
+    else if (gnTarget)
+        LiveCopyGbuffer(cmd, gnTarget, count, resources, oldStates, newStates, live.gnBuf, live.gnBytes, live.gnPitch,
+                        live.gnWidth, live.gnHeight, live.gnFormat, live.gnFrame, "normales (réglage gnormal_slot)");
     if (albedoTarget)
         LiveCopyGbuffer(cmd, albedoTarget, count, resources, oldStates, newStates, live.albedoBuf, live.albedoBytes, live.albedoPitch,
                         live.albedoWidth, live.albedoHeight, live.albedoFormat, live.albedoFrame, "couleur propre (albedo, cible 0)");
@@ -2421,6 +2454,23 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     // bilan du suivi du soleil, lu trois images plus tard
     if (const float* r = nullptr; live.sunReadback[live.frame % 3] && SUCCEEDED(live.sunReadback[live.frame % 3]->Map(0, nullptr, (void**)&r)) && r)
     {
+        if ((live.gnMode & 3) == 2)
+        {
+            const float* o = r + 2048 / 4;
+            const uint32_t* u = reinterpret_cast<const uint32_t*>(o);
+            if (u[10] > 0)
+                live.rotSum[0] += o[9], live.rotSum[1] += u[10], live.rotSum[2] += u[11] ? 1 : 0, live.rotSum[3] += 1;
+            if (++live.rotLogFrames >= 300)
+            {
+                const double k = std::max(live.rotSum[3], 1.0);
+                Log("URTI direct : orientation de la caméra par les normales du G-buffer : %.0f images sur 300 avec des pixels, accord moyen %.3f sur %.0f pixels, valide %.0f %% ; "
+                    "lignes (%.3f %.3f %.3f) (%.3f %.3f %.3f) (%.3f %.3f %.3f)",
+                    live.rotSum[3], live.rotSum[0] / k, live.rotSum[1] / k, live.rotSum[2] / k * 100.0, o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8]);
+                live.rotLogFrames = 0;
+                for (double& v : live.rotSum)
+                    v = 0;
+            }
+        }
         if (live.frame % 600 == 0)
             Log("URTI direct : loi de profondeur de l'image : %g + %g / w (valide %.0f) ; stockée : %g + %g / w", r[9], r[10], r[11], live.A, live.B);
         if (live.motionLog)
@@ -3952,16 +4002,38 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(6, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(7, giNow ? live.surfCache->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(8, giNow ? sceneTable->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(9, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(11, giNow ? live.giRaw->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    // (racine : 10 lectures t0-t9, puis u0 masque brut, u1 pénombre, u2 rebond, u3 comparaison des normales, puis les constantes)
+    list->SetComputeRootUnorderedAccessView(10, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(12, giNow ? live.giRaw->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    // normales du G-buffer de cette image (anneau : la case du matériau de l'image ; sinon la dernière copie)
+    ID3D12Resource* gnNow = nullptr;
+    if (live.gnMode && live.gnFrame != ~0ull && live.frame <= live.gnFrame + 8 && live.gnWidth >= live.width && live.gnHeight >= live.height)
+        gnNow = live.frameSync ? (live.materialIndexNow >= 0 ? live.gnSnap[live.materialIndexNow].Get() : nullptr) : live.gnBuf.Get();
+    if (gnNow && !live.frameSync)
+        Transition(list.Get(), gnNow, D3D12_RESOURCE_STATE_COPY_DEST, srv);
+    const bool gnStatsNow = gnNow && live.gnCompare;
+    const bool gnRotNow = gnNow && (live.gnMode & 3) == 2 && live.rotfitPso;
+    if ((gnStatsNow || gnRotNow) && !live.gnStats)
+    {
+        live.gnStats = UavBuffer(g.device, 128, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        live.gnStatsRb = MakeBuffer(g.device, 64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (gnRotNow && live.gnStats)
+    {
+        Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(live.gnStats.Get(), 64, g.zeros.Get(), 0, 64);
+        Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    list->SetComputeRootShaderResourceView(9, gnNow ? gnNow->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(13, (gnStatsNow || gnRotNow) && live.gnStats ? live.gnStats->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
     // SIGMA (NVIDIA) : un rayon par pixel, pénombre et poids des corrections ; débruitage ensuite
 #if URTI_NRD
     const bool nrdActive = live.nrdShadows && motionOk && live.mvConvention < 16 && live.shadowRawBuf && NrdEnsure(runtime);
-    list->SetComputeRootUnorderedAccessView(10, nrdActive ? g_nrd.penumbraBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(11, nrdActive ? g_nrd.penumbraBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
 #else
     const bool nrdActive = false;
-    list->SetComputeRootUnorderedAccessView(10, live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(11, live.shadowBuf->GetGPUVirtualAddress());
 #endif
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     // ciel couvert, crépuscule : la part du soleil mesurée dans l'image est si faible qu'une ombre RT ne se
@@ -3991,14 +4063,46 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         float aoAmount, aoRadius;
         uint32_t aoMotion, cacheTriangles, regionCount;
         float aoMaxDist;
+        uint32_t gnMode, gnPitch;
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
              live.aoAmount, live.aoRadius, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
-             giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow };
-    list->SetComputeRoot32BitConstants(12, 30, &sc, 0);
+             giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
+             gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, gnNow ? live.gnPitch : 0u };
+    list->SetComputeRoot32BitConstants(14, 32, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+    live.gnNowFrame = gnNow; // (sans anneau : gardée lisible jusqu'après les reflets)
+    // comparaison des normales : relue toutes les 300 images (copiée, remise à zéro ; lue trois images plus tard)
+    if (gnStatsNow && live.gnStats && live.gnStatsRb)
+    {
+        if (live.frame % 300 == 3)
+        {
+            if (const int32_t* v = nullptr; SUCCEEDED(live.gnStatsRb->Map(0, nullptr, (void**)&v)) && v)
+            {
+                char line[512];
+                int len = std::snprintf(line, sizeof(line), "URTI direct : normales du G-buffer contre celles de la profondeur (surfaces planes), accord moyen par signes inversés :");
+                for (int s = 0; s < 8 && len < int(sizeof(line)) - 40; s++)
+                    len += std::snprintf(line + len, sizeof(line) - len, " %s%s%s %.3f (%d)", (s & 1) ? "-x" : "x", (s & 2) ? "-y" : "y", (s & 4) ? "-z" : "z",
+                                         v[s * 2 + 1] ? v[s * 2] / 1000.0 / v[s * 2 + 1] : 0.0, v[s * 2 + 1]);
+                Log("%s", line);
+                live.gnStatsRb->Unmap(0, nullptr);
+            }
+        }
+        if (live.frame % 300 == 0)
+        {
+            D3D12_RESOURCE_BARRIER sb = {};
+            sb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            sb.UAV.pResource = live.gnStats.Get();
+            list->ResourceBarrier(1, &sb);
+            Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyBufferRegion(live.gnStatsRb.Get(), 0, live.gnStats.Get(), 0, 64);
+            Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(live.gnStats.Get(), 0, g.zeros.Get(), 0, 64);
+            Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+    }
     LiveTimeD(list.Get(), 10);
     if (giNow)
         Transition(list.Get(), live.surfCache.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -4127,6 +4231,24 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, kLiveSunBytes);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // orientation de la caméra (normales du monde du G-buffer) : résolue ici, lue par les reflets de cette image
+    if (gnRotNow && live.gnStats)
+    {
+        D3D12_RESOURCE_BARRIER rb[2] = {};
+        rb[0].Type = rb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        rb[0].UAV.pResource = live.gnStats.Get(), rb[1].UAV.pResource = live.sunBuf.Get();
+        list->ResourceBarrier(2, rb);
+        list->SetComputeRootSignature(live.rotfitRs.Get());
+        list->SetPipelineState(live.rotfitPso.Get());
+        list->SetComputeRootUnorderedAccessView(0, live.gnStats->GetGPUVirtualAddress());
+        list->SetComputeRootUnorderedAccessView(1, live.sunBuf->GetGPUVirtualAddress());
+        const float minAgree = 0.35f; // (relief des textures dans les normales du jeu : 0,5 à 0,65 pour la bonne rotation, près de 0 pour une fausse)
+        uint32_t rc[4] = { 300u, 0, 0, 0 };
+        std::memcpy(&rc[1], &minAgree, 4);
+        list->SetComputeRoot32BitConstants(2, 4, rc, 0);
+        list->Dispatch(1, 1, 1);
+        list->ResourceBarrier(1, &rb[1]);
+    }
 
     LiveTime(list.Get(), 4);
     LiveTimeD(list.Get(), 11);
@@ -4287,9 +4409,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRootShaderResourceView(11, radNow ? live.radHash->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(12, radNow ? live.radEnv->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(13, radNow ? radParams->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(14, live.reflectBuf->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(15, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
-            list->SetComputeRootUnorderedAccessView(17, radNow ? live.reflMix->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
+            const bool gnRefl = live.gnNowFrame && live.gnReflect;
+            list->SetComputeRootShaderResourceView(14, gnRefl ? live.gnNowFrame->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(15, live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(16, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
+            list->SetComputeRootUnorderedAccessView(18, radNow ? live.reflMix->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
             const struct
             {
                 uint32_t width, height, depthPitch, materialPitch;
@@ -4302,6 +4426,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 float up[3];
                 uint32_t budget;
                 float tMaxNow;
+                uint32_t gnInfo;
             } rc = { live.width, live.height, live.depthPitch, live.materialPitch, live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f,
                      d24 ? 1u : 0u, live.reflChannel, smoothMinEffective, 0.002f, (material ? 1u : 0u) | (live.reflInvert ? 2u : 0u) | (live.reflEverywhere ? 4u : 0u) | (live.debugView == 7 ? 8u : 0u) |
                      (live.debugView == 4 || live.debugReflect == 1 ? 16u : 0u) | (live.alphaScreen ? 32u : 0u) | (surfRead ? 64u : 0u) |
@@ -4309,9 +4434,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                          (trueCam && live.worldUpKnown && live.reflectUp && live.waterOnly ? 65536u : 0u) | (reflStatsNow ? 131072u : 0u) | (radNow ? 262144u : 0u) | (live.reflCoherent ? 524288u : 0u), live.f0, live.width * 16,
                      uint32_t(tableNow.size()), live.anchorAlpha > 0 && live.viewPrev && live.prevValid && !radNow ? 1u : 0u, uint32_t(live.capacity),
                      surfRead ? uint32_t(live.surfTriangles) : 0u, { live.worldUp[0], live.worldUp[1], live.worldUp[2] },
-                     live.reflStrideNow | (live.reflHopsNow << 4) | (uint32_t(live.frame) << 8), live.reflTMaxNow };
-            list->SetComputeRootUnorderedAccessView(16, reflStatsNow ? live.reflStats->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
-            list->SetComputeRoot32BitConstants(18, 25, &rc, 0);
+                     live.reflStrideNow | (live.reflHopsNow << 4) | (uint32_t(live.frame) << 8), live.reflTMaxNow,
+                     gnRefl ? (live.gnMode & 3) | (live.gnSigns << 2) | 32u | (live.gnPitch << 16) : 0u };
+            list->SetComputeRootUnorderedAccessView(17, reflStatsNow ? live.reflStats->GetGPUVirtualAddress() : live.reflectBuf->GetGPUVirtualAddress());
+            list->SetComputeRoot32BitConstants(19, 26, &rc, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             if (reflStatsNow && live.reflStatsRb[live.frame % 3])
             {
@@ -4343,6 +4469,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->ResourceBarrier(1, &uavb);
         }
     }
+    // normales du G-buffer (sans anneau) : rendues à la copie de la prochaine image
+    if (live.gnNowFrame && !live.frameSync)
+        Transition(list.Get(), live.gnNowFrame, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    live.gnNowFrame = nullptr;
 
     LiveTime(list.Get(), 5);
     if (live.timeDHeap && live.timeDRb[live.frame % 3])
@@ -5093,7 +5223,7 @@ void LiveComposite(effect_runtime* runtime)
         live.calibrated && live.framesSinceSun < 30)
     {
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, kLiveSunBytes - 1232);
+        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, 2048 - 1232); // (pas l'orientation de la caméra, 2048 et après)
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
         Transition(list.Get(), live.atlasBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);

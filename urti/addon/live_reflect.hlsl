@@ -58,7 +58,46 @@ cbuffer Constants : register(b0)
     float3 worldUp;       // flags 8192 : le haut du monde dans l'espace caméra de cette image (normale exacte de l'eau)
     uint budget;          // budget de temps (add-on) : bits 0 à 3 un pixel sur 1, 2 ou 4 reçoit un rayon, bits 4 à 7 sauts de trou en trou, bits 8 et plus numéro d'image
     float tMaxNow;        // portée des rayons réfléchis (mètres)
+    uint gnInfo;          // normales du G-buffer : bits 0-1 codage (1 octaèdre RG16, 2 RGB8 du monde), 2-4 signes inversés, 5 à utiliser, 16-31 pas des lignes
 };
+
+// normales exactes du jeu (G-buffer) : celle de la profondeur ne fait que la deviner, avec le grain du décalage sous-pixel ;
+// Red Dead les range dans le repère du monde : tournées par l'orientation de la caméra résolue à cette image (sunBuf 2048-2095)
+ByteAddressBuffer gnormal : register(t14);
+
+float3 GNormalAt(int2 t)
+{
+    const uint enc = gnInfo & 3, pitch = gnInfo >> 16;
+    if (enc == 0 || (gnInfo & 32) == 0 || pitch == 0)
+        return 0;
+    const uint v = gnormal.Load(t.y * pitch + t.x * 4);
+    float3 n;
+    if (enc == 1)
+    {
+        const float2 e = float2(v & 0xFFFF, v >> 16) / 65535.0 * 2.0 - 1.0;
+        n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+        if (n.z < 0)
+            n.xy = (1.0 - abs(n.yx)) * float2(n.x >= 0 ? 1.0 : -1.0, n.y >= 0 ? 1.0 : -1.0);
+    }
+    else
+        n = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0 * 2.0 - 1.0;
+    const uint signs = (gnInfo >> 2) & 7;
+    if (signs & 1)
+        n.x = -n.x;
+    if (signs & 2)
+        n.y = -n.y;
+    if (signs & 4)
+        n.z = -n.z;
+    if (enc == 2)
+    {
+        if (sunBuf.Load(2092) == 0)
+            return 0;
+        const float3 r0 = asfloat(sunBuf.Load3(2048)), r1 = asfloat(sunBuf.Load3(2060)), r2 = asfloat(sunBuf.Load3(2072));
+        n = float3(dot(r0, n), dot(r1, n), dot(r2, n));
+    }
+    const float l = length(n);
+    return l > 1e-3 && all(isfinite(n)) ? n / l : 0;
+}
 
 // flags 262144 : cache de radiance du monde (caméra du jeu connue). Un point reflété caché ou hors de l'écran prend la couleur vue là
 // (table de hachage spatiale), un rayon qui ne touche rien celle du ciel dans sa direction (carte du ciel) ; le rayon traverse les
@@ -358,6 +397,13 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     }
     float3 n = water ? nWater : p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
+    // normale exacte du jeu, si elle regarde la caméra et s'accorde à peu près avec la forme de la profondeur (pas un détail de texture)
+    if (!water && p.z > 0)
+    {
+        const float3 g = GNormalAt(int2(id));
+        if (dot(g, p) < 0 && dot(g, n) > 0.5)
+            n = g;
+    }
     // reflets RT seulement sur une surface plane (sol, flaque, vitre, eau) : sur un feuillage, des cheveux, un
     // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
     // gris) ; le jeu y garde ses propres reflets. Sol mouillé : en plus, tourné vers le haut
