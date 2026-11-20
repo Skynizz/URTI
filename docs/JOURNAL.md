@@ -2104,3 +2104,17 @@ Vérifié : Horizon deux lancements, deux Alt+Tab ; Red Dead 71 images par secon
   à départager du vrai scintillement).
 
 Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Social Club), Horizon un lancement. Installée dans les deux jeux (réglages par défaut : comme v93).
+
+## v95 : soleil retrouvé dans Red Dead, cases du menu de ReShade
+
+- **Soleil perdu depuis la v74 dans Red Dead** (0 % des images) : un étalonnage avait pris pour carte du soleil une profondeur 1024 × 1024 vue dans l'axe
+  de la caméra (soleil (0,002 0,059 0,998)) et l'avait enregistrée dans `urti_calib.ini` ; comme les ombres RT du soleil sont coupées, plus aucun
+  étalonnage ne la remplaçait. Corrigé : une direction à moins de 14° de l'axe de la caméra est refusée ; dans un jeu sans caméra lue, le soleil est
+  recherché tant qu'il n'est pas suivi, **seulement en partie** (scène RT d'au moins 20 dessins), de plus en plus espacé sans soleil (jusqu'à 32 intervalles).
+  Un essai qui cherchait dès le menu, toutes les 120 images, a mené Red Dead à « mémoire saturée » : écarté. Mesuré : soleil suivi sur 100 % des images,
+  46 paires par image, 4 cascades, 0,04° d'une image à l'autre ; soleil / ciel mesuré 0,21-0,25 (soir couvert). 60 images par seconde.
+- **Menu de ReShade** : cases « Reflets ray tracing », « Occultation ambiante ray tracing (RTAO) » (force, portée en mètres, 2,5 par défaut : 1,5 avant
+  dans Red Dead), « Éclairage indirect ray tracing (RTGI) » (force) ; relues à chaque présentation, elles multiplient les réglages d'urti.ini. Le rebond
+  garde ses rayons même si l'occultation est décochée. Pas encore de case pour les ombres du soleil (le mode actuel coupe le rebond).
+- Constat (rafale, même image avant / après) : URTI assombrit 3,5 % des pixels de plus de 5 % (lierre, coins du mur, pied du mur), 0,3 % de plus de 15 % ;
+  le rebond n'éclaircit rien de visible. Point de départ de l'audit pour un vrai éclairage RT.

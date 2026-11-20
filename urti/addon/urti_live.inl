@@ -445,6 +445,9 @@ struct LiveState
     // débruité (live_shadowtemporal), précédent (historique). Reçu selon la couleur propre des surfaces (albedo du
     // G-buffer, copiée à chaque image)
     float giStrength = 1.0f;
+    // cases et curseurs du menu de ReShade (urti.fx), relus à chaque présentation : multiplient les réglages d'urti.ini
+    bool menuRefl = true, menuAo = true, menuGi = true;
+    float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (portée 0 : celle d'urti.ini)
     bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
     ComPtr<ID3D12Resource> giRaw, giBuf, giPrev;
     bool giValid = false;       // giBuf écrit à la dernière image (sinon pas d'historique, pas de pose)
@@ -684,7 +687,10 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
 {
     const int mainSlot = g.captureSlot;
     if (mainSlot < 0)
+    {
+        live.missedCalibrations++; // (pas d'écran : la prochaine recherche plus tard)
         return;
+    }
     const float fov = 50.0f * 3.14159265f / 180.0f; // valeur arbitraire : les ombres n'en dépendent pas
     const float aspect = g.depthDesc.Height ? float(g.depthDesc.Width) / float(g.depthDesc.Height) : 16.0f / 9.0f;
     const float p11 = 1.0f / std::tan(fov * 0.5f), p00 = p11 / aspect;
@@ -825,8 +831,10 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
                     sum[q] += (c > 0 ? 1 : -1) * o.d[q] * o.w;
         }
         const double len = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
-        // vue verticale (pluie, occlusion) : pas le soleil
-        if (len <= 0 || std::fabs(sum[1] / len) > 0.995)
+        // vue verticale (pluie, occlusion) : pas le soleil ; vue dans l'axe de la caméra (profondeur réduite de l'écran pour l'élimination des objets
+        // cachés, 1024 × 1024 dans Red Dead) : pas le soleil non plus. Un étalonnage de Red Dead l'avait prise (soleil (0,002 0,059 0,998)) et l'avait
+        // enregistrée : plus aucun soleil suivi depuis
+        if (len <= 0 || std::fabs(sum[1] / len) > 0.995 || std::fabs(sum[2] / len) > 0.97)
             continue;
         bestScore = slotBest;
         bestSlot = s;
@@ -3970,7 +3978,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     // rebond de lumière : rayons d'occultation au quart, cache de surfaces rempli et couvrant toute la scène, table
     // des zones en mémoire vidéo
-    const bool giNow = live.giStrength > 0 && live.aoAmount > 0 && live.aoQuarter && !live.sunShadows && live.shadowRawBuf && live.denoisePso &&
+    // menu : occultation et rebond chacun coupé ou dosé ; le rebond a besoin des rayons d'occultation (lancés même si elle est coupée, presque sans effet)
+    const float aoEff = live.aoAmount * (live.menuAo ? live.menuAoForce : 0.0f), giEff = live.giStrength * (live.menuGi ? live.menuGiForce : 0.0f);
+    const float aoRadiusNow = live.menuAoRadius > 0 ? live.menuAoRadius : live.aoRadius;
+    const bool giNow = giEff > 0 && live.aoAmount > 0 && live.aoQuarter && !live.sunShadows && live.shadowRawBuf && live.denoisePso &&
                        live.giRaw && live.giBuf && live.giPrev && live.surfCacheOn && live.surfCache && live.surfFilled > 0 &&
                        live.surfTriangles >= live.capacity / 3 && live.sceneGpuReadable && sceneTable == live.sceneGpu.Get();
     if (giNow && live.giValid)
@@ -4068,7 +4079,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
-             live.aoAmount, live.aoRadius, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
+             aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
              giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
              gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, gnNow ? live.gnPitch : 0u };
     list->SetComputeRoot32BitConstants(14, 32, &sc, 0);
@@ -4271,7 +4282,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         runtime->get_uniform_value_int(v, &m, 1);
         live.fgMode = uint32_t(std::clamp(m, 0, 2));
     }
-    live.reflEffective = live.reflStrength;
+    live.reflEffective = live.menuRefl ? live.reflStrength : 0.0f;
     const float smoothMinEffective = live.smoothMin;
     // 4b. reflets : un rayon réfléchi par pixel lisse (matériau du G-buffer copié dans cette image)
     if (live.reflEffective > 0 || live.debugReflect)
@@ -5314,7 +5325,8 @@ void LiveComposite(effect_runtime* runtime)
     // (compté large, comme le masque : avec la génération d'images, plusieurs présentations de suite sans calcul ou sans
     // G-buffer copié arrivent en régime normal ; le rebond coupé sur l'une d'elles clignotait)
     const bool giFresh = live.giStamp != ~0ull && live.frame <= live.giStamp + 8;
-    const bool giUse = live.giStrength > 0 && live.giValid && giFresh && live.albedoBuf && live.albedoFrame != ~0ull &&
+    const float giEffC = live.giStrength * (live.menuGi ? live.menuGiForce : 0.0f);
+    const bool giUse = giEffC > 0 && live.giValid && giFresh && live.albedoBuf && live.albedoFrame != ~0ull &&
                        live.frame <= live.albedoFrame + 8 && live.albedoWidth >= live.width && live.albedoHeight >= live.height;
     const bool normalUse = giUse && live.personMask && live.normalBuf && live.normalFrame != ~0ull && live.frame <= live.normalFrame + 8 && live.normalWidth >= live.width &&
                            live.normalHeight >= live.height;
@@ -5378,7 +5390,7 @@ void LiveComposite(effect_runtime* runtime)
              (live.sunShadows ? 0u : 0x800u) | (leadUse && !ringUse ? 0x1000u : 0u) | (ringUse ? 0x2000u : 0u), live.p00, live.p11,
              { tinted ? live.sunSky[0] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[1] / live.sunSky[3] : 1.0f, tinted ? live.sunSky[2] / live.sunSky[3] : 1.0f },
              uint32_t((live.uiFrame - 1) & 1), { live.uiZone[0], live.uiZone[1], live.uiZone[2], live.uiZone[3] },
-             giUse ? live.giStrength : 0.0f, live.albedoPitch, alignView ? live.depthPitch : normalUse ? live.normalPitch : 0u,
+             giUse ? giEffC : 0.0f, live.albedoPitch, alignView ? live.depthPitch : normalUse ? live.normalPitch : 0u,
              shiftNow ? live.fgShift : 0.0f, waterBaseUse ? (live.waterBaseW | (live.waterBaseH << 16)) : 0u, waterBaseUse ? live.waterBaseOn : 0.0f, live.waterGain };
     list->SetComputeRoot32BitConstants(17, 29, &cc, 0);
     list->Dispatch((cc.width + 7) / 8, (cc.height + 7) / 8, 1);
@@ -5464,6 +5476,31 @@ void OnReshadePresent(effect_runtime* runtime)
         }
         else if (live.enabled != on)
             runtime->set_uniform_value_bool(v, live.enabled), live.menuOn = int(live.enabled); // F7
+    }
+    // cases du menu : reflets, occultation ambiante (force, portée), rebond de lumière (force)
+    {
+        auto readBool = [&](const char* name, bool& out) {
+            if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", name); v.handle)
+            {
+                bool b = out;
+                runtime->get_uniform_value_bool(v, &b, 1);
+                if (b != out)
+                    Log("URTI : menu, %s %s", name, b ? "coché" : "décoché");
+                out = b;
+            }
+        };
+        auto readFloat = [&](const char* name, float& out, float lo, float hi) {
+            if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", name); v.handle)
+            {
+                float f = out;
+                runtime->get_uniform_value_float(v, &f, 1);
+                if (std::isfinite(f))
+                    out = std::clamp(f, lo, hi);
+            }
+        };
+        readBool("UrtiReflets", live.menuRefl), readBool("UrtiOcclusion", live.menuAo), readBool("UrtiRebond", live.menuGi);
+        readFloat("UrtiOcclusionForce", live.menuAoForce, 0.0f, 2.0f), readFloat("UrtiOcclusionPortee", live.menuAoRadius, 0.5f, 5.0f);
+        readFloat("UrtiRebondForce", live.menuGiForce, 0.0f, 3.0f);
     }
     LiveComposite(runtime);
     // film : cette présentation (calculée ou générée), avant et après URTI, rangée dans l'anneau en mémoire vidéo

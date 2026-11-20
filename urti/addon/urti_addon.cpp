@@ -2280,13 +2280,20 @@ void OnPresent(command_queue* queue, swapchain* swap, const rect*, const rect*, 
     // défaut) et avec la loi de profondeur connue (mesurée aussi à chaque image), il ne sert à rien : dans Horizon
     // Forbidden West, sans carte d'ombres reconnue, il recommençait toutes les 480 images et la capture de la scène
     // RT s'arrêtait pendant ce temps (l'effet disparaissait puis revenait toutes les cinq secondes)
-    const bool calibrationUseful = live.sunShadows || !live.depthReady;
+    // Jeu sans caméra lue (Red Dead) : le soleil sert aussi à l'occultation et au rebond (part du ciel, du soleil) : cherché tant qu'il n'est pas suivi
+    // (trois essais de suite au plus, puis à l'intervalle allongé)
+    // (seulement en partie : une scène RT d'au moins 20 dessins calculée il y a moins de 2 secondes. Au menu, une recherche toutes les 120 images
+    // ne trouvait jamais d'écran, recommençait sans fin et menait Red Dead à « mémoire saturée »)
+    const bool inGame = live.sceneStamp != ~0ull && live.frame < live.sceneStamp + 120 && live.sceneCount >= 20;
+    const bool sunLost = g_camCbvSize == 0 && live.framesSinceSun >= 300 && inGame;
+    const bool calibrationUseful = live.sunShadows || !live.depthReady || sunLost;
     if (live.enabled && g.phase == Phase::Idle && g.nextCapture == ~0ull &&
-        (live.forceCalibration || (!live.calibrated && calibrationUseful && g.frame >= live.nextCalibration)))
+        (live.forceCalibration || ((!live.calibrated || sunLost) && calibrationUseful && g.frame >= live.nextCalibration)))
     {
         g.liveCalibration = true;
         g.nextCapture = g.frame + 1;
-        live.nextCalibration = g.frame + uint64_t(g_calibrationInterval) * (1ull << std::min<uint32_t>(live.missedCalibrations, 2));
+        // (sans soleil, nuit ou ciel couvert : de plus en plus espacé, jusqu'à 32 intervalles ; la capture de la scène s'arrête deux présentations)
+        live.nextCalibration = g.frame + uint64_t(g_calibrationInterval) * (1ull << std::min<uint32_t>(live.missedCalibrations, sunLost ? 5u : 2u));
         live.forceCalibration = false;
     }
     const std::string photoTrigger = g_dir + "\\urti_f7";
