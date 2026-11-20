@@ -299,6 +299,20 @@ float Flatness(int2 t, float3 p)
     return saturate(1.0 - min(eh, ev) / (0.004 * p.z + 0.002));
 }
 
+// surface continue autour du pixel (tronc, rocher, personnage, mur) : à 3 pixels dans les quatre directions, la profondeur reste proche ;
+// faux pour une branche, une brindille, un bord de feuillage, qui bougent au vent et où une occultation tremblait
+bool DepthContinuous(int2 t, float3 p)
+{
+    static const int2 kSide[4] = { int2(3, 0), int2(-3, 0), int2(0, 3), int2(0, -3) };
+    for (uint k = 0; k < 4; k++)
+    {
+        const float3 q = PointAt(t + kSide[k]);
+        if (q.z <= 0 || abs(q.z - p.z) > 0.04 * p.z + 0.05)
+            return false;
+    }
+    return true;
+}
+
 // feuillage (plaques découpées, planes donc acceptées par Flatness) : autour du pixel, à 6 pixels, la caméra
 // voit nettement plus loin (le fond à travers les trous des feuilles)
 bool SeesThroughAround(int2 t, float3 p)
@@ -466,7 +480,7 @@ void main(uint2 id : SV_DispatchThreadID)
     if ((gnMode & 0x1000) && !rough && w > 0 && w < aoMaxDist)
     {
         gnHere = GNormalCam(int2(id));
-        if (dot(gnHere, -normalize(p3)) <= 0.05)
+        if (dot(gnHere, -normalize(p3)) <= 0.05 || !(flatHere || DepthContinuous(int2(id), p3)))
             gnHere = 0;
     }
     const bool gnOk = any(gnHere != 0);
@@ -598,7 +612,7 @@ void main(uint2 id : SV_DispatchThreadID)
         float3 upCam = 0;
         if ((gnMode & 3) == 2 && sunBuf.Load(2092) != 0)
             upCam = float3(asfloat(sunBuf.Load(2056)), asfloat(sunBuf.Load(2068)), asfloat(sunBuf.Load(2080)));
-        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5)
+        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5 && (flatHere || DepthContinuous(int2(id), p3)))
         {
             upCam = normalize(upCam);
             const uint skyRays = w > 25.0 ? 1u : 2u;

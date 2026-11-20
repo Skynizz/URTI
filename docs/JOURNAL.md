@@ -2134,3 +2134,13 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   normales du jeu 6,6 / 0,5 % ; avec le ciel 13,2 / 3,1 % (pied du mur, dessous de la charrette, arbres, sol abrité). Scintillement ajouté 0,11 % des
   pixels à l'arrêt, 0,00 % en tournant la caméra. Passe d'occultation 1,2 -> 2,5 ms. Horizon vérifié (pas de plantage, 62-67 images par seconde).
 - Réglages de Red Dead ajoutés : `gnormal_slot=1`, `gnormal=2`, `gnormal_use=1`, `gnormal_reflect=0` (urti.ini d'avant gardé en `urti.ini.avant_v96`).
+
+## v97 : occultation « franche » par défaut, objets fins écartés
+
+- Choix du joueur : un effet franc. Valeurs physiques au lieu des valeurs prudentes : `ao=1` (0,8 avant), `ao_sky=1` (0,6), `ao_sky_range=16` m (12).
+- Premier essai : 15-19 % des pixels assombris de plus de 5 %, mais scintillement ajouté 0,37-0,78 % des pixels à l'arrêt (0,07 % sans les rayons longs),
+  sur les branches, le lierre, la grille : objets fins qui bougent au vent, où un ou deux rayons longs passent ou non entre les feuilles.
+- **Surfaces continues seulement** pour l'occultation par les normales du jeu et pour les rayons longs : à 3 pixels dans les quatre directions la
+  profondeur reste proche (sol, murs, troncs, rochers, personnages) ; branches, brindilles, bords de feuillage écartés.
+- Mesures (Red Dead, rafales) : 14-19 % des pixels assombris de plus de 5 %, 4,5-6,2 % de plus de 15 % (v95 au même endroit : 8,4 / 1,8 %) ;
+  scintillement ajouté 0,01-0,16 % à l'arrêt, 0,01 % en tournant. Passe d'occultation 2,7 ms.
