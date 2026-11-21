@@ -78,6 +78,25 @@ float3 SampleLinear(float2 uv);
 // couleur reflétée lue sur une petite zone (grille tournée de quatre lectures) : un miroir parfait lu en un seul point tombait, avec le décalage
 // sous-pixel de chaque image, tantôt sur une branche fine tantôt à côté (le reflet des objets fins scintillait) ; une eau réelle n'est jamais un
 // miroir au pixel près
+// distance du point reflété et rayon du flou d'un reflet brillant (live_reflect : w = distance + 20 000 × rayon en pixels de rendu)
+float HitDist(float w) { return w >= 2e4 ? w - 2e4 * floor(w / 2e4) : w; }
+float GlossPx(float w) { return w >= 2e4 ? floor(w / 2e4) : 0.0; }
+
+// lecture floue d'un reflet brillant : huit lectures sur un disque (spirale de Vogel), tournée selon le pixel (le lissage dans le temps et la moyenne
+// des voisins effacent le motif) ; radius en pixels de l'image présentée
+float3 SampleDisk(float2 uv, float radius, int2 at)
+{
+    const float2 px = radius / float2(width, height);
+    const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(at), float2(0.06711056, 0.00583715))));
+    float3 sum = 0;
+    for (uint k = 0; k < 8; k++)
+    {
+        const float r = sqrt((float(k) + 0.5) / 8.0), a = float(k) * 2.3999632 + rot;
+        sum += SampleLinear(uv + float2(cos(a), sin(a)) * r * px);
+    }
+    return sum / 8.0;
+}
+
 float3 SampleSoft(float2 uv)
 {
     if (softPx <= 0)
@@ -113,9 +132,15 @@ float3 RayColor(float4 rf, int2 at)
     if (flags & 16)
     {
         const float4 m = asfloat(mixIn.Load4((uint(at.y) * renderWidth + uint(at.x)) * 16));
-        return m.a > 0 ? m.rgb + m.a * SampleSoft(rf.xy - gJitterUv) : m.rgb;
+        if (m.a <= 0)
+            return m.rgb;
+        const float g = GlossPx(rf.w) * float(width) / float(renderWidth);
+        return m.rgb + m.a * (g > softPx * 1.5 ? SampleDisk(rf.xy - gJitterUv, g, at) : SampleSoft(rf.xy - gJitterUv));
     }
-    return rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleSoft(rf.xy - gJitterUv);
+    if (rf.x < -0.5)
+        return float3(-rf.x - 1.0, rf.y, rf.w);
+    const float g = GlossPx(rf.w) * float(width) / float(renderWidth);
+    return g > softPx * 1.5 ? SampleDisk(rf.xy - gJitterUv, g, at) : SampleSoft(rf.xy - gJitterUv);
 }
 
 float4 Current(int2 t, out bool known, bool center)
@@ -145,7 +170,7 @@ float4 Current(int2 t, out bool known, bool center)
                 {
                     sum += RayColor(rn, q), n += 1;
                     if (rn.x >= -0.5)
-                        hit += rn.w, hn += 1;
+                        hit += HitDist(rn.w), hn += 1;
                 }
             }
         if (n == 0)
@@ -299,7 +324,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (pr.z > 1e-3)
                 mvRot = float2(pr.x * p00 / pr.z * 0.5 + 0.5, 0.5 - pr.y * p11 / pr.z * 0.5) - uv;
         }
-        const float hitT = gSkippedHitT >= 0 ? gSkippedHitT : asfloat(reflection.Load((id.y * renderWidth + id.x) * 16 + 12));
+        const float hitT = gSkippedHitT >= 0 ? gSkippedHitT : HitDist(asfloat(reflection.Load((id.y * renderWidth + id.x) * 16 + 12)));
         const float2 ndc0 = float2(uv.x * 2 - 1, 1 - uv.y * 2);
         const float dist = w > 0 ? length(float3(ndc0.x * w / p00, ndc0.y * w / p11, w)) : 1;
         const float ratio = hitT >= 1e4 ? 0.0 : dist / (dist + max(hitT, 0.0));

@@ -58,7 +58,8 @@ cbuffer Constants : register(b0)
     float3 worldUp;       // flags 8192 : le haut du monde dans l'espace caméra de cette image (normale exacte de l'eau)
     uint budget;          // budget de temps (add-on) : bits 0 à 3 un pixel sur 1, 2 ou 4 reçoit un rayon, bits 4 à 7 sauts de trou en trou, bits 8 et plus numéro d'image
     float tMaxNow;        // portée des rayons réfléchis (mètres)
-    uint gnInfo;          // normales du G-buffer : bits 0-1 codage (1 octaèdre RG16, 2 RGB8 du monde), 2-4 signes inversés, 5 à utiliser, 16-31 pas des lignes
+    uint gnInfo;          // normales du G-buffer : bits 0-1 codage (1 octaèdre RG16, 2 RGB8 du monde), 2-4 signes inversés, 5 à utiliser, 16-31 pas des lignes ;
+                          // reflets brillants : bits 6-12 lissé minimal (× 127), bits 13-15 force (× 7)
 };
 
 // normales exactes du jeu (G-buffer) : celle de la profondeur ne fait que la deviner, avec le grain du décalage sous-pixel ;
@@ -387,9 +388,14 @@ void main(uint2 id : SV_DispatchThreadID)
     // deviennent lisses comme une rue après la pluie
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
+    // reflets brillants (surfaces moins lisses que le seuil des miroirs : parquet, bois ciré, métal, pavés) : de glossMin à sMin, le reflet entre
+    // en douceur, flouté selon la rugosité (plus bas). Au-dessus de sMin, rien ne change
+    const float glossMin = float((gnInfo >> 6) & 127) / 127.0, glossAmt = float((gnInfo >> 13) & 7) / 7.0;
+    const bool glossOn = smoothMin >= 0 && glossMin > 0 && glossMin < sMin && glossAmt > 0;
+    const float sLow = glossOn ? glossMin : sMin;
     // matériau d'abord : hors de l'eau et des surfaces lisses (la plus grande partie de l'écran), plus rien à calculer (ni normale ni planéité)
     float material = Smoothness(int2(id));
-    if (!water && wet <= 0 && (flags & 24) == 0 && (p.z <= 0 || material < sMin || ((flags & 65536) && material <= 0.98)))
+    if (!water && wet <= 0 && (flags & 24) == 0 && (p.z <= 0 || material < sLow || ((flags & 65536) && material <= 0.98)))
     {
         reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(float4(0, 0, 0, 0)));
         if (anchors != 0)
@@ -422,7 +428,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const float s = water ? 1.0 : max(material * ((flags & 4) || material > 0.98 ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
     // (flags 524288) surface lisse étendue seulement : au moins 5 de ses 8 voisins à 2 pixels lisses aussi et sur la même surface. Un rail, un bord de pavé, une
     // arête lisse isolée recevait un reflet dont la direction (tirée de la profondeur) changeait à chaque image : traits qui s'allumaient et s'éteignaient
-    if ((flags & 524288) && !water && (flags & 4) == 0 && wet <= 0 && s >= sMin && p.z > 0)
+    if ((flags & 524288) && !water && (flags & 4) == 0 && wet <= 0 && s >= sLow && p.z > 0)
     {
         uint ok = 0;
         for (uint j = 0; j < 8; j++)
@@ -430,7 +436,7 @@ void main(uint2 id : SV_DispatchThreadID)
             static const int2 kRing[8] = { int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2), int2(2, 2), int2(-2, 2), int2(2, -2), int2(-2, -2) };
             const int2 o = int2(id) + kRing[j];
             const float3 q = PointAt(o);
-            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= sMin)
+            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= sLow)
                 ok++;
         }
         waterFade *= saturate((float(ok) - 4.0) / 3.0);
@@ -442,7 +448,8 @@ void main(uint2 id : SV_DispatchThreadID)
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
     // pas de rayon là où le reflet serait presque invisible (surface vue de face : Fresnel ~4 %) : moins de 3 %
     const float fresnelEarly = f0 + (1.0 - f0) * pow(1.0 - saturate(dot(-normalize(p), n)), 5.0);
-    if (p.z > 0 && s >= sMin && fresnelEarly * saturate((s - sMin) / max(1e-3, 1.0 - sMin)) * waterFade >= 0.03)
+    const float ramp = max(saturate((s - sMin) / max(1e-3, 1.0 - sMin)), glossOn ? glossAmt * saturate((s - glossMin) / max(1e-3, sMin - glossMin)) : 0.0);
+    if (p.z > 0 && s >= sLow && fresnelEarly * ramp * waterFade >= 0.03)
     {
         // surface-miroir dans la géométrie captée : le premier triangle sur le rayon de la caméra, s'il est à
         // la profondeur que l'image montre
@@ -470,7 +477,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const float cosTheta = saturate(dot(-v, n));
         // Fresnel (Schlick) ; le lissé au-dessus du seuil module le poids
         const float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
-        const float weight = fresnel * saturate((s - sMin) / max(1e-3, 1.0 - sMin)) * waterFade;
+        const float weight = fresnel * ramp * waterFade;
         // par défaut : reflet attendu, couleur inconnue (remplacé ci-dessous si le point reflété est visible)
         if (weight > 0)
             result.z = -weight;
@@ -801,6 +808,20 @@ void main(uint2 id : SV_DispatchThreadID)
             result.w = 0.5 + 0.5 * n.y;
         if (flags & 4096)
             result.w = 0.5 + 0.5 * n.z;
+    }
+    // reflet brillant : rayon du flou (pixels de rendu) rangé avec la distance du point reflété, w = distance + 20 000 × rayon (live_reflresolve le
+    // relit). Lobe d'un matériau rugueux : demi-angle ~ alpha = rugosité², empreinte au point reflété vue de la caméra = distance × alpha / (distance
+    // de l'œil + distance), comme l'image virtuelle d'un miroir. Approximation nommée : un rayon miroir puis une lecture floue, pas de rayons tirés dans
+    // le lobe (pas de bruit, mais le flou ignore ce qui est caché à l'écran)
+    if (glossOn && (flags & 24) == 0 && result.z > 0 && result.x >= -0.5 && result.w >= 0 && result.w < 2e4)
+    {
+        const float rough = 1.0 - saturate(s), alpha = rough * rough;
+        if (alpha > 0.02)
+        {
+            const float t = result.w, eye = length(p);
+            const float blurPx = min(round(t * alpha / max(eye + t, 1e-3) * p11 * float(height) * 0.5), 60.0);
+            result.w = t + 2e4 * blurPx;
+        }
     }
     reflection.Store4(id.y * reflectPitch + id.x * 16, asuint(result));
     if (useRad)

@@ -2153,3 +2153,16 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
 - Sans occultation, sans rebond et sans ombres du soleil, **la carte du soleil n'est plus rejouée** et le soleil plus cherché (il revient dès qu'une case
   est recochée) : Red Dead 3,8 -> 1,7 millions de sommets rejoués par présentation, capture 5,9 -> 4,8 ms de processeur ; passe d'ombres 0,3 ms.
 - Horizon : scintillement ajouté 0,34 -> 0,05 % des pixels (l'occultation en était aussi la source), 66 images par seconde.
+
+## v99 : reflets sur les surfaces brillantes (parquet, bois ciré, métal, pavés)
+
+- Demande du joueur : les reflets sont ce qui marche ; les étendre. Jusqu'ici seules les surfaces au lissé ≥ `smooth_min` (0,5 dans Red Dead) avaient
+  un reflet RT ; les sols de Red Dead (~0,36) en étaient exclus.
+- `gloss_min=` (0 : coupé ; 0,2 dans Red Dead) : de ce lissé à `smooth_min`, le reflet entre en douceur (poids Fresnel × rampe × `gloss=`, 1 par défaut) ;
+  au-dessus de `smooth_min`, rien ne change. Case « Reflets sur les surfaces brillantes » dans ReShade.
+- **Flou selon la rugosité** : demi-angle du lobe ~ alpha = rugosité², empreinte au point reflété = distance × alpha / (distance de l'œil + distance),
+  au plus 60 pixels de rendu ; rangé avec la distance du point reflété (w = distance + 20 000 × rayon : la passe des reflets n'a plus de place dans sa
+  signature racine) ; lu par live_reflresolve sur un disque de huit lectures (spirale de Vogel tournée par pixel). Approximation nommée : un rayon miroir
+  puis une lecture floue, pas de rayons tirés dans le lobe (pas de bruit ; le flou ignore ce qui est caché à l'écran).
+- Mesures (Red Dead, Saint-Denis, rafales) : 20,7 % de l'écran à reflet ; image changée de plus de 5 % sur 6,5 % des pixels (0,2 % sans ; 3,6 % au seuil
+  0,3) ; scintillement ajouté 0,12 % à l'arrêt, 0,07 % en tournant ; reflets 0,69 ms, composition +0,5 ms ; 63 images par seconde. Horizon : coupé.
