@@ -2168,3 +2168,12 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   0,3) ; scintillement ajouté 0,12 % à l'arrêt, 0,07 % en tournant ; reflets 0,69 ms, composition +0,5 ms ; 63 images par seconde. Horizon : coupé.
 - Verdict du joueur : « beaucoup trop », des reflets à trop d'endroits et trop loin. Remis comme avant : `gloss_min` retiré des réglages de Red Dead, case
   « Reflets sur les surfaces brillantes » décochée par défaut (le code reste, coupé). Demande suivante : mieux décider quelles surfaces méritent un reflet.
+
+## v100 : reflets brillants triés (sols proches seulement)
+
+- Tri des surfaces brillantes (lissé entre `gloss_min` et `smooth_min`) avec les données du jeu, au lieu d'un seuil seul : **un sol** (normale à moins de
+  32° du haut du monde, donné par l'orientation de la caméra dans Red Dead), plan et étendu (règles des miroirs), **pas du feuillage ni de la peau**
+  (type de matériau de Red Dead, canal rouge de sa cible de matériau : 0,2 et 0,31), **proche** (effacé de 10 à 18 m). Red Dead : `gloss_min=0.3`,
+  `gloss=0.6`. Un réseau de neurones a été écarté : pas de données d'entraînement, plusieurs ms par image, et il devinerait ce que le G-buffer donne exactement.
+- Mesures (balcon de Saint-Denis, rue en contrebas) : 1,2 % de l'écran à reflet (20,7 % en v99) ; image changée de plus de 5 % sur 0,4 % des pixels ;
+  scintillement ajouté 0,01 % ; reflets 0,22 ms. À juger dans un intérieur ou sous les arcades (pierre polie 0,36).

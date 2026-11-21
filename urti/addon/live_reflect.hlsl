@@ -317,6 +317,12 @@ float Flatness(int2 t, float3 p, int k = 4)
     return saturate(1.0 - (k == 4 ? max(eh, ev) : min(eh, ev)) / (0.004 * p.z + 0.002));
 }
 
+// type de matériau (Red Dead : canal rouge de la cible de matériau ; 0,2 feuillage, 0,31 peau, 0,5 commun) ; 0,5 sans matériau lu
+float MaterialKind(int2 t)
+{
+    return (flags & 1) ? float(material.Load(t.y * materialPitch + t.x * 4) & 255) / 255.0 : 0.5;
+}
+
 float Smoothness(int2 t)
 {
     if (flags & 4) // contrôle : toutes les surfaces lisses
@@ -448,7 +454,24 @@ void main(uint2 id : SV_DispatchThreadID)
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
     // pas de rayon là où le reflet serait presque invisible (surface vue de face : Fresnel ~4 %) : moins de 3 %
     const float fresnelEarly = f0 + (1.0 - f0) * pow(1.0 - saturate(dot(-normalize(p), n)), 5.0);
-    const float ramp = max(saturate((s - sMin) / max(1e-3, 1.0 - sMin)), glossOn ? glossAmt * saturate((s - glossMin) / max(1e-3, sMin - glossMin)) : 0.0);
+    // tri des surfaces brillantes (sous le seuil des miroirs) : seulement un sol (plan, étendu, tourné vers le haut : pierre polie, parquet), proche
+    // (effacé de 10 à 18 m : au-delà la brume du jeu noie tout et un reflet y paraissait plaqué), pas du feuillage ni de la peau (type de matériau de
+    // Red Dead, canal rouge de sa cible de matériau : 0,2 feuillage, 0,31 peau). Le haut du monde : orientation de la caméra (Red Dead), sinon celle
+    // du jeu ; inconnu : pas de reflet brillant. Un premier essai sans ce tri en mettait sur 20 % de l'écran, trop et trop loin (avis du joueur)
+    float glossRamp = 0;
+    if (glossOn && p.z > 0 && s >= glossMin && s < sMin)
+    {
+        float3 upG = 0;
+        if (sunBuf.Load(2092) != 0)
+            upG = float3(asfloat(sunBuf.Load(2056)), asfloat(sunBuf.Load(2068)), asfloat(sunBuf.Load(2080)));
+        else if (flags & 8192)
+            upG = worldUp;
+        const float kind = MaterialKind(int2(id));
+        const bool skinOrLeaf = abs(kind - 0.2) < 0.04 || abs(kind - 0.31) < 0.04;
+        if (dot(upG, upG) > 0.5 && dot(n, normalize(upG)) > 0.85 && !skinOrLeaf)
+            glossRamp = glossAmt * saturate((s - glossMin) / max(1e-3, sMin - glossMin)) * saturate((18.0 - length(p)) / 8.0);
+    }
+    const float ramp = max(saturate((s - sMin) / max(1e-3, 1.0 - sMin)), glossRamp);
     if (p.z > 0 && s >= sLow && fresnelEarly * ramp * waterFade >= 0.03)
     {
         // surface-miroir dans la géométrie captée : le premier triangle sur le rayon de la caméra, s'il est à
