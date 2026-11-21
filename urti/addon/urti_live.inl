@@ -449,7 +449,7 @@ struct LiveState
     bool menuRefl = true, menuAo = true, menuGi = true;
     float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (portée 0 : celle d'urti.ini)
     float menuSky = 1.0f;                                               // (multiplie ao_sky=)
-    bool menuGloss = true;                                              // case « reflets sur les surfaces brillantes »
+    bool menuGloss = true; // case « reflets sur les sols brillants proches »
     float glossMin = 0.0f, glossAmount = 1.0f;                          // reflets brillants (gloss_min=, gloss=) : lissé minimal (0 : coupés), force
     float skyAmount = 1.0f, skyRange = 16.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
     bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
@@ -4429,7 +4429,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRootShaderResourceView(11, radNow ? live.radHash->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(12, radNow ? live.radEnv->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(13, radNow ? radParams->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-            const bool gnRefl = live.gnNowFrame && live.gnReflect;
+            const bool gnRefl = live.gnNowFrame != nullptr; // (bit 5 de gnInfo : la normale des reflets les prend, gnormal_reflect=1)
             list->SetComputeRootShaderResourceView(14, gnRefl ? live.gnNowFrame->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(15, live.reflectBuf->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(16, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
@@ -4455,7 +4455,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                      uint32_t(tableNow.size()), live.anchorAlpha > 0 && live.viewPrev && live.prevValid && !radNow ? 1u : 0u, uint32_t(live.capacity),
                      surfRead ? uint32_t(live.surfTriangles) : 0u, { live.worldUp[0], live.worldUp[1], live.worldUp[2] },
                      live.reflStrideNow | (live.reflHopsNow << 4) | (uint32_t(live.frame) << 8), live.reflTMaxNow,
-                     (gnRefl ? (live.gnMode & 3) | (live.gnSigns << 2) | 32u | (live.gnPitch << 16) : 0u) |
+                     (gnRefl ? (live.gnMode & 3) | (live.gnSigns << 2) | (live.gnReflect ? 32u : 0u) | (live.gnPitch << 16) : 0u) |
                          (live.menuGloss && live.glossMin > 0 && live.glossAmount > 0
                               ? (uint32_t(std::clamp(live.glossMin, 0.0f, 1.0f) * 127.0f + 0.5f) << 6) | (uint32_t(std::clamp(live.glossAmount, 0.0f, 1.0f) * 7.0f + 0.5f) << 13)
                               : 0u) };

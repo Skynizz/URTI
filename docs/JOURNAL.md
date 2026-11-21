@@ -2177,3 +2177,17 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   `gloss=0.6`. Un réseau de neurones a été écarté : pas de données d'entraînement, plusieurs ms par image, et il devinerait ce que le G-buffer donne exactement.
 - Mesures (balcon de Saint-Denis, rue en contrebas) : 1,2 % de l'écran à reflet (20,7 % en v99) ; image changée de plus de 5 % sur 0,4 % des pixels ;
   scintillement ajouté 0,01 % ; reflets 0,22 ms. À juger dans un intérieur ou sous les arcades (pierre polie 0,36).
+
+## v101 : flaques de nouveau nettes, sols brillants vraiment actifs, règle des miroirs remise
+
+- **Régression de v99-v100** (signalée par le joueur : « on distingue mal ce qui est reflété, avant les flaques avaient de plus gros reflets ») : le flou
+  selon la rugosité s'appliquait à toute surface sous un lissé de ~0,86, flaques comprises (0,60). Il ne vaut plus que pour la bande brillante (sous
+  `smooth_min`) : les miroirs, l'eau et les flaques sont de nouveau nets.
+- **Sols brillants jamais actifs en v100** : le tri prenait le haut du monde dans l'orientation de la caméra, résolue seulement quand l'occultation tourne
+  (coupée depuis v98). Le sol se reconnaît maintenant à la normale du monde du G-buffer de Red Dead (z > 0,85), liée aux reflets dès qu'elle existe.
+- **Règle des miroirs (v90) affaiblie** quand les reflets brillants étaient actifs : un miroir comptait des voisins seulement « brillants » ; des poutres
+  du plafond des arcades recevaient un reflet. Un miroir exige de nouveau des voisins miroirs.
+- Essayé et retiré : sauter la passe d'ombres sans occultation (0,3 ms) : le masque restait à zéro, toute l'image assombrie (95 % des pixels changés).
+- Mesures sous les arcades de Saint-Denis : sol de pierre polie reflétant le couloir éclairé, plafond inchangé ; scintillement ajouté 0,06 % à l'arrêt,
+  0,00 % en tournant ; reflets 0,25 ms, 71 images par seconde. Scintillement des fenêtres et câbles au loin : dans l'image du jeu seule (11,5 % des pixels
+  varient de plus de 3 niveaux d'une image à l'autre au balcon), pas ajouté par URTI (0,05 %).

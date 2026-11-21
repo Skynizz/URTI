@@ -66,6 +66,25 @@ cbuffer Constants : register(b0)
 // Red Dead les range dans le repère du monde : tournées par l'orientation de la caméra résolue à cette image (sunBuf 2048-2095)
 ByteAddressBuffer gnormal : register(t14);
 
+// normale du G-buffer telle que le jeu l'écrit (Red Dead : repère du monde, z vers le haut), signes appliqués ; 0 si absente
+float3 GNormalRaw(int2 t)
+{
+    const uint enc = gnInfo & 3, pitch = gnInfo >> 16;
+    if (enc != 2 || pitch == 0)
+        return 0;
+    const uint v = gnormal.Load(t.y * pitch + t.x * 4);
+    float3 n = float3(v & 255, (v >> 8) & 255, (v >> 16) & 255) / 255.0 * 2.0 - 1.0;
+    const uint signs = (gnInfo >> 2) & 7;
+    if (signs & 1)
+        n.x = -n.x;
+    if (signs & 2)
+        n.y = -n.y;
+    if (signs & 4)
+        n.z = -n.z;
+    const float l = length(n);
+    return l > 1e-3 && all(isfinite(n)) ? n / l : 0;
+}
+
 float3 GNormalAt(int2 t)
 {
     const uint enc = gnInfo & 3, pitch = gnInfo >> 16;
@@ -442,7 +461,7 @@ void main(uint2 id : SV_DispatchThreadID)
             static const int2 kRing[8] = { int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2), int2(2, 2), int2(-2, 2), int2(2, -2), int2(-2, -2) };
             const int2 o = int2(id) + kRing[j];
             const float3 q = PointAt(o);
-            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= sLow)
+            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= (s >= sMin ? sMin : sLow)) // (miroir : voisins miroirs aussi, règle de la v90 ; brillant : voisins brillants)
                 ok++;
         }
         waterFade *= saturate((float(ok) - 4.0) / 3.0);
@@ -468,7 +487,11 @@ void main(uint2 id : SV_DispatchThreadID)
             upG = worldUp;
         const float kind = MaterialKind(int2(id));
         const bool skinOrLeaf = abs(kind - 0.2) < 0.04 || abs(kind - 0.31) < 0.04;
-        if (dot(upG, upG) > 0.5 && dot(n, normalize(upG)) > 0.85 && !skinOrLeaf)
+        // sol : normale du monde du jeu tournée vers le haut (Red Dead, sans passer par l'orientation de la caméra, qui n'est résolue que si
+        // l'occultation tourne) ; sinon le haut du monde dans l'espace caméra
+        const float3 gw = GNormalRaw(int2(id));
+        const bool floorHere = any(gw != 0) ? gw.z > 0.85 : (dot(upG, upG) > 0.5 && dot(n, normalize(upG)) > 0.85);
+        if (floorHere && !skinOrLeaf)
             glossRamp = glossAmt * saturate((s - glossMin) / max(1e-3, sMin - glossMin)) * saturate((18.0 - length(p)) / 8.0);
     }
     const float ramp = max(saturate((s - sMin) / max(1e-3, 1.0 - sMin)), glossRamp);
@@ -836,7 +859,8 @@ void main(uint2 id : SV_DispatchThreadID)
     // relit). Lobe d'un matériau rugueux : demi-angle ~ alpha = rugosité², empreinte au point reflété vue de la caméra = distance × alpha / (distance
     // de l'œil + distance), comme l'image virtuelle d'un miroir. Approximation nommée : un rayon miroir puis une lecture floue, pas de rayons tirés dans
     // le lobe (pas de bruit, mais le flou ignore ce qui est caché à l'écran)
-    if (glossOn && (flags & 24) == 0 && result.z > 0 && result.x >= -0.5 && result.w >= 0 && result.w < 2e4)
+    // (seulement les surfaces brillantes, sous le seuil des miroirs : une flaque, lissé 0,60, recevait aussi ce flou en v99-v100 et son reflet devenait flou)
+    if (glossOn && s < sMin && glossRamp > 0 && (flags & 24) == 0 && result.z > 0 && result.x >= -0.5 && result.w >= 0 && result.w < 2e4)
     {
         const float rough = 1.0 - saturate(s), alpha = rough * rough;
         if (alpha > 0.02)
