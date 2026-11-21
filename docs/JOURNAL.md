@@ -2166,3 +2166,5 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   puis une lecture floue, pas de rayons tirés dans le lobe (pas de bruit ; le flou ignore ce qui est caché à l'écran).
 - Mesures (Red Dead, Saint-Denis, rafales) : 20,7 % de l'écran à reflet ; image changée de plus de 5 % sur 6,5 % des pixels (0,2 % sans ; 3,6 % au seuil
   0,3) ; scintillement ajouté 0,12 % à l'arrêt, 0,07 % en tournant ; reflets 0,69 ms, composition +0,5 ms ; 63 images par seconde. Horizon : coupé.
+- Verdict du joueur : « beaucoup trop », des reflets à trop d'endroits et trop loin. Remis comme avant : `gloss_min` retiré des réglages de Red Dead, case
+  « Reflets sur les surfaces brillantes » décochée par défaut (le code reste, coupé). Demande suivante : mieux décider quelles surfaces méritent un reflet.
