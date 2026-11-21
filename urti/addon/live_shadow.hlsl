@@ -52,7 +52,7 @@ cbuffer Constants : register(b0)
     float aoMaxDist;       // budget de temps : occultation calculée jusqu'à cette distance (mètres)
     uint gnMode;           // normales du G-buffer : bits 0-1 encodage (1 octaèdre RG16 en repère caméra, 2 RGB8 * 2 - 1), bits 8-10 signes (x, y, z inversés),
                            // bit 12 : l'occultation les prend, bit 13 : comparaison à la normale de la profondeur (journal)
-    uint gnPitch;          // octets par ligne de la copie
+    uint gnPitchPacked;    // bits 0-15 : octets par ligne de la copie des normales ; 16-31 : de la cible de matériau (Red Dead, t10 ; 0 : absente)
     float skyAmount;       // visibilité du ciel à grande portée : part de la lumière du ciel retirée quand un obstacle la cache (0 : coupée)
     float skyRange;        // portée de ces rayons (mètres)
 };
@@ -74,7 +74,9 @@ float PackPenumbra(float distanceToOccluder, float tanOfLightAngularRadius)
 }
 RWByteAddressBuffer penumbra : register(u1); // float par pixel (pas : shadowPitch), mode SIGMA
 ByteAddressBuffer gnormal : register(t9);     // copie de la cible des normales du G-buffer (gnMode)
-RWByteAddressBuffer nstats : register(u3);    // comparaison : par combinaison de signes, somme des produits scalaires (×1000) et nombre de pixels
+RWByteAddressBuffer nstats : register(u3);
+ByteAddressBuffer materialTarget : register(t10); // cible de matériau de Red Dead (r : type, 0,2 feuillage, 0,31 peau ; g : lissé)
+static uint gnPitch;    // comparaison : par combinaison de signes, somme des produits scalaires (×1000) et nombre de pixels
 
 // normale du G-buffer en espace caméra d'URTI (x droite, y haut, z vers la scène), selon l'encodage et les signes ; 0 si absente
 float3 GNormal(int2 t, uint signs)
@@ -301,9 +303,9 @@ float Flatness(int2 t, float3 p)
 
 // surface continue autour du pixel (tronc, rocher, personnage, mur) : à 3 pixels dans les quatre directions, la profondeur reste proche ;
 // faux pour une branche, une brindille, un bord de feuillage, qui bougent au vent et où une occultation tremblait
-bool DepthContinuous(int2 t, float3 p)
+bool DepthContinuous(int2 t, float3 p, int k0 = 3)
 {
-    static const int2 kSide[4] = { int2(3, 0), int2(-3, 0), int2(0, 3), int2(0, -3) };
+    const int2 kSide[4] = { int2(k0, 0), int2(-k0, 0), int2(0, k0), int2(0, -k0) };
     for (uint k = 0; k < 4; k++)
     {
         const float3 q = PointAt(t + kSide[k]);
@@ -354,6 +356,7 @@ void main(uint2 id : SV_DispatchThreadID)
 {
     if (id.x >= width || id.y >= height)
         return;
+    gnPitch = gnPitchPacked & 0xFFFF;
     // loi de profondeur mesurée dans cette image (live_depthfit), sinon celle des constantes
     const float3 law = asfloat(sunBuf.Load3(36));
     gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
@@ -474,6 +477,18 @@ void main(uint2 id : SV_DispatchThreadID)
     // par-dessus le brouillard)
     const float3 macroN = (!flatHere && (flags & (1u << 21)) && w < 20.0) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
     const bool rough = any(macroN != 0);
+    // personnages, chevaux (repère du G-buffer de Red Dead, alpha de ses normales) et feuillage, peau (type de matériau) : pas d'occultation.
+    // Ils bougent sans cesse (animation, vent) : leur occultation traînait derrière eux et scintillait (mesuré : le scintillement à l'arrêt venait
+    // surtout de la canopée)
+    bool aoExcluded = false;
+    if ((gnMode & 3) == 2 && gnPitch != 0 && float(gnormal.Load(id.y * gnPitch + id.x * 4) >> 24) / 255.0 > 0.25)
+        aoExcluded = true;
+    if ((gnPitchPacked >> 16) != 0)
+    {
+        const float kind = float(materialTarget.Load(id.y * (gnPitchPacked >> 16) + id.x * 4) & 255) / 255.0;
+        if (abs(kind - 0.2) < 0.04 || abs(kind - 0.31) < 0.04)
+            aoExcluded = true;
+    }
     // normale exacte du jeu (gnMode bit 12) : l'occultation vaut aussi pour les surfaces qui ne sont pas planes (troncs, rochers, objets,
     // personnages), où celle de la profondeur n'était que du bruit ; elle regarde la caméra
     float3 gnHere = 0;
@@ -484,9 +499,9 @@ void main(uint2 id : SV_DispatchThreadID)
             gnHere = 0;
     }
     const bool gnOk = any(gnHere != 0);
-    if (!aoOnly && aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) && !SeesThroughAround(int2(id), p3))
+    if (!aoOnly && aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) && !aoExcluded && !SeesThroughAround(int2(id), p3))
         aoSkipped = notThisFrame; // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
-    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) &&
+    if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) && !aoExcluded &&
         !SeesThroughAround(int2(id), p3))
     {
         float3 n = rough ? macroN : NormalAt(int2(id), p3);
@@ -612,7 +627,7 @@ void main(uint2 id : SV_DispatchThreadID)
         float3 upCam = 0;
         if ((gnMode & 3) == 2 && sunBuf.Load(2092) != 0)
             upCam = float3(asfloat(sunBuf.Load(2056)), asfloat(sunBuf.Load(2068)), asfloat(sunBuf.Load(2080)));
-        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5 && (flatHere || DepthContinuous(int2(id), p3)))
+        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5 && DepthContinuous(int2(id), p3, 6)) // (grandes surfaces : pas une branche au vent)
         {
             upCam = normalize(upCam);
             const uint skyRays = w > 25.0 ? 1u : 2u;

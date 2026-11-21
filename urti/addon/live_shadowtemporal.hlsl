@@ -202,7 +202,9 @@ void main(uint2 id : SV_DispatchThreadID)
             if (!hasCur)
                 lenNew = max(lenNew - 1.0, 1.0);
             // historique court : bornage plus large (le voisinage d'un point découvert est encore bruité)
-            const float g = gamma * (lenOn && lenNew < 4.0 ? 1.5 : 1.0);
+            // en mouvement, bornage resserré (moitié à 4 pixels par image et plus) : l'occultation d'il y a quelques images ne survit plus au voisinage
+            // courant (traînées)
+            const float g = gamma * (lenOn && lenNew < 4.0 ? 1.5 : 1.0) * lerp(1.0, 0.5, saturate(motionPixels / 4.0));
             for (uint c = 0; c < planes; c++)
                 outValue[c] = lerp(clamp(hist[c], mean[c] - g * sigma[c] - 0.02, mean[c] + g * sigma[c] + 0.02), cur[c], alpha);
         }

@@ -2191,3 +2191,18 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
 - Mesures sous les arcades de Saint-Denis : sol de pierre polie reflétant le couloir éclairé, plafond inchangé ; scintillement ajouté 0,06 % à l'arrêt,
   0,00 % en tournant ; reflets 0,25 ms, 71 images par seconde. Scintillement des fenêtres et câbles au loin : dans l'image du jeu seule (11,5 % des pixels
   varient de plus de 3 niveaux d'une image à l'autre au balcon), pas ajouté par URTI (0,05 %).
+
+## v102 : une seule case dans le menu, occultation propre (sans personnages ni feuillage, débruiteur réactif)
+
+- Demande du joueur : plus de réglages affichés, tout actif par défaut avec les meilleurs réglages ; l'occultation peut être belle si elle ne traîne et
+  ne scintille pas. Menu de ReShade : seule la case « URTI » visible ; reflets, sols brillants proches, occultation et ombre d'ambiance actifs ; rebond de
+  lumière coupé (invisible, ~0,9 ms). Valeurs enregistrées dans les préréglages effacées (copies `ReShadePreset.ini.avant_v102`).
+- **Mesure des traînées** (`trainee.py`) : rafales en tournant la caméra ; décalage de la carte d'assombrissement d'URTI comparé à celui de l'image du jeu
+  (retard 0 : accrochée) et écart qui reste une fois la carte précédente recalée sur le mouvement de l'image.
+- Causes trouvées : occultation sur les personnages, chevaux (animés) et la canopée (au vent) ; rayons longs sur les branches ; bornage de l'historique
+  trop large en mouvement.
+- Corrigé : **pas d'occultation sur les personnages** (alpha des normales du G-buffer de Red Dead) **ni sur le feuillage et la peau** (type de matériau,
+  cible de matériau liée maintenant à la passe d'occultation, t10) ; rayons longs réservés aux grandes surfaces continues (continuité à 6 pixels) ;
+  `ao_sky` 1 -> 0,7 ; bornage de l'historique resserré en mouvement (moitié à 4 pixels par image et plus).
+- Mesures (Red Dead, rue arborée de Saint-Denis) : écart après recalage en tournant 4,0-4,7 % -> 1,5-1,7 % ; scintillement ajouté à l'arrêt 1,49 % ->
+  0,22 % des pixels ; assombrissement moyen 4-6 % de l'image ; retard 0,00-0,14. Horizon : occultation 0,24 % (0,15 % sans), 67 images par seconde.

@@ -451,7 +451,7 @@ struct LiveState
     float menuSky = 1.0f;                                               // (multiplie ao_sky=)
     bool menuGloss = true; // case « reflets sur les sols brillants proches »
     float glossMin = 0.0f, glossAmount = 1.0f;                          // reflets brillants (gloss_min=, gloss=) : lissé minimal (0 : coupés), force
-    float skyAmount = 1.0f, skyRange = 16.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
+    float skyAmount = 0.7f, skyRange = 16.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
     bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
     ComPtr<ID3D12Resource> giRaw, giBuf, giPrev;
     bool giValid = false;       // giBuf écrit à la dernière image (sinon pas d'historique, pas de pose)
@@ -928,7 +928,7 @@ bool LiveCreatePipelines(ID3D12Device* device)
            make(g_live_camfit, sizeof(g_live_camfit), 0, live.camfitRs, live.camfitPso, 4, 2) &&
            make(g_live_mvsynth, sizeof(g_live_mvsynth), 3, live.mvsynthRs, live.mvsynthPso, 8) &&
            make(g_live_planes, sizeof(g_live_planes), 2, live.planesRs, live.planesPso, 4, 2) &&
-           make(g_live_shadow, sizeof(g_live_shadow), 10, live.shadowRs, live.shadowPso, 34, 4) &&
+           make(g_live_shadow, sizeof(g_live_shadow), 11, live.shadowRs, live.shadowPso, 34, 4) &&
            make(g_live_mvcal, sizeof(g_live_mvcal), 4, live.mvcalRs, live.mvcalPso, 8) &&
            make(g_live_shadowtemporal, sizeof(g_live_shadowtemporal), 7, live.denoiseRs, live.denoisePso, 15, 2) &&
            make(g_live_sunfit, sizeof(g_live_sunfit), 3, live.fitRs, live.fitPso, 4) &&
@@ -1151,7 +1151,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, skyIni = 1.0f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, skyIni = 0.7f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -4020,9 +4020,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(6, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(7, giNow ? live.surfCache->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(8, giNow ? sceneTable->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    // (racine : 10 lectures t0-t9, puis u0 masque brut, u1 pénombre, u2 rebond, u3 comparaison des normales, puis les constantes)
-    list->SetComputeRootUnorderedAccessView(10, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(12, giNow ? live.giRaw->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    // (racine : 11 lectures t0-t10, puis u0 masque brut, u1 pénombre, u2 rebond, u3 comparaison des normales, puis les constantes)
+    list->SetComputeRootUnorderedAccessView(11, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(13, giNow ? live.giRaw->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     // normales du G-buffer de cette image (anneau : la case du matériau de l'image ; sinon la dernière copie)
     ID3D12Resource* gnNow = nullptr;
     if (live.gnMode && live.gnFrame != ~0ull && live.frame <= live.gnFrame + 8 && live.gnWidth >= live.width && live.gnHeight >= live.height)
@@ -4043,15 +4043,23 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     list->SetComputeRootShaderResourceView(9, gnNow ? gnNow->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    list->SetComputeRootUnorderedAccessView(13, (gnStatsNow || gnRotNow) && live.gnStats ? live.gnStats->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    // cible de matériau de Red Dead (normales du monde : même disposition du G-buffer) : son type écarte feuillage et peau de l'occultation
+    ID3D12Resource* matShadow = nullptr;
+    if ((live.gnMode & 3) == 2 && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 8 && live.materialPitch < 65536 &&
+        live.materialWidth >= live.width && live.materialHeight >= live.height)
+        matShadow = live.frameSync ? (live.materialIndexNow >= 0 ? live.materialSnap[live.materialIndexNow].Get() : nullptr) : live.materialBuf.Get();
+    if (matShadow && !live.frameSync)
+        Transition(list.Get(), matShadow, D3D12_RESOURCE_STATE_COPY_DEST, srv);
+    list->SetComputeRootShaderResourceView(10, matShadow ? matShadow->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(14, (gnStatsNow || gnRotNow) && live.gnStats ? live.gnStats->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
     // SIGMA (NVIDIA) : un rayon par pixel, pénombre et poids des corrections ; débruitage ensuite
 #if URTI_NRD
     const bool nrdActive = live.nrdShadows && motionOk && live.mvConvention < 16 && live.shadowRawBuf && NrdEnsure(runtime);
-    list->SetComputeRootUnorderedAccessView(11, nrdActive ? g_nrd.penumbraBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(12, nrdActive ? g_nrd.penumbraBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
 #else
     const bool nrdActive = false;
-    list->SetComputeRootUnorderedAccessView(11, live.shadowBuf->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(12, live.shadowBuf->GetGPUVirtualAddress());
 #endif
     // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
     // ciel couvert, crépuscule : la part du soleil mesurée dans l'image est si faible qu'une ombre RT ne se
@@ -4089,10 +4097,12 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
              aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
              giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
-             gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, gnNow ? live.gnPitch : 0u,
+             gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, (gnNow ? live.gnPitch : 0u) | (matShadow ? live.materialPitch << 16 : 0u),
              aoEff > 0 ? live.skyAmount * live.menuSky : 0.0f, live.skyRange };
-    list->SetComputeRoot32BitConstants(14, 34, &sc, 0);
+    list->SetComputeRoot32BitConstants(15, 34, &sc, 0);
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
+    if (matShadow && !live.frameSync)
+        Transition(list.Get(), matShadow, srv, D3D12_RESOURCE_STATE_COPY_DEST);
     live.gnNowFrame = gnNow; // (sans anneau : gardée lisible jusqu'après les reflets)
     // comparaison des normales : relue toutes les 300 images (copiée, remise à zéro ; lue trois images plus tard)
     if (gnStatsNow && live.gnStats && live.gnStatsRb)
