@@ -4,12 +4,15 @@ URTI adds real-time **ray-traced reflections** to DirectX 12 games that do not h
 files or shaders. It is a [ReShade](https://reshade.me) add-on. It watches the game's rendering, rebuilds the scene on
 its side and casts real rays into it with DXR 1.1 inline ray queries.
 
-| Without URTI | With URTI |
-|---|---|
-| ![Horizon Forbidden West, water without URTI](docs/images/hfw_water_before.jpg) | ![Horizon Forbidden West, water with URTI](docs/images/hfw_water_after.jpg) |
+![Red Dead Redemption 2 with URTI: a polished parquet hall mirroring the chandelier, the statues and the fireplace](docs/images/rdr2_hall.jpg)
 
-Horizon Forbidden West: the game's own low-resolution water reflection (green, in blocks) is replaced by a ray-traced
-mirror of the forest, including the trees that are off screen.
+Red Dead Redemption 2 with URTI. The polished parquet mirrors the chandelier, the gilded statues and the candles. The
+game has no ray tracing of its own.
+
+| | |
+|---|---|
+| ![Red Dead Redemption 2 with URTI: a puddle reflecting the house's facade](docs/images/rdr2_street.jpg) | ![Red Dead Redemption 2 with URTI: wet flagstones in an alley](docs/images/rdr2_alley.jpg) |
+| A puddle on the cobblestones reflects the facade and its columns. | Wet flagstones in an alley pick up the passers-by and the buildings. |
 
 ## What it does
 

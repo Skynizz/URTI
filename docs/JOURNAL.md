@@ -2302,3 +2302,5 @@ Demande : une occultation RT viable dans Red Dead, sans décalage, mesurée avec
   surfaces passent les tests de planéité (21,5 / 11,5 % de l'écran à reflet contre 9,8 / 7,7 % à 50°, même moment).
 - Réglages de Red Dead remis à ceux des reflets d'avant : plus de `gloss_min`, `gloss`, `tess`, `gnormal_*` (copie `urti.ini.avant_v108`). Champ de vision
   mesuré gardé (angles justes). Si l'ancien rendu à 50° plaisait davantage : `fov_force=50`.
+- Images du README remplacées par trois captures du joueur en v108 (salle au parquet, flaque devant la maison, ruelle aux dalles mouillées) ;
+  les anciennes images avant / après (Horizon, Red Dead) sont retirées.
