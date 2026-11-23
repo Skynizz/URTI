@@ -2206,3 +2206,14 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
   `ao_sky` 1 -> 0,7 ; bornage de l'historique resserré en mouvement (moitié à 4 pixels par image et plus).
 - Mesures (Red Dead, rue arborée de Saint-Denis) : écart après recalage en tournant 4,0-4,7 % -> 1,5-1,7 % ; scintillement ajouté à l'arrêt 1,49 % ->
   0,22 % des pixels ; assombrissement moyen 4-6 % de l'image ; retard 0,00-0,14. Horizon : occultation 0,24 % (0,15 % sans), 67 images par seconde.
+
+## v103 : le terrain de Red Dead dans la scène RT (dessins tessellés)
+
+- Étape 1 du « transport de lumière » demandé par le joueur (rebond du soleil en nature) : le terrain, dessiné par tessellation, manquait à la scène RT.
+- Capture : les pipelines à hull + domain shader (sans géométrie ni mesh shader, qui écrivent la profondeur) gardent leur code ; leur pipeline de capture
+  rejoue VS + HS + DS (topologie PATCH) et la sortie de flux prend la position après le domain shader. Taille de sortie inconnue d'avance : 32 sommets par
+  point de contrôle d'abord, puis la taille apprise du maillage (comme les ExecuteIndirect), 196 608 sommets au plus. Réglage `tess=1` (Red Dead seulement ;
+  Horizon garde ses dessins tessellés à l'écart).
+- Mesures (rue de Saint-Denis) : dessins tessellés ignorés 11 -> 6 par présentation (les autres n'écrivent pas la profondeur de l'écran) ; structure de
+  l'image 1,19 -> 1,71 M sommets, reconstruction 1,72 -> 2,14 ms ; pas de plantage ; scintillement ajouté 0,25 -> 0,35 % ; traînées : écart en tournant
+  1,44 %. Effet visible faible en ville ; à juger en nature.

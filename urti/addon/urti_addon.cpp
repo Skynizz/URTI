@@ -229,6 +229,7 @@ struct CensusEntry { uint64_t draws = 0, vertices = 0; std::map<uint32_t, uint32
 std::map<uint32_t, CensusEntry> g_liveCensus;       // urti.ini motion_log=1 : tous les dessins de la scène, par classe
 bool g_liveCensusOn = false;
 bool g_liveTranspOn = true;                         // urti.ini water=0 : pas de couche transparente
+bool g_liveTessOn = false;                          // urti.ini tess=1 : dessins tessellés de l'écran principal captés (terrain de Red Dead)
 // zone où le jeu dessine vraiment son image dans la profondeur de l'écran : la plus fréquente parmi les zones de
 // dessin de ses dessins (bord droit, bord bas), cette fenêtre. Avec le DLSS et la résolution dynamique, Horizon
 // Forbidden West dessine en 1280×720 à 1707×960 dans des cibles de 2560×1440 ; quelques dessins (repères en 3D)
@@ -492,6 +493,9 @@ struct PipelineInfo
     bool transparentUsable = false; // surface transparente captée à part (couche 2 de la scène RT : reflets de l'eau)
     bool noDepthUsable = false;     // triangles sans test de profondeur (surface dessinée sans profondeur liée)
     bool otherStage = false;        // géométrie, tessellation ou mesh shader
+    std::vector<uint8_t> hs, ds;    // tessellation : rejouée avec elle (terrain de Red Dead), sortie après le domain shader
+    bool gsOrMesh = false;
+    bool tessUsable = false;        // tessellation seule (ni géométrie ni mesh), écrit la profondeur
     ComPtr<ID3D12PipelineState> shadow;
     bool shadowFailed = false;
 };
@@ -523,15 +527,19 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
         }
         case pipeline_subobject_type::hull_shader:
         case pipeline_subobject_type::domain_shader:
-            if (s.data && static_cast<const shader_desc*>(s.data)->code_size)
+            if (const shader_desc* d = static_cast<const shader_desc*>(s.data); d && d->code && d->code_size)
+            {
                 other = true, info.tessellated = true;
+                (s.type == pipeline_subobject_type::hull_shader ? info.hs : info.ds)
+                    .assign(static_cast<const uint8_t*>(d->code), static_cast<const uint8_t*>(d->code) + d->code_size);
+            }
             break;
         case pipeline_subobject_type::geometry_shader:
         case pipeline_subobject_type::mesh_shader:
         case pipeline_subobject_type::amplification_shader:
         case pipeline_subobject_type::compute_shader:
             if (s.data && static_cast<const shader_desc*>(s.data)->code_size)
-                other = true;
+                other = true, info.gsOrMesh = true;
             break;
         case pipeline_subobject_type::input_layout:
         {
@@ -572,7 +580,7 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
             else if (t == primitive_topology::line_list || t == primitive_topology::line_strip)
                 info.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
             else if (t >= primitive_topology::patch_list_01_cp)
-                other = true;
+                other = true, info.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
             break;
         }
         default:
@@ -592,6 +600,8 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
     info.transparentUsable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && info.depthTested && !info.writesDepth;
     info.noDepthUsable = !other && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && info.rootSignature && !info.depthTested;
     info.otherStage = other;
+    info.tessUsable = info.tessellated && !info.gsOrMesh && !info.hs.empty() && !info.ds.empty() && info.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
+                      info.rootSignature && info.writesDepth;
     std::lock_guard<std::mutex> lock(g_mutex);
     PipelineInfo& stored = g_pipelines[pipe.handle] = std::move(info);
     for (size_t k = 0; k < stored.layout.size(); k++)
@@ -613,6 +623,8 @@ ID3D12PipelineState* GetShadow(ID3D12Device* device, PipelineInfo& info)
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = info.rootSignature;
     desc.VS = { info.vs.data(), info.vs.size() };
+    if (info.tessUsable)
+        desc.HS = { info.hs.data(), info.hs.size() }, desc.DS = { info.ds.data(), info.ds.size() }; // sortie : triangles après tessellation
     desc.StreamOutput.pSODeclaration = &entry;
     desc.StreamOutput.NumEntries = 1;
     desc.StreamOutput.pBufferStrides = &stride;
@@ -990,6 +1002,7 @@ void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint3
     ID3D12PipelineState* shadow = nullptr;
     int slot = -1;
     bool transp = false; // surface transparente (eau, vitre…) : couche à part de la scène RT
+    bool tess = false;   // dessin tessellé (terrain) : taille de sortie inconnue d'avance, apprise
     bool noDepth = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1035,6 +1048,8 @@ void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint3
                 shadow = GetShadow(g.device, it->second), transp = true;
             else if (it->second.usable)
                 shadow = GetShadow(g.device, it->second);
+            else if (g_liveTessOn && it->second.tessUsable && g.phase != Phase::Capturing && state.depth == g_liveMainDepth && kind != 2)
+                shadow = GetShadow(g.device, it->second), tess = true;
             else if (liveTransp && it->second.transparentUsable && state.depth == g_liveMainDepth && (!g_liveGbuffer[0] || state.gbufferSet != g_liveGbuffer[0]))
                 shadow = GetShadow(g.device, it->second), transp = true;
         }
@@ -1089,6 +1104,9 @@ void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint3
         // début du flux ; une zone d'un autre multiple décalerait toutes les suivantes (triangles géants
         // reliant des objets différents)
         uint64_t vertices = (kind == 2 ? 65536ull : uint64_t(params[0]) * std::max(1u, params[1]) + 2) / 3 * 3;
+        // tessellé : les points de contrôle ne disent pas combien de triangles sortent ; première estimation 32 sommets par point, puis la taille apprise
+        if (tess)
+            vertices = std::min<uint64_t>(vertices * 32, 196608);
         LivePending pend;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -1132,9 +1150,9 @@ void CaptureDrawImpl(ID3D12GraphicsCommandList* list, uint32_t kind, const uint3
                 mesh = MeshId(idKey);
                 // taille apprise de ce maillage (une même signature sert à des dessins de toutes tailles : son
                 // maximum imposait 65 536 sommets à tous)
-                if (kind == 2)
+                if (kind == 2 || tess)
                     if (const auto jt = g_liveLearned.find(mesh); jt != g_liveLearned.end())
-                        vertices = std::min<uint64_t>(65536, (uint64_t(jt->second) * 5 / 4 + 64 + 2) / 3 * 3);
+                        vertices = std::min<uint64_t>(tess ? 196608 : 65536, (uint64_t(jt->second) * 5 / 4 + 64 + 2) / 3 * 3);
                 // tous les dessins comptent pour choisir l'écran principal, même hors budget (sinon une autre
                 // profondeur, moins chargée, finirait par passer devant)
                 g.slotDraws[slot]++;
