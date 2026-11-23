@@ -5576,9 +5576,9 @@ void OnReshadePresent(effect_runtime* runtime)
                     out = std::clamp(f, lo, hi);
             }
         };
-        readBool("UrtiReflets", live.menuRefl), readBool("UrtiOcclusion", live.menuAo), readBool("UrtiRebond", live.menuGi), readBool("UrtiBrillant", live.menuGloss);
-        readFloat("UrtiOcclusionForce", live.menuAoForce, 0.0f, 2.0f), readFloat("UrtiOcclusionPortee", live.menuAoRadius, 0.5f, 5.0f);
-        readFloat("UrtiRebondForce", live.menuGiForce, 0.0f, 3.0f), readFloat("UrtiCiel", live.menuSky, 0.0f, 1.6f);
+        readBool("UrtiReflections", live.menuRefl), readBool("UrtiOcclusion", live.menuAo), readBool("UrtiBounce", live.menuGi), readBool("UrtiGloss", live.menuGloss);
+        readFloat("UrtiOcclusionStrength", live.menuAoForce, 0.0f, 2.0f), readFloat("UrtiOcclusionRange", live.menuAoRadius, 0.5f, 5.0f);
+        readFloat("UrtiBounceStrength", live.menuGiForce, 0.0f, 3.0f), readFloat("UrtiSky", live.menuSky, 0.0f, 1.6f);
         // occlusion and bounce unticked: the sun is no longer used, its map is only replayed by eighths (2 million vertices per present in Red Dead)
         g_liveSunEighth = !live.sunShadows && (live.sunEighth || !(live.menuAo || live.menuGi));
         // (game without a read camera, field of view measured automatically: sun tracking stays, its cascades measure the field of view, which

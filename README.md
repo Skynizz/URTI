@@ -4,6 +4,10 @@ URTI adds real-time **ray-traced reflections** to DirectX 12 games that do not h
 files or shaders. It is a [ReShade](https://reshade.me) add-on. It watches the game's rendering, rebuilds the scene on
 its side and casts real rays into it with DXR 1.1 inline ray queries.
 
+<p align="center">
+  <a href="https://github.com/Skynizz/URTI/releases/latest/download/URTI.zip"><img alt="Download URTI for ReShade" src="https://img.shields.io/badge/Download-URTI%20for%20ReShade-2ea44f?style=for-the-badge&logo=github"></a>
+</p>
+
 ![Red Dead Redemption 2 with URTI: a polished parquet hall mirroring the chandelier, the statues and the fireplace](docs/images/rdr2_hall.jpg)
 
 Red Dead Redemption 2 with URTI. The polished parquet mirrors the chandelier, the gilded statues and the candles. The
@@ -52,12 +56,18 @@ The log of every experiment and measurement: [docs/JOURNAL.md](docs/JOURNAL.md) 
 
 ## Installation
 
-You need a DXR 1.1 capable GPU and [ReShade](https://reshade.me) 6.8 **with add-on support**.
+You need a DXR 1.1 capable GPU (NVIDIA RTX 20 series or newer, AMD RX 6000 or newer) and
+[ReShade](https://reshade.me) 6.8 **with add-on support**.
 
-1. Install ReShade into the game folder (or use `tools/reshade/install.py`, reversible with `--remove`).
-2. Copy `urti.addon64` next to the game executable, and the `reshade/` effects into ReShade's effect folder.
-3. Create `urti.ini` in the same place as the game executable, with `live=1`, `reflect=1` and the game's settings from
-   the table above.
+1. **[Download URTI.zip](https://github.com/Skynizz/URTI/releases/latest/download/URTI.zip)** (latest release: the
+   compiled add-on, its effects and the Red Dead Redemption 2 profile).
+2. Install ReShade with add-on support into the game folder, for DirectX 12.
+3. Copy `urti.addon64` and `urti.ini` next to the game executable, and the files of `reshade-shaders/Shaders` into the
+   game's `reshade-shaders/Shaders` folder.
+4. In game, open the ReShade menu (Home) and tick **URTI**.
+
+For another game, start from the settings in the table above. To build the add-on yourself, see
+[Building](#building).
 
 | Key | Action |
 |---|---|

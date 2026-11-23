@@ -1,5 +1,5 @@
-// URTI : effet invisible qui demande la profondeur du jeu. Le module « Generic Depth » de ReShade en
-// garde alors une copie fiable à chaque frame ; l'add-on URTI la lit pour son test de couverture.
+// URTI: invisible effect that asks for the game's depth. ReShade's "Generic Depth" module then keeps
+// a reliable copy of it every frame; the URTI add-on reads it.
 
 #include "ReShade.fxh"
 
@@ -12,7 +12,7 @@ float PS_UrtiDepth(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     return tex2D(sUrtiDepth, uv).x;
 }
 
-technique URTI_Depth < ui_label = "URTI (profondeur pour l'injecteur, invisible)"; >
+technique URTI_Depth < ui_label = "URTI (depth for the injector, invisible)"; >
 {
     pass { VertexShader = PostProcessVS; PixelShader = PS_UrtiDepth; RenderTarget = UrtiDummy; }
 }
