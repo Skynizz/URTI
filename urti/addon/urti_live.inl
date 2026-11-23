@@ -450,6 +450,7 @@ struct LiveState
     float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (portée 0 : celle d'urti.ini)
     float menuSky = 1.0f;                                               // (multiplie ao_sky=)
     bool menuGloss = true; // case « reflets sur les sols brillants proches »
+    bool aoMotionFull = true; // ao_motion= : pixels en mouvement calculés à chaque image (0 : au quart comme avant)
     float glossMin = 0.0f, glossAmount = 1.0f;                          // reflets brillants (gloss_min=, gloss=) : lissé minimal (0 : coupés), force
     float skyAmount = 0.7f, skyRange = 16.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
     bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
@@ -1151,7 +1152,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, tessIni = 0, skyIni = 0.7f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, tessIni = 0, aoMotionIni = 1, skyIni = 0.7f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1188,7 +1189,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni), value("ao_sky=", skyIni), value("ao_sky_range=", skyRangeIni), value("gloss_min=", glossMinIni), value("gloss=", glossIni), value("tess=", tessIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni), value("ao_sky=", skyIni), value("ao_sky_range=", skyRangeIni), value("gloss_min=", glossMinIni), value("gloss=", glossIni), value("tess=", tessIni), value("ao_motion=", aoMotionIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1216,6 +1217,7 @@ void LiveHotReload(ID3D12Device* device)
             live.gnSlot = int(gnSlotIni), live.gnMode = uint32_t(std::clamp(gnModeIni, 0.0f, 2.0f)), live.gnSigns = uint32_t(gnSignsIni) & 7;
             live.gnUse = gnUseIni != 0, live.gnCompare = gnCompareIni != 0, live.gnReflect = gnReflectIni != 0;
             live.skyAmount = std::clamp(skyIni, 0.0f, 1.0f), live.skyRange = std::clamp(skyRangeIni, 1.0f, 40.0f);
+            live.aoMotionFull = aoMotionIni != 0;
             live.glossMin = std::clamp(glossMinIni, 0.0f, 0.95f), live.glossAmount = std::clamp(glossIni, 0.0f, 1.0f);
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
@@ -4096,7 +4098,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
              0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
-             aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoBoost && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u,
+             aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoMotionFull && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u, // (vecteurs de mouvement : pixels en mouvement calculés à chaque image)
              giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
              gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, (gnNow ? live.gnPitch : 0u) | (matShadow ? live.materialPitch << 16 : 0u),
              aoEff > 0 ? live.skyAmount * live.menuSky : 0.0f, live.skyRange };
@@ -4183,7 +4185,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
                  // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
                  // accumulées et un bornage plus large (moins de grain qui tremble)
-                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
+                 live.sunShadows ? 0.1f : 0.06f, 0.5f, // (en mouvement : la moitié de neuf, les pixels qui bougent étant calculés à chaque image) live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
                  live.p00, live.p11, live.sunShadows || !live.denoiseFarSkip ? 0.0f : live.aoDistNow * 1.02f + 0.5f };
         list->SetComputeRoot32BitConstants(9, 15, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);

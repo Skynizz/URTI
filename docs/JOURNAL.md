@@ -2217,3 +2217,15 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
 - Mesures (rue de Saint-Denis) : dessins tessellés ignorés 11 -> 6 par présentation (les autres n'écrivent pas la profondeur de l'écran) ; structure de
   l'image 1,19 -> 1,71 M sommets, reconstruction 1,72 -> 2,14 ms ; pas de plantage ; scintillement ajouté 0,25 -> 0,35 % ; traînées : écart en tournant
   1,44 %. Effet visible faible en ville ; à juger en nature.
+
+## v104 : l'occultation suit le mouvement (pixels qui bougent calculés à chaque image)
+
+- Retour du joueur : en bougeant, l'occultation « pétille » sur les objets, suit mal le mouvement et laisse des traits d'ombre sur eux.
+- Cause : l'occultation au quart (un pixel par bloc 2 × 2 à chaque image, à tour de rôle) ; en mouvement, un pixel n'avait une valeur neuve qu'une image
+  sur quatre, le reste était de l'ancien recollé par les vecteurs de mouvement. Les vecteurs du jeu n'étaient même pas lus par la passe (lus seulement
+  avec `ao_boost=1`).
+- Corrigé : la passe lit le mouvement de chaque pixel ; **un pixel qui bouge de plus d'un pixel par image est calculé à chaque image** (deux rayons de
+  contact, un rayon long), les autres restent au quart. Débruiteur : en mouvement, la moitié de neuf (0,3 avant). `ao_motion=0` : ancien calcul.
+- Mesures (Red Dead, Saint-Denis, même lancement, réglage changé à chaud) : en marchant, scintillement ajouté 0,10-0,21 % des pixels contre 0,88-1,85 %
+  (une rafale à 1,79 %, la première marche, la plus agitée) ; en tournant, part de l'occultation qui ne suit pas 0,36-0,52 × l'assombrissement moyen
+  contre 0,75. Passe d'occultation ~1,2 ms en mouvement (0,8 à l'arrêt).

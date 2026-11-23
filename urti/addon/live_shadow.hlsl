@@ -373,7 +373,19 @@ void main(uint2 id : SV_DispatchThreadID)
     // planéité ni carte du jeu (toute cette préparation coûtait plusieurs millisecondes, quel que soit le nombre de rayons)
     const bool aoOnly = (flags & 64) != 0 && (flags & (8u | 4096u)) == 0 && debugMode == 0;
     static const uint2 kQuarter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
-    const bool notThisFrame = (flags & 128) != 0 && any((id & 1u) != kQuarter[frameIndex & 3]);
+    // mouvement de ce pixel (vecteurs du jeu) : un pixel qui bouge de plus d'un pixel par image est calculé à chaque image, pas au quart. Au quart, en
+    // mouvement, il n'avait une valeur neuve qu'une image sur quatre et le reste était de l'ancien recollé : l'occultation pétillait et laissait des
+    // traits aux bords des objets (signalé par le joueur)
+    float motionPxAo = 0;
+    if (aoMotion < 16 && w > 0)
+    {
+        const uint rawMv = motion.Load(id.y * motionPitch + id.x * 4);
+        float2 mvA = float2(f16tof32(rawMv & 0xFFFF), f16tof32(rawMv >> 16));
+        mvA = (aoMotion & 3) == 0 ? mvA : (aoMotion & 3) == 1 ? mvA * 0.5 : (aoMotion & 3) == 2 ? mvA / float2(width, height) : mvA * 2.0;
+        motionPxAo = all(isfinite(mvA)) ? length(mvA * float2(width, height)) : 0.0;
+    }
+    const bool movingHere = motionPxAo > 1.0;
+    const bool notThisFrame = (flags & 128) != 0 && any((id & 1u) != kQuarter[frameIndex & 3]) && !movingHere;
     if (aoOnly && (d == gClear || !(w > 0) || w >= aoMaxDist || aoAmount <= 0 || notThisFrame))
     {
         const bool later = notThisFrame && d != gClear && w > 0 && w < aoMaxDist && aoAmount > 0; // calculé à une autre image : -1, reconstruit par live_shadowtemporal
@@ -547,14 +559,9 @@ void main(uint2 id : SV_DispatchThreadID)
             aoRays = 1;
         else if (w > 12.0)
             aoRays = min(aoRays, 2u);
-        if (aoMotion < 16)
-        {
-            const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
-            float2 mv = float2(f16tof32(raw & 0xFFFF), f16tof32(raw >> 16));
-            mv = (aoMotion & 3) == 0 ? mv : (aoMotion & 3) == 1 ? mv * 0.5 : (aoMotion & 3) == 2 ? mv / float2(width, height) : mv * 2.0;
-            if (all(isfinite(mv)) && length(mv * float2(width, height)) > 1.5)
-                aoRays = aoRest ? aoRest + max(1u, aoRest / 2) : (flags & 128) ? 6u : 4u;
-        }
+        // en mouvement : calculé à chaque image (plus au quart), deux rayons suffisent (le coût par bloc 2×2 reste du même ordre)
+        if (movingHere && (flags & 128))
+            aoRays = min(aoRays, 2u);
         uint h = AoHash(id.x * 1973u + id.y * 9277u + frameIndex * 26699u);
         float occlusion = 0;
         for (uint k = 0; k < aoRays; k++, h = AoHash(h))
@@ -630,7 +637,7 @@ void main(uint2 id : SV_DispatchThreadID)
         if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5 && DepthContinuous(int2(id), p3, 6)) // (grandes surfaces : pas une branche au vent)
         {
             upCam = normalize(upCam);
-            const uint skyRays = w > 25.0 ? 1u : 2u;
+            const uint skyRays = (w > 25.0 || (movingHere && (flags & 128))) ? 1u : 2u;
             uint hs = AoHash(id.x * 7919u + id.y * 104729u + frameIndex * 15485863u + 17u);
             for (uint ks = 0; ks < skyRays; ks++, hs = AoHash(hs))
             {
