@@ -44,7 +44,7 @@ game has no ray tracing of its own.
    and composed on every displayed frame in HDR, leaving the UI untouched.
 
 The full walkthrough, with diagrams and the reasoning behind each step: **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)**.
-The log of every experiment and measurement: [docs/JOURNAL.md](docs/JOURNAL.md) (in French).
+The log of every experiment and measurement: [docs/JOURNAL.md](docs/JOURNAL.md).
 
 ## Tested games
 
