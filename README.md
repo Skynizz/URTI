@@ -1,63 +1,68 @@
 # URTI — Universal Ray Tracing Injector
 
-URTI adds real-time ray tracing to DirectX 12 games that do not have it, without modifying their files or shaders.
-It is a [ReShade](https://reshade.me) add-on: it watches the game's rendering, rebuilds the scene on its side and
-casts real rays into it (DXR 1.1).
+URTI adds real-time **ray-traced reflections** to DirectX 12 games that do not have them, without modifying their
+files or shaders. It is a [ReShade](https://reshade.me) add-on. It watches the game's rendering, rebuilds the scene on
+its side and casts real rays into it with DXR 1.1 inline ray queries.
 
 | Without URTI | With URTI |
 |---|---|
 | ![Horizon Forbidden West, water without URTI](docs/images/hfw_water_before.jpg) | ![Horizon Forbidden West, water with URTI](docs/images/hfw_water_after.jpg) |
-| ![Horizon Forbidden West, forest without URTI](docs/images/hfw_forest_before.jpg) | ![Horizon Forbidden West, forest with URTI](docs/images/hfw_forest_after.jpg) |
-| ![Red Dead Redemption 2, without URTI](docs/images/rdr2_before.jpg) | ![Red Dead Redemption 2, with URTI](docs/images/rdr2_after.jpg) |
 
-Horizon Forbidden West, water: the game's own low-resolution reflection (green, in blocks) is replaced by a ray-traced
-mirror of the forest. Forest: ray-traced ambient occlusion and light bounce. Red Dead Redemption 2: light bounced by the
-sunlit ground reaches the shaded fountain and walls.
+Horizon Forbidden West: the game's own low-resolution water reflection (green, in blocks) is replaced by a ray-traced
+mirror of the forest, including the trees that are off screen.
 
-## What it adds
+## What it does
 
-- **Ray-traced ambient occlusion**, in the real geometry of the scene, off-screen included.
-- **Diffuse light bounce**, from colours already seen on screen.
-- **Reflections** on water and wet surfaces, stabilised over time. Reflected points that are hidden or off screen take
-  their colour from a world-space radiance cache (a spatial hash, after NVIDIA's SHaRC) filled from what the screen
-  has shown; rays that leave the scene read a learned sky map.
+- **Ray-traced reflections** on water, puddles, glass and polished surfaces. They are stable over time and drawn on
+  every presented frame, including frame-generated ones.
+- **Glossy floors** (Red Dead Redemption 2): polished stone and wooden floors close to the camera get a reflection
+  blurred according to their roughness.
+- **Off-screen content.** Reflected points that are hidden or off screen take their colour from a world-space radiance
+  cache (a spatial hash after NVIDIA's SHaRC) filled from what the screen has shown. Rays that leave the scene read a
+  learned sky map.
+- **One checkbox.** The ReShade menu shows a single "URTI" box; everything else is tuned automatically.
+- **Optional ambient occlusion**, kept in the code and off by default.
 
-## How it works
+## How it works, in short
 
-1. **Geometry capture.** Every draw of the game is replayed through stream output: URTI gets the triangles as the
-   vertex shaders transformed them (animation and instancing included), with nothing to decode.
-2. **RT scene.** One acceleration structure per frame for what is near and moving, plus an object cache for
-   everything else, placed with the game's camera.
-3. **Rays.** Compute passes with inline ray queries: occlusion, bounce, reflections. Each pass has a time budget
-   enforced every frame.
-4. **Composition.** The denoised and stabilised result is applied to the game image. The UI stays untouched when
-   the game provides an image without its UI.
+1. **Geometry capture.** Every draw of the game is replayed through stream output, so URTI gets the triangles exactly
+   as the game's vertex shaders transformed them (animation, instancing and terrain tessellation included).
+2. **Measurements.** Depth law, field of view, sun direction, sub-pixel jitter and camera motion are measured from the
+   game's own frames; nothing is hard-coded per game except a few material slots.
+3. **RT scene.** A per-frame acceleration structure for what is near and moving, plus an object cache for everything
+   else.
+4. **Reflection rays.** Only on surfaces that the game's G-buffer marks as smooth, flat and extended, under a time
+   budget enforced every frame.
+5. **Stabilisation and composition.** The reflection is denoised, reprojected with the motion of the reflected point,
+   and composed on every displayed frame in HDR, leaving the UI untouched.
 
-The detailed log of experiments and measurements is in [docs/JOURNAL.md](docs/JOURNAL.md) (in French).
+The full walkthrough, with diagrams and the reasoning behind each step: **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)**.
+The log of every experiment and measurement: [docs/JOURNAL.md](docs/JOURNAL.md) (in French).
 
 ## Tested games
 
 | Game | Effects | Settings (`urti.ini`) |
 |---|---|---|
-| Red Dead Redemption 2 | occlusion, bounce, reflections on wet surfaces | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `shadow_rays=2` |
-| Horizon Forbidden West (Complete Edition) | occlusion, bounce, water reflections | `camera_cb=512`, `material_slot=4`, `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`, `ao_rough=1`, `person_mask=0` |
+| Red Dead Redemption 2 | reflections, glossy floors | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `gnormal_slot=1`, `gnormal=2`, `gloss_min=0.3`, `gloss=0.6`, `tess=1`, `sun_measure=0` |
+| Horizon Forbidden West (Complete Edition) | water reflections | `camera_cb=512`, `material_slot=4`, `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`, `person_mask=0` |
 
-In Horizon Forbidden West, the in-game Reflections option must stay on: URTI reads the game's camera from that
-pass.
+In Horizon Forbidden West, the in-game Reflections option must stay on: URTI reads the game's camera from that pass.
 
-**Story mode only.** URTI injects itself into the game's rendering: never use it online.
+**Single player only.** URTI injects itself into the game's rendering: never use it online.
 
 ## Installation
 
 You need a DXR 1.1 capable GPU and [ReShade](https://reshade.me) 6.8 **with add-on support**.
 
 1. Install ReShade into the game folder (or use `tools/reshade/install.py`, reversible with `--remove`).
-2. Copy `urti.addon64` next to the game executable.
-3. Create `urti.ini` in the same place, with `live=1`, `ao=1`, `reflect=1` and the game's settings (table above).
+2. Copy `urti.addon64` next to the game executable, and the `reshade/` effects into ReShade's effect folder.
+3. Create `urti.ini` in the same place as the game executable, with `live=1`, `reflect=1` and the game's settings from
+   the table above.
 
 | Key | Action |
 |---|---|
-| F7 | turn URTI on or off |
+| F7 | turn URTI on or off (same as the menu checkbox) |
+| F4 | before / after, full screen |
 | F5 | split screen, without and with URTI |
 | F8 | measurement burst: 30 frames saved without and with URTI |
 
@@ -77,39 +82,50 @@ The add-on is written to `urti/build/Release/urti.addon64`.
 
 | Key | Role | Default |
 |---|---|---|
-| `ao_ms` | target time for occlusion and its denoising (ms, 0: no budget) | 4 |
-| `refl_ms` | target time for reflections (ms, 0: no budget) | 3.5 |
-| `ao_radius` | occlusion range (m) | per game |
+| `refl_ms` | time budget for reflections (ms, 0: no budget) | 3.5 |
+| `smooth_min` | smoothness above which a surface is a mirror | 0.5 |
+| `gloss_min`, `gloss` | glossy floors: lowest smoothness (0: off) and strength | 0, 1 |
+| `radcache` | world radiance cache for hidden and off-screen reflected points | 1 |
 | `water_gain` | weight of the reflection on water, relative to Fresnel | 1.5 |
-| `radcache` | world radiance cache: colours of hidden and off-screen reflected points, sky map (0: per-object colours) | 1 |
-| `lag` | shift the effects onto the frame actually displayed (frame generation shows older frames; 0: off) | 1 |
-| `water_base` | smooth the game's own water reflection under URTI's (0: off) | 0 |
+| `lag` | lay each effect layer on the frame it belongs to (frame generation) | 1 |
 | `fg_shift` | shift of the effects on generated frames (0: frozen) | 0.5 |
-| `hudless` | use the UI-free image provided by the game (0: ignore it) | 1 |
-| `reflect_all` | reflections outside water too (when the game camera is known) | 0 |
+| `hudless` | use the UI-free image provided by the game | 1 |
+| `tess` | capture tessellated draws (terrain) | 0 |
+| `fov_auto` | measure the game's field of view and correct the projection | 1 |
+| `ao` | optional ambient occlusion strength (also needs the hidden `UrtiOcclusion` box) | 1 |
 
 ## Measuring
 
-`tools/reshade/` holds automated in-game tests (launch, walk, bursts, real-pace films kept in GPU memory) and their
-analysis, including the perceptual difference between consecutive frames with NVIDIA's
-[FLIP](https://github.com/NVlabs/flip): what URTI adds as shimmer or jumps on top of what the game itself changes.
+Every change is judged in the game, against the same frame without URTI:
+
+- **In-game tests.** `tools/reshade/` holds automated tests: launch, walk, turn, bursts, and real-pace films kept in
+  GPU memory.
+- **Analysis.** `tools/analyse/` holds the analysis tools:
+
+| Tool | Measures |
+|---|---|
+| `rafale_bruit.py` | flicker added by URTI on top of what the game itself changes |
+| `decalage.py` | alignment at a tenth of a pixel (phase correlation): does the effect follow the image, is it offset, how stable is it |
+| `trainee.py` | trails while the camera turns |
+
+Perceptual comparisons use NVIDIA's [FLIP](https://github.com/NVlabs/flip).
 
 ## Repository layout
 
 | Folder | Content |
 |---|---|
 | `urti/` | the add-on (C++, HLSL) and its test bench |
-| `reshade/` | related ReShade effects |
-| `tools/reshade/` | installation, in-game automated tests, image analysis |
-| `docs/` | journal, roadmap, results, state of the art (in French) |
+| `reshade/` | the ReShade effects that carry the menu and the depth access |
+| `tools/` | installation, in-game automated tests, analysis |
+| `docs/` | how it works, journal, roadmap, results |
 | `src/`, `krc_sdk/` | KRC, the radiance cache studied first |
 | `third_party/` | SHaRC and patches for Quake II RTX, RTGL1 and RTXGI |
 | `results/` | measurements and captures |
 
 ## KRC — Knowledge Radiance Cache
 
-The repository also contains the research prototype behind the project: a spatial radiance cache where each cell
-knows its own uncertainty, and rays go where the doubt is. Protocol in [docs/HYPOTHESE.md](docs/HYPOTHESE.md),
+The repository also contains the research prototype behind the project: a spatial radiance cache where each cell knows
+its own uncertainty, so that rays go where the doubt is. Protocol in [docs/HYPOTHESE.md](docs/HYPOTHESE.md),
 measurements in [docs/RESULTATS.md](docs/RESULTATS.md).
 
 ```sh
@@ -119,13 +135,16 @@ cargo run --release -- sponza 480
 
 ## Limits
 
-- Each game needs a small settings profile: the water mask and the camera are found through a pass survey.
-- Mesh-shader and tessellated draws are not captured.
-- Without a UI-free image from the game, only a fixed screen area is protected.
+- **Per-game profile.** Each game needs a small settings profile (material slots, and the camera's constant buffer
+  when one is found).
+- **Unsupported draws.** Mesh-shader draws are not captured.
+- **Colours of hidden points.** A reflected point never seen on screen has an approximate colour.
+- **UI protection.** Without a UI-free image from the game, only a fixed screen area is protected.
 
 ## License
 
 URTI and KRC code is under the [MIT](LICENSE) license. Third-party code keeps the license of its original project:
-`third_party/`, `urti/third_party/` (ReShade, Dear ImGui), `reshade/ReShade*.fxh`.
+`third_party/`, `urti/third_party/` (ReShade, Dear ImGui), `reshade/ReShade*.fxh`. NVIDIA's NRD, optionally compiled
+in, is not part of the repository.
 
 This project is not affiliated with Rockstar Games, Guerrilla Games, Sony, NVIDIA or ReShade.

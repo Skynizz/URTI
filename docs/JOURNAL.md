@@ -2284,3 +2284,12 @@ Demande : une occultation RT viable dans Red Dead, sans décalage, mesurée avec
   `ao_ms` 4 -> 2,5 ms.
 - Installé dans Red Dead à la demande du joueur, qui teste lui-même ; pas encore mesuré par URTI. Champ de vision : pendant sa partie, mesuré 55-69° et
   corrigé à 56,1° (garde-fous respectés : caméra immobile, mesure stable) ; Red Dead change probablement de champ selon la caméra (ruelle, mode).
+
+## v107 : reflets seuls, documentation complète, dépôt publié
+
+- Décision du joueur : l'occultation (« le système d'ombre ») est trop instable en jeu, on garde uniquement les reflets, « déjà exceptionnels ». Case
+  « Occultation » décochée par défaut dans urti.fx (le code reste, `UrtiOcclusion` caché). Le suivi du soleil reste actif dans un jeu sans caméra lue :
+  ses cascades mesurent le champ de vision, dont les reflets ont besoin (Red Dead). Champ de vision stocké remis à 37,92°.
+- Documentation : `README.md` réécrit (état actuel : reflets, sols brillants, une seule case, réglages par jeu, outils de mesure) et
+  `docs/HOW_IT_WORKS.md` (toute la chaîne : capture, scène RT, mesures, matériaux, rayons, stabilisation, composition, occultation optionnelle, méthode
+  de mesure, leçons, limites).

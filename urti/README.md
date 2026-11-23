@@ -34,8 +34,9 @@ What a real game (RDR2) required:
 - capture over 4 presents (with frame generation, one out of two has no game draw);
 - only compare pipelines that write depth (full-screen lighting passes read it).
 
-Limits: pipelines with geometry / tessellation / mesh shaders are ignored; triangles crossing the near plane are
-ignored in the coverage test.
+Limits: pipelines with geometry or mesh shaders are ignored; tessellated pipelines are replayed with their hull and
+domain shaders when `tess=1` (Red Dead Redemption 2's terrain); triangles crossing the near plane are ignored in the
+coverage test. How the whole add-on works today: [docs/HOW_IT_WORKS.md](../docs/HOW_IT_WORKS.md).
 
 ## Build and test
 

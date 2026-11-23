@@ -5572,7 +5572,9 @@ void OnReshadePresent(effect_runtime* runtime)
         readFloat("UrtiRebondForce", live.menuGiForce, 0.0f, 3.0f), readFloat("UrtiCiel", live.menuSky, 0.0f, 1.6f);
         // occultation et rebond décochés : le soleil ne sert plus, sa carte n'est rejouée que par huitièmes (2 millions de sommets par présentation dans Red Dead)
         g_liveSunEighth = !live.sunShadows && (live.sunEighth || !(live.menuAo || live.menuGi));
-        g_liveSunUnused = !live.sunShadows && !live.menuAo && !live.menuGi;
+        // (jeu sans caméra lue, champ de vision mesuré automatiquement : le suivi du soleil reste, ses cascades mesurent le champ de vision, dont les
+        // reflets ont besoin pour des angles justes)
+        g_liveSunUnused = !live.sunShadows && !live.menuAo && !live.menuGi && (live.camLive || !live.fovAuto);
     }
     LiveComposite(runtime);
     // film : cette présentation (calculée ou générée), avant et après URTI, rangée dans l'anneau en mémoire vidéo
