@@ -361,6 +361,14 @@ struct LiveState
     float fovStretch = 0; // t² mesuré par live_sunvote (étirement de la projection supposée)
     bool fovAuto = true;  // projection corrigée par le champ de vision mesuré (urti.ini fov_auto=0 : 50° supposés)
     bool fovReset = false; // sommes de la mesure à remettre à zéro (projection changée)
+    // champ de vision mesuré (corrigé au moins une fois, ou relu dans urti_calib.ini) : l'étalonnage ne remet plus les 50° supposés. De la v95 à la v105,
+    // chaque recherche du soleil dans Red Dead les remettait, et la correction ne repassait jamais (seuil de rotation trop haut) : URTI travaillait à 50°
+    // pour un jeu à 38°, angles faux (normale du sol, direction des reflets, forme de l'occultation : reflets « décalés »)
+    bool fovMeasured = false;
+    float fovK2Ref = 0; // mesure de référence (stabilité dans le temps)
+    uint64_t motLastMoveFrame = 0; // dernière image où la caméra avançait (notre mesure sur la géométrie)
+    uint64_t fovK2RefFrame = 0;
+    float fovStored = 0; // champ vertical relu (degrés), 0 : aucun
     uint32_t fovHold = 0;  // images à ignorer après une correction (mesures lues avec trois images de retard)
     // part du soleil dans l'image du jeu (live_sunlight) : rapport soleil / ciel par canal (rouge, vert, bleu,
     // luminance), lissé ; les ombres RT ne retirent que cette part (urti.ini sun_measure=0 : pente fixe)
@@ -450,7 +458,10 @@ struct LiveState
     float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (portée 0 : celle d'urti.ini)
     float menuSky = 1.0f;                                               // (multiplie ao_sky=)
     bool menuGloss = true; // case « reflets sur les sols brillants proches »
-    bool aoMotionFull = true; // ao_motion= : pixels en mouvement calculés à chaque image (0 : au quart comme avant)
+    bool aoMotionFull = true;
+    bool denoiseDual = true;
+    bool aoIgn = true;
+    bool aoSunRay = true; // ao_sunray= : visibilité du soleil par un rayon RT pour l'occultation (bit 28), au lieu de la carte d'ombres du jeu // ao_ign= : directions des rayons d'occultation à faible discrépance (bit 27 des drapeaux de live_shadow) // denoise_dual= : double historique (rapide + lent) dans le débruiteur de l'occultation // ao_motion= : pixels en mouvement calculés à chaque image (0 : au quart comme avant)
     float glossMin = 0.0f, glossAmount = 1.0f;                          // reflets brillants (gloss_min=, gloss=) : lissé minimal (0 : coupés), force
     float skyAmount = 0.7f, skyRange = 16.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
     bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
@@ -593,6 +604,8 @@ void LiveSaveCalibration()
         std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\nmotion_target=%u\nmotion_source=%s\n", live.A, live.B,
                      live.sunSign > 0 ? 1 : -1, live.sunMapWidth, live.sunMapHeight, live.sunMapFormat, live.mvSynthetic ? 255u : live.mvConvention,
                      live.mvCandidate, live.mvSynthetic ? "camera" : "jeu");
+        if (live.fovMeasured && live.p11 > 0 && !live.camLive)
+            std::fprintf(f, "fov_v=%.2f\n", 2.0f * std::atan(1.0f / live.p11) * 57.2957795f); // champ de vision vertical mesuré (degrés)
         std::fclose(f);
     }
 }
@@ -600,9 +613,12 @@ void LiveSaveCalibration()
 // projection supposée (champ de vision arbitraire, comme Calibrate) pour le rapport largeur / hauteur
 void LiveSetProjection(const D3D12_RESOURCE_DESC& depthDesc)
 {
-    const float fov = 50.0f * 3.14159265f / 180.0f;
+    const bool stored = live.fovStored >= 15.0f && live.fovStored <= 80.0f;
+    const float fov = (stored ? live.fovStored : 50.0f) * 3.14159265f / 180.0f;
     const float aspect = depthDesc.Height ? float(depthDesc.Width) / float(depthDesc.Height) : 16.0f / 9.0f;
     live.p11 = 1.0f / std::tan(fov * 0.5f), live.p00 = live.p11 / aspect;
+    if (stored)
+        live.fovMeasured = true;
 }
 
 // à la première présentation : étalonnage relu ; la carte d'ombres sera reconnue à sa description
@@ -626,6 +642,7 @@ void LiveLoadCalibration()
         if (std::sscanf(line, "motion=%u", &motionConvention) == 1 && motionConvention < 16)
             live.mvConvention = motionConvention;
         std::sscanf(line, "motion_target=%u", &live.mvCandidate);
+        std::sscanf(line, "fov_v=%f", &live.fovStored);
         if (std::strncmp(line, "motion_source=camera", 20) == 0 && live.motionSource != 1)
             live.mvSynthetic = true, live.mvConvention = 0;
     }
@@ -724,7 +741,9 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     }
     if (!live.depthReady)
         Log("URTI direct : loi de profondeur = %.6f + %.6f / w (reflets possibles même sans soleil)", A, B);
-    live.A = float(A), live.B = float(B), live.p00 = p00, live.p11 = p11;
+    live.A = float(A), live.B = float(B);
+    if (!live.fovMeasured || live.p11 <= 0) // (champ de vision mesuré : gardé ; celui de l'étalonnage est arbitraire, 50°)
+        live.p00 = p00, live.p11 = p11;
     g.depthReversed = B > 0;
     live.depthReady = true;
 
@@ -872,7 +891,9 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
         live.sun[q] = float(bestSun[q]);
     if (!std::isfinite(A) || !std::isfinite(B) || B == 0)
         return; // loi dégénérée : rien n'est adopté
-    live.A = float(A), live.B = float(B), live.p00 = p00, live.p11 = p11;
+    live.A = float(A), live.B = float(B);
+    if (!live.fovMeasured || live.p11 <= 0) // (champ de vision mesuré : gardé ; celui de l'étalonnage est arbitraire, 50°)
+        live.p00 = p00, live.p11 = p11;
     g.depthReversed = B > 0; // profondeur inversée : d = B / w, le ciel (w infini) à 0
     live.calibrated = true;
     live.verified = true;
@@ -1152,7 +1173,7 @@ void LiveHotReload(ID3D12Device* device)
             float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
             float zone[4] = {};
             bool traceIni = false;
-            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, tessIni = 0, aoMotionIni = 1, skyIni = 0.7f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
+            float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, tessIni = 0, aoMotionIni = 1, dualIni = 1, ignIni = 1, sunRayIni = 1, skyIni = 0.7f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
             char line[256];
             while (std::fgets(line, sizeof(line), f))
             {
@@ -1189,7 +1210,7 @@ void LiveHotReload(ID3D12Device* device)
                 value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
                 value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
                 value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
-                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni), value("ao_sky=", skyIni), value("ao_sky_range=", skyRangeIni), value("gloss_min=", glossMinIni), value("gloss=", glossIni), value("tess=", tessIni), value("ao_motion=", aoMotionIni);
+                value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni), value("ao_sky=", skyIni), value("ao_sky_range=", skyRangeIni), value("gloss_min=", glossMinIni), value("gloss=", glossIni), value("tess=", tessIni), value("ao_motion=", aoMotionIni), value("denoise_dual=", dualIni), value("ao_ign=", ignIni), value("ao_sunray=", sunRayIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
                 if (l.rfind("jitter_log=", 0) == 0)
@@ -1217,7 +1238,7 @@ void LiveHotReload(ID3D12Device* device)
             live.gnSlot = int(gnSlotIni), live.gnMode = uint32_t(std::clamp(gnModeIni, 0.0f, 2.0f)), live.gnSigns = uint32_t(gnSignsIni) & 7;
             live.gnUse = gnUseIni != 0, live.gnCompare = gnCompareIni != 0, live.gnReflect = gnReflectIni != 0;
             live.skyAmount = std::clamp(skyIni, 0.0f, 1.0f), live.skyRange = std::clamp(skyRangeIni, 1.0f, 40.0f);
-            live.aoMotionFull = aoMotionIni != 0;
+            live.aoMotionFull = aoMotionIni != 0, live.denoiseDual = dualIni != 0, live.aoIgn = ignIni != 0, live.aoSunRay = sunRayIni != 0;
             live.glossMin = std::clamp(glossMinIni, 0.0f, 0.95f), live.glossAmount = std::clamp(glossIni, 0.0f, 1.0f);
             g_liveTraceOn = traceIni;
             // (avec la caméra du jeu seulement : sinon, rien ne change)
@@ -2434,6 +2455,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const double tr = std::clamp((double(m[0]) + m[4] + m[8] - 1.0) * 0.5, -1.0, 1.0);
             const double rot = std::acos(tr) * 180.0 / 3.14159265, move = std::sqrt(double(m[9]) * m[9] + double(m[10]) * m[10] + double(m[11]) * m[11]);
             live.motValid++, live.motRot += rot, live.motTrans += move;
+            if (move > 0.01) // (plus d'un centimètre par image : la caméra avance ; la mesure du champ de vision en est faussée)
+                live.motLastMoveFrame = live.frame;
             live.motKept += m[14] > 0 ? m[13] / m[14] : 0.0, live.motRms += m[15];
             if (!live.camLive)
                 live.geoPoseDistance = std::sqrt(double(m[41]) * m[41] + double(m[42]) * m[42] + double(m[43]) * m[43]);
@@ -2564,17 +2587,32 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             // un espace caméra étiré, la normale du sol est fausse et le reflet décalé : il « flotte »)
             if (live.fovHold)
                 live.fovHold--;
-            else if (live.fovAuto && !live.camLive && r[304] > 0 && r[305] > 0 && r[300] + r[302] > 4e-4f)
+            // (seuil de rotation 4e-4 -> 1e-4 : avec des mouvements de caméra ordinaires il n'était jamais atteint ; garde : les étirements horizontal et
+            // vertical concordent à 15 % près, une mesure cohérente)
+            else if (live.fovAuto && !live.camLive && r[304] > 0 && r[305] > 0 && r[300] + r[302] > 1e-4f && std::fabs(r[304] / r[305] - 1.0f) < 0.15f)
             {
                 const float k2 = (r[300] * r[304] + r[302] * r[305]) / (r[300] + r[302]);
-                if (std::fabs(k2 - 1.0f) > 0.03f)
+                // stable dans le temps : la même valeur (à 5 % près) qu'au moins 30 images plus tôt ; sinon elle devient la référence. En marchant, pendant
+                // une rafale, la mesure partait parfois seule (37,9° -> 60,8° -> 91,2°)
+                bool stable = false;
+                if (live.fovK2Ref > 0 && live.frame >= live.fovK2RefFrame + 30)
+                {
+                    stable = std::fabs(k2 / live.fovK2Ref - 1.0f) < 0.05f;
+                    live.fovK2Ref = stable ? 0.0f : k2, live.fovK2RefFrame = live.frame;
+                }
+                else if (live.fovK2Ref <= 0)
+                    live.fovK2Ref = k2, live.fovK2RefFrame = live.frame;
+                // (et la caméra n'a pas avancé depuis 220 images : les sommes de la mesure, qui s'effacent en ~200 images, ne contiennent plus de marche)
+                if (stable && live.frame > live.motLastMoveFrame + 220 && std::fabs(k2 - 1.0f) > 0.03f)
                 {
                     const float before = 2.0f * std::atan(1.0f / live.p11) * 57.2957795f;
                     const float aspect = live.p11 / live.p00;
-                    live.p11 = std::clamp(live.p11 * std::pow(k2, 0.4f), // 80 % de l'écart : pas d'oscillation
-                                            1.0f / std::tan(55.0f / 57.2957795f), 1.0f / std::tan(10.0f / 57.2957795f));
+                    // (pas plus de ~25 % d'un coup, champ vertical entre 25° et 75°)
+                    live.p11 = std::clamp(live.p11 * std::pow(std::clamp(k2, 0.6f, 1.7f), 0.4f), // 80 % de l'écart : pas d'oscillation
+                                            1.0f / std::tan(37.5f / 57.2957795f), 1.0f / std::tan(12.5f / 57.2957795f));
                     live.p00 = live.p11 / aspect;
-                    live.fovReset = true, live.fovHold = 6;
+                    live.fovReset = true, live.fovHold = 6, live.fovMeasured = true;
+                    LiveSaveCalibration();
                     Log("URTI direct : champ de vision corrigé : %.1f° -> %.1f°", before, 2.0f * std::atan(1.0f / live.p11) * 57.2957795f);
                 }
             }
@@ -4077,7 +4115,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                            (sunNow ? 0u : 16u) | (live.sunShadows ? 0u : 64u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) |
                            (nrdActive ? 4096u : 0u) |
                            (live.aoQuarter && !live.sunShadows && !nrdActive && live.shadowRawBuf && live.denoisePso ? 128u | (live.aoRays << 16) : 0u) |
-                           (giNow && !nrdActive ? 1u << 20 : 0u) | (live.aoRough ? 1u << 21 : 0u) | (live.slowRays ? 1u << 23 : 0u) | (live.aoHopsNow << 24);
+                           (giNow && !nrdActive ? 1u << 20 : 0u) | (live.aoRough ? 1u << 21 : 0u) | (live.slowRays ? 1u << 23 : 0u) | (live.aoHopsNow << 24) |
+                           (live.aoIgn ? 1u << 27 : 0u) | (live.aoSunRay ? 1u << 28 : 0u);
     const struct
     {
         float sunSign, gameBias, unused, bias;
@@ -4097,7 +4136,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
-             0u, uint32_t(live.frame), live.sunMeasure ? live.sunSky[3] : 0.0f, live.gameDilate, live.gameMin ? 1u : 0u,
+             // (soleil / ciel : la mesure dans l'image du jeu s'appuie sur sa carte d'ombres, qui ne concorde pas dans Red Dead : 0,04 en plein soleil.
+             // En dessous de 0,3, peu crédible : 2,2, la valeur supposée d'URTI)
+             0u, uint32_t(live.frame), live.sunMeasure && live.sunSky[3] >= 0.3f ? live.sunSky[3] : 2.2f, live.gameDilate, live.gameMin ? 1u : 0u,
              aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoMotionFull && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u, // (vecteurs de mouvement : pixels en mouvement calculés à chaque image)
              giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
              gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, (gnNow ? live.gnPitch : 0u) | (matShadow ? live.materialPitch << 16 : 0u),
@@ -4185,7 +4226,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
                  // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
                  // accumulées et un bornage plus large (moins de grain qui tremble)
-                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows || live.aoMotionFull ? 0.5f : 0.3f, // (en mouvement : la moitié de neuf, les pixels qui bougent calculés à chaque image) live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
+                 // (en mouvement : la moitié de neuf, les pixels qui bougent étant calculés à chaque image ; v104 avait ce commentaire en milieu de ligne,
+                 // qui retirait le bornage et le rayon du flou : réglages décalés d'une place)
+                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows || live.aoMotionFull ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f,
+                 (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u) | (lenNow && live.denoiseDual && !live.sunShadows ? 4096u : 0u),
                  live.p00, live.p11, live.sunShadows || !live.denoiseFarSkip ? 0.0f : live.aoDistNow * 1.02f + 0.5f };
         list->SetComputeRoot32BitConstants(9, 15, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
@@ -4201,7 +4245,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             auto gn = dn;
             gn.motionConvention = motionOk && live.giValid ? live.mvConvention : 255u;
             gn.debugMode = 0;
-            gn.blurRadius = 2u | 256u | 512u | (lenNow ? 2048u | 1024u : 0u); // 5×5, jamais calculé -> 0, trois plans ; longueur lue (la même que l'occultation), pas écrite
+            gn.blurRadius = 2u | 256u | 512u | (lenNow ? 2048u | 1024u : 0u) | (lenNow && live.denoiseDual && !live.sunShadows ? 4096u : 0u); // (4096 : longueurs rangées avec l'historique rapide) // 5×5, jamais calculé -> 0, trois plans ; longueur lue (la même que l'occultation), pas écrite
             list->SetComputeRoot32BitConstants(9, 15, &gn, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.giRaw.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

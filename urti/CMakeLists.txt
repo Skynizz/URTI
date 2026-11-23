@@ -51,6 +51,9 @@ target_link_libraries(urti_addon d3d12)
 set_target_properties(urti_addon PROPERTIES OUTPUT_NAME urti SUFFIX ".addon64")
 # symboles de débogage aussi en Release (piles d'appels lisibles en cas de plantage)
 target_compile_options(urti_addon PRIVATE /Zi)
+# conversion qui rétrécit un nombre dans une liste d'initialisation (C4838) : erreur. En v104, un commentaire en milieu de ligne avait
+# décalé d'une place les réglages du débruiteur ; un flottant rangé dans un entier l'aurait signalé
+target_compile_options(urti_addon PRIVATE /we4838)
 target_link_options(urti_addon PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 
 # débruiteurs de NVIDIA (NRD 4.17.3 avec NRI : SIGMA pour les ombres), s'ils ont été compilés dans

@@ -31,7 +31,8 @@ cbuffer Constants : register(b0)
     uint blurRadius;       // 1 : flou 3×3 (ombres du soleil, bords nets) ; 2 : 5×5 (occultation ambiante seule, douce) ;
                            // bit 8 : pixel jamais calculé -> 0 (sinon 1, « éclairé ») ; bit 9 : trois plans (rebond de
                            // lumière R, G, B, l'un après l'autre, chacun de shadowPitch × height octets) ; bit 10 : longueur lue, pas écrite ;
-                           // bit 11 : longueur d'historique disponible (sinon l'ancienne règle)
+                           // bit 11 : longueur d'historique disponible (sinon l'ancienne règle) ; bit 12 : double historique (la longueur est rangée
+                           // avec l'historique rapide : partie entière = longueur × 4, partie fractionnaire = historique rapide × 0,999)
     float p00;             // projection supposée (décalage sous-pixel en pixels)
     float p11;
     float farSkip;         // occultation seule : au-delà de cette distance (portée de l'occultation), rien à débruiter (0 : pas de saut)
@@ -78,6 +79,12 @@ void main(uint2 id : SV_DispatchThreadID)
     for (uint c = 0; c < 3; c++)
         center[c] = c < planes ? Raw(t, c) : 0.0, outValue[c] = center[c];
     float lenNew = 1.0;
+    // double historique (bit 12, occultation seule) : un historique rapide (2 à 3 images, part de neuf 0,5 au moins) suit vite ce qui change (objet qui
+    // passe, mouvement) ; l'historique lent (jusqu'à 1 / alphaMin images) est borné autour de lui, et plus autour du voisinage courant, trop bruité
+    // (bornage large : traînées ; serré : scintillement). Principe des débruiteurs de NVIDIA (historiques rapide et lent de ReBLUR)
+    const bool packedLen = (blurRadius & 4096) != 0 && lenOn;
+    const bool dual = packedLen && planes == 1;
+    float fastNew = unknown;
     const float w = law.z > 0 ? ViewDepth(depth, t) : -1;
     // au-delà de la portée de l'occultation : la passe des rayons y écrit « rien » (1, rebond 0) ; rien à filtrer ni à accumuler
     if (w > 0 && farSkip > 0 && w > farSkip && (blurRadius & 255) == 2 && debugMode == 0)
@@ -85,7 +92,7 @@ void main(uint2 id : SV_DispatchThreadID)
         for (uint c = 0; c < planes; c++)
             result.Store(c * gPlane + id.y * shadowPitch + id.x * 4, asuint(unknown));
         if (lenOn && (blurRadius & 1024) == 0)
-            lenOut.Store(id.y * shadowPitch + id.x * 4, asuint(1.0));
+            lenOut.Store(id.y * shadowPitch + id.x * 4, asuint(packedLen ? 4.0 + 0.999 * saturate(unknown) : 1.0));
         return;
     }
     if (w > 0)
@@ -94,7 +101,7 @@ void main(uint2 id : SV_DispatchThreadID)
         float motionPixels = 0;
         bool used = false;
         float hist[3] = { 0, 0, 0 };
-        float lenH = 0;
+        float lenH = 0, fastH = 0;
         if (motionConvention < 16)
         {
             const uint rm = motion.Load(id.y * motionPitch + id.x * 4);
@@ -124,7 +131,9 @@ void main(uint2 id : SV_DispatchThreadID)
                         const uint o = s.y * shadowPitch + s.x * 4;
                         for (uint c = 0; c < planes; c++)
                             hist[c] += asfloat(history.Load(c * gPlane + o)) * bw;
-                        lenH += (lenOn ? asfloat(lenPrev.Load(o)) : 32.0) * bw;
+                        const float lp = lenOn ? asfloat(lenPrev.Load(o)) : 32.0;
+                        lenH += (packedLen ? floor(lp) * 0.25 : lp) * bw;
+                        fastH += (packedLen ? frac(lp) / 0.999 : 0.0) * bw;
                         hw += bw;
                     }
                 }
@@ -133,6 +142,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     for (uint c = 0; c < planes; c++)
                         hist[c] /= hw;
                     lenH = isfinite(lenH) ? lenH / hw : 0.0;
+                    fastH = isfinite(fastH) ? fastH / hw : 0.0;
                     used = true;
                 }
             }
@@ -207,7 +217,17 @@ void main(uint2 id : SV_DispatchThreadID)
             const float g = gamma * (lenOn && lenNew < 4.0 ? 1.5 : 1.0) * lerp(1.0, 0.5, saturate(motionPixels / 4.0));
             for (uint c = 0; c < planes; c++)
                 outValue[c] = lerp(clamp(hist[c], mean[c] - g * sigma[c] - 0.02, mean[c] + g * sigma[c] + 0.02), cur[c], alpha);
+            if (dual)
+            {
+                // historique rapide : moyenne vraie de ses premières images, puis au moins la moitié de neuf
+                fastNew = hasCur ? lerp(fastH, cur[0], max(1.0 / lenNew, 0.5)) : fastH;
+                // historique lent borné autour du rapide (fenêtre resserrée en mouvement), puis la part de neuf habituelle
+                const float gf = (0.5 * sigma[0] + 0.04) * lerp(1.0, 0.6, saturate(motionPixels / 4.0));
+                outValue[0] = lerp(clamp(hist[0], fastNew - gf, fastNew + gf), cur[0], alpha);
+            }
         }
+        else if (dual)
+            fastNew = outValue[0] >= 0 ? outValue[0] : unknown;
         if (debugMode == 1)
             outValue[0] = center[0];
         else if (debugMode == 2)
@@ -220,5 +240,5 @@ void main(uint2 id : SV_DispatchThreadID)
     for (uint c = 0; c < planes; c++)
         result.Store(c * gPlane + id.y * shadowPitch + id.x * 4, asuint(outValue[c] < 0 ? unknown : outValue[c])); // jamais un pixel « non calculé »
     if (lenOn && (blurRadius & 1024) == 0)
-        lenOut.Store(id.y * shadowPitch + id.x * 4, asuint(lenNew));
+        lenOut.Store(id.y * shadowPitch + id.x * 4, asuint(packedLen ? floor(min(lenNew, 60.0) * 4.0) + 0.999 * saturate(dual ? fastNew : 1.0) : lenNew));
 }

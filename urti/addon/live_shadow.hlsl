@@ -57,6 +57,15 @@ cbuffer Constants : register(b0)
     float skyRange;        // portée de ces rayons (mètres)
 };
 
+// bruit à gradient entrelacé (Jimenez 2014), déplacé à chaque image de 5,588238 pixels : à faible discrépance dans l'espace (deux pixels voisins tirent
+// des directions éloignées, le flou du débruiteur les moyenne vite) et dans le temps. Le bruit blanc (hachage) laissait des amas de directions
+// semblables : grain qui ne se moyennait qu'en beaucoup d'images (la documentation de NRD exige un bruit à faible discrépance pour l'occultation)
+float Ign(float2 p, uint frame)
+{
+    p += 5.588238 * float(frame & 63);
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
 uint AoHash(uint x)
 {
     x ^= x >> 16, x *= 0x7feb352d, x ^= x >> 15, x *= 0x846ca68b, x ^= x >> 16;
@@ -498,7 +507,10 @@ void main(uint2 id : SV_DispatchThreadID)
     if ((gnPitchPacked >> 16) != 0)
     {
         const float kind = float(materialTarget.Load(id.y * (gnPitchPacked >> 16) + id.x * 4) & 255) / 255.0;
-        if (abs(kind - 0.2) < 0.04 || abs(kind - 0.31) < 0.04)
+        // (« feuillage » couvre aussi l'herbe : exclue en v102, les pelouses et la nature avaient perdu toute occultation. L'herbe au sol, normale du
+        // monde tournée vers le haut, la garde ; seules les feuilles des arbres et des buissons, orientées en tous sens, restent exclues)
+        const float3 gwUp = (gnMode & 3) == 2 ? GNormal(int2(id), (gnMode >> 8) & 7) : float3(0, 0, 0);
+        if ((abs(kind - 0.2) < 0.04 && !(gwUp.z > 0.6)) || abs(kind - 0.31) < 0.04)
             aoExcluded = true;
     }
     // normale exacte du jeu (gnMode bit 12) : l'occultation vaut aussi pour les surfaces qui ne sont pas planes (troncs, rochers, objets,
@@ -566,7 +578,10 @@ void main(uint2 id : SV_DispatchThreadID)
         float occlusion = 0;
         for (uint k = 0; k < aoRays; k++, h = AoHash(h))
         {
-            const float u1 = float(h & 0xFFFF) / 65536.0, u2 = (float(h >> 16) / 65536.0 + float(k)) / float(aoRays);
+            // (bit 27 : faible discrépance ; sinon hachage) rayon k : rotation commune du pixel en azimut (strates), rayon par la suite du nombre d'or
+            const float n0 = Ign(float2(id), frameIndex), n1 = Ign(float2(id.yx) + 17.0, frameIndex + 7u);
+            const float u1 = (flags & (1u << 27)) ? frac(n0 + 0.618034 * float(k)) : float(h & 0xFFFF) / 65536.0;
+            const float u2 = (flags & (1u << 27)) ? (frac(n1) + float(k)) / float(aoRays) : (float(h >> 16) / 65536.0 + float(k)) / float(aoRays);
             const float r = sqrt(u1), phi = 6.2831853 * u2;
             RayDesc ray;
             ray.Origin = p3 + n * (rough ? max(0.08, 0.004 * length(p3)) : max(0.01, 0.002 * length(p3)));
@@ -641,7 +656,9 @@ void main(uint2 id : SV_DispatchThreadID)
             uint hs = AoHash(id.x * 7919u + id.y * 104729u + frameIndex * 15485863u + 17u);
             for (uint ks = 0; ks < skyRays; ks++, hs = AoHash(hs))
             {
-                const float s1 = float(hs & 0xFFFF) / 65536.0, s2 = (float(hs >> 16) / 65536.0 + float(ks)) / float(skyRays);
+                const float m0 = Ign(float2(id) + 41.0, frameIndex + 3u), m1 = Ign(float2(id.yx) + 71.0, frameIndex + 11u);
+                const float s1 = (flags & (1u << 27)) ? frac(m0 + 0.618034 * float(ks)) : float(hs & 0xFFFF) / 65536.0;
+                const float s2 = (flags & (1u << 27)) ? (frac(m1) + float(ks)) / float(skyRays) : (float(hs >> 16) / 65536.0 + float(ks)) / float(skyRays);
                 const float rr = sqrt(s1), ph = 6.2831853 * s2;
                 RayDesc sr;
                 sr.Origin = p3 + n * max(0.01, 0.002 * length(p3));
@@ -677,7 +694,39 @@ void main(uint2 id : SV_DispatchThreadID)
             skyOcc = skyW > 0 ? skyOcc / skyW : 0.0;
             occlusion = 1.0 - (1.0 - saturate(occlusion)) * (1.0 - skyAmount * skyOcc);
         }
-        if (aoOnly && (flags & 17) == 1)
+        // ce point reçoit-il le soleil ? (l'occultation ne retire que la lumière du ciel ; au soleil, elle n'en est qu'une petite part)
+        // bit 28 : un rayon RT vers le soleil (trous des feuilles traversés comme pour l'occultation). La carte d'ombres du jeu, lue sinon, ne concorde
+        // pas dans Red Dead (v44 : tout « au bord ») : les murs au soleil étaient assombris comme s'ils étaient à l'ombre
+        if (aoOnly && (flags & 16) == 0 && (flags & (1u << 28)))
+        {
+            gameVis = 0.0;
+            if (dot(n, sun) > 0.08)
+            {
+                RayDesc sr2;
+                sr2.Origin = p3 + n * max(0.01, 0.002 * length(p3));
+                sr2.Direction = sun;
+                sr2.TMin = 0.05;
+                sr2.TMax = 300.0;
+                bool sunBlocked = false;
+                const uint maxHopsSun = (flags >> 24) & 7;
+                for (uint hop3 = 0; hop3 <= maxHopsSun; hop3++)
+                {
+                    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> qs3;
+                    qs3.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, sr2);
+                    qs3.Proceed();
+                    sunBlocked = qs3.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+                    if (!sunBlocked)
+                        break;
+                    const float t3 = qs3.CommittedRayT();
+                    if (!((flags & 2048) && Hole(sr2.Origin + sr2.Direction * t3, p3)))
+                        break;
+                    sunBlocked = false;
+                    sr2.TMin = t3 + max(1e-3, 1e-4 * t3);
+                }
+                gameVis = sunBlocked ? 0.0 : 1.0;
+            }
+        }
+        else if (aoOnly && (flags & 17) == 1)
             gameVis = dot(n, sun) > 0.08 ? GameLit(p3) : 0.0;
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;
         const float skyShare = sunSky > 0 ? 1.0 / (1.0 + sunSky * ndlSky) : 1.0 - 0.6 * ndlSky;

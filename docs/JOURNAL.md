@@ -2232,3 +2232,42 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
 - Horizon : le calcul à chaque image en mouvement y est coupé (`ao_motion=0`) ; mesure à l'arrêt troublée par la météo (pluie puis soleil d'un lancement
   à l'autre). Au soleil, l'occultation y scintillait sur le sol clair (0,57-2,6 %) : le soleil n'y est pas connu, elle retire toute la lumière, même au
   soleil. `ao=0.5` dans Horizon : 0,16 % (0,14 % sans occultation). `ao_rough=0` : sans effet.
+
+## v105 : la projection de Red Dead enfin juste (38° et pas 50°), occultation stable et posée, double historique, rayons à faible discrépance
+
+Demande : une occultation RT viable dans Red Dead, sans décalage, mesurée avec des outils précis ; vérifier si Red Dead était mieux avant Horizon.
+
+**Outils**
+- `decalage.py` (rafales avant / après) : mouvement de l'image et de la carte d'assombrissement par corrélation de phase au dixième de pixel ;
+  **suivi** (1 : accrochée, 0 : figée), **décalage fixe** de la carte par rapport aux contours de l'image, **instabilité** (écart de la carte à la
+  précédente recalée sur le mouvement, rapporté à l'assombrissement moyen), part assombrie. `rdr2_regress.sh` : même séance de mesure pour n'importe
+  quelle version de l'add-on.
+
+**Régressions trouvées**
+1. **Champ de vision** : la v70 le mesurait (37,9°) et corrigeait la projection ; depuis, URTI travaillait à **50°** dans Red Dead. La mesure (s², t²
+   des cascades) donnait toujours 37,7-37,8°, mais la correction exigeait une rotation cumulée (4e-4) jamais atteinte, et chaque étalonnage (recherche du
+   soleil, v95) remettait 50°. Espace caméra étiré de 31 % : normale du sol, direction des reflets, forme de l'occultation faussées. Corrigé : seuil
+   1e-4, étirements horizontal et vertical concordants à 15 %, **même mesure à 5 % près 30 images plus tard**, **caméra immobile depuis 220 images**
+   (en marchant la mesure partait : 37,9° -> 60,8° -> 91,2°), pas plus de ~25 % par correction, 25° à 75° ; l'étalonnage ne remet plus 50° ;
+   champ mesuré enregistré (`fov_v=` dans urti_calib.ini) et relu au lancement.
+2. **Herbe** : « feuillage » (type de matériau de Red Dead) couvre aussi l'herbe : exclue en v102, parcs et nature sans occultation (0,5-1,3 % de
+   l'image contre 18-27 % en v70 / v83). Seule l'herbe tournée vers le haut (normale du monde, z > 0,6) la garde ; les feuilles des arbres restent exclues.
+3. **Réglages du débruiteur décalés en v104** (commentaire en milieu de ligne : bornage 0,9 au lieu de 2, flou 3×3, sans longueur d'historique).
+   Corrigé, et **C4838 (conversion qui rétrécit dans une liste d'initialisation) est maintenant une erreur de compilation**.
+4. **Soleil et occultation** : la part du soleil venait de la carte d'ombres du jeu, qui ne concorde pas dans Red Dead (v44), et du rapport soleil / ciel
+   mesuré avec elle (0,04 en plein soleil : soleil « trop faible », coupé). Murs au soleil assombris comme à l'ombre. Corrigé : **un rayon RT vers le soleil**
+   (trous des feuilles traversés) décide si le point est éclairé (`ao_sunray=1`) ; rapport soleil / ciel peu crédible (< 0,3) -> 2,2 ;
+   `sun_measure=0` dans Red Dead.
+
+**Techniques ajoutées (recherche : NRD / ReBLUR, brevets NVIDIA sur l'historique borné, bruit bleu spatio-temporel)**
+- **Double historique** (`denoise_dual=1`) : historique rapide (2-3 images, au moins la moitié de neuf) rangé avec la longueur d'historique ;
+  l'historique lent est borné autour de lui (fenêtre 0,5 σ + 0,04, resserrée en mouvement), plus autour du voisinage courant bruité.
+- **Rayons à faible discrépance** (`ao_ign=1`) : bruit à gradient entrelacé déplacé à chaque image, rotation commune et strates en azimut, nombre d'or
+  entre les rayons d'un pixel (contact et rayons longs).
+
+**Mesures (Red Dead, rue arborée et parc de Saint-Denis, au soleil)**
+- v70 / v83 / v105 : instabilité à l'arrêt 0,19 / 0,20 / **0,11** ; en tournant 0,22-0,50 / 0,43 / **0,20-0,23** ; suivi 0,90-0,91 / 0,91-0,95 /
+  **0,94-0,95** ; décalage fixe 0,02 / 0,02 / **0,00-0,02 px** ; part assombrie de plus de 5 % 18-21 % / 23-27 % / 24-27 % ; scintillement ajouté à
+  l'arrêt 0,39 / 0,66 / 0,40 %, en marchant 0,09-1,04 / 0,26-1,15 / 0,30-0,67 %.
+- Murs au soleil : seule la part du ciel retirée ; taches de soleil au sol intactes, ombre des arbres assombrie.
+- Horizon : scintillement ajouté par l'occultation 0,06 % à l'arrêt, 0,08 % en marchant ; 99 images par seconde.
