@@ -2293,3 +2293,12 @@ Demande : une occultation RT viable dans Red Dead, sans décalage, mesurée avec
 - Documentation : `README.md` réécrit (état actuel : reflets, sols brillants, une seule case, réglages par jeu, outils de mesure) et
   `docs/HOW_IT_WORKS.md` (toute la chaîne : capture, scène RT, mesures, matériaux, rayons, stabilisation, composition, occultation optionnelle, méthode
   de mesure, leçons, limites).
+
+## v108 : Red Dead revient aux reflets nets (sans sols brillants ni terrain)
+
+- Retour du joueur : les reflets semblent de moins bonne qualité qu'avant. Comparaison en jeu (`fov_force=` ajouté pour imposer le champ de vision) :
+  le personnage changeait de lieu pendant la séance, pas de comparaison propre ; mais les rafales montrent les sols brillants (v99-v101) qui donnent à
+  tout le pavage sec un reflet flou et brillant, l'air mouillé et brouillé, là où il n'y avait avant que des miroirs nets. Champ de vision 38° : plus de
+  surfaces passent les tests de planéité (21,5 / 11,5 % de l'écran à reflet contre 9,8 / 7,7 % à 50°, même moment).
+- Réglages de Red Dead remis à ceux des reflets d'avant : plus de `gloss_min`, `gloss`, `tess`, `gnormal_*` (copie `urti.ini.avant_v108`). Champ de vision
+  mesuré gardé (angles justes). Si l'ancien rendu à 50° plaisait davantage : `fov_force=50`.

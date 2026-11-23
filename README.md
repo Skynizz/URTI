@@ -15,8 +15,8 @@ mirror of the forest, including the trees that are off screen.
 
 - **Ray-traced reflections** on water, puddles, glass and polished surfaces. They are stable over time and drawn on
   every presented frame, including frame-generated ones.
-- **Glossy floors** (Red Dead Redemption 2): polished stone and wooden floors close to the camera get a reflection
-  blurred according to their roughness.
+- **Optional glossy floors**: polished floors close to the camera can get a reflection blurred by their roughness
+  (`gloss_min=`). Off by default: sharp mirrors look better than a blurred sheen on every pavement.
 - **Off-screen content.** Reflected points that are hidden or off screen take their colour from a world-space radiance
   cache (a spatial hash after NVIDIA's SHaRC) filled from what the screen has shown. Rays that leave the scene read a
   learned sky map.
@@ -43,7 +43,7 @@ The log of every experiment and measurement: [docs/JOURNAL.md](docs/JOURNAL.md) 
 
 | Game | Effects | Settings (`urti.ini`) |
 |---|---|---|
-| Red Dead Redemption 2 | reflections, glossy floors | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `gnormal_slot=1`, `gnormal=2`, `gloss_min=0.3`, `gloss=0.6`, `tess=1`, `sun_measure=0` |
+| Red Dead Redemption 2 | reflections on puddles, wet streets, windows, polished floors | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `sun_measure=0` |
 | Horizon Forbidden West (Complete Edition) | water reflections | `camera_cb=512`, `material_slot=4`, `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`, `person_mask=0` |
 
 In Horizon Forbidden West, the in-game Reflections option must stay on: URTI reads the game's camera from that pass.

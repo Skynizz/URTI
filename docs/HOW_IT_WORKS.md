@@ -100,11 +100,12 @@ A pixel receives a ray-traced reflection when all of these hold:
    would flicker as its normal changes with the jitter.
 4. **Visible enough.** Its Fresnel weight is worth a ray (≥ 3 %).
 
-**Glossy floors.** Red Dead Redemption 2's floors are smooth but below the mirror threshold. They get a blurred
-reflection only if they are a floor (world normal pointing up), not foliage or skin, and closer than 10 to 18 m (the
-reflection fades out over that range). The blur follows the material's lobe: half-angle α = roughness², and footprint =
+**Glossy floors** (optional, `gloss_min=`, off by default). Red Dead Redemption 2's floors are smooth but below the
+mirror threshold. When enabled, they get a blurred reflection only if they are a floor (world normal pointing up), not
+foliage or skin, and closer than 10 to 18 m (the reflection fades out over that range). The blur follows the material's lobe: half-angle α = roughness², and footprint =
 hit distance × α / (eye distance + hit distance), read with 8 taps on a Vogel disk. A first version without this sorting
-put reflections on 20 % of the screen, which was too much.
+put reflections on 20 % of the screen, which was too much. Even sorted, a blurred sheen on dry pavement read as lower
+quality than sharp mirrors, so it stays off.
 
 **Water** (Horizon Forbidden West) uses the world's up vector as its normal: the depth-derived normal of a rippled
 surface changes every frame.
