@@ -1,11 +1,11 @@
-"""URTI : étude du G-buffer d'un jeu (relevé des passes, fichiers urti_passes : urti_instant_NN_passe_NNN.raw)
+"""URTI: study of a game's G-buffer (pass survey, urti_passes files: urti_snapshot_NN_pass_NNN.raw)
 
-    python urti_gbuffer.py <dossier du jeu ou dossier des .raw> [sortie]
+    python urti_gbuffer.py <game folder or folder of the .raw files> [output]
 
-Chaque .raw (texels bruts à demi-résolution, tous les canaux) est décodé canal par canal : une planche par
-image (un canal = une vignette en gris, valeur brute 0..1, flottants ramenés par leur 99,5e centile) et une
-ligne de statistiques par canal (min, max, moyenne, nombre de valeurs distinctes, part à 0 et à 1). Le
-journal (urti_log.txt) dit quelles passes sont les cibles du G-buffer.
+Each .raw (raw texels at half resolution, every channel) is decoded channel by channel: one sheet per
+image (one channel = one grey thumbnail, raw value 0..1, floats brought back by their 99.5th percentile) and one
+statistics line per channel (min, max, mean, number of distinct values, share at 0 and at 1). The
+log (urti_log.txt) tells which passes are the G-buffer targets.
 """
 import os
 import re
@@ -14,7 +14,7 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw
 
-# format DXGI -> (type numpy, nombre de canaux, normalisation) ; None : décodage particulier
+# DXGI format -> (numpy type, number of channels, normalisation); None: special decoding
 FORMATS = {
     2: ('<f4', 4, None), 16: ('<f4', 2, None), 41: ('<f4', 1, None),
     9: ('<f2', 4, None), 10: ('<f2', 4, None), 11: ('<u2', 4, 65535), 33: ('<f2', 2, None), 34: ('<f2', 2, None),
@@ -58,7 +58,7 @@ def decode(path):
 
 
 def show(c):
-    """canal -> gris 8 bits : 0..1 tel quel, sinon ramené par le 99,5e centile de sa valeur absolue"""
+    """channel -> 8-bit grey: 0..1 as is, otherwise brought back by the 99.5th percentile of its absolute value"""
     c = np.nan_to_num(c, nan=0, posinf=0, neginf=0)
     lo = float(c.min())
     if lo >= 0 and float(c.max()) <= 1.0:
@@ -79,15 +79,15 @@ def main():
     log = os.path.join(src, 'urti_log.txt')
     if os.path.exists(log):
         for line in open(log, encoding='utf-8', errors='replace'):
-            if (m := re.search(r'G-buffer cible (\d+) = passe (\d+)', line)):
+            if (m := re.search(r'G-buffer target (\d+) = pass (\d+)', line)):
                 gb[int(m.group(2))] = int(m.group(1))
-    files = sorted(n for n in os.listdir(src) if re.match(r'urti_(instant|passe)_.*\.raw$', n))
+    files = sorted(n for n in os.listdir(src) if re.match(r'urti_(snapshot|pass)_.*\.raw$', n))
     for name in files:
         fmt, a = decode(os.path.join(src, name))
-        order = int(re.search(r'passe_(\d+)', name).group(1))
-        tag = f'  [G-buffer cible {gb[order]}]' if order in gb else ''
+        order = int(re.search(r'pass_(\d+)', name).group(1))
+        tag = f'  [G-buffer target {gb[order]}]' if order in gb else ''
         if a is None:
-            print(f'{name}: format {fmt} non décodé')
+            print(f'{name}: format {fmt} not decoded')
             continue
         h, w, n = a.shape
         print(f'{name}: {NAMES.get(fmt, fmt)} {w}x{h}{tag}')
@@ -96,8 +96,8 @@ def main():
             c = a[..., k]
             fin = c[np.isfinite(c)]
             q = np.round(np.clip(fin, -4, 4) * 255).astype(np.int32)
-            print(f'   canal {k}: min {fin.min():8.3f} max {fin.max():8.3f} moy {fin.mean():7.3f} '
-                  f'distinctes {len(np.unique(q)):4d}  à 0 {100 * np.mean(fin == 0):5.1f} %  à 1 {100 * np.mean(fin == 1):5.1f} %')
+            print(f'   channel {k}: min {fin.min():8.3f} max {fin.max():8.3f} mean {fin.mean():7.3f} '
+                  f'distinct {len(np.unique(q)):4d}  at 0 {100 * np.mean(fin == 0):5.1f} %  at 1 {100 * np.mean(fin == 1):5.1f} %')
             img = Image.fromarray(show(c)).resize((w // 2, h // 2), Image.BILINEAR)
             ImageDraw.Draw(img).text((6, 4), f'{order:03d} c{k}', fill=255)
             tiles.append(img)
@@ -107,7 +107,7 @@ def main():
             sheet.paste(t, (x, 0))
             x += t.width
         sheet.save(os.path.join(out, name[:-4] + '.png'))
-    print(f'planches : {out}')
+    print(f'sheets: {out}')
 
 
 if __name__ == '__main__':

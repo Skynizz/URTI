@@ -1,14 +1,14 @@
-"""URTI : analyse d'un film au rythme réel (fichier urti_film, urti_film_N\\avant_k.raw / apres_k.raw, une ligne FILM par présentation).
+"""URTI: analysis of a real-pace film (urti_film file, urti_film_N\\before_k.raw / after_k.raw, one FILM line per present).
 
-    python urti_film_ana.py <dossier du film> [journal] [numéro du film dans le journal]
+    python urti_film_ana.py <film folder> [log] [film number in the log]
 
-Mesure ce que l'œil voit trembler, avec ꟻLIP (NVIDIA, flip-evaluator) : erreur perçue entre chaque présentation et la suivante, sur l'image
-du jeu (avant) et sur l'image avec URTI (après). Ce que le jeu change d'une image à l'autre (mouvement de la scène) est commun aux deux ;
-l'excédent après - avant est ce qu'URTI ajoute : reflet qui saute, tremble, se décale par à-coups. Mesuré sur la zone où URTI pose
-quelque chose (couche après - avant visible), séparément pour les paires calculée → générée et générée → calculée (DLSS-G).
-Aussi : décalage de l'image et de la couche URTI d'une présentation à la suivante (corrélation de phase) : une couche qui ne bouge
-qu'une fois sur deux saccade.
-Sorties dans le dossier : flip_exces.png (carte de l'excédent moyen), bande.png (huit présentations de suite, zone du reflet).
+Measures what the eye sees shake, with ꟻLIP (NVIDIA, flip-evaluator): perceived error between each present and the next, on the game's
+image (before) and on the image with URTI (after). What the game changes from one frame to the next (scene motion) is common to both;
+the excess after - before is what URTI adds: a reflection that jumps, shakes, shifts in jerks. Measured on the area where URTI lays
+something (visible after - before layer), separately for computed → generated and generated → computed pairs (DLSS-G).
+Also: shift of the image and of URTI's layer from one present to the next (phase correlation): a layer that moves only
+one time in two stutters.
+Outputs in the folder: flip_excess.png (map of the mean excess), strip.png (eight consecutive presents, reflection area).
 """
 import os
 import re
@@ -34,7 +34,7 @@ def load_raw(p):
         lin = nits / 203.0
         m = np.array([[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083], [-0.0182, -0.1006, 1.1187]])
         lin = np.maximum(lin @ m.T, 0)
-        t_ = lin * (1 + lin / 4) / (1 + lin)  # même épaule que les .ppm des rafales
+        t_ = lin * (1 + lin / 4) / (1 + lin)  # same shoulder as the bursts' .ppm
         return np.clip(t_, 0, 1) ** (1 / 2.2), e.mean(-1)
     c = np.stack([v & 255, (v >> 8) & 255, (v >> 16) & 255], -1).astype(np.float64) / 255.0
     if f == 87:
@@ -65,21 +65,21 @@ journal = sys.argv[2] if len(sys.argv) > 2 else None
 gen = {}
 if journal and os.path.exists(journal):
     for line in open(journal, encoding='utf-8', errors='replace'):
-        m = re.match(r'FILM (\d+) (\d+) image (\d+) genere (\d) calcul (\d)', line)
+        m = re.match(r'FILM (\d+) (\d+) frame (\d+) generated (\d) computed (\d)', line)
         if m:
             gen.setdefault(int(m[1]), {})[int(m[2])] = (int(m[4]), int(m[5]), int(m[3]))
 film_no = int(sys.argv[3]) if len(sys.argv) > 3 else (max(gen) if gen else None)
-frames = sorted(int(m[1]) for n in os.listdir(d) if (m := re.match(r'avant_(\d+)\.raw$', n)))
+frames = sorted(int(m[1]) for n in os.listdir(d) if (m := re.match(r'before_(\d+)\.raw$', n)))
 A, B, LA, LB = [], [], [], []
 for k in frames:
-    a, la = load_raw(f'{d}/avant_{k}.raw')
-    b, lb = load_raw(f'{d}/apres_{k}.raw')
+    a, la = load_raw(f'{d}/before_{k}.raw')
+    b, lb = load_raw(f'{d}/after_{k}.raw')
     A.append(a), B.append(b), LA.append(la), LB.append(lb)
 A, B, LA, LB = map(np.array, (A, B, LA, LB))
 layer = LB - LA
-# zone : là où URTI pose quelque chose de visible dans au moins un tiers des présentations (et pas le HUD, intact)
+# area: where URTI lays something visible in at least a third of the presents (and not the HUD, left intact)
 zone = (np.abs(layer) > 0.01).mean(0) > 0.33
-print(f'{len(frames)} présentations, zone URTI {zone.mean() * 100:.1f} % de l\'image')
+print(f'{len(frames)} presents, URTI area {zone.mean() * 100:.1f} % of the image')
 exA, exB = [], []
 sums = np.zeros(A.shape[1:3])
 rows = []
@@ -94,19 +94,19 @@ for k in range(len(frames) - 1):
     g0 = gen.get(film_no, {}).get(frames[k], (-1, -1, 0))
     g1 = gen.get(film_no, {}).get(frames[k + 1], (-1, -1, 0))
     rows.append((k, g0[0], g1[0], fa[zone].mean(), fb[zone].mean(), ex[zone].mean(), sx, sy, lx, ly, np.abs(layer[k + 1] - layer[k])[zone].mean() * 1023))
-print(f"{'k':>3} {'gén':>4} {'ꟻLIP jeu':>10} {'ꟻLIP URTI':>11} {'excédent':>9} {'image dx':>9} {'dy':>6} {'couche dx':>10} {'dy':>6} {'|Δcouche|':>10}")
+print(f"{'k':>3} {'gen':>4} {'ꟻLIP game':>10} {'ꟻLIP URTI':>11} {'excess':>9} {'image dx':>9} {'dy':>6} {'layer dx':>10} {'dy':>6} {'|Δlayer|':>10}")
 for k, g0, g1, a_, b_, e_, sx, sy, lx, ly, dl in rows:
     print(f'{k:3d} {g0:>2}→{g1:<1} {a_:10.4f} {b_:11.4f} {e_:9.4f} {sx:9.2f} {sy:6.2f} {lx:10.2f} {ly:6.2f} {dl:10.2f}')
 r = np.array(rows)
 if len(r):
-    print(f'moyenne : ꟻLIP jeu {r[:, 3].mean():.4f}, avec URTI {r[:, 4].mean():.4f}, excédent URTI {r[:, 5].mean():.4f} '
-          f'({r[:, 5].mean() / max(r[:, 3].mean(), 1e-6) * 100:.0f} % de ce que le jeu change lui-même)')
-    for lab, sel in (('calculée → générée', (r[:, 1] == 0) & (r[:, 2] == 1)), ('générée → calculée', (r[:, 1] == 1) & (r[:, 2] == 0))):
+    print(f'mean: ꟻLIP game {r[:, 3].mean():.4f}, with URTI {r[:, 4].mean():.4f}, URTI excess {r[:, 5].mean():.4f} '
+          f'({r[:, 5].mean() / max(r[:, 3].mean(), 1e-6) * 100:.0f} % of what the game changes itself)')
+    for lab, sel in (('computed → generated', (r[:, 1] == 0) & (r[:, 2] == 1)), ('generated → computed', (r[:, 1] == 1) & (r[:, 2] == 0))):
         if sel.any():
-            print(f'  {lab} : excédent {r[sel, 5].mean():.4f}, |Δcouche| {r[sel, 10].mean():.2f} niveaux, décalage image {np.abs(r[sel, 6]).mean():.2f} px, '
-                  f'couche {np.abs(r[sel, 8]).mean():.2f} px')
+            print(f'  {lab}: excess {r[sel, 5].mean():.4f}, |Δlayer| {r[sel, 10].mean():.2f} levels, image shift {np.abs(r[sel, 6]).mean():.2f} px, '
+                  f'layer {np.abs(r[sel, 8]).mean():.2f} px')
     m = sums / max(len(rows), 1)
-    Image.fromarray((np.clip(m / max(np.percentile(m, 99.5), 1e-6), 0, 1) * 255).astype(np.uint8)).save(os.path.join(d, 'flip_exces.png'))
+    Image.fromarray((np.clip(m / max(np.percentile(m, 99.5), 1e-6), 0, 1) * 255).astype(np.uint8)).save(os.path.join(d, 'flip_excess.png'))
     ys, xs = np.nonzero(zone)
     if len(ys):
         y0, y1 = max(0, int(np.percentile(ys, 5)) - 20), min(A.shape[1], int(np.percentile(ys, 95)) + 20)
@@ -116,4 +116,4 @@ if len(r):
         sheet = np.zeros((h_ * 2, w_ * 4, 3), np.uint8)
         for i, t in enumerate(tiles):
             sheet[(i // 4) * h_:(i // 4 + 1) * h_, (i % 4) * w_:(i % 4 + 1) * w_] = t
-        Image.fromarray(sheet).save(os.path.join(d, 'bande.png'))
+        Image.fromarray(sheet).save(os.path.join(d, 'strip.png'))
