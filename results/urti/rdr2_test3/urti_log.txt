@@ -1,0 +1,25 @@
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: presenting device chosen; 0 captures planned; F9: capture
+URTI: trigger, capture of frame 5641
+URTI: draws per device during the capture: 3258 (the presenting one)
+URTI: capture 0, frame 5644 : 3465 draws, 1220 captured, 38 ignored (unusable pipeline), 2207 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 1041 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: trigger, capture of frame 10921
+URTI: draws per device during the capture: 3099 (the presenting one)
+URTI: capture 1, frame 10924 : 3310 draws, 1222 captured, 25 ignored (unusable pipeline), 2063 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 1043 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: trigger, capture of frame 16291
+URTI: draws per device during the capture: 3459 (the presenting one)
+URTI: capture 2, frame 16294 : 3636 draws, 1203 captured, 28 ignored (unusable pipeline), 2405 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 1024 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: trigger, capture of frame 21571
+URTI: draws per device during the capture: 3124 (the presenting one)
+URTI: capture 3, frame 21574 : 3301 draws, 1215 captured, 58 ignored (unusable pipeline), 2028 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 1036 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test

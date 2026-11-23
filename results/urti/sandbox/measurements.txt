@@ -1,0 +1,4 @@
+snapshots compared: 31 (800 to 830)
+RT effect (mean difference RT / native): 2.10 %
+flicker from one frame to the next: RT 2.281 %, native 2.126 %, added +0.155 %
+jumping points (change to the next frame > native + 8 %): 0.930 % of pixels, at worst 1.041 %

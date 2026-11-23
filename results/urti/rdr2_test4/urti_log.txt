@@ -1,0 +1,19 @@
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: presenting device chosen; 0 captures planned; F9: capture
+URTI: trigger, capture of frame 5611
+URTI: draws per device during the capture: 2959 (the presenting one)
+URTI: capture 0, frame 5614 : 3166 draws, 1210 captured, 30 ignored (unusable pipeline), 1926 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 1031 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 1031 draws on this depth, 658478 triangles (67215 crossing the near plane)
+URTI: COVERAGE 0.00 % of the game's depth pixels (0 / 409440); extra geometry on 0 pixels; mean deviation 9.59e-01
+URTI: trigger, capture of frame 10831
+URTI: draws per device during the capture: 2899 (the presenting one)
+URTI: capture 1, frame 10834 : 3109 draws, 1222 captured, 23 ignored (unusable pipeline), 1864 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 1043 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 1043 draws on this depth, 640147 triangles (77662 crossing the near plane)
+URTI: COVERAGE 0.00 % of the game's depth pixels (0 / 246991); extra geometry on 162449 pixels; mean deviation 9.18e-01

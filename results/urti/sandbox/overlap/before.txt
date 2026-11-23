@@ -1,0 +1,7 @@
+events (pixel × frame): 43200000
+jumps, shadows + reflections: 1.257 %
+jumps, reflections alone: 0.588 %; shadows alone: 0.738 %
+jumps of both explained by shadows alone: 0.682 %; by reflections alone: 0.513 %
+jumps that only exist when both are on (overlap): 0.062 % (5.0 % of the jumps)
+jumps of shadows alone that disappear with the reflections: 0.056 %
+floor (native against ground truth: ideal reflections that move): 1.373 %

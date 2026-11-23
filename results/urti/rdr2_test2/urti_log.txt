@@ -1,0 +1,25 @@
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: presenting device chosen; 0 captures planned; F9: capture
+URTI: trigger, capture of frame 5641
+URTI: draws per device during the capture: 2778 (the presenting one)
+URTI: capture 0, frame 5644 : 2988 draws, 2929 captured, 59 ignored (unusable pipeline), 2850 out of budget, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1024x1024, format 19, 27 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: trigger, capture of frame 10951
+URTI: draws per device during the capture: 2743 (the presenting one)
+URTI: capture 1, frame 10954 : 2954 draws, 2895 captured, 59 ignored (unusable pipeline), 2719 out of budget, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 87 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: trigger, capture of frame 16321
+URTI: draws per device during the capture: 2657 (the presenting one)
+URTI: capture 2, frame 16324 : 2833 draws, 2772 captured, 61 ignored (unusable pipeline), 2697 out of budget, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 121 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: trigger, capture of frame 21601
+URTI: draws per device during the capture: 2772 (the presenting one)
+URTI: capture 3, frame 21604 : 2943 draws, 2869 captured, 74 ignored (unusable pipeline), 2764 out of budget, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: depth 1706x960, format 19, 100 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test

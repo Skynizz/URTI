@@ -1,4 +1,0 @@
-scène      rattrapé       noirceur (r v b)   ailleurs scintillement
-rue             55.9%      2.462 1.938 1.556     1.914%       1.238%
-occlusion       56.6%      2.619 1.997 1.561     1.290%       0.565%
-marche          55.2%      1.401 1.293 1.179     0.507%       6.419%

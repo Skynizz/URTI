@@ -1,0 +1,37 @@
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: presenting device chosen; 0 captures planned; F9: capture
+URTI: trigger, capture of frame 27361
+URTI: draws per device during the capture: 7087 (the presenting one)
+URTI: capture 0, frame 27368 : 7264 draws, 5180 captured, 990 ignored (unusable pipeline), 1094 on an off-screen depth, 512.0 MB of vertices; 2444 pipelines with a vertex shader of which 1489 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 2265 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 2265 draws on this depth, 1607042 triangles (90686 crossing the near plane)
+URTI: COVERAGE 47.88 % of the game's depth pixels (129593 / 270684); extra geometry on 9610 pixels; mean deviation 3.57e-03
+URTI: capture written for analysis (F:\Red Dead Redemption 2\urti_capture0.urti, 84.3 MB)
+URTI: trigger, capture of frame 33451
+URTI: draws per device during the capture: 5883 (the presenting one)
+URTI: capture 1, frame 33458 : 6113 draws, 4173 captured, 859 ignored (unusable pipeline), 1081 on an off-screen depth, 512.0 MB of vertices; 2444 pipelines with a vertex shader of which 1489 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 2133 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 2133 draws on this depth, 1420311 triangles (93898 crossing the near plane)
+URTI: COVERAGE 84.12 % of the game's depth pixels (225940 / 268587); extra geometry on 4342 pixels; mean deviation 3.20e-04
+URTI: capture written for analysis (F:\Red Dead Redemption 2\urti_capture1.urti, 75.8 MB)
+URTI: trigger, capture of frame 39931
+URTI: draws per device during the capture: 5919 (the presenting one)
+URTI: capture 2, frame 39938 : 6126 draws, 4166 captured, 783 ignored (unusable pipeline), 1177 on an off-screen depth, 512.0 MB of vertices; 2444 pipelines with a vertex shader of which 1489 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 2183 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 2183 draws on this depth, 1394560 triangles (97728 crossing the near plane)
+URTI: COVERAGE 54.44 % of the game's depth pixels (145448 / 267152); extra geometry on 12788 pixels; mean deviation 4.68e-04
+URTI: capture written for analysis (F:\Red Dead Redemption 2\urti_capture2.urti, 74.8 MB)
+URTI: trigger, capture of frame 46501
+URTI: draws per device during the capture: 5836 (the presenting one)
+URTI: capture 3, frame 46508 : 6040 draws, 4074 captured, 711 ignored (unusable pipeline), 1255 on an off-screen depth, 512.0 MB of vertices; 2444 pipelines with a vertex shader of which 1489 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 2133 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 2133 draws on this depth, 1274553 triangles (104627 crossing the near plane)
+URTI: COVERAGE 63.06 % of the game's depth pixels (170402 / 270222); extra geometry on 14134 pixels; mean deviation 6.20e-04
+URTI: capture written for analysis (F:\Red Dead Redemption 2\urti_capture3.urti, 69.6 MB)

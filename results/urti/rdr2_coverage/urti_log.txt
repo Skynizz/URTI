@@ -1,0 +1,26 @@
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: presenting device chosen; 0 captures planned; F9: capture
+URTI: trigger, capture of frame 5641
+URTI: draws per device during the capture: 3334 (the presenting one)
+URTI: capture 0, frame 5644 : 3550 draws, 1062 captured, 230 ignored (unusable pipeline), 2258 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 1488 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 883 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 883 draws on this depth, 647588 triangles (56421 crossing the near plane)
+URTI: COVERAGE 97.63 % of the game's depth pixels (274546 / 281215); extra geometry on 1467 pixels; mean deviation 9.42e-05
+URTI: trigger, capture of frame 10891
+URTI: draws per device during the capture: 3464 (the presenting one)
+URTI: capture 1, frame 10894 : 3679 draws, 1019 captured, 205 ignored (unusable pipeline), 2455 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 1488 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 840 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 840 draws on this depth, 532302 triangles (56397 crossing the near plane)
+URTI: COVERAGE 97.55 % of the game's depth pixels (274839 / 281742); extra geometry on 1498 pixels; mean deviation 1.06e-04
+URTI: trigger, capture of frame 16261
+URTI: draws per device during the capture: 2904 (the presenting one)
+URTI: capture 2, frame 16264 : 3083 draws, 1005 captured, 191 ignored (unusable pipeline), 1887 on an off-screen depth, 512.0 MB of vertices; 2443 pipelines with a vertex shader of which 1488 usable, 15646 root signatures modified
+URTI: depth 1706x960, format 19, 826 draws on it
+URTI: depth copied by ReShade (1706x960, format 19)
+URTI: depth 1706x960 reversed; 826 draws on this depth, 521172 triangles (56428 crossing the near plane)
+URTI: COVERAGE 97.52 % of the game's depth pixels (273841 / 280791); extra geometry on 1580 pixels; mean deviation 1.01e-04

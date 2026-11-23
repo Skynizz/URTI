@@ -1,4 +1,0 @@
-photos comparées : 31 (800 à 830)
-effet du RT (écart moyen RT / natif) : 2.10 %
-scintillement d'une image à la suivante : RT 2.281 %, natif 2.126 %, ajouté +0.155 %
-points qui sautent (écart à l'image suivante > natif + 8 %) : 0.930 % des pixels, au pire 1.041 %

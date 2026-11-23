@@ -1,8 +1,0 @@
-scène               écart    ajouté    sautent clignotent
-batiment              3.31%    +0.015%     0.012%     0.101%
-arbre_immobile        2.97%    +0.036%     0.084%     0.163%
-arbre_vent            2.94%    +0.044%     0.086%     0.164%
-personnage            2.75%    +0.033%     0.191%     0.093%
-camera_fixe           1.19%    +0.049%     0.144%     0.118%
-camera_mouvement      1.15%    +0.044%     1.257%     0.871%
-occlusion             1.99%    +0.024%     0.181%     0.093%

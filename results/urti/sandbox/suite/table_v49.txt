@@ -1,0 +1,8 @@
+scene           deviation    added    jumping   blinking
+building              0.08%    +0.004%     0.000%     0.000%
+still_tree            2.22%    +0.045%     0.017%     0.044%
+tree_wind             2.23%    +0.047%     0.016%     0.036%
+character             0.48%    +0.020%     0.028%     0.023%
+fixed_camera          0.48%    +0.044%     0.057%     0.063%
+moving_camera         0.60%    -0.007%     0.484%     0.557%
+occlusion             0.36%    +0.010%     0.040%     0.007%

@@ -1,25 +1,17 @@
+# local leftovers of the KRC prototype (moved to github.com/Skynizz/KRC)
 target/
-results/ref/*.bin
 target-dev/
-assets/
-results/ref_*/*.bin
-results/cornell_1024/*/*.png
-results/sponza_1280x720/*/*.png
-results/gpu_dev/
-results/ref_cornell_1024/*.png
-results/ref_sponza_*/*.png
 target-sh/
-results/ref_*/*.bin
-results/*_cam_1024/*/*.png
-results/*_cam_1280x720/*/*.png
-results/ref_*/*.png
-results/vitrine/krc/
-results/vitrine/sharc/
-results/vitrine/reference/
-results/vitrine/test_*.png
-results/ref_vitrine*/
+assets/
+results/ref*/
+results/cornell_1024/
+results/sponza_1280x720/
+results/gpu_dev/
+results/*_cam_1024/
+results/*_cam_1280x720/
+results/vitrine/
 
-# dépendances externes téléchargées (NRD de NVIDIA : licence RTX SDK, pas dans le dépôt)
+# downloaded external dependencies (NVIDIA NRD: RTX SDK license, not in the repository)
 urti/third_party/NRD/
 
 __pycache__/

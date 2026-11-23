@@ -1,0 +1,4 @@
+2918 draws on the main depth, frames [48274, 48276, 48278], 8263305 vertices
+901 draws found between frames 48274 and 48278
+estimated vertical field of view: 38.75°; rigidity error 0.003 %; 77.5 % of vertices still
+camera motion: rotation 0.050°, translation 0.002 (game units)

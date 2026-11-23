@@ -1,0 +1,19 @@
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: CreateRootSignature hooked
+URTI: ExecuteIndirect hooked
+URTI: presenting device chosen; 5 captures planned; F9: capture
+URTI: capture 0, frame 2001 : 75 draws, 75 captured, 0 ignored (unusable pipeline), 0 out of budget, 0.1 MB of vertices; 2442 pipelines with a vertex shader of which 2407 usable, 15639 root signatures modified
+URTI: depth 2560x1440, format 19, 74 draws on it
+URTI: depth 2560x1440 reversed; 74 draws on this depth, 926 triangles (0 crossing the near plane)
+URTI: COVERAGE 0.00 % of the game's depth pixels (0 / 0); extra geometry on 0 pixels; mean deviation 0.00e+00
+URTI: capture 1, frame 5001 : 75 draws, 75 captured, 0 ignored (unusable pipeline), 0 out of budget, 0.1 MB of vertices; 2442 pipelines with a vertex shader of which 2407 usable, 15639 root signatures modified
+URTI: depth 2560x1440, format 19, 74 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: capture 2, frame 9001 : 75 draws, 75 captured, 0 ignored (unusable pipeline), 0 out of budget, 0.1 MB of vertices; 2442 pipelines with a vertex shader of which 2407 usable, 15639 root signatures modified
+URTI: depth 2560x1440, format 19, 74 draws on it
+URTI: depth not copied (no clear seen in the next frame): no coverage test
+URTI: capture 3, frame 14001 : 4 draws, 4 captured, 0 ignored (unusable pipeline), 0 out of budget, 0.0 MB of vertices; 2442 pipelines with a vertex shader of which 2407 usable, 15645 root signatures modified
+URTI: no draw captured on a depth
+URTI: capture 4, frame 20001 : 0 draws, 0 captured, 0 ignored (unusable pipeline), 0 out of budget, 0.0 MB of vertices; 2443 pipelines with a vertex shader of which 2408 usable, 15645 root signatures modified
+URTI: no draw captured on a depth
