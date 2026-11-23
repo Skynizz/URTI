@@ -61,7 +61,7 @@ Steps v1 to v24 (KRC, the radiance cache studied first) are in the [KRC](https:/
   0.55, split screen available). Sun and depth law recalibrated every 120 frames.
 - Screenshots: the game displays in HDR10; they are read from the display buffer after the effects, PQ decoded,
   BT.2020 → BT.709, white at 203 nits. Also fixed: F7 left the old shadow image on screen.
-- RDR2 (Saint Denis station, `results/urti/rdr2_direct/`): the RT shadows fall in the same place as the game's (the
+- RDR2 (Saint Denis station, `results/urti/rdr2_live/`): the RT shadows fall in the same place as the game's (the
   station canopy on the ground), which validates the chain (geometry, sun, depth). But the game already has its
   shadows: the darkening adds on top and makes already-shadowed areas too black. Faces turned away from the sun
   (backlit wagons) are also blackened while the game already lights them less.
@@ -89,7 +89,7 @@ Steps v1 to v24 (KRC, the radiance cache studied first) are in the [KRC](https:/
 - RDR2 has no separate shadow mask: pass survey (F8) with snapshots taken at the end of the writing of each target;
   G-buffer found (normals, materials) for reflections.
 - **Fast tests**: settings (`urti.ini`) and shaders (`urti_shaders/*.cso`, `tools/reshade/urti_shaders.sh`) hot-reloaded
-  in game in ~2 s; launch driven by the log (`urti_rdr2_rapide.ps1`).
+  in game in ~2 s; launch driven by the log (`urti_rdr2_quick.ps1`).
 - Fixed along the way: `&` on a `ComPtr` (releases it), effect parameters removed by ReShade's compiler when no longer
   read, barriers without a resource, ReShade → D3D12 states.
 
@@ -104,7 +104,7 @@ Steps v1 to v24 (KRC, the radiance cache studied first) are in the [KRC](https:/
   reflections work at night too.
 - **RT reflections**: one reflected ray per smooth pixel (normal from depth), hit point reprojected and checked
   visible, colour read from the image, Fresnel. Validated on the bench (floor reflecting the cubes,
-  `results/urti/banc_direct/reflets_rt.png`). In RDR2, the G-buffer is located and its material image copied at the end
+  `results/urti/bench_live/rt_reflections.png`). In RDR2, the G-buffer is located and its material image copied at the end
   of its writing every frame; still to find which channel holds smoothness (channel sweep through hot reload, to redo
   in front of water or a wet street).
 - GPU lost in RDR2: the composition read the buffer of disabled reflections beyond the buffer bound in its place; an
@@ -147,7 +147,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
 - Screenshots at precise presents (`photo_frames=800-830` in urti.ini); `--photos` runs two identical launches (RT then
   native) and `urti_sandbox_compare.py` measures the RT effect, the added flicker and the map of jumping points.
   Reference: effect 2.1 %, added flicker +0.16 %, 0.9 % of pixels jumping, concentrated on distant reflections in the
-  puddles — the defect seen in RDR2 (`results/urti/bac_a_sable/`).
+  puddles — the defect seen in RDR2 (`results/urti/sandbox/`).
 - Full test (two launches and measurements): ~30 s.
 
 ## v33 — URTI: suite of 7 tests, ground truth, geometric anchoring tried
@@ -161,7 +161,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
 - New measurement: **blinking pixels** (the deviation from the reference changes sign from one frame to the next),
   distinct from an error that moves with the scene.
 - `tools/reshade/urti_sandbox_suite.sh`: still building, still tree, tree in the wind, character, fixed camera, moving
-  camera, occlusion (~3 min 30). Reference (`results/urti/bac_a_sable/suite/`):
+  camera, occlusion (~3 min 30). Reference (`results/urti/sandbox/suite/`):
 
   | scene | deviation | added | jumping | blinking |
   |---|---|---|---|---|
@@ -181,7 +181,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
 - **Geometric anchoring** of reflections (`anchor_alpha=`): stable identity per draw (signature + rank), previous
   frame's vertices kept, mirror and reflected point found in the captured geometry (same triangle, same barycentrics,
   deformations included), previous frame's virtual point → exact place in the history, kept only if the same object
-  was reflected in the same mirror. It works (two thirds of reflecting pixels, `ancrage_couverture.png`) but **does
+  was reflected in the same mirror. It works (two thirds of reflecting pixels, `anchoring_coverage.png`) but **does
   not reduce blinking**: 0.909 % against 0.871 % while walking, slightly worse with a fixed camera (switching from one
   filter to the other depending on the pixel adds some). Kept, off by default, free when off.
 - Test settings in urti.ini: `refl_alpha_min`, `refl_alpha_max`, `refl_gamma`, `refl_depth_tol`, `anchor_alpha`,
@@ -198,7 +198,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   0.062 % (5 %)**. Shadows alone jump on 0.738 %: the biggest part.
 - Fix: the shadow is applied before the reflection (which partly replaces it). Jumps 1.257 → 1.168 %, overlap 0.062 →
   0.037 %; across the 7 scenes, deviation from truth and jumps go down everywhere
-  (`results/urti/bac_a_sable/suite/tableau_v34.txt`, `results/urti/bac_a_sable/superposition/`).
+  (`results/urti/sandbox/suite/table_v34.txt`, `results/urti/sandbox/overlap/`).
 
 ## v35 — URTI: alpha-tested foliage (holes recognised by the camera and by the sun)
 
@@ -209,7 +209,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
 - Sandbox: foliage as crossed cut-out cards (screen, shadow map, ground-truth mirror), `URTI_SANDBOX_LEAVES=blocs` for
   the old one; the tree test framed with its reflection in the puddle; realistic shadow map (depth over 400 m, bias of
   40 D16 steps instead of 600: ~25 cm instead of several metres). The defect is reproduced: the tree's reflection full
-  of holes and made of rectangles (`results/urti/bac_a_sable/feuillage/`).
+  of holes and made of rectangles (`results/urti/sandbox/foliage/`).
 - Fix (`alpha_screen=1`, default): every triangle a ray meets is examined.
   - On screen: if the camera sees further than this point (or the sky), it is a hole: the ray goes on.
   - Off screen (shadows of the canopy above the camera): the game's shadow map is the sun's view, alpha test included;
@@ -217,7 +217,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
     records its occluders a bit further than they are: a fixed threshold made every RT shadow disappear, seen in the
     mask and fixed). The game's map is therefore also copied outside combined mode (+0.17 ms).
 - Measurements (with the cards): walk, jumps 1.294 → 1.177 %, blinking 0.952 → 0.853 %, deviation from truth 1.14 →
-  1.01 %; tree, deviation 2.67 → 2.46 %. The 7 scenes: `suite/tableau_v35.txt` (the sandbox changed: foliage and shadow
+  1.01 %; tree, deviation 2.67 → 2.46 %. The 7 scenes: `suite/table_v35.txt` (the sandbox changed: foliage and shadow
   map, so earlier tables do not compare line by line).
 
 ## v36 — URTI: reflection "popping" fixed, acceleration structure half as expensive
@@ -234,7 +234,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   street at a grazing angle, leaves) dropped to zero, then came back as soon as it was visible again. It is now missing
   data (negative weight): stabilisation keeps the history, which fades (× 0.9 per frame), and the clamp counts only
   known neighbours: 0.276 → 0.140 % (−65 % in total). Against ground truth, no trail: walk, jumps 1.177 → 1.133 %,
-  blinking 0.853 → 0.802 %, deviation 1.01 → 0.98 %; other scenes equal or better (`suite/tableau_v36.txt`).
+  blinking 0.853 → 0.802 %, deviation 1.01 → 0.98 %; other scenes equal or better (`suite/table_v36.txt`).
 - Speed: the acceleration structure was built over the whole reserved capacity (8.4 million vertices in RDR2), empty
   part included; it now covers only the frame's vertices. And as long as the list of draws is the same as at the last
   build, it is updated (refit) instead of rebuilt, with a rebuild at least every 8 frames (`blas_refit=`, 0: always
@@ -269,8 +269,8 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   Reflections read their colours from it, and the pixels that differ (the UI) are left untouched. Sandbox with a UI
   (minimap, bars, a menu open 2 s out of 4): snapshot 0 found on its own (88.7 % identical); without it, the menu is
   reflected on the ground and the reflected scene goes over it; with it, the menu is clean
-  (`results/urti/bac_a_sable/interface/`). `ui_photo=0` to compare.
-- 7 scenes equal or better (`suite/tableau_v37.txt`); popping 0.138 %.
+  (`results/urti/sandbox/ui/`). `ui_photo=0` to compare.
+- 7 scenes equal or better (`suite/table_v37.txt`); popping 0.138 %.
 
 ## v38 — URTI: stable identities, budget respected, without OptiScaler
 
@@ -291,7 +291,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
 - **Crash at startup without OptiScaler** (ucrtbase, 0xc0000409): ReShade, loaded directly (`dxgi.dll`), unloads and
   reloads add-ons for every device RDR2 creates at startup to test the card; the function-table entries replaced by
   URTI (`CreateRootSignature`, `ExecuteIndirect`) then pointed to the code of an unloaded add-on. They are now restored
-  when the add-on unloads. Checked: the game starts (`tools/reshade/rdr2_demarrage.ps1`: click-free start, watches
+  when the add-on unloads. Checked: the game starts (`tools/reshade/rdr2_start.ps1`: click-free start, watches
   processes and crashes).
 
 ## v39 — URTI: NVIDIA denoisers (NRD / SIGMA) integrated; jitter, cause of the remaining shimmer
@@ -332,7 +332,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   at the unjittered position (the presented image is stabilised by the TAA), reflections take their colour at the
   unjittered position, histories are reprojected with the jitter difference. Realigning only the history is worse (it
   then follows the jitter instead of averaging it).
-- 7 scenes, all better (`suite/tableau_v40.txt`): blinking building 0.077 → 0.003 %, still tree 0.124 → 0.054 %, tree
+- 7 scenes, all better (`suite/table_v40.txt`): blinking building 0.077 → 0.003 %, still tree 0.124 → 0.054 %, tree
   in the wind 0.115 → 0.050 %, character 0.076 → 0.034 %, fixed camera 0.098 → 0.081 %, occlusion 0.126 → 0.081 %,
   walk 0.801 → 0.803 %.
 - `jitter_log=1`: jitter measured every frame in the log.
@@ -358,7 +358,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   measurement restarts from zero and the next 6 readings (three frames of latency) are ignored. Sandbox: 50.0° → 54.1° →
   54.9° (true: 55°), stable. In RDR2 the measured field varies from 49.5° to 60.6° (aiming, camera). With exact angles,
   the floor's normal and the reflection direction are no longer skewed. Suite: walk, deviation from truth 0.96 →
-  0.90 %, added flicker +0.054 → +0.025 %; other scenes equal or better (`suite/tableau_v42.txt`).
+  0.90 %, added flicker +0.054 → +0.025 %; other scenes equal or better (`suite/table_v42.txt`).
 - Log of the v41 session: the reserve was still full ("65536/22176 65536/65535 65536/0"): one command signature serves
   ExecuteIndirects of every size, and its maximum imposed 65,536 vertices on all of them. Identity of an
   ExecuteIndirect: signature, argument buffer and position in that buffer (no more rank); size learned per identity
@@ -390,15 +390,15 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   sun twice where the game already shadows. `game_min=0`, `game_dilate=`: old combination, for testing.
 - Bug avoided: a `float3` in the composition's constants, moved to the next 16-byte boundary, received only red: three
   separate numbers.
-- **New test** `tools/reshade/urti_sandbox_ombres.sh`: the "game's" map forgets poles, posts, wall, carts and
+- **New test** `tools/reshade/urti_sandbox_shadows.sh`: the "game's" map forgets poles, posts, wall, carts and
   passers-by (`URTI_SANDBOX_GAMESHADOW=partiel`); it is compared with the launch where the game shadows them (dry
   ground, reflections off). Forgotten shadow recovered, before → after: street 56 → 90 %, occlusion 57 → 91 %, walk
   55 → 68 %; darkness in the street (RT light / game, red green blue) 2.5 1.9 1.6 → 1.08 1.12 1.11 (right tint);
   deviation outside the area 1.9 / 1.3 / 0.5 → 0.15 / 0.11 / 0.19 % (no more double shadow); flicker in the area while
-  walking 6.4 → 5.2 % (`ombres/tableau_avant.txt`, `ombres/tableau_v43.txt`). Sun / sky measured in the sandbox: 4.5
+  walking 6.4 → 5.2 % (`shadows/table_before.txt`, `shadows/table_v43.txt`). Sun / sky measured in the sandbox: 4.5
   (red 5.8, green 4.3, blue 3.0).
 - Reflection suite (ground truth = game shadows only): deviation building 2.13 → 0.08 %, passers-by 1.60 → 0.47 %, walk
-  0.90 → 0.60 % (jumping 1.10 → 0.50 %, blinking 0.81 → 0.57 %), occlusion 1.32 → 0.36 % (`suite/tableau_v43.txt`).
+  0.90 → 0.60 % (jumping 1.10 → 0.50 %, blinking 0.81 → 0.57 %), occlusion 1.32 → 0.36 % (`suite/table_v43.txt`).
 - Left: while walking, thin and distant shadows (poles, cables) are over-smoothed (68 %).
 
 ## v44 — URTI: RT reflections only on flat surfaces; RDR2's shadow map does not match
@@ -435,10 +435,10 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
 - Request: "the reflections jump, you say it's fixed but it never is". Sandbox measurements are not enough: RDR2
   itself must be measured.
 - **Burst** (F8 key or trigger file `urti_rafale`): 30 consecutive frames saved without URTI (copy of the image before
-  the composition) and with it, in `urti_rafale_N\`. `tools/reshade/urti_rafale.py`: URTI's contribution C = after −
+  the composition) and with it, in `urti_rafale_N\`. `tools/reshade/urti_burst.py`: URTI's contribution C = after −
   before; what jumps = the change of C from one frame to the next (independent of the scene); shadow / reflection
   areas; objects entering / leaving the RT scene per frame (BURST lines of the log); map of the jumps and a close-up of
-  the worst area. Results in `results/urti/jeu/rafales/`.
+  the worst area. Results in `results/urti/game/bursts/`.
 - RDR2's settings re-read (system.xml): RTX 4070, DX12, DLSS, HDR, motion blur off, sharpness at maximum, screen-space
   water reflections on (the game keeps its reflections where URTI puts none), several shadow sources (cascades, distant,
   terrain, screen space, long). Nothing that skews URTI.
@@ -493,7 +493,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   still shot without sub-pixel jitter, menu open 2 s every 4 s: snapshot lost 2 times out of 600 frames → 0.
 - **Invisible shadows**: sun / sky measured under 0.15 (less than 13 % of the light removed: overcast, dusk): no more
   shadow rays (3.8 ms saved in this scene); they resume when direct light comes back (the measurement goes on).
-- Reflection suite unchanged (`suite/tableau_v49.txt`). Not checked in game: to measure (F8 bursts on the wet ground,
+- Reflection suite unchanged (`suite/table_v49.txt`). Not checked in game: to measure (F8 bursts on the wet ground,
   and one with a menu open).
 
 ## v50–v52 — URTI: a single checkbox, RT ambient occlusion, sun shadows off (measured: invisible)
@@ -522,7 +522,7 @@ A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seco
   add.
 - Denoising of the mask when it carries only occlusion: more accumulated frames (current share 0.05 to 0.3) and a wider
   clamp (2 standard deviations).
-- Measurements in RDR2 (bursts, `results/urti/jeu/rafales/`):
+- Measurements in RDR2 (bursts, `results/urti/game/bursts/`):
   - v50 (occlusion everywhere): 32.5 % of the image changed, jumping pixels 0.21 %, shadows + occlusion 6.1 ms;
   - v50 flat occlusion: 20.2 %, 0.12 %, 5.1 ms;
   - v51 (no sun shadows, fog): 8.2 %, 0.08 %, 1.2 ms, 56-58 fps;
@@ -585,7 +585,7 @@ elsewhere): only comparisons within one launch are valid.
   - **fixed UI zone** `ui_zone=0.012,0.69,0.16,0.97` (minimap and icons): minimap altered 7.5 → 1.7 levels.
   - The snapshot taken right after the first draw (only in a direct list) no longer crashes the game.
 - Motion-vector convention re-measured in game: the same (no. 2). In motion, the effect follows the image at **98 %**
-  (`tools/reshade/urti_rafale_decalage.py`: shift of the effect / shift of the image by phase correlation).
+  (`tools/reshade/urti_burst_alignment.py`: shift of the effect / shift of the image by phase correlation).
 - **Sub-pixel jitter**: compensation off in RDR2 (`jitter=0`): shaking 0.19 → 0.13 %; reflection area shakes 2.57 →
   1.79 %, jumps 0.10 → 0.06 %. The sandbox keeps the compensation.
 - **Structure updates**:
@@ -601,7 +601,7 @@ elsewhere): only comparisons within one launch are valid.
     used part is lost to holes.
   - Rail yard, overcast: URTI 3.9 ms in total, 73 fps.
 - Player's opinion of v66: "perfect, the look is insane"; frames per second still to gain.
-- **Sandbox** (`suite/tableau_v66.txt`):
+- **Sandbox** (`suite/table_v66.txt`):
   - trees and character clearly better (jumping 0.010 → 0 %);
   - **moving camera worse**: jumping 0.63 → 1.24 % (blinking 0.68 → 0.55 %), larger deviations from truth everywhere.
     To understand: reflection changes (weight threshold, minimum range, centred normal) or the snapshot before the UI
@@ -623,7 +623,7 @@ elsewhere): only comparisons within one launch are valid.
 - **Sandbox regression with a moving camera explained** (jumping 0.63 → 1.25 % since v62): occlusion off, 0.48 % (the
   earlier level). The ground truth has no occlusion: darkening that follows the scenery counts as jumps there. Before
   v62, the exact UI comparison prevented occlusion on a large share of pixels (weaker effect). In game, the effect
-  follows motion at 98 % (`urti_rafale_decalage.py`).
+  follows motion at 98 % (`urti_burst_alignment.py`).
 - For the player to check in RDR2: frames per second, cost per step (log), missing objects when the budget drops.
 
 ## v68 — URTI: optimisation validated in RDR2; aberrant vertices (RT scene invisible since v66)
@@ -667,7 +667,7 @@ elsewhere): only comparisons within one launch are valid.
   `ao_ms=`, from 4 to 2 rays).
 - Table of the RT scene's regions copied into video memory every frame (conversion, reflections and cache looked up
   their region across the PCIe bus).
-- Tools: `urti_rdr2_rapide.ps1` no longer takes the old log or "first frame" for a running game, recognises the menu
+- Tools: `urti_rdr2_quick.ps1` no longer takes the old log or "first frame" for a running game, recognises the menu
   without a calibration capture, does not click when someone is using the PC.
 - To check in RDR2: tuning of occlusion rays and the frame-rate gain under the arcades; cost of the cache with the table
   in video memory.
@@ -762,7 +762,7 @@ Towards a URTI that discovers how each game works instead of assuming it.
   own geometry) instead of a rebuild every frame.
 - **RDR2, non-regression check** (wet quay in Saint Denis): effect 10.2 %, shaking 0.01 %, jumping 0.000 % (as in v70);
   0 late draws, 518 stable objects (0 new places, 0 entries or exits per frame), 64.6 fps.
-- Tools: `premier_plan.ps1` (is the game in the foreground, without reading anything else).
+- Tools: `foreground.ps1` (is the game in the foreground, without reading anything else).
 
 ## v73 — URTI: camera motion measured on our geometry; crash on HDR switch / Alt+Tab; rendered area (DLSS, dynamic resolution); NaN depth law
 
@@ -1126,7 +1126,7 @@ we need an image analysis that shows whether it's good or not (the NVIDIA thing)
 - `tools/reshade/urti_film_ana.py`: ꟻLIP (NVIDIA, flip-evaluator 1.7) between each present and the next, on the game's
   image and on the image with URTI; the excess is what URTI adds as perceived change (shaking, jumping). Also the shift
   of the image and of URTI's layer from one present to the next (phase correlation).
-- `tools/reshade/urti_eau_hauteur.py`: height of each water pixel from the film's depth.
+- `tools/reshade/urti_water_height.py`: height of each water pixel from the film's depth.
 - Detailed GPU timing ("GPU detail" log): every step of the computation and the composition.
 
 **Cause of the shift in motion: URTI's layer frozen on generated frames.** With DLSS-G, one present in two or three has
@@ -1598,7 +1598,7 @@ Checked: Red Dead five launches (one crash caused by opening the Social Club).
   beautiful if it neither trails nor flickers. ReShade menu: only the "URTI" checkbox visible; reflections, close glossy
   floors, occlusion and ambient shadow on; light bounce off (invisible, ~0.9 ms). Values stored in the presets cleared
   (copies `ReShadePreset.ini.avant_v102`).
-- **Trail measurement** (`trainee.py`): bursts while turning the camera; shift of URTI's darkening map compared with the
+- **Trail measurement** (`trails.py`): bursts while turning the camera; shift of URTI's darkening map compared with the
   game image's (lag 0: attached) and the deviation left once the previous map is realigned on the image's motion.
 - Causes found: occlusion on characters, horses (animated) and the canopy (in the wind); long rays on branches; history
   clamp too wide in motion.
@@ -1639,7 +1639,7 @@ Request: viable RT occlusion in Red Dead, without offset, measured with precise 
 before.
 
 **Tools**
-- `decalage.py` (bursts before / after): motion of the image and of the darkening map by phase correlation at a tenth of a
+- `alignment.py` (bursts before / after): motion of the image and of the darkening map by phase correlation at a tenth of a
   pixel; **follow** (1: attached, 0: frozen), **fixed offset** of the map relative to the image's edges, **instability**
   (deviation of the map from the previous one realigned on the motion, relative to the mean darkening), darkened share.
   `rdr2_regress.sh`: the same measurement session for any version of the add-on.

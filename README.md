@@ -114,9 +114,9 @@ Every change is judged in the game, against the same frame without URTI:
 
 | Tool | Measures |
 |---|---|
-| `rafale_bruit.py` | flicker added by URTI on top of what the game itself changes |
-| `decalage.py` | alignment at a tenth of a pixel (phase correlation): does the effect follow the image, is it offset, how stable is it |
-| `trainee.py` | trails while the camera turns |
+| `burst_noise.py` | flicker added by URTI on top of what the game itself changes |
+| `alignment.py` | alignment at a tenth of a pixel (phase correlation): does the effect follow the image, is it offset, how stable is it |
+| `trails.py` | trails while the camera turns |
 
 Perceptual comparisons use NVIDIA's [FLIP](https://github.com/NVlabs/flip).
 

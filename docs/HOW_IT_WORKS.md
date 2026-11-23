@@ -167,12 +167,12 @@ The occlusion pass is still in the code and can be enabled (`UrtiOcclusion` in t
 
 Every change is judged in the game, at real pace, against the same frame without URTI:
 
-- **Bursts** (F8, or a trigger file). 30 frames saved before and after URTI's composition. `tools/analyse/rafale_bruit.py`
+- **Bursts** (F8, or a trigger file). 30 frames saved before and after URTI's composition. `tools/analyse/burst_noise.py`
   reports the flicker URTI adds on top of the game's own.
-- **Alignment and stability.** `tools/analyse/decalage.py` uses phase correlation at a tenth of a pixel. It reports
+- **Alignment and stability.** `tools/analyse/alignment.py` uses phase correlation at a tenth of a pixel. It reports
   whether an effect follows the image (1: attached, 0: frozen), any fixed offset, and the residual instability after
   realignment.
-- **Trails.** `tools/analyse/trainee.py` measures, while the camera turns, how much of an effect lags behind.
+- **Trails.** `tools/analyse/trails.py` measures, while the camera turns, how much of an effect lags behind.
 - **Films.** Kept in GPU memory at real pace and compared with NVIDIA's
   [FLIP](https://github.com/NVlabs/flip).
 - **Regressions.** The same session is replayed on old builds, so a change can be compared with what came before.
