@@ -1,5 +1,5 @@
-# Clic gauche à une position relative de la fenêtre du jeu (0..1), après l'avoir mise au premier plan.
-# Usage : click.ps1 -Process RDR2 -X 0.78 -Y 0.925
+# Left click at a relative position of the game window (0..1), after bringing it to the foreground.
+# Usage: click.ps1 -Process RDR2 -X 0.78 -Y 0.925
 param([string]$Process = 'RDR2', [double]$X = 0.5, [double]$Y = 0.5)
 
 Add-Type @"
@@ -35,7 +35,7 @@ if ([KrcMouse]::GetForegroundWindow() -ne $h) {
     [KrcMouse]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 500
 }
-if ([KrcMouse]::GetForegroundWindow() -ne $h) { "$Process n'est pas au premier plan"; exit 1 }
+if ([KrcMouse]::GetForegroundWindow() -ne $h) { "$Process is not in the foreground"; exit 1 }
 $r = New-Object KrcMouse+RECT
 [KrcMouse]::GetClientRect($h, [ref]$r) | Out-Null
 $pt = New-Object KrcMouse+POINT
@@ -44,4 +44,4 @@ $pt.X = [int]($r.Right * $X); $pt.Y = [int]($r.Bottom * $Y)
 [KrcMouse]::SetCursorPos($pt.X, $pt.Y) | Out-Null
 Start-Sleep -Milliseconds 200
 [KrcMouse]::Click()
-"clic en ($($pt.X), $($pt.Y)) dans $Process ($($r.Right)x$($r.Bottom))"
+"click at ($($pt.X), $($pt.Y)) in $Process ($($r.Right)x$($r.Bottom))"

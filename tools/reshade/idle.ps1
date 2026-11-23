@@ -1,4 +1,4 @@
-# Secondes depuis la dernière action clavier / souris de l'utilisateur (pour ne pas gêner une partie en cours)
+# Seconds since the user's last keyboard / mouse action (so as not to disturb a game in progress)
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public static class UrtiIdle { [StructLayout(LayoutKind.Sequential)] struct LII { public uint cbSize; public uint dwTime; }

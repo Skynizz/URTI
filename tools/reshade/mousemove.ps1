@@ -1,5 +1,5 @@
-# Balayage de souris relatif (fait tourner la caméra d'un jeu) : Steps mouvements de Dx, Dy pixels.
-# -Process : seulement si ce jeu est au premier plan, arrêt dès qu'il ne l'est plus (sinon la souris de l'utilisateur bouge sur son bureau).
+# Relative mouse sweep (turns a game's camera): Steps moves of Dx, Dy pixels.
+# -Process: only if that game is in the foreground, stopping as soon as it no longer is (otherwise the user's mouse moves on their desktop).
 param([int]$Dx = 15, [int]$Dy = 0, [int]$Steps = 60, [int]$Delay = 20, [string]$Process = '')
 
 Add-Type @"
@@ -19,8 +19,8 @@ public static class KrcMove {
 }
 "@
 $game = if ($Process) { Get-Process -Name $Process -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
-if ($Process -and -not $game) { "jeu absent : souris non touchée"; exit 1 }
+if ($Process -and -not $game) { "game not running: mouse untouched"; exit 1 }
 for ($i = 0; $i -lt $Steps; $i++) {
-    if ($game -and [KrcMove]::ForegroundPid() -ne $game.Id) { "jeu pas au premier plan : souris non touchée"; exit 1 }
+    if ($game -and [KrcMove]::ForegroundPid() -ne $game.Id) { "game not in the foreground: mouse untouched"; exit 1 }
     [KrcMove]::Move($Dx, $Dy); Start-Sleep -Milliseconds $Delay
 }

@@ -1,5 +1,5 @@
-# Maintient une touche (code matériel) enfoncée dans un jeu, le temps demandé, seulement si ce jeu est au premier plan : sinon
-# rien n'est envoyé (la touche partirait dans la fenêtre de l'utilisateur). hold_key.ps1 -Process HorizonForbiddenWest -Scan 0x11 -Seconds 6
+# Holds a key (hardware code) down in a game for the requested time, only if that game is in the foreground: otherwise
+# nothing is sent (the key would go to the user's window). hold_key.ps1 -Process RDR2 -Scan 0x11 -Seconds 6
 param([string]$Process, [int]$Scan = 0x11, [double]$Seconds = 5, [int]$Scan2 = 0)
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -17,14 +17,14 @@ public static class UrtiHold {
 }
 "@
 $game = Get-Process -Name $Process -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $game -or [UrtiHold]::ForegroundPid() -ne $game.Id) { "jeu pas au premier plan : aucune touche envoyée"; exit 1 }
+if (-not $game -or [UrtiHold]::ForegroundPid() -ne $game.Id) { "game not in the foreground: no key sent"; exit 1 }
 [UrtiHold]::Key($Scan, $false); if ($Scan2) { [UrtiHold]::Key($Scan2, $false) }
 $t0 = Get-Date
 while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
     Start-Sleep -Milliseconds 50
-    # l'utilisateur a changé de fenêtre : on relâche tout de suite
-    if ([UrtiHold]::ForegroundPid() -ne $game.Id) { "premier plan perdu : touche relâchée"; break }
+    # the user switched windows: release at once
+    if ([UrtiHold]::ForegroundPid() -ne $game.Id) { "foreground lost: key released"; break }
     [UrtiHold]::Key($Scan, $false); if ($Scan2) { [UrtiHold]::Key($Scan2, $false) }
 }
 [UrtiHold]::Key($Scan, $true); if ($Scan2) { [UrtiHold]::Key($Scan2, $true) }
-"touche tenue"
+"key held"

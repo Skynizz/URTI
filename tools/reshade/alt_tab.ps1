@@ -1,6 +1,6 @@
-# Vrai Alt+Tab (hors du jeu, attente, retour au jeu), pour vérifier que l'add-on survit au changement de fenêtre.
-# Usage : alt_tab.ps1 -Process HorizonForbiddenWest -Secondes 6 ; écrit oui si le jeu tourne encore à la fin.
-param([string]$Process = 'HorizonForbiddenWest', [int]$Secondes = 6)
+# Real Alt+Tab (out of the game, wait, back to the game), to check that the add-on survives the window switch.
+# Usage: alt_tab.ps1 -Process RDR2 -Seconds 6; prints yes if the game is still running at the end.
+param([string]$Process = 'RDR2', [int]$Seconds = 6)
 
 Add-Type @"
 using System;
@@ -20,17 +20,17 @@ public static class UrtiAltTab {
 }
 "@
 $p = Get-Process -Name $Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-if (-not $p) { "non"; exit 1 }
+if (-not $p) { "no"; exit 1 }
 $game = $p.MainWindowHandle
 [UrtiAltTab]::SetForegroundWindow($game) | Out-Null
 Start-Sleep -Milliseconds 500
 [UrtiAltTab]::AltTab()
-Start-Sleep -Seconds $Secondes
+Start-Sleep -Seconds $Seconds
 $left = [UrtiAltTab]::GetForegroundWindow() -ne $game
-if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { "non (plantage hors du jeu, parti : $left)"; exit 1 }
-# retour au jeu : Alt+Tab, puis la fenêtre remise devant s'il le faut
+if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { "no (crash outside the game, left: $left)"; exit 1 }
+# back to the game: Alt+Tab, then the window brought to the front if needed
 [UrtiAltTab]::AltTab()
 Start-Sleep -Seconds 1
 if ([UrtiAltTab]::GetForegroundWindow() -ne $game) { [UrtiAltTab]::ShowWindow($game, 9) | Out-Null; [UrtiAltTab]::SetForegroundWindow($game) | Out-Null }
-Start-Sleep -Seconds $Secondes
-if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { "oui (parti du jeu : $left, revenu : $([UrtiAltTab]::GetForegroundWindow() -eq $game))" } else { "non (plantage au retour)"; exit 1 }
+Start-Sleep -Seconds $Seconds
+if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { "yes (left the game: $left, came back: $([UrtiAltTab]::GetForegroundWindow() -eq $game))" } else { "no (crash on return)"; exit 1 }

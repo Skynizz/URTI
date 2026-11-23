@@ -1,4 +1,4 @@
-# Image de la fenêtre du jeu seulement (pas du reste du bureau) : CopyFromScreen sur son rectangle client
+# Image of the game window only (not the rest of the desktop): CopyFromScreen on its client rectangle
 param([string]$Process = 'RDR2', [string]$Out)
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
