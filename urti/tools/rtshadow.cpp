@@ -1,11 +1,11 @@
-// URTI : ombres du soleil en ray tracing sur une capture (.urti), sur le GPU (DXR, requêtes en ligne).
+// URTI: ray-traced sun shadows on a capture (.urti), on the GPU (DXR, inline queries).
 //
-// La géométrie captée passe de l'espace de découpage à l'espace caméra (linéaire : x / P00, y / P11, w),
-// devient une structure d'accélération ; chaque pixel du jeu est reconstruit depuis sa profondeur
-// (profondeur de découpage = A + B / w, A et B ajustés sur les sommets captés) et lance un rayon vers le
-// soleil. Sortie : masque d'ombre en PFM (1 éclairé, 0 à l'ombre), à la taille de la profondeur.
+// The captured geometry goes from clip space to camera space (linear: x / P00, y / P11, w),
+// becomes an acceleration structure; each game pixel is rebuilt from its depth
+// (clip depth = A + B / w, A and B fitted on the captured vertices) and casts a ray toward the
+// sun. Output: shadow mask as PFM (1 lit, 0 in shadow), at the depth's size.
 //
-//   urti_rtshadow capture.urti fov_degres soleil_x soleil_y soleil_z sortie.pfm [biais]
+//   urti_rtshadow capture.urti fov_degrees sun_x sun_y sun_z output.pfm [bias]
 
 #include <windows.h>
 #include <d3d12.h>
@@ -18,7 +18,7 @@
 #include <cstring>
 #include <vector>
 
-#include "rtshadow_cs.h" // g_main : shader compilé (dxc)
+#include "rtshadow_cs.h" // g_main: compiled shader (dxc)
 
 using Microsoft::WRL::ComPtr;
 
@@ -64,7 +64,7 @@ int main(int argc, char** argv)
 {
     if (argc < 7)
     {
-        std::fprintf(stderr, "usage : urti_rtshadow capture.urti fov_degres sx sy sz sortie.pfm [biais]\n");
+        std::fprintf(stderr, "usage: urti_rtshadow capture.urti fov_degrees sx sy sz output.pfm [bias]\n");
         return 1;
     }
     const float fov = float(std::atof(argv[2])) * 3.14159265f / 180.0f;
@@ -75,7 +75,7 @@ int main(int argc, char** argv)
         for (float& v : sun) v /= l;
     }
 
-    // --- lecture de la capture (version 2)
+    // --- reading the capture (version 2)
     FILE* f = std::fopen(argv[1], "rb");
     if (!f)
         return 1;
@@ -87,7 +87,7 @@ int main(int argc, char** argv)
     const uint32_t* h = reinterpret_cast<const uint32_t*>(data.data());
     if (h[0] != 0x49545255u || h[1] < 2)
     {
-        std::fprintf(stderr, "capture URTI version 2 attendue\n");
+        std::fprintf(stderr, "URTI capture version 2 expected\n");
         return 1;
     }
     const uint32_t drawCount = h[2], mainSlot = h[3], width = h[4], height = h[5], slots = h[11];
@@ -99,7 +99,7 @@ int main(int argc, char** argv)
         slotBytes[s] = info[2] ? (uint64_t(info[3]) | (uint64_t(info[4]) << 32)) : 0;
         off += 24;
     }
-    // dessins de la dernière frame sur la profondeur principale : la caméra a pu bouger entre deux frames
+    // draws of the last frame on the main depth: the camera may have moved between two frames
     struct Range { uint64_t start, end; };
     std::vector<Range> ranges;
     uint32_t lastFrame = 0;
@@ -125,12 +125,12 @@ int main(int argc, char** argv)
         off += size_t(slotBytes[s]);
     }
     const float* depth = reinterpret_cast<const float*>(data.data() + off);
-    const float clearDepth = h[10] ? 0.0f : 1.0f; // profondeur inversée : le ciel est à 0
+    const float clearDepth = h[10] ? 0.0f : 1.0f; // reversed depth: the sky is at 0
     uint64_t vertexCount = 0;
     for (const Range& r : ranges)
         vertexCount += (r.end - r.start) / 3 * 3;
 
-    // --- espace caméra (linéaire en espace de découpage) et loi de la profondeur
+    // --- camera space (linear in clip space) and depth law
     const float aspect = float(width) / float(height);
     const float p11 = 1.0f / std::tan(fov * 0.5f), p00 = p11 / aspect;
     std::vector<float> view(size_t(vertexCount) * 3);
@@ -144,9 +144,9 @@ int main(int argc, char** argv)
             if (c[3] > 1e-3f && (o % 7) == 0)
                 sw += c[3], sz += c[2], sww += double(c[3]) * c[3], swz += double(c[3]) * c[2], n += 1;
         }
-    // z_découpage = A w + B (projection perspective) : profondeur = A + B / w
+    // clip z = A w + B (perspective projection): depth = A + B / w
     const double A = (n * swz - sw * sz) / (n * sww - sw * sw), B = (sz - A * sw) / n;
-    std::printf("%llu sommets ; profondeur = %.6f + %.6f / w\n", (unsigned long long)vertexCount, A, B);
+    std::printf("%llu vertices; depth = %.6f + %.6f / w\n", (unsigned long long)vertexCount, A, B);
     std::vector<float> positions(size_t(width) * height * 4, 0.0f);
     for (uint32_t y = 0; y < height; y++)
         for (uint32_t x = 0; x < width; x++)
@@ -169,7 +169,7 @@ int main(int argc, char** argv)
     device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
     if (o5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1)
     {
-        std::fprintf(stderr, "ray tracing en ligne (DXR 1.1) indisponible\n");
+        std::fprintf(stderr, "inline ray tracing (DXR 1.1) unavailable\n");
         return 1;
     }
     D3D12_COMMAND_QUEUE_DESC qd = {};
@@ -227,7 +227,7 @@ int main(int argc, char** argv)
     list->BuildRaytracingAccelerationStructure(&td, 0, nullptr);
     UavBarrier(list.Get(), tlas.Get());
 
-    // shader de calcul : SRV t0 (scène), SRV t1 (positions), UAV u0 (ombre), constantes b0
+    // compute shader: SRV t0 (scene), SRV t1 (positions), UAV u0 (shadow), constants b0
     D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[0].Descriptor.ShaderRegister = 0;
@@ -289,7 +289,7 @@ int main(int argc, char** argv)
             std::fwrite(mask + size_t(y) * width, 4, width, o);
         std::fclose(o);
     }
-    std::printf("BLAS %.1f Mo ; %llu pixels de géométrie, %.1f %% éclairés par le soleil\n", bi.ResultDataMaxSizeInBytes / 1048576.0,
+    std::printf("BLAS %.1f MB; %llu geometry pixels, %.1f %% lit by the sun\n", bi.ResultDataMaxSizeInBytes / 1048576.0,
                 (unsigned long long)valid, valid ? 100.0 * lit / valid : 0.0);
     return 0;
 }

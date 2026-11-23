@@ -1,14 +1,14 @@
-// URTI : ombres du soleil en ray tracing sur la géométrie captée (requêtes de rayons en ligne, SM 6.5).
-// Un fil par pixel : point du jeu reconstruit depuis sa profondeur, rayon vers le soleil.
+// URTI: ray-traced sun shadows on the captured geometry (inline ray queries, SM 6.5).
+// One thread per pixel: game point rebuilt from its depth, ray toward the sun.
 
 RaytracingAccelerationStructure scene : register(t0);
-StructuredBuffer<float4> positions : register(t1); // espace caméra ; w = 0 : ciel
-RWStructuredBuffer<float> shadow : register(u0);   // 1 éclairé, 0 à l'ombre
+StructuredBuffer<float4> positions : register(t1); // camera space; w = 0: sky
+RWStructuredBuffer<float> shadow : register(u0);   // 1 lit, 0 in shadow
 
 cbuffer Constants : register(b0)
 {
-    float3 sun;    // vers le soleil, espace caméra
-    float bias;    // décalage relatif à la distance (contre l'auto-intersection)
+    float3 sun;    // toward the sun, camera space
+    float bias;    // offset relative to the distance (against self-intersection)
     uint count;
     float maxDistance;
     float2 pad;
@@ -27,7 +27,7 @@ void main(uint id : SV_DispatchThreadID)
     }
     const float dist = length(p.xyz);
     RayDesc ray;
-    ray.Origin = p.xyz * (1.0 - bias) + sun * bias * dist; // un peu vers la caméra et vers le soleil
+    ray.Origin = p.xyz * (1.0 - bias) + sun * bias * dist; // a bit toward the camera and toward the sun
     ray.Direction = sun;
     ray.TMin = 0.0;
     ray.TMax = maxDistance;

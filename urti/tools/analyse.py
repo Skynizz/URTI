@@ -1,17 +1,17 @@
-"""URTI : analyse hors ligne d'une capture (.urti) : objets retrouvés d'une frame à l'autre, champ de
-vision et mouvement de la caméra estimés sans rien savoir du jeu (auto-étalonnage), comparés à la
-vérité terrain si elle existe (banc : URTI_TRUTH).
+"""URTI: offline analysis of a capture (.urti): objects found from one frame to the next, field of
+view and camera motion estimated without knowing anything about the game (self-calibration), compared with the
+ground truth if it exists (bench: URTI_TRUTH).
 
-Principe. En espace de découpage, w est la profondeur le long de l'axe de vue. Avec le champ de vision
-vertical (P11 = 1 / tan(fov / 2), P00 = P11 × hauteur / largeur), chaque sommet devient un point de
-l'espace caméra. Un objet immobile vu dans deux frames doit alors bouger d'un seul mouvement rigide
-(rotation + translation) : on cherche le champ de vision pour lequel ce mouvement est le plus rigide.
+Principle. In clip space, w is the depth along the view axis. With the vertical field of
+view (P11 = 1 / tan(fov / 2), P00 = P11 × height / width), each vertex becomes a point of
+camera space. A still object seen in two frames must then move by a single rigid motion
+(rotation + translation): we look for the field of view for which that motion is the most rigid.
 
-Soleil. Le jeu dessine aussi la scène vue du soleil (carte d'ombres, projection parallèle) : le même
-objet y passe par une application affine de l'espace caméra. La direction que cette application envoie
-sur l'axe de profondeur de la carte, sans bouger dans son image, est celle du soleil.
+Sun. The game also draws the scene seen from the sun (shadow map, parallel projection): the same
+object goes there through an affine map of camera space. The direction that map sends
+onto the map's depth axis, without moving in its image, is the sun's.
 
-  python -I urti/tools/analyse.py capture.urti [--truth verite.txt]
+  python -I urti/tools/analyse.py capture.urti [--truth truth.txt]
 """
 
 import argparse
@@ -24,7 +24,7 @@ import numpy as np
 def read_capture(path):
     data = open(path, 'rb').read()
     h = struct.unpack_from('<12I', data, 0)
-    assert h[0] == 0x49545255, 'pas une capture URTI'
+    assert h[0] == 0x49545255, 'not a URTI capture'
     version, count, width, height, sw, sh = h[1], h[2], h[4], h[5], h[6], h[7]
     filled = h[8] | (h[9] << 32)
     off = 48
@@ -61,7 +61,7 @@ def signature(d):
 
 
 def matched_pairs(cap, fa, fb):
-    """Dessins de même signature et même nombre de sommets dans les frames fa et fb."""
+    """Draws with the same signature and the same vertex count in frames fa and fb."""
     by = {}
     for d in cap['draws']:
         if d['frame'] in (fa, fb):
@@ -71,8 +71,8 @@ def matched_pairs(cap, fa, fb):
         if frame != fa:
             continue
         other = by.get((sig, fb), [])
-        # signatures répétées (même maillage dessiné plusieurs fois) : appariées dans l'ordre d'émission ;
-        # l'ajustement robuste écarte ensuite les erreurs et les objets qui bougent
+        # repeated signatures (the same mesh drawn several times): paired in emission order;
+        # the robust fit then discards errors and moving objects
         if len(lst) == len(other):
             for x, y in zip(lst, other):
                 if x['end'] - x['start'] == y['end'] - y['start']:
@@ -86,7 +86,7 @@ def to_view(clip, p11, aspect):
 
 
 def kabsch(a, b, weights=None):
-    """Mouvement rigide b ≈ R a + t (moindres carrés, pondéré)."""
+    """Rigid motion b ≈ R a + t (weighted least squares)."""
     w = np.ones(len(a)) if weights is None else weights
     w = w / w.sum()
     ca, cb = (a * w[:, None]).sum(0), (b * w[:, None]).sum(0)
@@ -98,7 +98,7 @@ def kabsch(a, b, weights=None):
 
 
 def rigid_fit(c1, c2, p11, aspect, iterations=4):
-    """Mouvement rigide robuste (les objets qui bougent eux-mêmes sont écartés) ; renvoie R, t, erreur."""
+    """Robust rigid motion (objects that move on their own are discarded); returns R, t, error."""
     a, b = to_view(c1, p11, aspect), to_view(c2, p11, aspect)
     weights = np.ones(len(a))
     for _ in range(iterations):
@@ -111,11 +111,11 @@ def rigid_fit(c1, c2, p11, aspect, iterations=4):
 
 
 def sun_direction(cap, frame, p11, aspect):
-    """Direction du soleil (vers lui) dans l'espace caméra, à partir des cartes d'ombres de la frame.
+    """Sun direction (toward it) in camera space, from the frame's shadow maps.
 
-    Un même maillage peut figurer plusieurs fois dans une carte (cascades d'un atlas, chacune avec sa
-    projection) : on ajuste une application affine par paire « dessin de la vue / dessin de la carte »,
-    chacune donne une direction, et on garde la direction sur laquelle s'accorde le plus de sommets.
+    The same mesh may appear several times in a map (cascades of an atlas, each with its own
+    projection): an affine map is fitted per pair "view draw / map draw",
+    each gives a direction, and the direction on which the most vertices agree is kept.
     """
     results = []
     main = cap['main']
@@ -146,18 +146,18 @@ def sun_direction(cap, frame, p11, aspect):
                 r = np.linalg.norm(X @ M - S, axis=1)
                 scale = np.abs(S - S.mean(0)).max() + 1e-12
                 if np.median(r) > 1e-3 * scale or np.linalg.cond(X) > 1e8:
-                    continue  # pas une projection parallèle de ce maillage (autre objet, ou animé)
+                    continue  # not a parallel projection of this mesh (another object, or animated)
                 A = M[:3, :].T
                 try:
                     d = np.linalg.solve(A, np.array([0.0, 0.0, 1.0]))
                 except np.linalg.LinAlgError:
                     continue
                 dirs.append(-d / np.linalg.norm(d))
-                weights.append(ok.sum() * (8 if m == my_rank else 1))  # même rang : sans doute le même objet
+                weights.append(ok.sum() * (8 if m == my_rank else 1))  # same rank: probably the same object
         if not dirs:
             continue
         dirs, weights = np.array(dirs), np.array(weights, float)
-        # direction (au signe près) sur laquelle s'accordent le plus de sommets, à 2° près
+        # direction (up to sign) on which the most vertices agree, within 2°
         cos = np.abs(dirs @ dirs.T)
         votes = (cos > np.cos(np.radians(2))) @ weights
         best = int(np.argmax(votes))
@@ -175,33 +175,33 @@ def view_rotation(eye, at):
     x = np.array([z[2], 0.0, -z[0]])
     x /= np.linalg.norm(x)
     y = np.cross(z, x)
-    return np.stack([x, y, z])  # lignes : axes de la caméra dans le monde
+    return np.stack([x, y, z])  # rows: the camera's axes in the world
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('capture')
     ap.add_argument('--truth')
-    ap.add_argument('--fov', type=float, help='champ de vision impose (degres), sans auto-etalonnage')
+    ap.add_argument('--fov', type=float, help='imposed field of view (degrees), without self-calibration')
     a = ap.parse_args()
     cap = read_capture(a.capture)
     sw, sh = cap['screen']
     width, height = cap['size']
     aspect = width / height
     frames = sorted({d['frame'] for d in cap['draws']})
-    print(f'{len(cap["draws"])} dessins sur la profondeur principale, frames {frames}, {len(cap["verts"])} sommets')
+    print(f'{len(cap["draws"])} draws on the main depth, frames {frames}, {len(cap["verts"])} vertices')
     if len(frames) < 2:
-        print('une seule frame : pas d\'auto-étalonnage possible')
+        print('a single frame: no self-calibration possible')
         return
     fa, fb = frames[0], frames[-1]
     pairs = matched_pairs(cap, fa, fb)
-    print(f'{len(pairs)} dessins retrouvés entre les frames {fa} et {fb}')
+    print(f'{len(pairs)} draws found between frames {fa} and {fb}')
     c1 = np.concatenate([cap['verts'][p[0]['start'] // 16:p[0]['end'] // 16] for p in pairs])
     c2 = np.concatenate([cap['verts'][p[1]['start'] // 16:p[1]['end'] // 16] for p in pairs])
     ok = (c1[:, 3] > 1e-3) & (c2[:, 3] > 1e-3)
     c1, c2 = c1[ok].astype(np.float64), c2[ok].astype(np.float64)
 
-    # champ de vision : recherche du plus rigide, grossière puis fine
+    # field of view: search for the most rigid, coarse then fine
     best = None
     for fov in np.radians(np.linspace(20, 120, 101)):
         p11 = 1 / np.tan(fov / 2)
@@ -219,15 +219,15 @@ def main():
     p11 = 1 / np.tan(fov / 2)
     R, t, err, inliers = rigid_fit(c1, c2, p11, aspect)
     angle = np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))
-    print(f'champ de vision vertical estimé : {np.degrees(fov):.2f}° ; erreur de rigidité {100 * err:.3f} % ; '
-          f'{100 * inliers.mean():.1f} % des sommets immobiles')
-    print(f'mouvement de la caméra : rotation {angle:.3f}°, translation {np.linalg.norm(t):.3f} (unités du jeu)')
+    print(f'estimated vertical field of view: {np.degrees(fov):.2f}°; rigidity error {100 * err:.3f} %; '
+          f'{100 * inliers.mean():.1f} % of vertices still')
+    print(f'camera motion: rotation {angle:.3f}°, translation {np.linalg.norm(t):.3f} (game units)')
     suns = sun_direction(cap, fb, p11, aspect)
     for si, sun, n, pairs, agree in suns:
-        print(f'soleil (carte d\'ombres du flux {si}, {cap["slots"][si]["size"][0]}x{cap["slots"][si]["size"][1]}) : direction '
-              f'dans l\'espace caméra {np.round(sun, 4)} (au signe près) ; {pairs} paires, {100 * agree:.0f} % d\'accord, {n} sommets')
+        print(f'sun (shadow map of stream {si}, {cap["slots"][si]["size"][0]}x{cap["slots"][si]["size"][1]}): direction '
+              f'in camera space {np.round(sun, 4)} (up to sign); {pairs} pairs, {100 * agree:.0f} % agreement, {n} vertices')
     if not suns:
-        print('soleil : aucune carte d\'ombres appariée')
+        print('sun: no shadow map paired')
 
     if a.truth:
         truth = {}
@@ -235,16 +235,16 @@ def main():
             v = line.split()
             truth[int(v[0])] = (np.array(list(map(float, v[1:4]))), np.array(list(map(float, v[4:20]))).reshape(4, 4),
                                 np.array(list(map(float, v[20:23]))) if len(v) >= 23 else None)
-        # le banc : fov vertical 1,05 rad ; frame de capture = numéro de frame de l'application
-        print(f'vérité : champ de vision 60.16° ; écart {np.degrees(fov) - 60.16:+.2f}°')
+        # the bench: vertical fov 1.05 rad; capture frame = the application's frame number
+        print(f'truth: field of view 60.16°; difference {np.degrees(fov) - 60.16:+.2f}°')
         if fa in truth and fb in truth:
             ea, eb = truth[fa][0], truth[fb][0]
-            print(f'vérité : la caméra s\'est déplacée de {np.linalg.norm(eb - ea):.3f} ; estimé {np.linalg.norm(t):.3f}')
+            print(f'truth: the camera moved by {np.linalg.norm(eb - ea):.3f}; estimated {np.linalg.norm(t):.3f}')
             if truth[fb][2] is not None and suns:
                 true_sun = view_rotation(eb, [0.0, 0.5, 1.0]) @ truth[fb][2]
                 for si, sun, *_ in suns:
                     err_deg = np.degrees(np.arccos(np.clip(np.dot(sun, true_sun), -1, 1)))
-                    print(f'vérité : soleil dans l\'espace caméra {np.round(true_sun, 4)} ; écart {err_deg:.2f}°')
+                    print(f'truth: sun in camera space {np.round(true_sun, 4)}; difference {err_deg:.2f}°')
 
 
 if __name__ == '__main__':

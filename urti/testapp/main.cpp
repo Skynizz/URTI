@@ -1,10 +1,10 @@
-// URTI : application de test DirectX 12 en rastérisation, à géométrie connue (banc de l'injecteur).
+// URTI: DirectX 12 rasterisation test application with known geometry (the injector's bench).
 //
-// Scène : sol, six cubes fixes, un cube qui tourne, un cube déformé par le vertex shader, seize cubes
-// instanciés. Signature racine créée sans ALLOW_STREAM_OUTPUT (comme un jeu) : c'est à l'injecteur
-// de l'ajouter. Fenêtre jamais montrée sauf URTI_SHOW=1 ; URTI_FRAMES frames puis sortie.
-// URTI_ORBIT=1 : la caméra tourne autour de la scène ; URTI_TRUTH=fichier : vérité terrain (position
-// de la caméra et matrice vue × projection de chaque frame, pour vérifier l'estimation de la caméra).
+// Scene: a floor, six still cubes, a rotating cube, a cube deformed by the vertex shader, sixteen instanced
+// cubes. Root signature created without ALLOW_STREAM_OUTPUT (like a game): it is up to the injector
+// to add it. Window never shown unless URTI_SHOW=1; URTI_FRAMES frames, then exit.
+// URTI_ORBIT=1: the camera turns around the scene; URTI_TRUTH=file: ground truth (camera
+// position and view × projection matrix of each frame, to check the camera estimate).
 
 #include <windows.h>
 #include <d3d12.h>
@@ -117,7 +117,7 @@ VSOut vs(VSIn i)
 {
     VSOut o;
     float3 p = i.pos;
-    if (misc.x > 0.0) // déformation dans le vertex shader (comme une animation sur GPU)
+    if (misc.x > 0.0) // deformation in the vertex shader (like an animation on the GPU)
         p += i.nrm * 0.25 * sin(4.0 * p.y + 3.0 * time.x) * (p.y + 0.5);
     float4 w = mul(float4(p, 1.0), world);
 #ifdef INSTANCED
@@ -160,7 +160,7 @@ void MakeCube(std::vector<Vertex>& v, std::vector<uint16_t>& idx)
             }
             v.push_back(x);
         }
-        // sens des triangles indifférent : pas d'élimination des faces
+        // triangle winding irrelevant: no face culling
         const uint16_t q[6] = { 0, 1, 2, 0, 2, 3 };
         for (uint16_t k : q)
             idx.push_back(base + k);
@@ -196,7 +196,7 @@ ComPtr<ID3DBlob> Compile(const char* entry, const char* target, bool instanced)
     ComPtr<ID3DBlob> code, errors;
     if (FAILED(D3DCompile(kShaders, std::strlen(kShaders), "urti_testapp", instanced ? macros : macros + 1, nullptr, entry, target, 0, 0, &code, &errors)))
     {
-        std::fprintf(stderr, "%s\n", errors ? (const char*)errors->GetBufferPointer() : "erreur de compilation");
+        std::fprintf(stderr, "%s\n", errors ? (const char*)errors->GetBufferPointer() : "compilation error");
         std::exit(1);
     }
     return code;
@@ -220,7 +220,7 @@ int main()
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"URTI test", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, nullptr);
     if (show)
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE); // jamais par défaut : l'écran sert à autre chose
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE); // never by default: the screen is used for something else
 
     ComPtr<IDXGIFactory4> factory;
     CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
@@ -247,7 +247,7 @@ int main()
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kBuffers };
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
     CHECK(device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap)));
-    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2 }; // écran, carte d'ombres
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = { D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2 }; // screen, shadow map
     CHECK(device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap)));
     const UINT rtvStep = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     ComPtr<ID3D12Resource> backBuffers[kBuffers];
@@ -277,7 +277,7 @@ int main()
         device->CreateDepthStencilView(depth.Get(), nullptr, dsvHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
-    // carte d'ombres du soleil (passe de profondeur seule vue depuis le soleil, comme dans un jeu)
+    // sun shadow map (depth-only pass seen from the sun, as in a game)
     constexpr UINT kShadowSize = 2048;
     ComPtr<ID3D12Resource> shadowMap;
     D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -299,7 +299,7 @@ int main()
         device->CreateDepthStencilView(shadowMap.Get(), nullptr, shadowDsv);
     }
 
-    // signature racine sans ALLOW_STREAM_OUTPUT, comme dans un jeu
+    // root signature without ALLOW_STREAM_OUTPUT, as in a game
     ComPtr<ID3D12RootSignature> rootSig;
     {
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -347,7 +347,7 @@ int main()
         desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         desc.SampleDesc.Count = 1;
         CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso[inst])));
-        // passe d'ombres : même vertex shader, pas de pixel shader ni de cible de couleur
+        // shadow pass: same vertex shader, no pixel shader or colour target
         desc.PS = {};
         desc.NumRenderTargets = 0;
         desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
@@ -367,7 +367,7 @@ int main()
         offsets.push_back(4.0f + 1.5f * (i / 4));
     }
     ComPtr<ID3D12Resource> instances = UploadBuffer(device.Get(), offsets.data(), offsets.size() * sizeof(float));
-    ComPtr<ID3D12Resource> frameCb = UploadBuffer(device.Get(), nullptr, 256 * kBuffers * 2); // caméra, soleil
+    ComPtr<ID3D12Resource> frameCb = UploadBuffer(device.Get(), nullptr, 256 * kBuffers * 2); // camera, sun
     uint8_t* frameCbData = nullptr;
     CHECK(frameCb->Map(0, nullptr, (void**)&frameCbData));
 
@@ -375,7 +375,7 @@ int main()
     const D3D12_VERTEX_BUFFER_VIEW ivbv = { instances->GetGPUVirtualAddress(), (UINT)(offsets.size() * sizeof(float)), 12 };
     const D3D12_INDEX_BUFFER_VIEW ibv = { ib->GetGPUVirtualAddress(), (UINT)(idx.size() * sizeof(uint16_t)), DXGI_FORMAT_R16_UINT };
 
-    // dessin indirect (ExecuteIndirect) des cubes instanciés, comme un moteur piloté par le GPU
+    // indirect draw (ExecuteIndirect) of the instanced cubes, like a GPU-driven engine
     ComPtr<ID3D12CommandSignature> drawSignature;
     {
         D3D12_INDIRECT_ARGUMENT_DESC arg = {};
@@ -403,7 +403,7 @@ int main()
     const bool orbit = orbitEnv && std::atoi(orbitEnv) != 0;
     FILE* truth = std::getenv("URTI_TRUTH") ? std::fopen(std::getenv("URTI_TRUTH"), "w") : nullptr;
     const float at[3] = { 0.0f, 0.5f, 1.0f };
-    float sun[3] = { 0.25f, 0.75f, 0.6f }; // vers le soleil (devant la caméra : ombres portées visibles)
+    float sun[3] = { 0.25f, 0.75f, 0.6f }; // toward the sun (in front of the camera: visible cast shadows)
     {
         const float l = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
         for (float& v : sun) v /= l;
@@ -431,7 +431,7 @@ int main()
             std::fprintf(truth, "%d %g %g %g", frame, eye[0], eye[1], eye[2]);
             for (float v : viewProj.m)
                 std::fprintf(truth, " %.9g", v);
-            std::fprintf(truth, " %.9g %.9g %.9g", sun[0], sun[1], sun[2]); // direction du soleil (monde)
+            std::fprintf(truth, " %.9g %.9g %.9g", sun[0], sun[1], sun[2]); // sun direction (world)
             std::fputc('\n', truth);
         }
         const UINT bb = swapchain->GetCurrentBackBufferIndex();
@@ -490,9 +490,9 @@ int main()
             draw({ Mul(Scale(1.0f, h, 1.0f), Translate(-5.0f + 2.0f * i, h * 0.5f, -1.0f)), { 0, 0.8f, 0.3f + 0.1f * i, 0.25f } });
         }
         draw({ Mul(Mul(Scale(1.5f, 1.5f, 1.5f), RotateY(t)), Translate(3.5f, 0.75f, 2.0f)), { 0, 0.9f, 0.85f, 0.2f } }); // tourne
-        draw({ Mul(Scale(1.2f, 2.0f, 1.2f), Translate(-2.0f, 1.0f, 2.0f)), { 1, 0.3f, 0.6f, 0.9f } });                  // déformé
+        draw({ Mul(Scale(1.2f, 2.0f, 1.2f), Translate(-2.0f, 1.0f, 2.0f)), { 1, 0.3f, 0.6f, 0.9f } });                  // deformed
 
-        cmd->SetPipelineState(shadowPass ? shadowPso[1].Get() : pso[1].Get()); // instanciés
+        cmd->SetPipelineState(shadowPass ? shadowPso[1].Get() : pso[1].Get()); // instanced
         const D3D12_VERTEX_BUFFER_VIEW both[2] = { vbv, ivbv };
         cmd->IASetVertexBuffers(0, 2, both);
         const Object inst = { Scale(0.8f, 0.8f, 0.8f), { 0, 0.4f, 0.8f, 0.4f } };
@@ -513,6 +513,6 @@ int main()
     }
     if (truth)
         std::fclose(truth);
-    std::printf("urti_testapp : %d frames\n", frames);
+    std::printf("urti_testapp: %d frames\n", frames);
     return 0;
 }

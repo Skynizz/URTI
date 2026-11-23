@@ -1,36 +1,36 @@
-// URTI : bac à sable « jeu AAA » pour tester l'injecteur sans lancer un vrai jeu.
+// URTI: "AAA game" sandbox to test the injector without launching a real game.
 //
-// Même structure de rendu qu'un jeu récent (et que Red Dead Redemption 2 tel que le relevé des passes
-// l'a montré) :
-//  - G-buffer différé à la résolution de rendu (2/3 de l'écran, comme DLSS) : albédo sRGB, normales,
-//    matériau (lissé dans le canal 1 de la cible 2), divers, vecteurs de mouvement R16G16 en pixels
-//    (de l'image courante vers la précédente) ; décalage sous-pixel (jitter) à chaque image ;
-//  - profondeur inversée à l'infini (D32S8, effacée à 0) ; une seconde profondeur à mi-résolution ;
-//  - atlas de 4 cascades d'ombres 2048×8192 en D16, chacune dans son viewport, qui suivent la caméra
-//    par pas de texel ; éclairage plein écran qui lit l'atlas (filtrage 3×3) ;
-//  - anti-crénelage temporel (TAA) et mise à l'échelle vers l'écran (historique reprojeté par les vecteurs
-//    de mouvement, borné par le voisinage), sortie HDR10 (PQ, R10G10B10A2) comme RDR2 : l'image présentée
-//    est stable d'une image à l'autre, comme dans un vrai jeu ;
-//  - génération d'images en option : une présentation sur deux sans aucun dessin (copie seule).
-// Scène difficile pour le RT : rue, bâtiments, poteaux et câbles très fins, arbres dont les branches
-// bougent au vent (feuillage en plaques découpées par alpha test, comme dans les jeux : la géométrie est un
-// rectangle, la texture le découpe), charrettes et passants qui avancent, flaques (sol lisse par endroits), tonneaux par
-// ExecuteIndirect. Caméra scriptée, la même à chaque lancement (marche, regards, demi-tours rapides).
+// Same rendering structure as a recent game (and as Red Dead Redemption 2 as the pass survey
+// showed it):
+//  - deferred G-buffer at render resolution (2/3 of the screen, like DLSS): sRGB albedo, normals,
+//    material (smoothness in channel 1 of target 2), misc, R16G16 motion vectors in pixels
+//    (from the current frame to the previous one); sub-pixel jitter every frame;
+//  - reversed infinite depth (D32S8, cleared to 0); a second half-resolution depth;
+//  - atlas of 4 shadow cascades 2048×8192 in D16, each in its viewport, following the camera
+//    in texel steps; full-screen lighting reading the atlas (3×3 filtering);
+//  - temporal anti-aliasing (TAA) and upscaling to the screen (history reprojected by the motion
+//    vectors, clamped by the neighbourhood), HDR10 output (PQ, R10G10B10A2) like RDR2: the presented image
+//    is stable from one frame to the next, as in a real game;
+//  - optional frame generation: one present in two without any draw (copy only).
+// A hard scene for RT: a street, buildings, very thin poles and cables, trees whose branches
+// move in the wind (foliage as alpha-tested cut-out cards, as in games: the geometry is a
+// rectangle, the texture cuts it out), carts and walking passers-by, puddles (smooth ground in places), barrels through
+// ExecuteIndirect. Scripted camera, the same on every launch (walking, looking around, fast U-turns).
 //
-// Réglages (variables d'environnement) : URTI_FRAMES (nombre d'images, défaut 600), URTI_SHOW=1 (fenêtre
-// visible), URTI_SANDBOX_CAMERA=marche|fixe|orbite|batiment|arbre|rue|occlusion (les quatre derniers :
-// plans fixes des tests, voir tools/reshade/urti_sandbox_suite.sh), URTI_SANDBOX_FG=1 (génération d'images),
-// URTI_SANDBOX_SDR=1 (sortie sRGB au lieu de HDR10), URTI_SANDBOX_START=secondes (début du scénario),
-// URTI_SANDBOX_UI=0 (sans interface : mini-carte, barres, menu qui s'ouvre 2 s toutes les 4 s, dessinés dans
-// l'image d'écran après la scène, comme un jeu), URTI_SANDBOX_LEAVES=blocs (feuilles en petits blocs pleins au lieu de plaques découpées),
-// URTI_SANDBOX_JITTER=0 (sans décalage sous-pixel), URTI_SANDBOX_WIND=facteur (0 : pas de vent), URTI_SANDBOX_MOVERS=0 (charrettes et passants immobiles),
-// URTI_SANDBOX_WET=0..1 (part du sol couverte d'eau ; défaut : flaques éparses), URTI_SANDBOX_TRUTH=1 (vérité
-// terrain : le sol reflète la scène exacte, rendue en miroir, mélangée avec la même règle qu'URTI ; un
-// lancement sans URTI dans ce mode est l'image que les reflets RT devraient donner), URTI_SANDBOX_FPS=cadence maximale (défaut 90, 0 : sans limite ;
-// un lancement natif et un lancement avec RT atteignent ainsi la même image au même moment, après que
-// ReShade a retiré son bandeau d'accueil), URTI_SANDBOX_GAMESHADOW=partiel (la carte d'ombres du « jeu » oublie
-// les poteaux, piquets, le mur, les charrettes et les passants : URTI doit rendre ces ombres comme le jeu les
-// aurait faites ; tools/reshade/urti_sandbox_ombres.sh).
+// Settings (environment variables): URTI_FRAMES (number of frames, default 600), URTI_SHOW=1 (visible
+// window), URTI_SANDBOX_CAMERA=walk|fixed|orbit|building|tree|street|occlusion (the last four:
+// fixed shots of the tests, see tools/reshade/urti_sandbox_suite.sh), URTI_SANDBOX_FG=1 (frame generation),
+// URTI_SANDBOX_SDR=1 (sRGB output instead of HDR10), URTI_SANDBOX_START=seconds (start of the scenario),
+// URTI_SANDBOX_UI=0 (without UI: minimap, bars, a menu opening 2 s every 4 s, drawn into
+// the screen image after the scene, like a game), URTI_SANDBOX_LEAVES=blocks (leaves as small solid blocks instead of cut-out cards),
+// URTI_SANDBOX_JITTER=0 (no sub-pixel jitter), URTI_SANDBOX_WIND=factor (0: no wind), URTI_SANDBOX_MOVERS=0 (carts and passers-by still),
+// URTI_SANDBOX_WET=0..1 (share of the ground covered with water; default: scattered puddles), URTI_SANDBOX_TRUTH=1 (ground
+// truth: the floor reflects the exact scene, rendered mirrored, blended with the same rule as URTI; a
+// launch without URTI in this mode is the image RT reflections should give), URTI_SANDBOX_FPS=maximum frame rate (default 90, 0: no limit;
+// a native launch and a launch with RT thus reach the same image at the same moment, after
+// ReShade has removed its welcome banner), URTI_SANDBOX_GAMESHADOW=partial (the "game's" shadow map forgets
+// the poles, posts, the wall, the carts and the passers-by: URTI must render those shadows as the game would
+// have; tools/reshade/urti_sandbox_shadows.sh).
 
 #include <windows.h>
 #include <d3d12.h>
@@ -59,7 +59,7 @@ constexpr UINT kMaxObjects = 512;
 constexpr float kPi = 3.14159265f;
 
 // ------------------------------------------------------------------------------------------------
-// mathématiques (convention vecteur ligne : v * a * b)
+// maths (row-vector convention: v * a * b)
 // ------------------------------------------------------------------------------------------------
 
 struct Mat4
@@ -147,7 +147,7 @@ Mat4 OrthoLH(float w, float h, float zn, float zf)
     return r;
 }
 
-// perspective à profondeur inversée et plan lointain à l'infini : profondeur = near / z
+// perspective with reversed depth and far plane at infinity: depth = near / z
 Mat4 ReversedInfiniteLH(float fovY, float aspect, float zn)
 {
     const float h = 1.0f / std::tan(fovY * 0.5f), w = h / aspect;
@@ -202,39 +202,39 @@ float Halton(int i, int base)
 }
 
 // ------------------------------------------------------------------------------------------------
-// shaders (un seul texte, plusieurs points d'entrée)
+// shaders (a single text, several entry points)
 // ------------------------------------------------------------------------------------------------
 
 const char* kShaders = R"(
 cbuffer Frame : register(b0)
 {
-    row_major float4x4 viewProj;       // avec décalage sous-pixel
-    row_major float4x4 viewProjNJ;     // sans décalage
-    row_major float4x4 prevViewProjNJ; // image précédente, sans décalage
+    row_major float4x4 viewProj;       // with sub-pixel jitter
+    row_major float4x4 viewProjNJ;     // without jitter
+    row_major float4x4 prevViewProjNJ; // previous frame, without jitter
     row_major float4x4 invViewProj;    // inverse de viewProj
     row_major float4x4 lightViewProj[4];
     float4 cameraPos;  // w : temps
-    float4 sunDir;     // vers le soleil ; w : temps de l'image précédente
+    float4 sunDir;     // toward the sun; w: previous frame's time
     float4 renderSize; // largeur, hauteur, 1 / largeur, 1 / hauteur
-    float4 splits;     // distances de fin des cascades
+    float4 splits;     // end distances of the cascades
     float4 camForward; // w : vent
-    float4 output;     // x : 1 HDR10, 0 sRGB ; y : exposition ; zw : décalage sous-pixel (NDC)
-    float4 misc;       // x : eau au sol (< 0 : flaques éparses) ; y : 1 = historique du TAA à oublier ;
-                       // z : 1 = reflets exacts du sol (vérité terrain)
+    float4 output;     // x: 1 HDR10, 0 sRGB; y: exposure; zw: sub-pixel jitter (NDC)
+    float4 misc;       // x: water on the ground (< 0: scattered puddles); y: 1 = TAA history to forget;
+                       // z: 1 = exact floor reflections (ground truth)
 };
 cbuffer Object : register(b1)
 {
     row_major float4x4 world;
     row_major float4x4 prevWorld;
-    float4 color;  // albédo
-    float4 params; // x : vent (multiplicateur), y : 1 sol à flaques, z : réservé, w : métal
+    float4 color;  // albedo
+    float4 params; // x: wind (multiplier), y: 1 ground with puddles, z: reserved, w: metal
 };
 cbuffer PassConstants : register(b2)
 {
     uint cascade;
     uint3 passPad;
-    float4 uiRect;  // interface : rectangle (NDC : gauche, haut, droite, bas)
-    float4 uiColor; // couleur déjà encodée pour l'écran, alpha
+    float4 uiRect;  // UI: rectangle (NDC: left, top, right, bottom)
+    float4 uiColor; // colour already encoded for the screen, alpha
 };
 
 Texture2D<float4> gAlbedo : register(t0);
@@ -242,7 +242,7 @@ Texture2D<float4> gNormal : register(t1);
 Texture2D<float4> gMaterial : register(t2);
 Texture2D<float> gDepth : register(t3);
 Texture2D<float> gAtlas : register(t4);
-Texture2D<float4> gMirror : register(t5); // scène vue dans le miroir du sol (vérité terrain)
+Texture2D<float4> gMirror : register(t5); // scene seen in the floor's mirror (ground truth)
 SamplerState linearClamp : register(s0);
 SamplerComparisonState shadowCmp : register(s1);
 
@@ -250,16 +250,16 @@ struct VSIn
 {
     float3 pos : POSITION;
     float3 nrm : NORMAL;
-    float4 col : COLOR;  // alpha : lissé
-    float wind : WIND;   // poids du vent du sommet
-    float2 uv : TEXCOORD; // plaque de feuillage : coordonnées dans la texture découpée ; < 0 : surface pleine
+    float4 col : COLOR;  // alpha: smoothness
+    float wind : WIND;   // the vertex's wind weight
+    float2 uv : TEXCOORD; // foliage card: coordinates in the cut-out texture; < 0: solid surface
 #ifdef INSTANCED
     float4 inst : INSTOFFSET;
 #endif
 };
 
-// balancement au vent, selon le poids de chaque sommet (pied d'arbre et bouts de câble immobiles) ; la
-// phase dépend de la position : les feuilles et les câbles ne bougent pas tous ensemble
+// swaying in the wind, according to each vertex's weight (tree foot and cable ends still); the
+// phase depends on the position: leaves and cables do not all move together
 float3 Wind(float3 wp, float weight, float t)
 {
     const float amount = weight * params.x * camForward.w;
@@ -306,8 +306,8 @@ GVSOut vsGbuffer(VSIn i)
 
 float Hash(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
 
-// « texture » d'une plaque de feuillage : un bouquet de feuilles (ellipses) ; ailleurs, transparent
-// (alpha test : le pixel est jeté, la carte d'ombres et l'écran voient à travers)
+// "texture" of a foliage card: a cluster of leaves (ellipses); elsewhere, transparent
+// (alpha test: the pixel is discarded, the shadow map and the screen see through it)
 bool LeafCut(float2 uv)
 {
     if (uv.x < 0)
@@ -347,7 +347,7 @@ GOut psGbuffer(GVSOut i)
     float smooth = i.col.a;
     if (params.y > 0.5)
     {
-        // sol : pavés et flaques (lisses comme un miroir, plus sombres)
+        // ground: cobblestones and puddles (smooth as a mirror, darker)
         const float n = Noise(i.wpos.xz * 0.18) * 0.7 + Noise(i.wpos.xz * 0.9) * 0.3;
         const float puddle = misc.x < 0 ? smoothstep(0.58, 0.66, n) : smoothstep(1.02 - misc.x * 1.1, 1.08 - misc.x * 1.1, n);
         const float cobble = 0.85 + 0.15 * Noise(i.wpos.xz * 3.0);
@@ -359,7 +359,7 @@ GOut psGbuffer(GVSOut i)
     o.material = float4(0.5, smooth, params.w, params.y > 0.5 ? 0.5 : 1.0); // alpha 0,5 : sol
     o.misc = float4(0, 0, 0, 1);
     const float2 curNdc = i.cur.xy / i.cur.w, prevNdc = i.prev.xy / i.prev.w;
-    o.velocity = (prevNdc - curNdc) * float2(0.5, -0.5) * renderSize.xy; // pixels, vers l'image précédente
+    o.velocity = (prevNdc - curNdc) * float2(0.5, -0.5) * renderSize.xy; // pixels, toward the previous frame
     return o;
 }
 
@@ -372,7 +372,7 @@ SVSOut vsShadow(VSIn i)
     return o;
 }
 
-// carte d'ombres : le feuillage est découpé comme à l'écran
+// shadow map: foliage is cut out as on screen
 void psShadow(SVSOut i)
 {
     if (LeafCut(i.uv))
@@ -412,7 +412,7 @@ float3 Sky(float3 dir)
     return sky;
 }
 
-// éclairage direct et ambiant d'un point (sans reflet)
+// direct and ambient lighting of a point (without reflection)
 float3 Shade(float3 albedo, float3 n, float3 p)
 {
     const float ndl = saturate(dot(n, sunDir.xyz));
@@ -422,7 +422,7 @@ float3 Shade(float3 albedo, float3 n, float3 p)
     return albedo * (sunColor * ndl * shadow + ambient);
 }
 
-// vérité terrain : la scène dessinée en miroir sous le sol (y -> -y), éclairée à sa vraie place
+// ground truth: the scene drawn mirrored under the floor (y -> -y), lit at its true place
 GVSOut vsMirror(VSIn i)
 {
     GVSOut o;
@@ -458,14 +458,14 @@ float4 psLighting(FullOut i) : SV_Target
     const float3 n = normalize(gNormal.Load(int3(px, 0)).xyz * 2 - 1);
     const float4 mat = gMaterial.Load(int3(px, 0));
     float3 c = Shade(albedo, n, p);
-    // reflet « du jeu » (ciel seulement, comme un jeu sans RT) : Fresnel selon le lissé
+    // the "game's" reflection (sky only, like a game without RT): Fresnel according to smoothness
     const float3 r = reflect(viewDir, n);
     const float fres = 0.04 + 0.96 * pow(1 - saturate(dot(-viewDir, n)), 5);
     c = lerp(c, Sky(r) * 0.8, fres * mat.y * mat.y);
     if (misc.z > 0.5 && mat.w < 0.75)
     {
-        // vérité terrain : reflet exact du sol, mélangé comme URTI le fait (Fresnel f0 = 0,04, lissé au-dessus
-        // de 0,35, sol mouillé 0,9 ; couleur plafonnée à 4)
+        // ground truth: exact floor reflection, blended the way URTI does it (Fresnel f0 = 0.04, smoothness above
+        // 0.35, wet floor 0.9; colour capped at 4)
         const float sm = max(mat.y, 0.9 * saturate((n.y - 0.55) / 0.3));
         const float w = (0.04 + 0.96 * pow(1 - saturate(dot(-viewDir, n)), 5)) * saturate((sm - 0.35) / 0.65);
         const float4 m = gMirror.Load(int3(px, 0));
@@ -482,8 +482,8 @@ Texture2D<float4> gLit : register(t0);
 Texture2D<float2> gVelocity : register(t1);
 Texture2D<float4> gHistory : register(t2);
 
-// TAA : image courante (débarrassée du décalage sous-pixel) mélangée à l'historique reprojeté, borné par
-// le voisinage 3×3 de l'image courante ; sortie à la résolution de l'écran
+// TAA: current image (rid of the sub-pixel jitter) blended with the reprojected history, clamped by
+// the current image's 3×3 neighbourhood; output at screen resolution
 float4 psTaa(FullOut i) : SV_Target
 {
     const float2 rs = renderSize.xy;
@@ -511,7 +511,7 @@ float3 NitsToPq(float3 l)
 }
 float3 LinearToSrgb(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
 
-// interface du jeu : un rectangle plein, mélangé par son alpha, dessiné dans l'image d'écran
+// the game's UI: a solid rectangle, blended by its alpha, drawn into the screen image
 float4 vsUi(uint id : SV_VertexID) : SV_Position
 {
     const float2 c = float2((id & 1) ? uiRect.z : uiRect.x, (id & 2) ? uiRect.w : uiRect.y);
@@ -523,7 +523,7 @@ float4 psUpscale(FullOut i) : SV_Target
 {
     const float3 lit = gLit.SampleLevel(linearClamp, i.uv, 0).rgb * output.y;
     if (output.x > 0.5)
-        return float4(NitsToPq(lit * 203.0), 1);       // HDR10 : blanc de référence à 203 nits
+        return float4(NitsToPq(lit * 203.0), 1);       // HDR10: reference white at 203 nits
     return float4(LinearToSrgb(saturate(lit / (1 + lit))), 1); // sRGB, compression douce
 }
 )";
@@ -542,16 +542,16 @@ ComPtr<ID3DBlob> Compile(const char* entry, const char* target, bool instanced)
 }
 
 // ------------------------------------------------------------------------------------------------
-// maillages et scène
+// meshes and scene
 // ------------------------------------------------------------------------------------------------
 
-// sommet : position, normale, couleur (alpha : lissé), poids du vent (0 : immobile)
+// vertex: position, normal, colour (alpha: smoothness), wind weight (0: still)
 struct Vertex
 {
     float p[3], n[3], c[4], wind, uv[2];
 };
 
-// un maillage : sa plage dans le tampon d'indices commun (comme un jeu, chaque modèle a la sienne)
+// a mesh: its range in the shared index buffer (like a game, each model has its own)
 struct Mesh
 {
     UINT firstIndex = 0, indexCount = 0;
@@ -570,8 +570,8 @@ struct Geometry
     }
     void End(int mesh) { meshes[mesh].indexCount = UINT(idx.size()) - meshes[mesh].firstIndex; }
 
-    // pavé unité transformé par m (échelle d'abord, puis rotation et translation) ; wind(x, y, z) donne le
-    // poids du vent de chaque sommet, à partir de sa position dans le modèle
+    // unit box transformed by m (scale first, then rotation and translation); wind(x, y, z) gives the
+    // wind weight of each vertex, from its position in the model
     template <class WindFn>
     void Box(const Mat4& m, float r, float g, float b, float smooth, WindFn wind)
     {
@@ -609,8 +609,8 @@ struct Geometry
     {
         Box(m, r, g, b, smooth, [](float, float, float) { return 0.0f; });
     }
-    // plaque de feuillage carrée (côté size) centrée en c, tournée de yaw, inclinée de tilt, normale n
-    // (vers l'extérieur de l'arbre, comme les jeux le font pour éclairer le feuillage), découpée par alpha test
+    // square foliage card (side size) centred on c, turned by yaw, tilted by tilt, normal n
+    // (outward from the tree, as games do to light foliage), cut out by alpha test
     template <class WindFn>
     void Card(const float c[3], float size, float yaw, float tilt, const float n[3], float r, float g, float b, WindFn wind)
     {
@@ -635,7 +635,7 @@ struct Geometry
         for (uint32_t k : q)
             idx.push_back(base + k);
     }
-    // pavé fin de a à b (câble, branche), section s
+    // thin box from a to b (cable, branch), section s
     template <class WindFn>
     void Beam(const float a[3], const float b[3], float s, float r, float g, float bl, float smooth, WindFn wind)
     {
@@ -652,10 +652,10 @@ struct Object
     int mesh = 0;
     Mat4 world, prevWorld;
     float color[4];
-    float params[4]; // vent (multiplicateur), sol à flaques, réservé, métal
-    int mover = -1;  // objet animé (charrette, passant)
+    float params[4]; // wind (multiplier), ground with puddles, reserved, metal
+    int mover = -1;  // animated object (cart, passer-by)
     float moverPhase = 0;
-    bool optionalShadow = false; // absent de la carte d'ombres en mode URTI_SANDBOX_GAMESHADOW=partiel
+    bool optionalShadow = false; // missing from the shadow map in URTI_SANDBOX_GAMESHADOW=partial mode
 };
 
 struct ObjectConstants
@@ -677,8 +677,8 @@ float Rand(uint32_t& s)
     return float(s >> 8) / 16777216.0f;
 }
 
-// la scène : des modèles comme dans un jeu (un arbre, un bâtiment, une portée de câbles = un maillage,
-// donc un dessin par passe), plus de petits accessoires dessinés un par un (piquets de clôture)
+// the scene: models as in a game (a tree, a building, a span of cables = one mesh,
+// hence one draw per pass), plus small props drawn one by one (fence posts)
 std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
 {
     std::vector<Object> o;
@@ -692,14 +692,14 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
         o.push_back(x);
         return o.back();
     };
-    // sol (pavés et flaques)
+    // ground (cobblestones and puddles)
     {
         const int m = geo.Begin();
         geo.Box(Mul(Scale(240, 0.2f, 240), Translate(0, -0.1f, 0)), 0.42f, 0.38f, 0.33f, 0.25f);
         geo.End(m);
         add(m, 1);
     }
-    // bâtiments des deux côtés de la rue : murs, vitres lisses, corniche, porte
+    // buildings on both sides of the street: walls, smooth windows, cornice, door
     for (int side = -1; side <= 1; side += 2)
         for (int i = 0; i < 11; i++)
         {
@@ -713,7 +713,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             geo.End(m);
             add(m);
         }
-    // lignes électriques : poteaux, puis chaque portée (3 câbles qui pendent et se balancent au vent)
+    // power lines: poles, then each span (3 cables hanging and swaying in the wind)
     for (int side = -1; side <= 1; side += 2)
         for (int i = 0; i < 8; i++)
         {
@@ -743,7 +743,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             geo.End(span);
             add(span);
         }
-    // câbles en travers de la rue
+    // cables across the street
     for (int i = 0; i < 4; i++)
     {
         const float x = -37 + i * 30.0f;
@@ -761,7 +761,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
         geo.End(m);
         add(m);
     }
-    // arbres : tronc, branches fines et feuillage ; le vent croît avec la hauteur
+    // trees: trunk, thin branches and foliage; the wind grows with height
     const float treeX[5] = { -40, -18, 4, 26, 46 };
     for (float tx : treeX)
         for (int side = -1; side <= 1; side += 2)
@@ -786,7 +786,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
                     geo.Box(Mul(Mul(Scale(s, s * 0.6f, s), RotateY(yaw)), Translate(tx + std::cos(a) * r, y, tz + std::sin(a) * r)), cr, cg, 0.12f, 0.35f, windTree);
                     continue;
                 }
-                // bouquet : deux plaques croisées, trois fois plus grandes qu'un bloc (la texture en découpe les feuilles)
+                // cluster: two crossed cards, three times larger than a block (the texture cuts the leaves out)
                 const float c[3] = { tx + std::cos(a) * r, y, tz + std::sin(a) * r };
                 float n[3] = { std::cos(a), 0.6f, std::sin(a) };
                 const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
@@ -799,7 +799,7 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             geo.End(m);
             add(m);
         }
-    // clôtures devant les maisons : un piquet = un dessin (les jeux ont beaucoup de petits dessins)
+    // fences in front of the houses: one post = one draw (games have many small draws)
     for (int side = -1; side <= 1; side += 2)
     {
         const float z = side * 12.3f;
@@ -816,14 +816,14 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
             add(post).optionalShadow = true;
         }
     }
-    // un mur au milieu de la rue : deux passants passent derrière (test d'occlusion)
+    // a wall in the middle of the street: two passers-by walk behind it (occlusion test)
     {
         const int m = geo.Begin();
         geo.Box(Mul(Scale(4, 2.2f, 0.3f), Translate(1, 1.1f, 4)), 0.55f, 0.5f, 0.45f, 0.15f);
         geo.End(m);
         add(m).optionalShadow = true;
     }
-    // charrettes (caisse, roues, brancards) et passants : ils avancent (vecteurs de mouvement d'objets)
+    // carts (box, wheels, shafts) and passers-by: they move (object motion vectors)
     for (int c = 0; c < 3; c++)
     {
         const int m = geo.Begin();
@@ -849,10 +849,10 @@ std::vector<Object> BuildScene(Geometry& geo, bool leafCards)
     return o;
 }
 
-// position animée d'un objet mobile à l'instant t
+// animated position of a moving object at time t
 Mat4 MoverMatrix(const Object& o, float t)
 {
-    if (o.mover == 0) // charrette : va-et-vient le long de la rue
+    if (o.mover == 0) // cart: back and forth along the street
     {
         const float x = 30 * std::sin(t * 0.18f + o.moverPhase), lane = (o.moverPhase > 2 ? -1.0f : 1.0f) * 2.6f;
         const float dir = std::cos(t * 0.18f + o.moverPhase) >= 0 ? 0.0f : kPi;
@@ -862,21 +862,21 @@ Mat4 MoverMatrix(const Object& o, float t)
     return Translate(x, 0.05f * std::sin(t * 9 + o.moverPhase), z);
 }
 
-// caméra scriptée : marche dans la rue, regarde autour, demi-tours rapides ; identique à chaque lancement
+// scripted camera: walks down the street, looks around, fast U-turns; identical on every launch
 void CameraAt(const std::string& mode, float t, float eye[3], float at[3])
 {
-    if (mode == "fixe")
+    if (mode == "fixed")
     {
         eye[0] = -6, eye[1] = 1.7f, eye[2] = -3, at[0] = 6, at[1] = 2.5f, at[2] = 3;
         return;
     }
-    // plans fixes des tests (sol mouillé conseillé : les reflets couvrent l'image)
+    // fixed shots of the tests (wet ground advised: reflections cover the image)
     struct Shot { const char* name; float eye[3], at[3]; };
     static const Shot shots[] = {
-        { "batiment", { -5, 1.7f, 3 }, { -5, 2.5f, 11 } },       // façade, vitres, rien ne bouge
-        { "arbre", { 4, 1.7f, 4 }, { 4, 0.2f, -10.5f } },        // un arbre et son reflet dans la flaque
-        { "rue", { -12, 1.7f, -2 }, { -12, 1.0f, 5 } },          // des passants traversent
-        { "occlusion", { 1, 1.7f, -3 }, { 1, 1.4f, 5 } },        // des passants disparaissent derrière le mur
+        { "building", { -5, 1.7f, 3 }, { -5, 2.5f, 11 } },       // facade, windows, nothing moves
+        { "tree", { 4, 1.7f, 4 }, { 4, 0.2f, -10.5f } },        // a tree and its reflection in the puddle
+        { "street", { -12, 1.7f, -2 }, { -12, 1.0f, 5 } },          // passers-by cross
+        { "occlusion", { 1, 1.7f, -3 }, { 1, 1.4f, 5 } },        // passers-by disappear behind the wall
     };
     for (const Shot& shot : shots)
         if (mode == shot.name)
@@ -885,14 +885,14 @@ void CameraAt(const std::string& mode, float t, float eye[3], float at[3])
                 eye[c] = shot.eye[c], at[c] = shot.at[c];
             return;
         }
-    if (mode == "orbite")
+    if (mode == "orbit")
     {
         eye[0] = 20 * std::cos(t * 0.2f), eye[1] = 6, eye[2] = 20 * std::sin(t * 0.2f), at[0] = 0, at[1] = 2, at[2] = 0;
         return;
     }
     eye[0] = -45 + std::fmod(t * 1.6f, 90.0f), eye[1] = 1.7f + 0.03f * std::sin(t * 9.5f), eye[2] = 1.2f * std::sin(t * 0.3f);
     float yaw = 0.8f * std::sin(t * 0.45f);
-    const float cycle = std::fmod(t, 9.0f); // demi-tour rapide toutes les 9 s (0,6 s), retour 3 s plus tard
+    const float cycle = std::fmod(t, 9.0f); // fast U-turn every 9 s (0.6 s), back 3 s later
     if (cycle > 5.0f && cycle < 5.6f)
         yaw += kPi * (cycle - 5.0f) / 0.6f;
     else if (cycle >= 5.6f && cycle < 8.4f)
@@ -961,7 +961,7 @@ int main()
     };
     const int frames = std::atoi(env("URTI_FRAMES", "600").c_str());
     const bool show = env("URTI_SHOW", "0") != "0";
-    const std::string cameraMode = env("URTI_SANDBOX_CAMERA", "marche");
+    const std::string cameraMode = env("URTI_SANDBOX_CAMERA", "walk");
     const bool frameGen = env("URTI_SANDBOX_FG", "0") != "0";
     const bool hdr = env("URTI_SANDBOX_SDR", "0") == "0";
     const float start = float(std::atof(env("URTI_SANDBOX_START", "0").c_str()));
@@ -969,10 +969,10 @@ int main()
     const bool movers = env("URTI_SANDBOX_MOVERS", "1") != "0";
     const float wet = float(std::atof(env("URTI_SANDBOX_WET", "-1").c_str()));
     const bool truth = env("URTI_SANDBOX_TRUTH", "0") != "0";
-    const bool partialShadows = env("URTI_SANDBOX_GAMESHADOW", "complet") == "partiel";
-    const bool leafCards = env("URTI_SANDBOX_LEAVES", "cartes") != "blocs"; // feuillage en plaques découpées (défaut) ou en blocs
+    const bool partialShadows = env("URTI_SANDBOX_GAMESHADOW", "full") == "partial";
+    const bool leafCards = env("URTI_SANDBOX_LEAVES", "cards") != "blocks"; // foliage as cut-out cards (default) or as blocks
     const bool ui = env("URTI_SANDBOX_UI", "1") != "0";
-    const float jitter = float(std::atof(env("URTI_SANDBOX_JITTER", "1").c_str())); // 0 : sans décalage sous-pixel
+    const float jitter = float(std::atof(env("URTI_SANDBOX_JITTER", "1").c_str())); // 0: no sub-pixel jitter
     const double fpsCap = std::atof(env("URTI_SANDBOX_FPS", "90").c_str());
 
     WNDCLASSW wc = {};
@@ -982,7 +982,7 @@ int main()
     RegisterClassW(&wc);
     RECT rect = { 0, 0, (LONG)kWidth, (LONG)kHeight };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"URTI bac à sable", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"URTI sandbox", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
                               rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, nullptr);
     if (show)
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1009,7 +1009,7 @@ int main()
     ComPtr<IDXGISwapChain3> swapchain;
     CHECK(sc1.As(&swapchain));
     if (hdr)
-        swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020); // HDR10 si l'écran le permet
+        swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020); // HDR10 if the screen allows it
     ComPtr<ID3D12Resource> backBuffers[kBuffers];
     for (UINT i = 0; i < kBuffers; i++)
         CHECK(swapchain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])));
@@ -1024,7 +1024,7 @@ int main()
         gbuffer[i] = Texture(device.Get(), kRenderW, kRenderH, gFormats[i], D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv);
     }
     D3D12_CLEAR_VALUE depthClear = { DXGI_FORMAT_D32_FLOAT_S8X24_UINT };
-    depthClear.DepthStencil.Depth = 0.0f; // profondeur inversée : le loin à 0
+    depthClear.DepthStencil.Depth = 0.0f; // reversed depth: far at 0
     ComPtr<ID3D12Resource> depth = Texture(device.Get(), kRenderW, kRenderH, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &depthClear);
     D3D12_CLEAR_VALUE halfClear = { DXGI_FORMAT_D32_FLOAT };
@@ -1088,15 +1088,15 @@ int main()
         s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         device->CreateShaderResourceView(r, &s, srvCpu(slot));
     };
-    // table de l'éclairage (t0..t4) puis table de la mise à l'échelle (t0 = image éclairée, le reste comblé)
+    // lighting table (t0..t4) then upscaling table (t0 = lit image, the rest filled in)
     for (int i = 0; i < 3; i++)
         srv2d(gbuffer[i].Get(), gFormats[i], i);
     srv2d(depth.Get(), DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, 3);
     srv2d(atlas.Get(), DXGI_FORMAT_R16_UNORM, 4);
-    srv2d(mirror.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 5); // t5 de l'éclairage
+    srv2d(mirror.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 5); // t5 of the lighting
     for (int i = 6; i < 10; i++)
         srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, i);
-    // tables du TAA (écrit l'historique k, lit l'historique 1 - k) : 10 + 5 k ; de la sortie : 20 + 5 k
+    // TAA tables (writes history k, reads history 1 - k): 10 + 5 k; output: 20 + 5 k
     for (int k = 0; k < 2; k++)
     {
         srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 10 + 5 * k);
@@ -1108,10 +1108,10 @@ int main()
         for (int j = 1; j < 5; j++)
             srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 20 + 5 * k + j);
     }
-    for (int i = 30; i < 32; i++) // les tables lisent 6 descripteurs : la dernière déborde ici
+    for (int i = 30; i < 32; i++) // the tables read 6 descriptors: the last one overflows here
         srv2d(lit.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, i);
 
-    // ---------------- signature racine (sans ALLOW_STREAM_OUTPUT, comme un jeu) ----------------
+    // ---------------- root signature (without ALLOW_STREAM_OUTPUT, like a game) ----------------
     ComPtr<ID3D12RootSignature> rootSig;
     {
         D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6, 0, 0, 0 };
@@ -1163,7 +1163,7 @@ int main()
         d.RasterizerState.SlopeScaledDepthBias = depthBias ? 1.5f : 0.0f;
         d.DepthStencilState.DepthEnable = dsvFormat != DXGI_FORMAT_UNKNOWN;
         d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-        d.DepthStencilState.DepthFunc = depthBias ? D3D12_COMPARISON_FUNC_LESS : D3D12_COMPARISON_FUNC_GREATER; // ombres : normal ; écran : inversé
+        d.DepthStencilState.DepthFunc = depthBias ? D3D12_COMPARISON_FUNC_LESS : D3D12_COMPARISON_FUNC_GREATER; // shadows: normal; screen: reversed
         d.InputLayout = { layout, instanced ? 6u : 5u };
         d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         d.NumRenderTargets = targets;
@@ -1204,7 +1204,7 @@ int main()
     ComPtr<ID3D12PipelineState> lightingPso = fullscreenPso("psLighting", DXGI_FORMAT_R16G16B16A16_FLOAT);
     ComPtr<ID3D12PipelineState> upscalePso = fullscreenPso("psUpscale", outFormat);
     ComPtr<ID3D12PipelineState> taaPso = fullscreenPso("psTaa", DXGI_FORMAT_R16G16B16A16_FLOAT);
-    // interface : rectangles mélangés par leur alpha, dans l'image d'écran (une vue par image d'écran)
+    // UI: rectangles blended by their alpha, into the screen image (one view per screen image)
     ComPtr<ID3D12PipelineState> uiPso;
     {
         ComPtr<ID3DBlob> v = Compile("vsUi", "vs_5_1", false), q = Compile("psUi", "ps_5_1", false);
@@ -1229,12 +1229,12 @@ int main()
     for (UINT i = 0; i < kBuffers; i++)
         device->CreateRenderTargetView(backBuffers[i].Get(), nullptr, rtv(10 + i));
 
-    // ---------------- maillages, tonneaux par ExecuteIndirect ----------------
+    // ---------------- meshes, barrels through ExecuteIndirect ----------------
     Geometry geo;
     std::vector<Object> scene = BuildScene(geo, leafCards);
     const int barrelMesh = geo.Begin();
     geo.Box(Scale(0.7f, 1.0f, 0.7f), 0.35f, 0.22f, 0.12f, 0.3f);
-    geo.Box(Mul(Scale(0.74f, 0.08f, 0.74f), Translate(0, 0.3f, 0)), 0.15f, 0.15f, 0.15f, 0.6f); // cerclage métallique
+    geo.Box(Mul(Scale(0.74f, 0.08f, 0.74f), Translate(0, 0.3f, 0)), 0.15f, 0.15f, 0.15f, 0.6f); // metal hoop
     geo.Box(Mul(Scale(0.74f, 0.08f, 0.74f), Translate(0, -0.3f, 0)), 0.15f, 0.15f, 0.15f, 0.6f);
     geo.End(barrelMesh);
     const std::vector<Vertex>& verts = geo.verts;
@@ -1259,7 +1259,7 @@ int main()
         CHECK(device->CreateCommandSignature(&d, nullptr, IID_PPV_ARGS(&cmdSig)));
     }
 
-    if (scene.size() + 1 > kMaxObjects) // trop d'objets pour le tampon
+    if (scene.size() + 1 > kMaxObjects) // too many objects for the buffer
         return 1;
     ComPtr<ID3D12Resource> objectBuf = Buffer(device.Get(), kMaxObjects * sizeof(ObjectConstants), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     ComPtr<ID3D12Resource> frameBuf = Buffer(device.Get(), 256 * ((sizeof(FrameConstants) + 255) / 256), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -1292,12 +1292,12 @@ int main()
             v /= l;
     }
     Mat4 prevViewProjNJ = Identity();
-    std::printf("urti_sandbox : %d images, caméra %s%s, sortie %s, rendu %ux%u -> %ux%u\n", frames, cameraMode.c_str(), frameGen ? ", génération d'images" : "",
+    std::printf("urti_sandbox: %d frames, camera %s%s, output %s, render %ux%u -> %ux%u\n", frames, cameraMode.c_str(), frameGen ? ", frame generation" : "",
                 hdr ? "HDR10" : "sRGB", kRenderW, kRenderH, kWidth, kHeight);
 
-    // temps GPU de chaque passe (moyenne affichée à la fin)
+    // GPU time of each pass (average shown at the end)
     constexpr UINT kStamps = 7;
-    const char* stampNames[kStamps - 1] = { "cascades", "G-buffer", "mi-résolution", "éclairage", "mise à l'échelle", "copie" };
+    const char* stampNames[kStamps - 1] = { "cascades", "G-buffer", "half resolution", "lighting", "upscaling", "copy" };
     ComPtr<ID3D12QueryHeap> stampHeap;
     {
         D3D12_QUERY_HEAP_DESC d = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kStamps };
@@ -1320,7 +1320,7 @@ int main()
             QueryPerformanceCounter(&tick0);
         if (fpsCap > 0)
         {
-            // cadence fixe : on attend le moment prévu de cette image
+            // fixed pace: wait for this frame's planned moment
             pace.QuadPart += LONGLONG(freq.QuadPart / fpsCap);
             for (LARGE_INTEGER now; QueryPerformanceCounter(&now), now.QuadPart < pace.QuadPart;)
                 if (pace.QuadPart - now.QuadPart > freq.QuadPart / 500)
@@ -1328,14 +1328,14 @@ int main()
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             if (now.QuadPart > pace.QuadPart + freq.QuadPart / 10)
-                pace = now; // très en retard (machine occupée) : on ne rattrape pas en rafale
+                pace = now; // far behind (busy machine): no catching up in a burst
         }
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
             TranslateMessage(&msg), DispatchMessageW(&msg);
         const float dt = 1.0f / 60.0f, t = start + frame * dt, tPrev = t - dt;
 
-        // ---------------- caméra (décalage sous-pixel comme DLSS) ----------------
+        // ---------------- camera (sub-pixel jitter like DLSS) ----------------
         float eye[3], at[3];
         CameraAt(cameraMode, t, eye, at);
         const Mat4 view = LookAtLH(eye, at);
@@ -1354,7 +1354,7 @@ int main()
                 v /= l;
         }
 
-        // ---------------- cascades : suivent la caméra, par pas de texel ----------------
+        // ---------------- cascades: follow the camera, in texel steps ----------------
         Mat4 lightVP[4];
         for (UINT k = 0; k < kCascades; k++)
         {
@@ -1364,7 +1364,7 @@ int main()
             Mat4 lv = LookAtLH(lightEye, c);
             const float texel = cascadeSize[k] / kAtlas;
             lv.m[12] = std::floor(lv.m[12] / texel) * texel, lv.m[13] = std::floor(lv.m[13] / texel) * texel;
-            // profondeur sur 400 m autour du centre (D16 : 6 mm par pas), décalage de 40 pas (~25 cm) comme un jeu
+            // depth over 400 m around the centre (D16: 6 mm per step), bias of 40 steps (~25 cm) like a game
             lightVP[k] = Mul(lv, OrthoLH(cascadeSize[k], cascadeSize[k], 100, 500));
         }
 
@@ -1381,7 +1381,7 @@ int main()
         fc.output[0] = hdr ? 1.0f : 0.0f, fc.output[1] = 1.0f, fc.output[2] = projJ.m[8], fc.output[3] = projJ.m[9];
         fc.misc[0] = wet, fc.misc[1] = frame == 0 ? 1.0f : 0.0f, fc.misc[2] = truth ? 1.0f : 0.0f;
 
-        // objets : positions de cette image et de la précédente (vecteurs de mouvement)
+        // objects: positions in this frame and the previous one (motion vectors)
         for (size_t i = 0; i < scene.size(); i++)
         {
             Object& o = scene[i];
@@ -1423,7 +1423,7 @@ int main()
         };
 
         stamp(0);
-        // 1. atlas des cascades (une passe par cascade, chacune dans son viewport)
+        // 1. cascade atlas (one pass per cascade, each in its viewport)
         Barrier(list.Get(), atlas.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         list->OMSetRenderTargets(0, nullptr, FALSE, &dsv(1));
         list->ClearDepthStencilView(dsv(1), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -1440,7 +1440,7 @@ int main()
         Barrier(list.Get(), atlas.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         stamp(1);
-        // 2. G-buffer à la résolution de rendu
+        // 2. G-buffer at render resolution
         for (int i = 0; i < 5; i++)
             Barrier(list.Get(), gbuffer[i].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         Barrier(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1459,7 +1459,7 @@ int main()
             Barrier(list.Get(), gbuffer[i].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Barrier(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        // 2b. vérité terrain : la scène en miroir sous le sol (sans le sol lui-même)
+        // 2b. ground truth: the scene mirrored under the floor (without the floor itself)
         if (truth)
         {
             Barrier(list.Get(), mirror.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1483,7 +1483,7 @@ int main()
         }
 
         stamp(2);
-        // 3. profondeur à mi-résolution (comme une passe d'occlusion ambiante)
+        // 3. half-resolution depth (like an ambient-occlusion pass)
         list->OMSetRenderTargets(0, nullptr, FALSE, &dsv(2));
         list->ClearDepthStencilView(dsv(2), D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
         const D3D12_VIEWPORT hvp = { 0, 0, float(kRenderW / 2), float(kRenderH / 2), 0, 1 };
@@ -1492,14 +1492,14 @@ int main()
         list->RSSetScissorRects(1, &hsr);
         list->SetPipelineState(halfPso.Get());
         list->IASetVertexBuffers(0, 1, &vbv);
-        for (size_t i = 0; i < scene.size(); i += 3) // une partie de la scène suffit
+        for (size_t i = 0; i < scene.size(); i += 3) // part of the scene is enough
         {
             list->SetGraphicsRootConstantBufferView(1, objectBuf->GetGPUVirtualAddress() + i * sizeof(ObjectConstants));
             list->DrawIndexedInstanced(geo.meshes[scene[i].mesh].indexCount, 1, geo.meshes[scene[i].mesh].firstIndex, 0, 0);
         }
 
         stamp(3);
-        // 4. éclairage plein écran (lit le G-buffer et l'atlas)
+        // 4. full-screen lighting (reads the G-buffer and the atlas)
         Barrier(list.Get(), lit.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->OMSetRenderTargets(1, &rtv(5), FALSE, nullptr);
         list->RSSetViewports(1, &rvp);
@@ -1510,7 +1510,7 @@ int main()
         Barrier(list.Get(), lit.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         stamp(4);
-        // 5. TAA et mise à l'échelle vers l'écran, puis sortie HDR10 ou sRGB
+        // 5. TAA and upscaling to the screen, then HDR10 or sRGB output
         const int k = frame & 1;
         const D3D12_VIEWPORT dvp = { 0, 0, float(kWidth), float(kHeight), 0, 1 };
         const D3D12_RECT dsr = { 0, 0, LONG(kWidth), LONG(kHeight) };
@@ -1530,13 +1530,13 @@ int main()
         Barrier(list.Get(), finalTex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
         stamp(5);
-        // 6. copie vers l'image présentée
+        // 6. copy into the presented image
         ID3D12Resource* bb = backBuffers[swapchain->GetCurrentBackBufferIndex()].Get();
         Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(bb, finalTex.Get());
         if (ui)
         {
-            // 7. interface du jeu, dessinée par-dessus la scène dans l'image d'écran
+            // 7. the game's UI, drawn over the scene into the screen image
             Barrier(list.Get(), bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
             const D3D12_CPU_DESCRIPTOR_HANDLE bbv = rtv(10 + swapchain->GetCurrentBackBufferIndex());
             list->OMSetRenderTargets(1, &bbv, FALSE, nullptr);
@@ -1549,10 +1549,10 @@ int main()
                 list->SetGraphicsRoot32BitConstants(2, 8, c, 4);
                 list->DrawInstanced(4, 1, 0, 0);
             };
-            // valeurs déjà encodées pour l'écran (PQ en HDR10 : 0,58 ~ 200 nits)
+            // values already encoded for the screen (PQ in HDR10: 0.58 ~ 200 nits)
             rect(-0.95f, -0.55f, -0.65f, -0.95f, 0.25f, 0.22f, 0.18f, 0.85f); // mini-carte
             rect(-0.92f, -0.6f, -0.68f, -0.62f, 0.62f, 0.6f, 0.55f, 1.0f);
-            rect(-0.95f, 0.92f, -0.55f, 0.89f, 0.6f, 0.15f, 0.12f, 1.0f); // barres de vie et d'endurance
+            rect(-0.95f, 0.92f, -0.55f, 0.89f, 0.6f, 0.15f, 0.12f, 1.0f); // health and stamina bars
             rect(-0.95f, 0.87f, -0.62f, 0.84f, 0.55f, 0.55f, 0.55f, 1.0f);
             if (std::fmod(t, 4.0f) > 2.0f) // menu ouvert
             {
@@ -1592,7 +1592,7 @@ int main()
             }
         }
 
-        // génération d'images : une présentation intercalée sans aucun dessin (copie de la dernière image)
+        // frame generation: a present inserted without any draw (copy of the last image)
         if (frameGen)
         {
             CHECK(allocator->Reset());
@@ -1614,14 +1614,14 @@ int main()
     waitGpu();
     QueryPerformanceCounter(&tickNow);
     if (frames > 30)
-        std::printf("urti_sandbox : %.1f images par seconde (hors démarrage)\n", (frames - 30) / (double(tickNow.QuadPart - tick0.QuadPart) / freq.QuadPart));
+        std::printf("urti_sandbox: %.1f frames per second (excluding startup)\n", (frames - 30) / (double(tickNow.QuadPart - tick0.QuadPart) / freq.QuadPart));
     if (stampFrames > 0)
     {
-        std::printf("urti_sandbox : processeur par image (ms) : présentation %.2f, attente du GPU %.2f\n", presentSum / stampFrames, waitSum / stampFrames);
-        std::printf("urti_sandbox : GPU par image (ms) :");
+        std::printf("urti_sandbox: CPU per frame (ms): present %.2f, GPU wait %.2f\n", presentSum / stampFrames, waitSum / stampFrames);
+        std::printf("urti_sandbox: GPU per frame (ms):");
         for (UINT i = 0; i + 1 < kStamps; i++)
             std::printf(" %s %.2f%s", stampNames[i], stampSum[i] / stampFrames, i + 2 < kStamps ? "," : "\n");
     }
-    std::printf("urti_sandbox : terminé\n");
+    std::printf("urti_sandbox: done\n");
     return 0;
 }
