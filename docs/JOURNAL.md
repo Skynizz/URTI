@@ -1,1788 +1,1714 @@
-# Journal de bord
+# Development journal
 
-Les étapes v1 à v24 (KRC, le cache de radiance étudié d'abord) sont dans le dépôt [KRC](https://github.com/Skynizz/KRC).
+Steps v1 to v24 (KRC, the radiance cache studied first) are in the [KRC](https://github.com/Skynizz/KRC) repository.
 
-## v25 — URTI, étape 1 validée dans Red Dead Redemption 2
+## v25 — URTI, step 1 validated in Red Dead Redemption 2
 
-- URTI (idée de Skynizz : injecteur de ray tracing universel) : add-on ReShade qui capte la géométrie
-  d'un jeu DX12 sans toucher à son rendu. Pipeline « ombre » par pipeline du jeu (même vertex shader,
-  sortie de flux de SV_Position, sans rastérisation), dessins rejoués pendant la capture, y compris
-  `ExecuteIndirect` (intercepté directement) ; `ALLOW_STREAM_OUTPUT` ajouté aux signatures racines du
-  jeu. Banc DX12 à géométrie connue : 99,80 % de couverture.
-- RDR2 (DX12, OptiScaler, DLSS et génération d'images DLSS-G, 2560×1440, rendu 1706×960) : **97,5 à
-  97,6 % de la profondeur du jeu reproduite** par la géométrie captée (3 captures, écart moyen 1e-4),
-  personnages animés compris ; le critère de l'étape (> 95 %) est atteint. Scène : la scène de
-  chargement du mode histoire, rendue par le moteur (~3 300 dessins, 520 000 à 650 000 triangles).
-- Pièges du vrai jeu, un par essai : plusieurs appareils D3D12 (plantage à F9) ; une présentation
-  sur deux sans dessin (génération d'images) ; budget de sommets trop large ; dessins successifs qui
-  s'écrasent dans un flux partagé (barrière) ; profondeur jamais effacée de façon visible (copie de
-  ReShade) ; passes d'éclairage plein écran prises pour de la géométrie (pipelines sans écriture de
-  profondeur exclus).
-- Tests menés sans Skynizz : lancement, menu (clic sur « Histoire » ; l'Entrée injectée est ignorée),
-  captures par fichier déclencheur (`tools/reshade/urti_rdr2.ps1`). Mode histoire uniquement.
-- Reste à faire pour l'étape 2 : caméra (matrices) pour passer en espace monde, géométrie
-  persistante, BVH, ombres RT du soleil ; essai en monde ouvert (pas seulement la scène de chargement).
+- URTI (Skynizz's idea: a universal ray-tracing injector) is a ReShade add-on that captures the geometry of a DX12 game
+  without touching its rendering. There is one "shadow" pipeline per game pipeline: same vertex shader, stream output
+  of SV_Position, no rasterisation. Draws are replayed during the capture, including `ExecuteIndirect` (intercepted
+  directly). `ALLOW_STREAM_OUTPUT` is added to the game's root signatures. DX12 bench with known geometry: 99.80 %
+  coverage.
+- RDR2 (DX12, OptiScaler, DLSS and DLSS-G frame generation, 2560×1440, rendered at 1706×960): **97.5 to 97.6 % of the
+  game's depth is reproduced** by the captured geometry (3 captures, mean deviation 1e-4), animated characters
+  included. The step's criterion (> 95 %) is met. Scene: the story mode loading scene, rendered by the engine (~3,300
+  draws, 520,000 to 650,000 triangles).
+- Pitfalls of the real game, one per attempt: several D3D12 devices (crash on F9); one present out of two without any
+  draw (frame generation); vertex budget too large; successive draws overwriting each other in a shared stream
+  (barrier); depth never visibly cleared (ReShade's copy); full-screen lighting passes taken for geometry (pipelines
+  without depth writes excluded).
+- Tests run without Skynizz: launch, menu (click on "Story"; injected Enter is ignored), captures through a trigger
+  file (`tools/reshade/urti_rdr2.ps1`). Story mode only.
+- Left for step 2: camera (matrices) to get to world space, persistent geometry, BVH, RT sun shadows; a test in the
+  open world (not only the loading scene).
 
-## v26 — URTI, étape 2a : la caméra retrouvée sans rien savoir du jeu
+## v26 — URTI, step 2a: the camera found without knowing anything about the game
 
-- Capture enrichie (fichier `.urti`) : signature et bornes de chaque dessin dans le flux (début et
-  fin lus sur le compteur du GPU), profondeur. Analyse hors ligne `urti/tools/analyse.py`.
-- **Auto-étalonnage** : w de l'espace de découpage donne la profondeur le long de l'axe de vue ; avec
-  le champ de vision, chaque sommet devient un point de l'espace caméra ; un objet immobile vu dans
-  deux frames doit bouger d'un seul mouvement rigide : on cherche le champ de vision le plus rigide
-  (ajustement robuste, les objets qui bougent eux-mêmes sont écartés).
-- Banc (caméra en orbite, vérité terrain) : 60,15° pour 60,16°, déplacement 0,390 pour 0,390.
-- RDR2 en jeu (souris injectée pour tourner la caméra) : 36,95° et 36,50° sur les deux captures où la
-  caméra tourne de plus de 1° ; 38,8 à 39,1° quand elle tourne à peine (mal contraint). Pas de vérité
-  terrain dans le jeu ; la cohérence des estimations est le seul contrôle.
-- Couverture en jeu, caméra en mouvement, sur 8 présentations : 70 à 94 % (la géométrie de plusieurs
-  frames est comparée à la profondeur de la dernière) ; à refaire frame par frame.
+- Richer capture (`.urti` file): signature and bounds of each draw in the stream (start and end read from the GPU
+  counter), depth. Offline analysis: `urti/tools/analyse.py`.
+- **Self-calibration**: clip-space w gives the depth along the view axis; with the field of view, each vertex becomes a
+  camera-space point. A still object seen in two frames must move by a single rigid motion: we look for the most rigid
+  field of view (robust fit; objects that move on their own are discarded).
+- Bench (orbiting camera, ground truth): 60.15° for 60.16°, displacement 0.390 for 0.390.
+- RDR2 in game (injected mouse to turn the camera): 36.95° and 36.50° on the two captures where the camera turns by
+  more than 1°; 38.8 to 39.1° when it barely turns (poorly constrained). No ground truth in the game; the consistency
+  of the estimates is the only check.
+- In-game coverage, moving camera, over 8 presents: 70 to 94 % (geometry from several frames is compared with the depth
+  of the last one); to be redone frame by frame.
 
-## v27 — URTI, étape 2b : soleil retrouvé, premières ombres en ray tracing dans RDR2
+## v27 — URTI, step 2b: sun found, first ray-traced shadows in RDR2
 
-- Le banc a maintenant un soleil et une passe de carte d'ombres, comme un jeu. L'add-on capte tous
-  les flux de profondeur (écran et cartes d'ombres) ; le fichier `.urti` passe en version 2.
-- **Direction du soleil** : le même maillage vu par la caméra et dans la carte d'ombres (projection
-  parallèle) est relié par une application affine ; la direction qu'elle envoie sur l'axe de
-  profondeur de la carte est celle du soleil. Ajustement par paire de dessins puis vote (un maillage
-  figure dans plusieurs cascades d'un atlas). Banc : écart 0,01°. RDR2 : l'atlas 2048×8192 des
-  cascades donne une direction nette (82 à 84 % des paires d'accord) ; les petites cartes (1024², 512²,
-  64²) sont des vues verticales (pluie, occlusion), pas le soleil. Signe : celui qui laisse la scène
-  éclairée (l'autre met tout à l'ombre, soleil sous l'horizon).
-- **Ombres en ray tracing** (`urti/tools/urti_rtshadow`, DXR 1.1, requêtes en ligne) : géométrie de
-  la dernière frame en espace caméra (linéaire en espace de découpage), structure d'accélération,
-  pixel reconstruit depuis la profondeur du jeu (profondeur = A + B / w ajustés sur les sommets),
-  rayon vers le soleil. Le résultat ne dépend pas d'une erreur de champ de vision (application
-  affine : les intersections sont conservées). Banc : ombres portées justes. RDR2 (1,7 M triangles,
-  BLAS 38 Mo) : ombres cohérentes (épaules éclairées, ombre portée du personnage, structure du quai) ;
-  scène brumeuse, peu d'ombres nettes du jeu pour comparer.
-- Champ de vision par auto-étalonnage dans RDR2 : instable (51,5° ici, 37° avant) quand la caméra
-  tourne peu ; sans effet sur les ombres, mais à fiabiliser pour l'éclairage.
+- The bench now has a sun and a shadow-map pass, like a game. The add-on captures every depth stream (screen and shadow
+  maps); the `.urti` file moves to version 2.
+- **Sun direction**: the same mesh seen by the camera and in the shadow map (parallel projection) is linked by an
+  affine map; the direction it sends onto the map's depth axis is the sun's. Fit per pair of draws, then a vote (a mesh
+  appears in several cascades of an atlas). Bench: 0.01° off. RDR2: the 2048×8192 cascade atlas gives a clear direction
+  (82 to 84 % of pairs agree); the small maps (1024², 512², 64²) are vertical views (rain, occlusion), not the sun.
+  Sign: the one that leaves the scene lit (the other puts everything in shadow, sun below the horizon).
+- **Ray-traced shadows** (`urti/tools/urti_rtshadow`, DXR 1.1, inline queries): geometry of the last frame in camera
+  space (linear in clip space), acceleration structure, pixel rebuilt from the game's depth (depth = A + B / w fitted on
+  the vertices), ray toward the sun. The result does not depend on a field-of-view error (affine map: intersections are
+  preserved). Bench: correct cast shadows. RDR2 (1.7 M triangles, 38 MB BLAS): consistent shadows (lit shoulders, the
+  character's cast shadow, the pier's structure); hazy scene, few sharp game shadows to compare with.
+- Field of view by self-calibration in RDR2: unstable (51.5° here, 37° before) when the camera barely turns; no effect
+  on shadows, but it must be made reliable for lighting.
 
-## v28 — URTI, ombres du soleil en ray tracing en direct dans RDR2
+## v28 — URTI, live ray-traced sun shadows in RDR2
 
-- Mode direct (`live=1` dans `urti.ini`, F7 : actives / coupées, F6 : réétalonner) : à chaque image,
-  la géométrie de l'écran captée par flux de sortie devient une structure d'accélération (BLAS
-  reconstruite, 4,6 à 8,4 M sommets en jeu), puis un rayon par pixel de la profondeur du jeu part
-  vers le soleil (DXR 1.1, requêtes en ligne). L'effet `urti.fx` assombrit les pixels à l'ombre
-  (force 0,55, écran partagé possible). Soleil et loi de profondeur réétalonnés toutes les 120 images.
-- Photos : le jeu affiche en HDR10 ; elles sont lues dans le tampon d'affichage après les effets,
-  PQ décodé, BT.2020 → BT.709, blanc à 203 nits. Corrigé aussi : F7 laissait l'ancienne image
-  d'ombres affichée.
-- RDR2 (gare de Saint-Denis, `results/urti/rdr2_direct/`) : les ombres RT tombent au même endroit que
-  celles du jeu (auvent de la gare sur le sol), ce qui valide la chaîne (géométrie, soleil, profondeur).
-  Mais le jeu a déjà ses ombres : l'assombrissement s'ajoute par-dessus et rend les zones déjà
-  ombrées trop noires. Les faces tournées à l'opposé du soleil (wagons à contre-jour) sont aussi
-  noircies alors que le jeu les éclaire déjà moins.
-- Sous la pluie, ciel couvert : le jeu ne dessine pas de carte d'ombres du soleil, donc pas de soleil
-  à retrouver et pas d'ombres RT (comportement voulu).
-- Coût : environ 124 → 81 images par seconde (génération d'images DLSS active), soit −35 %.
-- Suite : ne pas assombrir ce qui est déjà à l'ombre dans l'image du jeu (comparer la luminance aux
-  voisins éclairés, ou n'agir que sur les pixels où l'ombre du jeu manque : lointain, petits objets),
-  ignorer les faces dos au soleil (normales tirées de la profondeur), BLAS mise à jour plutôt que
-  reconstruite pour réduire le coût.
+- Live mode (`live=1` in `urti.ini`, F7: on / off, F6: recalibrate): every frame, the screen geometry captured by stream
+  output becomes an acceleration structure (BLAS rebuilt, 4.6 to 8.4 M vertices in game), then one ray per pixel of the
+  game's depth goes toward the sun (DXR 1.1, inline queries). The `urti.fx` effect darkens shadowed pixels (strength
+  0.55, split screen available). Sun and depth law recalibrated every 120 frames.
+- Screenshots: the game displays in HDR10; they are read from the display buffer after the effects, PQ decoded,
+  BT.2020 → BT.709, white at 203 nits. Also fixed: F7 left the old shadow image on screen.
+- RDR2 (Saint Denis station, `results/urti/rdr2_direct/`): the RT shadows fall in the same place as the game's (the
+  station canopy on the ground), which validates the chain (geometry, sun, depth). But the game already has its
+  shadows: the darkening adds on top and makes already-shadowed areas too black. Faces turned away from the sun
+  (backlit wagons) are also blackened while the game already lights them less.
+- In the rain, overcast sky: the game draws no sun shadow map, so there is no sun to find and no RT shadows (intended).
+- Cost: about 124 → 81 frames per second (DLSS frame generation on), i.e. −35 %.
+- Next: do not darken what is already in shadow in the game's image (compare luminance with lit neighbours, or act
+  only on pixels where the game's shadow is missing: distance, small objects), ignore faces turned away from the sun
+  (normals from depth), update the BLAS instead of rebuilding it to reduce cost.
 
-## v29 — URTI : ombres RT stables dans RDR2, génération d'images, rechargement à chaud
+## v29 — URTI: stable RT shadows in RDR2, frame generation, hot reload
 
-- **Soleil mesuré à chaque image sur le GPU** : paires de dessins écran / carte d'ombres du soleil de
-  même signature, ajustement affine par paire, vote ; 220 à 250 paires par image dans RDR2, mesuré
-  sur 90 à 100 % des images. Plus d'étalonnage lourd périodique (seulement au départ et sur F6). Le
-  sens du soleil vient de la convention de profondeur de la carte (fixée une fois), plus de
-  l'image précédente : F7 off/on ne fait plus partir les ombres dans tous les sens.
-- **Génération d'images (OptiScaler, DLSS-G)** : les images générées sont fabriquées à partir de
-  l'image du jeu avant ReShade, d'où l'alternance « native / RT ». Les ombres sont maintenant posées
-  par l'add-on sur chaque image présentée (300 / 300, dont ~140 générées), en lumière linéaire
-  (HDR10 PQ décodé).
-- **Ombre du jeu recalculée** depuis sa carte d'ombres (cascades repérées par leur viewport,
-  application caméra -> carte mesurée à chaque image). Mode « seulement les ombres que le jeu n'a pas »
-  et mode « ombres RT complètes » (plus contrastées), au choix dans le menu de ReShade (UrtiMode).
-  Constat : les ombres de RDR2 sont déjà précises ; le RT apporte surtout le détail fin (roues,
-  pattes du cheval) et le contraste en mode complet.
-- Faces tournées à l'opposé du soleil (normale tirée de la profondeur) : pas d'ombre RT ajoutée en
-  mode combiné (taches sur les façades à contre-jour supprimées). Quatre rayons par pixel dans le
-  disque solaire (0,5°) et filtre 3×3 : bords d'ombre doux.
-- RDR2 n'a pas de masque d'ombre séparé : relevé des passes (F8) avec instantanés pris à la fin de
-  l'écriture de chaque image ; G-buffer trouvé (normales, matériaux) pour les reflets.
-- **Tests rapides** : réglages (`urti.ini`) et shaders (`urti_shaders/*.cso`, `tools/reshade/urti_shaders.sh`)
-  rechargés à chaud dans le jeu en ~2 s ; lancement piloté par le journal (`urti_rdr2_rapide.ps1`).
-- Corrigés en route : `&` sur un `ComPtr` (le libère), paramètres de l'effet retirés par le
-  compilateur de ReShade s'ils ne sont plus lus, barrières sans ressource, états ReShade -> D3D12.
+- **Sun measured every frame on the GPU**: pairs of draws screen / sun shadow map with the same signature, affine fit
+  per pair, vote; 220 to 250 pairs per frame in RDR2, measured on 90 to 100 % of frames. No more heavy periodic
+  calibration (only at start and on F6). The sun's orientation comes from the map's depth convention (set once), no
+  longer from the previous frame: F7 off/on no longer sends shadows in every direction.
+- **Frame generation (OptiScaler, DLSS-G)**: generated frames are built from the game's image before ReShade, hence the
+  "native / RT" alternation. Shadows are now laid by the add-on on every presented frame (300 / 300, ~140 of them
+  generated), in linear light (HDR10 PQ decoded).
+- **Game shadow recomputed** from its shadow map (cascades identified by their viewport, camera → map mapping measured
+  every frame). Mode "only the shadows the game lacks" and mode "full RT shadows" (more contrast), chosen in the ReShade
+  menu (UrtiMode). Finding: RDR2's shadows are already precise; RT mostly brings fine detail (wheels, the horse's legs)
+  and contrast in full mode.
+- Faces turned away from the sun (normal from depth): no RT shadow added in combined mode (spots on backlit facades
+  removed). Four rays per pixel within the sun disc (0.5°) and a 3×3 filter: soft shadow edges.
+- RDR2 has no separate shadow mask: pass survey (F8) with snapshots taken at the end of the writing of each target;
+  G-buffer found (normals, materials) for reflections.
+- **Fast tests**: settings (`urti.ini`) and shaders (`urti_shaders/*.cso`, `tools/reshade/urti_shaders.sh`) hot-reloaded
+  in game in ~2 s; launch driven by the log (`urti_rdr2_rapide.ps1`).
+- Fixed along the way: `&` on a `ComPtr` (releases it), effect parameters removed by ReShade's compiler when no longer
+  read, barriers without a resource, ReShade → D3D12 states.
 
-## v30 — URTI : corrections du direct, premiers reflets RT
+## v30 — URTI: live-mode fixes, first RT reflections
 
-- Ombres figées à l'écran quand la caméra bouge : le masque était posé même quand il n'avait pas pu
-  être recalculé (étalonnage, profondeur absente, image du jeu prise pour une image générée). Le
-  masque n'est plus appliqué que s'il date de cette image ou de la précédente ; image générée =
-  présentation sans aucun dessin du jeu.
-- Menu de ReShade : l'effet URTI décoché ou les effets coupés suppriment les ombres RT (l'add-on les
-  posait lui-même sans en tenir compte) ; mode, force, écran partagé lus et journalisés.
-- Sans soleil (nuit, intérieur) : étalonnages espacés (1×, 2×, 4×… l'intervalle), loi de profondeur
-  gardée seule : les reflets marchent aussi la nuit.
-- **Reflets RT** : un rayon réfléchi par pixel lisse (normale tirée de la profondeur), point touché
-  reprojeté et vérifié visible, couleur lue dans l'image, Fresnel. Validé sur le banc (sol qui reflète
-  les cubes, `results/urti/banc_direct/reflets_rt.png`). Dans RDR2, le G-buffer est repéré et son
-  image de matériau copiée à la fin de son écriture à chaque image ; reste à savoir quel canal porte
-  le lissé (balayage des canaux par rechargement à chaud, à refaire devant de l'eau ou une rue
-  mouillée).
-- GPU perdu dans RDR2 : la composition lisait le tampon des reflets coupés au-delà du tampon lié à sa
-  place ; une lecture hors d'un tampon racine n'est pas bornée. Corrigé.
+- Shadows frozen on screen when the camera moves: the mask was applied even when it could not be recomputed
+  (calibration, missing depth, game frame taken for a generated one). The mask is now applied only if it dates from
+  this frame or the previous one; generated frame = present without any game draw.
+- ReShade menu: the URTI effect unchecked, or effects turned off, now remove RT shadows (the add-on applied them itself
+  without checking); mode, strength, split screen read and logged.
+- Without a sun (night, indoors): calibrations spaced out (1×, 2×, 4×… the interval), depth law kept alone:
+  reflections work at night too.
+- **RT reflections**: one reflected ray per smooth pixel (normal from depth), hit point reprojected and checked
+  visible, colour read from the image, Fresnel. Validated on the bench (floor reflecting the cubes,
+  `results/urti/banc_direct/reflets_rt.png`). In RDR2, the G-buffer is located and its material image copied at the end
+  of its writing every frame; still to find which channel holds smoothness (channel sweep through hot reload, to redo
+  in front of water or a wet street).
+- GPU lost in RDR2: the composition read the buffer of disabled reflections beyond the buffer bound in its place; an
+  out-of-bounds read of a root buffer is not bounded. Fixed.
 
-## v31 — URTI : capture sans attente, stabilité temporelle (étapes 1 à 4)
+## v31 — URTI: capture without waiting, temporal stability (steps 1 to 4)
 
-- Capture : une zone du flux et un compteur par dessin (plus de barrière par dessin) : de ~20 à ~50 i/s
-  dans RDR2. Zones arrondies à trois sommets (sinon les triangles se formaient à cheval sur deux objets :
-  grands triangles au sol qui apparaissaient et disparaissaient).
-- Démarrage instantané : étalonnage stocké (`urti_calib.ini` : convention et description de la carte
-  d'ombres, convention des vecteurs de mouvement), loi de profondeur mesurée à chaque image sur le GPU,
-  emplacement réservé à la carte d'ombres du soleil.
-- Soleil : vote affiné à 0,75°, saut faible rejeté, grand saut accepté seulement s'il se confirme.
-- Vecteurs de mouvement du jeu copiés depuis son G-buffer, convention trouvée seule (16 candidates, par
-  la profondeur de l'image précédente) : RDR2 = pixels, sens direct.
-- Ombres : passe de débruitage séparée (flou 3×3 guidé par la profondeur, historique reprojeté, bornage
-  moyenne ± 1,5 σ, mélange adaptatif 0,1 à 0,5 selon le mouvement), motif des rayons tournant d'une image
-  à l'autre, ombre pondérée par N·L (ne retire que la lumière directe), effacée au loin (brume).
-- Reflets : stabilisés (historique, bornage ± σ, mélange adaptatif, couleur plafonnée) et reprojetés sur
-  le point reflété : rotation de la caméra mesurée d'une image à l'autre par les cascades (partie linéaire
-  de L_préc⁻¹ L_cour, la translation des cascades ne la touche pas), translation déduite du vecteur de
-  mouvement de la surface et de la profondeur virtuelle (distance + distance de touche).
-- Neuf vues de diagnostic (menu ReShade et `debug_view`), images générées (DLSS-G) au choix.
+- Capture: one region of the stream and one counter per draw (no more barrier per draw): from ~20 to ~50 fps in RDR2.
+  Regions rounded to three vertices (otherwise triangles formed across two objects: large ground triangles that
+  appeared and disappeared).
+- Instant start: stored calibration (`urti_calib.ini`: shadow-map convention and description, motion-vector
+  convention), depth law measured every frame on the GPU, slot reserved for the sun's shadow map.
+- Sun: vote refined to 0.75°, small jumps rejected, large jumps accepted only once confirmed.
+- The game's motion vectors copied from its G-buffer, convention found on its own (16 candidates, using the previous
+  frame's depth): RDR2 = pixels, forward direction.
+- Shadows: separate denoising pass (3×3 blur guided by depth, reprojected history, clamp to mean ± 1.5 σ, adaptive
+  blend 0.1 to 0.5 depending on motion), ray pattern rotating from frame to frame, shadow weighted by N·L (removes only
+  direct light), faded out in the distance (haze).
+- Reflections: stabilised (history, clamp to ± σ, adaptive blend, capped colour) and reprojected onto the reflected
+  point: camera rotation measured from frame to frame through the cascades (linear part of L_prev⁻¹ L_cur; the
+  cascades' translation does not affect it), translation derived from the surface's motion vector and the virtual
+  depth (distance + hit distance).
+- Nine diagnostic views (ReShade menu and `debug_view`), generated frames (DLSS-G) optional.
 
-## v32 — URTI : bac à sable « jeu AAA » (urti_sandbox)
+## v32 — URTI: "AAA game" sandbox (urti_sandbox)
 
-Un mini-jeu D3D12 qui reproduit les conditions de RDR2, pour tester URTI en quelques secondes au lieu
-de lancer le vrai jeu (`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`).
+A small D3D12 game that reproduces RDR2's conditions, to test URTI in a few seconds instead of launching the real game
+(`urti/sandbox/main.cpp`, `tools/reshade/urti_sandbox.sh`).
 
-- Rendu comme un jeu récent : G-buffer différé à 2/3 de la résolution avec décalage sous-pixel (comme
-  DLSS), mêmes formats que RDR2 (matériau RGBA8 avec le lissé dans le canal 1 de la cible 2, vecteurs de
-  mouvement R16G16 en pixels), profondeur inversée à l'infini D32S8, profondeur à mi-résolution, atlas de
-  4 cascades 2048×8192 D16 qui suivent la caméra, éclairage plein écran, mise à l'échelle, sortie HDR10
-  (PQ). Signature racine sans stream-output, ExecuteIndirect, génération d'images en option.
-- Scène difficile : rue, bâtiments à vitres lisses, flaques, poteaux et câbles fins qui pendent et se
-  balancent au vent, arbres (branches et feuilles au vent), charrettes et passants qui avancent, clôtures
-  (un piquet = un dessin), tonneaux. 226 objets, ~1 200 dessins par image. Caméra scriptée (marche,
-  regards, demi-tours rapides), identique à chaque lancement ; cadence fixée à 90 i/s.
-- URTI le reconnaît comme un jeu : loi de profondeur exacte (0,15 / w = plan proche), soleil sur 98 %
-  des images, cascades, rotation de la caméra, vecteurs de mouvement dans la même convention que RDR2 (2).
-- Photos à des présentations précises (`photo_frames=800-830` dans urti.ini) ; `--photos` fait deux
-  lancements identiques (RT puis natif) et `urti_sandbox_compare.py` mesure l'effet du RT, le
-  scintillement ajouté et la carte des points qui sautent. Référence : effet 2,1 %, scintillement ajouté
-  +0,16 %, 0,9 % de pixels qui sautent, concentrés sur les reflets lointains dans les flaques — le
-  défaut vu dans RDR2 (`results/urti/bac_a_sable/`).
-- Test complet (deux lancements et mesures) : ~30 s.
+- Rendered like a recent game: deferred G-buffer at 2/3 resolution with sub-pixel jitter (like DLSS), same formats as
+  RDR2 (RGBA8 material with smoothness in channel 1 of target 2, R16G16 motion vectors in pixels), reversed infinite
+  depth D32S8, half-resolution depth, atlas of 4 cascades 2048×8192 D16 following the camera, full-screen lighting,
+  upscaling, HDR10 output (PQ). Root signature without stream output, ExecuteIndirect, optional frame generation.
+- Hard scene: a street, buildings with smooth windows, puddles, thin poles and cables hanging and swinging in the wind,
+  trees (branches and leaves in the wind), carts and walking passers-by, fences (one post = one draw), barrels. 226
+  objects, ~1,200 draws per frame. Scripted camera (walking, looking around, fast U-turns), identical on every launch;
+  frame rate locked at 90 fps.
+- URTI recognises it as a game: exact depth law (0.15 / w = near plane), sun on 98 % of frames, cascades, camera
+  rotation, motion vectors in the same convention as RDR2 (2).
+- Screenshots at precise presents (`photo_frames=800-830` in urti.ini); `--photos` runs two identical launches (RT then
+  native) and `urti_sandbox_compare.py` measures the RT effect, the added flicker and the map of jumping points.
+  Reference: effect 2.1 %, added flicker +0.16 %, 0.9 % of pixels jumping, concentrated on distant reflections in the
+  puddles — the defect seen in RDR2 (`results/urti/bac_a_sable/`).
+- Full test (two launches and measurements): ~30 s.
 
-## v33 — URTI : suite de 7 tests, vérité terrain, essai de l'ancrage géométrique
+## v33 — URTI: suite of 7 tests, ground truth, geometric anchoring tried
 
-- Bac à sable plus proche d'un jeu : TAA (historique reprojeté, borné, mise à l'échelle) — l'image
-  native est stable d'une image à l'autre comme dans RDR2 ; rue mouillée réglable (`URTI_SANDBOX_WET`),
-  objets mobiles figés à la demande, mur pour l'occlusion, décalage sous-pixel
-  désactivable (`URTI_SANDBOX_JITTER=0`).
-- **Vérité terrain** (`URTI_SANDBOX_TRUTH=1`, `--verite`) : le sol reflète la scène exacte (rendue en
-  miroir), mélangée avec la même règle qu'URTI (Fresnel f0 0,04, lissé > 0,35, plafond 4). On mesure
-  l'écart des reflets RT à l'image idéale ; un reflet qui bouge normalement ne compte plus comme un saut.
-- Nouvelle mesure : **pixels qui clignotent** (l'écart à la référence change de sens d'une image à la
-  suivante), distincte d'une erreur qui se déplace avec la scène.
-- `tools/reshade/urti_sandbox_suite.sh` : bâtiment immobile, arbre immobile, arbre au vent, personnage,
-  caméra fixe, caméra en mouvement, occlusion (~3 min 30). Référence (`results/urti/bac_a_sable/suite/`) :
+- Sandbox closer to a game: TAA (reprojected, clamped history, upscaling) — the native image is stable from frame to
+  frame as in RDR2; adjustable wet street (`URTI_SANDBOX_WET`), moving objects frozen on demand, a wall for occlusion,
+  sub-pixel jitter can be turned off (`URTI_SANDBOX_JITTER=0`).
+- **Ground truth** (`URTI_SANDBOX_TRUTH=1`, `--verite`): the floor reflects the exact scene (rendered mirrored), blended
+  with the same rule as URTI (Fresnel f0 0.04, smoothness > 0.35, cap 4). We measure how far RT reflections are from
+  the ideal image; a reflection that moves normally no longer counts as a jump.
+- New measurement: **blinking pixels** (the deviation from the reference changes sign from one frame to the next),
+  distinct from an error that moves with the scene.
+- `tools/reshade/urti_sandbox_suite.sh`: still building, still tree, tree in the wind, character, fixed camera, moving
+  camera, occlusion (~3 min 30). Reference (`results/urti/bac_a_sable/suite/`):
 
-  | scène | écart | ajouté | sautent | clignotent |
+  | scene | deviation | added | jumping | blinking |
   |---|---|---|---|---|
-  | bâtiment | 3,31 % | +0,015 % | 0,012 % | 0,101 % |
-  | arbre immobile | 2,97 % | +0,036 % | 0,084 % | 0,163 % |
-  | arbre au vent | 2,94 % | +0,044 % | 0,086 % | 0,164 % |
-  | personnage | 2,75 % | +0,033 % | 0,191 % | 0,093 % |
-  | caméra fixe | 1,19 % | +0,049 % | 0,144 % | 0,118 % |
-  | caméra en mouvement | 1,15 % | +0,044 % | 1,257 % | 0,871 % |
-  | occlusion | 1,99 % | +0,024 % | 0,181 % | 0,093 % |
+  | building | 3.31 % | +0.015 % | 0.012 % | 0.101 % |
+  | still tree | 2.97 % | +0.036 % | 0.084 % | 0.163 % |
+  | tree in the wind | 2.94 % | +0.044 % | 0.086 % | 0.164 % |
+  | character | 2.75 % | +0.033 % | 0.191 % | 0.093 % |
+  | fixed camera | 1.19 % | +0.049 % | 0.144 % | 0.118 % |
+  | moving camera | 1.15 % | +0.044 % | 1.257 % | 0.871 % |
+  | occlusion | 1.99 % | +0.024 % | 0.181 % | 0.093 % |
 
-- Diagnostic sur la marche (le seul cas mauvais) : sauts dus pour moitié aux ombres RT (0,59 % sans
-  elles), le reste aux reflets autour de l'horizon. Écartés par la mesure : le décalage sous-pixel (même
-  résultat sans), le bornage, la tolérance de profondeur et la part d'historique (0,59 % ± 0,03 quel que
-  soit le réglage), la synchronisation des deux lancements (vérifiée), la composition (test à vide :
-  0,000 %). La vérité terrain a son propre crénelage (0,49 % de clignotement contre le natif) : c'est le
-  plancher de la mesure.
-- **Ancrage géométrique** des reflets (`anchor_alpha=`) : identité stable par dessin (signature + rang),
-  sommets de l'image précédente gardés, miroir et point reflété retrouvés dans la géométrie captée (même
-  triangle, mêmes barycentriques, déformations comprises), point virtuel de l'image précédente → endroit
-  exact de l'historique, gardé seulement si le même objet se reflétait dans le même miroir. Fonctionne
-  (deux tiers des pixels reflétants, `ancrage_couverture.png`) mais **ne réduit pas le clignotement** :
-  0,909 % contre 0,871 % en marche, un peu moins bon caméra fixe (le passage d'un filtre à l'autre selon
-  les pixels en ajoute). Gardé, coupé par défaut, sans coût quand il est coupé.
-- Réglages d'essai dans urti.ini : `refl_alpha_min`, `refl_alpha_max`, `refl_gamma`, `refl_depth_tol`,
-  `anchor_alpha`, `anchor_gamma`.
+- Diagnosis of the walk (the only bad case): half of the jumps come from RT shadows (0.59 % without them), the rest
+  from reflections around the horizon. Ruled out by measurement: sub-pixel jitter (same result without), clamping,
+  depth tolerance and history share (0.59 % ± 0.03 whatever the setting), synchronisation of the two launches
+  (checked), composition (empty test: 0.000 %). The ground truth has its own aliasing (0.49 % blinking against native):
+  that is the measurement's floor.
+- **Geometric anchoring** of reflections (`anchor_alpha=`): stable identity per draw (signature + rank), previous
+  frame's vertices kept, mirror and reflected point found in the captured geometry (same triangle, same barycentrics,
+  deformations included), previous frame's virtual point → exact place in the history, kept only if the same object
+  was reflected in the same mirror. It works (two thirds of reflecting pixels, `ancrage_couverture.png`) but **does
+  not reduce blinking**: 0.909 % against 0.871 % while walking, slightly worse with a fixed camera (switching from one
+  filter to the other depending on the pixel adds some). Kept, off by default, free when off.
+- Test settings in urti.ini: `refl_alpha_min`, `refl_alpha_max`, `refl_gamma`, `refl_depth_tol`, `anchor_alpha`,
+  `anchor_gamma`.
 
-## v34 — URTI : ombres et reflets, l'un ne s'applique plus sur l'autre
+## v34 — URTI: shadows and reflections no longer apply on top of each other
 
-- Question : les ombres RT tremblent-elles *à travers* les reflets ? La composition mélangeait le reflet
-  puis assombrissait le tout par le masque d'ombre : une flaque à l'ombre voyait son reflet assombri
-  (faux : l'ombre ne retire que la lumière directe de la surface) et le tremblement de l'ombre s'ajoutait
-  à celui du reflet.
-- Mesure par événement (pixel × image, `tools/reshade/urti_sandbox_overlap.sh` : cinq lancements, ombres
-  seules contre le natif, reflets seuls et les deux contre la vérité terrain ; les événements se
-  chevauchent, on ne soustrait pas des pourcentages) sur la marche :
-  sauts avec les deux 1,257 %, expliqués par les ombres 0,682 %, par les reflets 0,513 %, **dus à la
-  seule superposition 0,062 % (5 %)**. Les ombres seules sautent sur 0,738 % : le plus gros morceau.
-- Correction : l'ombre s'applique avant le reflet (qui la remplace en partie). Sauts 1,257 → 1,168 %,
-  superposition 0,062 → 0,037 % ; sur les 7 scènes, écart à la vérité et sauts en baisse partout
+- Question: do RT shadows shake *through* reflections? The composition blended the reflection, then darkened
+  everything with the shadow mask: a puddle in shadow had its reflection darkened (wrong: the shadow only removes the
+  surface's direct light), and the shadow's shaking added to the reflection's.
+- Measurement per event (pixel × frame, `tools/reshade/urti_sandbox_overlap.sh`: five launches, shadows alone against
+  native, reflections alone and both against ground truth; events overlap, percentages are not subtracted) on the
+  walk: jumps with both 1.257 %, explained by shadows 0.682 %, by reflections 0.513 %, **due to the overlap alone
+  0.062 % (5 %)**. Shadows alone jump on 0.738 %: the biggest part.
+- Fix: the shadow is applied before the reflection (which partly replaces it). Jumps 1.257 → 1.168 %, overlap 0.062 →
+  0.037 %; across the 7 scenes, deviation from truth and jumps go down everywhere
   (`results/urti/bac_a_sable/suite/tableau_v34.txt`, `results/urti/bac_a_sable/superposition/`).
 
-## v35 — URTI : feuillage découpé par alpha test (trous reconnus par la caméra et par le soleil)
-
-- Pourquoi le feuillage de RDR2 « saute » et pas celui du bac à sable : les jeux dessinent le feuillage
-  (herbe, franges, grillages) en plaques dont la texture découpe les feuilles (alpha test). URTI capte la
-  géométrie, pas la texture : pour lui chaque plaque est un rectangle plein ; un rayon qui tape un trou
-  est rejeté (le reflet disparaît) ou fait une ombre en rectangle, et le vent fait alterner.
-- Bac à sable : feuillage en plaques croisées découpées (écran, carte d'ombres, miroir de la vérité
-  terrain), `URTI_SANDBOX_LEAVES=blocs` pour l'ancien ; cadrage du test arbre avec son reflet dans la
-  flaque ; carte d'ombres réaliste (profondeur sur 400 m, décalage de 40 pas D16 au lieu de 600 : ~25 cm
-  au lieu de plusieurs mètres). Le défaut est reproduit : reflet de l'arbre troué et fait de rectangles
-  (`results/urti/bac_a_sable/feuillage/`).
-- Correction (`alpha_screen=1`, par défaut) : chaque triangle rencontré par un rayon est examiné.
-  - À l'écran : si la caméra voit plus loin que ce point (ou le ciel), c'est un trou : le rayon continue.
-  - Hors de l'écran (ombres de la couronne au-dessus de la caméra) : la carte d'ombres du jeu est la vue
-    du soleil, alpha test compris ; le point est un trou si le premier obstacle qu'elle a noté est au
-    moins à mi-chemin entre lui et le récepteur (le jeu note ses obstacles un peu plus loin qu'ils ne
-    sont : un seuil fixe faisait disparaître toutes les ombres RT, vu au masque et corrigé). La carte du
-    jeu est donc aussi copiée hors du mode combiné (+0,17 ms).
-- Mesures (avec les plaques) : marche, sauts 1,294 → 1,177 %, clignotement 0,952 → 0,853 %, écart à la
-  vérité 1,14 → 1,01 % ; arbre, écart 2,67 → 2,46 %. Les 7 scènes : `suite/tableau_v35.txt` (le bac à
-  sable a changé : feuillage et carte d'ombres, les tableaux précédents ne se comparent pas ligne à ligne).
-
-## v36 — URTI : fin du « pop / dépop » des reflets, structure d'accélération deux fois moins chère
-
-- Retour du jeu : les reflets ne partent plus dans tous les sens mais apparaissent et disparaissent en
-  boucle, très vite. Nouvelle vue de diagnostic 9 (part du reflet RT réellement appliquée) et mesure des
-  bascules (`tools/reshade/urti_sandbox_popping.sh` : la part change de plus de 0,3 d'une image à
-  l'autre ; aller-retour : dans un sens puis dans l'autre aussitôt). Marche : 0,404 % d'allers-retours
-  des pixels reflétants par image, concentrés dans le feuillage, les câbles et les vitres.
-- Cause 1 : le mode « sol mouillé » (actif par défaut dans RDR2) rendait lisse toute surface dont la
-  normale tirée de la profondeur pointe vers le haut ; dans un feuillage cette normale est du bruit, le
-  pixel devenait réfléchissant une image sur deux. Le mode mouillé ne vaut plus que sur une surface plane
-  (les points à 4 pixels de part et d'autre, sur chaque axe, alignés avec lui) : 0,404 → 0,276 %.
-- Cause 2 : une surface lisse dont le point reflété est caché ou hors de l'écran (vitre qui reflète
-  l'autre côté de la rue vu de biais, feuilles) passait à zéro, puis revenait dès qu'il redevenait
-  visible. C'est maintenant une donnée manquante (poids négatif) : la stabilisation garde l'historique,
-  qui s'estompe (× 0,9 par image), et le bornage ne compte que les voisins connus : 0,276 → 0,140 %
-  (−65 % en tout). Contre la vérité terrain, pas de traînée : marche, sauts 1,177 → 1,133 %, clignotement
-  0,853 → 0,802 %, écart 1,01 → 0,98 % ; les autres scènes égales ou meilleures (`suite/tableau_v36.txt`).
-- Vitesse : la structure d'accélération était construite sur toute la capacité réservée (8,4 millions de
-  sommets dans RDR2), partie vide comprise ; elle ne couvre plus que les sommets de l'image. Et tant que
-  la liste des dessins est la même qu'à la dernière construction, elle est mise à jour (refit) au lieu
-  d'être reconstruite, avec une reconstruction au moins toutes les 8 images (`blas_refit=`, 0 : toujours
-  reconstruire). Bac à sable : 0,65 → 0,35 ms, image identique ; le journal donne maintenant les sommets
-  par image et le nombre de reconstructions et de mises à jour.
-
-## v37 — URTI : budget de géométrie, tailles apprises, interface du jeu épargnée
-
-- Le journal de RDR2 (v36) l'a montré : **8 388 605 sommets sur 8 388 608** — l'emplacement de capture
-  est plein à chaque image. Les dessins suivants sont refusés, mais des petits passent encore : les objets
-  présents dans la scène RT changent d'une image à l'autre (ombres et reflets qui sautent), la structure
-  couvre toute la capacité (pas de gain de vitesse) et la liste change toujours (0 mise à jour). Le bac à
-  sable (122 000 sommets) ne pouvait pas le voir.
-- **ExecuteIndirect** : chaque dessin réservait 65 536 sommets (nombre inconnu avant le dessin). Taille
-  maintenant apprise par identité (mesurée, + 25 % et 64 de marge). Bac à sable : la demande passe de
-  122 000 à 60 000 sommets — la moitié de l'emplacement était du vide.
-- **Budget de géométrie** (`vertex_budget=`, 4 millions par défaut ; 0 : sans) : chaque objet capté est
-  mesuré sur le GPU (`live_regionstats.hlsl` : distance minimale et taille dans l'espace caméra) ; seuls
-  les plus importants (taille apparente) entrent dans la scène RT, bonus de 30 % à ceux qui y sont déjà
-  (pas de va-et-vient) ; un objet trop gros pour la place restante est sauté. Les objets hors budget ne
-  sont pas captés du tout (moins de dessins rejoués) et sont re-mesurés par roulement dans une zone de
-  mesure en fin d'emplacement, hors de la structure (`probe_budget=`, 1 million de sommets par image) :
-  un objet dont on s'approche rentre. Le budget ne vaut que pour l'écran principal (une seconde passe de
-  profondeur, comme celle à mi-résolution du bac à sable, faisait changer d'écran principal) ; les
-  identités sont calculées avant tout refus (elles glissaient quand l'emplacement était plein).
-- Saturation reproduite (`slot_limit=` : emplacement réduit) : marche, sauts 1,133 → 1,402 % sans budget ;
-  avec budget, l'image est plus proche de l'idéale (écart 1,16 → 1,08 %, scintillement ajouté +0,067 →
-  +0,021 %). Dans le bac à sable les dessins refusés sont toujours les mêmes ; dans RDR2 ils changent, et
-  c'est cette instabilité que le budget supprime : à confirmer en jeu (le journal donne désormais
-  sommets réservés, objets dans la scène RT, hors budget, re-mesurés, refusés).
-- **Interface du jeu** (menus reflétés au sol) : les reflets lisaient leurs couleurs dans l'image finale,
-  interface comprise, et la composition dessinait ombres et reflets par-dessus les menus. URTI
-  photographie maintenant l'écran au premier dessin de chaque liaison de l'image d'écran (jusqu'à quatre
-  par image) ; `live_uicompare.hlsl` compte les pixels de chaque photo identiques à l'image finale ; la
-  première photo identique à plus de 60 % est l'image d'avant l'interface. Les reflets y lisent leurs
-  couleurs, et les pixels qui en diffèrent (l'interface) sont laissés tels quels. Bac à sable avec une
-  interface (mini-carte, barres, menu ouvert 2 s sur 4) : photo 0 trouvée seule (88,7 % identique) ; sans
-  elle, le menu se reflète au sol et la scène reflétée passe par-dessus ; avec, le menu est propre
-  (`results/urti/bac_a_sable/interface/`). `ui_photo=0` pour comparer.
-- 7 scènes égales ou meilleures (`suite/tableau_v37.txt`) ; pop / dépop 0,138 %.
-
-## v38 — URTI : identités stables, budget respecté, sans OptiScaler
-
-- Journal de la session v37 dans RDR2 : budget sans effet (8,37 millions de sommets réservés, ~200
-  dessins refusés par image) car **120 000 identités pour ~800 objets à l'écran** : l'identité incluait
-  le nombre d'instances et la première instance, qui changent à chaque image (végétation par instances).
-  Elle ne garde plus que le maillage (nombre d'indices ou de sommets, début dans ses tampons) ; un
-  ExecuteIndirect, sa signature de commande ; plus le rang. Bac à sable : 381 mesures en mémoire.
-- Budget respecté : un objet inconnu n'entre dans la scène RT que tant que la place du budget le permet ;
-  au-delà il est mesuré dans la zone de mesure (dans sa limite par image). Saturation reproduite :
-  30 697 sommets pour un budget de 30 000, 0 dessin refusé.
-- Photo d'avant l'interface : dans RDR2 le rang de la bonne photo change d'une image à l'autre (le jeu
-  enregistre ses commandes sur plusieurs fils). Choix sur le GPU dans la même image
-  (`live_uiselect.hlsl`) : photo de cette image (identique à plus de 60 % à l'image finale et plus
-  proche d'elle que de l'image affichée précédente, sinon c'est une ancienne image), la moins identique
-  (la plus tôt, le moins d'interface) ; copiée dans un tampon que reflets et composition lisent.
-- « Une image sur deux » : OptiScaler avait la génération d'images active (`FGOutput = DLSSG`) ; URTI ne
-  s'appliquait qu'aux images réelles. L'utilisateur l'a retiré.
-- **Plantage au démarrage sans OptiScaler** (ucrtbase, 0xc0000409) : ReShade, chargé directement
-  (`dxgi.dll`), décharge et recharge les add-ons à chaque appareil que RDR2 crée au démarrage pour tester
-  la carte ; les entrées de tables de fonctions remplacées par URTI (`CreateRootSignature`,
-  `ExecuteIndirect`) pointaient alors vers le code d'un add-on déchargé. Elles sont maintenant remises à
-  l'origine au déchargement. Vérifié : le jeu démarre (`tools/reshade/rdr2_demarrage.ps1` : démarrage sans
-  clic, surveille processus et plantages).
-
-## v39 — URTI : débruiteurs de NVIDIA (NRD / SIGMA) intégrés ; le jitter, cause du tremblement restant
-
-- **NRD 4.17.3** (NVIDIA, licence RTX SDK, autorisée pour l'intégration dans une application ; source et
-  bibliothèques hors du dépôt, dans `urti/third_party/NRD`, compilées avec NRI en statique, shaders DXIL
-  seulement, **sans le support Agility SDK** : sinon NRI appelle `ID3D12Device15::TryCreate…View`, absent
-  du DirectX 12 du système (`ID3D12Device14`) → écriture n'importe où, plantage dans D3D12Core). CMake
-  l'inclut s'il est compilé (`URTI_NRD`).
-- Intégration (`urti_nrd.inl`, réglage `nrd=1`) : SIGMA (ombres) via la couche NRDIntegration sur NRI, qui
-  enveloppe l'appareil D3D12 du jeu, sa file de commandes et nos textures (barrières classiques). Entrées :
-  `live_shadow` en mode SIGMA (un rayon par pixel, pénombre = distance de l'obstacle × tan du rayon du
-  soleil, et le poids des corrections d'URTI), `live_nrdprep` (profondeur linéaire, normales encodées par
-  `NRD_FrontEnd_PackNormalAndRoughness`), vecteurs de mouvement du jeu tels quels (échelle selon leur
-  convention). NRD tourne sur sa propre liste de commandes (il installe ses tables de descripteurs : rien ne
-  fuit dans l'état de ReShade), soumise entre nos passes ; `live_nrdpost` recompose le masque. Un
-  plantage dans NRD est rattrapé (pile d'appels symbolisée dans le journal) et URTI repasse à son
-  débruitage ; symboles de débogage générés en Release.
-- Mesures (bac à sable) : SIGMA **moins bon** que le débruitage d'URTI (arbre au vent, clignotement 0,115 →
-  0,301 % ; marche 0,801 → 0,929 %) ; seuil de disocclusion, nombre d'images, taille du soleil : sans effet.
-  **Sans décalage sous-pixel** (`URTI_SANDBOX_JITTER=0`), l'arbre au vent devient presque parfait avec les
-  deux (URTI 0,000 %, SIGMA 0,010 %) : le tremblement restant d'une scène fixe vient du **jitter** du jeu
-  (DLSS / TAA). URTI calcule sur la profondeur décalée et compose sur l'image déjà stabilisée ; NRD exige
-  ce décalage (`cameraJitter`), qu'URTI ne connaît pas. SIGMA coupé par défaut en attendant.
-- Piste : le jitter apparaît dans le passage d'une image à l'autre mesuré par les cascades (live_sunvote)
-  comme un cisaillement, séparable de la rotation (`A[0][2] + A[2][0]`, `A[1][2] + A[2][1]`).
-
-## v40 — URTI : décalage sous-pixel (jitter) et champ de vision du jeu mesurés et compensés
-
-- Le décalage sous-pixel du jeu (DLSS / TAA) est mesuré à chaque image sans rien savoir du jeu : la
-  projection décalée ajoute à l'espace caméra un cisaillement x' = x + a w, y' = y + b w ; le passage d'une
-  image à l'autre mesuré par les cascades vaut A = K_préc S R S⁻¹ K_cour⁻¹. Au premier ordre
-  a_préc - a_cour = A[0][2] + s² A[2][0] (b avec t²), où s, t sont l'étirement de l'espace caméra d'URTI
-  (champ de vision supposé) par rapport au vrai. s² et t² sont mesurés par régression (sommes
-  décroissantes) sur les images où la caméra tourne : sans eux, la rotation fuyait dans la mesure (dérive
-  de ~16 pixels en marchant). Décalage absolu : somme des écarts moins sa moyenne glissante (la suite
-  d'un jeu est centrée) ; bac à sable : ±0,4 pixel, le cycle de Halton à 8 images retrouvé.
-- **Champ de vision du jeu mesuré** (s = tan(champ vrai / 2) / tan(champ supposé / 2)) : bac à sable
-  54,9° à 55,1° pour 55° (URTI supposait 50°). Journalisé ; pas encore réinjecté dans la projection.
-- Compensation (`jitter=2` par défaut ; 1 : seulement l'écart, 0 : rien) : la composition lit masque et
-  reflets à l'endroit non décalé (l'image présentée est stabilisée par le TAA), les reflets prennent leur
-  couleur à l'endroit non décalé, les historiques sont reprojetés avec l'écart de décalage. Recaler
-  seulement l'historique est pire (il suit alors le décalage au lieu de le moyenner).
-- 7 scènes, toutes meilleures (`suite/tableau_v40.txt`) : clignotement bâtiment 0,077 → 0,003 %, arbre
-  immobile 0,124 → 0,054 %, arbre au vent 0,115 → 0,050 %, personnage 0,076 → 0,034 %, caméra fixe
-  0,098 → 0,081 %, occlusion 0,126 → 0,081 %, marche 0,801 → 0,803 %.
-- `jitter_log=1` : décalage mesuré à chaque image dans le journal.
-
-## v41 — URTI : réserve de géométrie des ExecuteIndirect apprise par signature
-
-- Première session de la v40 dans RDR2 (lancée par URTI) : le jeu démarre, champ de vision mesuré 49,5° à
-  53,8° (il varie : visée, caméra), 49 à 53 i/s. Nouveau bilan des plus gros objets : **les ExecuteIndirect
-  réservent 65 535 sommets et en écrivent de 0 à 10 000** (86289/86289 65535/2787 65535/10242 65535/0…) :
-  sur 8,3 millions de sommets réservés, 1,3 à 1,5 million écrits — plus de 80 % de l'emplacement est du
-  vide, d'où sa saturation (50 à 230 dessins refusés par image) et le coût de la structure.
-- L'apprentissage par identité ne prenait pas : l'ordre des ExecuteIndirect change d'une image à l'autre
-  dans RDR2. Taille apprise maintenant **par signature de commande** : le plus grand nombre de sommets
-  écrits par ses dessins (décroît de 2 % par image) ; une zone remplie jusqu'au bout (tronquée) double la
-  taille apprise ; réserve = taille apprise × 1,25 + 64. Bac à sable inchangé ; à vérifier dans RDR2.
-
-## v42 — URTI : sol mouillé retiré, champ de vision corrigé tout seul, ExecuteIndirect identifiés par leurs arguments
-
-- Retour de jeu : le sol mouillé ajouté par URTI fait des bugs (RDR2 n'a pas ce rendu) ; les reflets
-  semblent parfois « flotter au-dessus » des flaques. Sol mouillé coupé par défaut (`UrtiWet` = 0 dans
-  urti.fx ; le réglage reste pour essai).
-- **Projection d'URTI corrigée par le champ de vision mesuré** (`fov_auto=1` par défaut) : quand la mesure
-  est fiable (assez de rotation de la caméra) et s'écarte de plus de 3 %, p11 est corrigé de 80 % de
-  l'écart, la mesure repart de zéro et les 6 lectures suivantes (trois images de retard) sont ignorées.
-  Bac à sable : 50,0° → 54,1° → 54,9° (vrai : 55°), stable. Dans RDR2 le champ mesuré varie de 49,5° à
-  60,6° (visée, caméra). Avec des angles exacts, la normale du sol et la direction des reflets ne sont plus
-  faussées. Suite : marche, écart à la vérité 0,96 → 0,90 %, scintillement ajouté +0,054 → +0,025 % ;
-  les autres scènes égales ou meilleures (`suite/tableau_v42.txt`).
-- Journal de la session v41 : la réserve était encore pleine (« 65536/22176 65536/65535 65536/0 ») : une même
-  signature de commande sert à des ExecuteIndirect de toutes tailles, son maximum imposait 65 536 sommets à
-  tous. Identité d'un ExecuteIndirect : signature, tampon d'arguments et position dans ce tampon (plus de
-  rang) ; taille apprise par identité (0 compris : réserve de 66 sommets) ; une zone remplie jusqu'au bout
-  repart à la réserve maximale, la mesure suivante redonne la vraie taille.
-
-## v43 — URTI : les ombres ne retirent que la lumière du soleil ; carte d'ombres du jeu enfin bien lue
-
-- Demande : une ombre est une visibilité du soleil, elle ne doit retirer que la lumière directe, pas
-  assombrir toute la couleur (`c *= 1 - force × (1 - masque)`, même proportion partout, même par temps
-  couvert).
-- **Part du soleil mesurée dans l'image du jeu** (`live_sunlight.hlsl`, à chaque présentation, avant la
-  composition) : un point tiré par bloc de 4×4 pixels de rendu, face au soleil (N·L > 0,2), à moins de
-  100 m, nettement éclairé ou nettement à l'ombre dans la carte du jeu (voisinage 5×5 dans le même état) ;
-  partenaire à 10 pixels sur le même plan, dans l'autre état. Rapport des couleurs de l'image :
-  ombré / éclairé = ciel / (ciel + soleil × N·L), d'où x = soleil / ciel par canal et en luminance,
-  accumulé dans des histogrammes (log2, quarts d'octave) dans le tampon du soleil (octets 1232 à 1887),
-  médiane lue sur le processeur, lissée en log (5 % par image). Moins de 32 paires : valeur gardée.
-- **Ombre physique** : le masque retire x N·L / (1 + x N·L) de la luminance (au lieu de la pente fixe
-  min(1, 2,5 N·L)) ; la composition l'applique par canal avec la teinte mesurée (le soleil est plus chaud
-  que le ciel : l'ombre bleuit comme celles du jeu). `UrtiStrength` = 1 par défaut : aussi sombre que les
-  ombres du jeu. `sun_measure=0` : ancienne règle.
-- **Bug trouvé : la carte d'ombres du jeu était mal lue depuis le début.** RDR2 (et le bac à sable) l'ont
-  en R16 (format 53, deux octets par texel) ; URTI lisait quatre octets comme un flottant : valeurs
-  absurdes, lectures hors des lignes. Touchés : le mode « seulement les ombres que le jeu n'a pas »
-  (décidé au hasard pixel par pixel, qui bouge avec les cascades : une cause probable des ombres qui
-  gigotent dans le jeu, où ce mode est choisi) et le test des trous du feuillage hors de l'écran. Lecture
-  16 bits ajoutée (bit 32 des drapeaux de `live_shadow`).
-- **Combinaison avec l'ombre du jeu** : part éclairée filtrée sur 3×3 texels (sa pénombre comprise) et
-  visibilité finale = la plus faible des deux (URTI retire max(0, jeu - RT)), au lieu d'une ombre du jeu
-  élargie de deux texels (tout ou rien) multipliée. Mode par défaut : « seulement les ombres que le jeu
-  n'a pas » (`UrtiMode` = 1) : le mode « complet » retire deux fois le soleil là où le jeu ombre déjà.
-  `game_min=0`, `game_dilate=` : ancienne combinaison, pour essai.
-- Bug évité : un `float3` dans les constantes de la composition, déplacé à la frontière de 16 octets
-  suivante, ne recevait que le rouge : trois nombres séparés.
-- **Nouveau test** `tools/reshade/urti_sandbox_ombres.sh` : la carte du « jeu » oublie poteaux, piquets,
-  mur, charrettes et passants (`URTI_SANDBOX_GAMESHADOW=partiel`) ; on compare au lancement où le jeu les
-  ombre (sol sec, reflets coupés). Ombre oubliée rattrapée, avant → après :
-  rue 56 → 90 %, occlusion 57 → 91 %, marche 55 → 68 % ; noirceur dans la rue (lumière RT / jeu, rouge
-  vert bleu) 2,5 1,9 1,6 → 1,08 1,12 1,11 (teinte juste) ; écart hors de la zone 1,9 / 1,3 / 0,5 → 0,15 /
-  0,11 / 0,19 % (plus de double ombre) ; scintillement dans la zone en marche 6,4 → 5,2 %
-  (`ombres/tableau_avant.txt`, `ombres/tableau_v43.txt`). Soleil / ciel mesuré dans le bac à sable : 4,5
-  (rouge 5,8, vert 4,3, bleu 3,0).
-- Suite des reflets (vérité terrain = ombres du jeu seules) : écart bâtiment 2,13 → 0,08 %, passants
-  1,60 → 0,47 %, marche 0,90 → 0,60 % (sautent 1,10 → 0,50 %, clignotent 0,81 → 0,57 %), occlusion
-  1,32 → 0,36 % (`suite/tableau_v43.txt`).
-- Reste : en marche, les ombres fines et lointaines (poteaux, câbles) sont trop lissées (68 %).
-
-## v44 — URTI : reflets RT seulement sur les surfaces planes ; la carte d'ombres de RDR2 ne concorde pas
-
-- Retour de jeu (v43, jardin de Saint-Denis au soleil) : les reflets tremblent encore, des choses sautent,
-  **les arbres ont des points gris flous qui tremblent**, et les ombres ne font **aucune différence**
-  activées ou non. Journal : soleil / ciel mesuré 0,06 à 0,16 (6 à 13 % de la lumière retirée : ombres
-  invisibles) alors que la scène a des ombres franches ; 50 à 115 objets sur ~800 dans la scène RT ;
-  48 i/s, ~7 ms d'URTI par image. Préréglage du joueur à la fin : mode « ombres RT complètes », force 1.
-- **Points gris** : les reflets RT se posaient sur toute surface que le jeu déclare lisse (cheveux,
-  feuilles, peau) ; la normale tirée de la profondeur y est du bruit, le reflet partait au hasard et
-  clignotait (vu sur la nuque du personnage dans une capture). Le contrôle de planéité (jusqu'ici réservé
-  au sol mouillé) s'applique maintenant à tous les reflets : voisins à 2 pixels (à 4, au loin ils
-  tombaient sur un autre objet : sauts en marche 0,50 → 0,91 %), et une surface n'est refusée que si elle
-  a du relief dans les deux directions (le bord d'une flaque contre un mur reste plan). Bac à sable
-  (reproductible à l'identique : contrôle coupé = v43 au chiffre près) : sautent / clignotent, marche
-  0,501 / 0,565 → 0,484 / 0,557 %, arbres au vent 0,019 / 0,041 → 0,016 / 0,036 %, rue fixe
-  0,066 / 0,075 → 0,057 / 0,063 %. Le jeu garde ses propres reflets sur les surfaces refusées.
-- **La carte d'ombres de RDR2 ne concorde pas** avec ce qu'URTI en attend (session lancée par URTI dans le
-  bayou, temps couvert) : contrôle ajouté dans `live_sunlight` (points face au soleil que la carte dit
-  éclairés / à l'ombre / au bord / hors des cascades, luminance moyenne des deux premiers) : **100 % au
-  bord** ; la vue « ombre du jeu recalculée » est blanche partout. Dans le bac à sable : 65 % éclairés,
-  31 % à l'ombre, rapport de luminance 5,9. Le test de profondeur dans la carte de RDR2 n'avait jamais pu
-  être vérifié (lecture fausse jusqu'à la v43) : la profondeur que la projection d'URTI donne au point
-  n'est probablement pas celle que le jeu écrit (plage de profondeur du viewport, décalage…). Ajouté au
-  journal toutes les 300 images : histogramme de la profondeur des points dans la cascade et de l'écart
-  carte - point (bac à sable : points dans 0,375 à 0,625 ; écart nul pour les points éclairés, très
-  négatif pour ceux à l'ombre). À relever dans RDR2 **au soleil** pour corriger.
-- **Garde-fou** : la mesure soleil / ciel n'est prise que si la carte concorde avec l'image (points
-  éclairés au moins 1,3 fois plus clairs que ceux à l'ombre) ; sinon la valeur par défaut reste (2,2 :
-  69 % de la lumière retirée face au soleil, l'ancien rendu) au lieu d'effacer les ombres.
-- Bug de l'outil de contrôle : `show_mask=1` dans urti.ini cochait « masque seul » dans l'effet, sans
-  jamais la décocher : écran blanc (masque sans ombre) après le contrôle. Décochée maintenant quand la
-  ligne est retirée. Le jeu, lancé par URTI pour ce contrôle, a été fermé (aucune progression jouée).
-
-## v45–v46 — URTI : mesure dans le jeu (rafales) ; la scène RT de RDR2 était tirée au hasard à chaque image
-
-- Demande : « les reflets sautent, tu dis que c'est corrigé mais ça ne l'est jamais ». Les mesures du bac
-  à sable ne suffisent pas : il faut mesurer dans RDR2.
-- **Rafale** (touche F8 ou fichier déclencheur `urti_rafale`) : 30 images consécutives enregistrées sans
-  URTI (copie de l'image avant la composition) et avec, dans `urti_rafale_N\`. `tools/reshade/urti_rafale.py`
-  : contribution d'URTI C = après - avant, ce qui saute = variation de C d'une image à la suivante
-  (indépendante de la scène) ; zones ombres / reflets ; objets entrés / sortis de la scène RT par image
-  (lignes RAFALE du journal) ; carte des sauts et gros plan de la pire zone. Résultats dans
-  `results/urti/jeu/rafales/`.
-- Réglages de RDR2 relus (system.xml) : RTX 4070, DX12, DLSS, HDR, flou de mouvement coupé, netteté au
-  maximum, reflets de l'eau en espace écran actifs (le jeu garde ses reflets là où URTI n'en met pas),
-  plusieurs sources d'ombres (cascades, lointaines, relief, espace écran, longues). Rien qui fausse URTI.
-- Séance dans RDR2 lancée par URTI (Saint-Denis la nuit, pavés mouillés) : URTI changeait 0,2 % des pixels ;
-  au plus fort saut, le reflet orange d'un lampadaire apparaissait deux ou trois images puis disparaissait.
-  Journal : **0 objet connu dans la scène RT, 6,1 M sommets jamais mesurés, 183 499 mesures en mémoire
-  pour ~930 objets à l'écran**. Cause : l'identité d'un ExecuteIndirect (v42) comprenait l'adresse et la
-  position de ses arguments, qui tournent dans RDR2 : nouvelle identité à chaque image, jamais mesurée,
-  réserve maximale ; les inconnus remplissaient le budget dans l'ordre d'enregistrement (variable) : la
-  scène RT était un tirage différent à chaque image. Le bac à sable (arguments fixes) ne pouvait pas le voir.
-- **Identité stable** : signature de commande, pipeline, tampons d'indices et de sommets liés (événements
-  `bind_index_buffer` / `bind_vertex_buffers` suivis par liste de commandes), nombre maximal de commandes.
-  Dans RDR2 : 671 objets à l'écran, **671 dans la scène RT, 0 jamais mesuré, 785 mesures en mémoire,
-  0 hors budget**, 0,4 objet entré ou sorti par image. Rafale caméra fixe, zone des reflets d'URTI :
-  tremblent 8,2 → 1,5 %, sautent 0,88 → 0,12 %. Budget porté à 6 M sommets (place d'un emplacement : 8 M).
-  Bac à sable inchangé au chiffre près.
-- Coût : la scène RT contient maintenant de vrais triangles (4,5 M sommets) : construction de la structure
-  2,6 → 4,1 ms, reflets 0,2 → 1,0 ms ; ~51 i/s dans cette scène de nuit (64 avant, avec une scène RT
-  vide de sens). La structure est reconstruite à chaque image (300 sur 300) : la mise à jour exige la même
-  disposition, or la place de chaque objet dans le flux suit l'ordre d'enregistrement des dessins, qui
-  change d'une image à l'autre (RDR2 enregistre sur plusieurs fils). À faire : une place fixe par objet.
-- Non vérifiable cette nuit-là : reflets de jour, ombres (pas de soleil). La rafale caméra en mouvement
-  mêle le déplacement normal du reflet aux sauts : à affiner.
-
-## v47 — URTI : F4, avant / après en plein écran
-
-- Demande du joueur : un bouton pour voir la différence en direct. **F4** bascule entre l'image du jeu seule
-  et l'image avec URTI, en plein écran et sans délai : seule la pose sur l'image est sautée, le calcul RT
-  continue (les images par seconde ne changent donc pas : pour elles, F7 coupe tout). F5 reste l'écran
-  partagé (gauche sans, droite avec).
-
-## v48 — URTI : case « URTI activé » dans le menu (tout le calcul coupé), F7 synchronisée
-
-- Demande : un bouton qui coupe complètement le ray tracing (plus aucun calcul) et le relance. Case
-  `UrtiOn` dans le menu de ReShade : décochée, plus de capture de géométrie, de structure, d'ombres, de
-  reflets ni de pose ; recochée, tout reprend. F7 fait la même chose et la case suit. Sans effet si
-  urti.ini n'a pas `live=1` (les lancements natifs du bac à sable restent natifs ; suite inchangée).
-- « Aucune différence » avec F4 : la partie du joueur était de nuit (soleil suivi sur 0 % des images, pas
-  de carte d'ombres du soleil). La nuit, URTI ne fait pas d'ombres (seulement celles du soleil) et ses
-  reflets, limités aux surfaces planes, reflètent une scène sombre : 0,2 % des pixels changés (rafale).
-  Les reflets visibles sur les pavés mouillés la nuit sont ceux du jeu.
-
-## v49 — URTI : plus de menus dans les reflets ; plus d'ombres invisibles qui coûtent 4 ms
-
-- Retour de jeu (Saint-Denis, jour de pluie, sol mouillé par le jeu) : les reflets tremblent, **les menus
-  s'affichent dans les reflets au sol**, des reflets se décollent du sol, aucune différence pour les
-  ombres ; 20 à 27 i/s. Journal : soleil suivi, carte d'ombres concordante (éclairés 3,2 fois plus clairs
-  que les points à l'ombre), mais soleil / ciel mesuré 0,06 (ciel couvert : 6 % de la lumière retirée) ;
-  GPU : ombres 3,8 ms, reflets 3,1 ms, soleil et structure 3,9 ms. « Pas de photo avant l'interface »
-  27 fois dans la partie.
-- **Menus dans les reflets** : la photo d'avant l'interface (couleurs des reflets) n'était gardée que si
-  elle ressemblait plus à l'image courante qu'à la précédente. Image immobile (le joueur regarde le sol,
-  un menu est ouvert) : égalité, aucune photo, couleurs lues dans l'image finale, menus compris. Le GPU
-  garde maintenant son choix d'une image à l'autre (`live_uiselect`, octets 64 / 68 de ses comptes) : la
-  photo précédente reste si elle ressemble encore à au moins 30 % à l'image finale (un grand menu en
-  couvre une part) et n'est pas une copie de l'image affichée précédente (photo prise trop tôt). Si
-  aucune photo n'est sûre, les reflets RT s'effacent en douceur (-15 % par image) et reviennent avec elle.
-  Bac à sable, plan fixe sans décalage sous-pixel, menu ouvert 2 s toutes les 4 s : photo perdue 2 fois
-  sur 600 images → 0.
-- **Ombres invisibles** : soleil / ciel mesuré sous 0,15 (moins de 13 % de la lumière retirée : ciel
-  couvert, crépuscule) : plus de rayons d'ombre (3,8 ms gagnées dans cette scène) ; ils reprennent quand
-  la lumière directe revient (la mesure continue).
-- Suite des reflets inchangée (`suite/tableau_v49.txt`). Non vérifié dans le jeu : à mesurer (rafales F8
-  sur le sol mouillé, et une avec un menu ouvert).
-
-## v50–v52 — URTI : une seule case, occultation ambiante RT, ombres du soleil coupées (mesuré : invisibles)
-
-- Retour du joueur : « 0 différence » et beaucoup d'images par seconde perdues ; trop d'options ; demande un
-  RT « à la NVIDIA » (une case, tout automatique), l'occultation ambiante, voire du path tracing et la Ray
-  Reconstruction ; une option de beau temps ; plantage en ouvrant le Social Club (touche Home, « erreur
-  mémoire »).
-- Analyse de sa partie : **force des reflets à 0 dans son menu** (`UrtiReflect=0`) et ombres suspendues
-  (ciel couvert) : URTI ne pouvait rien changer, en coûtant 4 à 5 ms (structure, suivi du soleil).
-- Recherches : le « ray tracing » vu sur RDR2 est fait de shaders ReShade en espace écran (RTGI / PTGI de
-  Pascal Gilcher, sans direction du soleil) ; la Ray Reconstruction ne s'injecte (forks expérimentaux
-  d'OptiScaler) que dans des jeux qui ont déjà du path tracing ; beau temps à la demande : ScriptHookRDR2 et
-  un trainer (fichiers tiers, non installés sans accord).
-- Plantage Social Club : pas reproduit (touche Home envoyée : pas de menu, pas de plantage) ; aucun
-  plantage dans le journal de Windows depuis le 31/10 ; ReShade s'ouvre sur Page suivante (pas de
-  conflit) ; mémoire vidéo 7,0 / 12 Go. À revoir avec le texte exact de l'erreur.
-- **Menu réduit à « URTI activé »** : les autres réglages sont cachés et ignorés (l'ancien `UrtiReflect=0`
-  du préréglage n'éteint plus rien) : reflets à 1, ombres « seulement celles que le jeu n'a pas », pas de
-  sol mouillé ; urti.ini garde la main pour les essais.
-- **Occultation ambiante RT** (`live_shadow`, ao=0,8, ao_radius=1,5 m) : deux rayons courts par pixel
-  (hémisphère pondéré par le cosinus, motif tournant), obstacle à t : occultation (1 - t / portée)² ; trous
-  du feuillage reconnus ; ne retire que la lumière du ciel (toute à l'ombre, 1 / (1 + x N·L) au soleil, x
-  soleil / ciel mesuré) ; débruitée avec le masque. **Seulement sur les surfaces planes** (sol, murs,
-  routes) et à moins de 50 m : sur l'herbe et les grilles, chaque brin est de la géométrie, tout
-  s'assombrissait (le jeu y a déjà son occultation) et tremblait.
-- **Ombres du soleil RT coupées par défaut** (`shadows=1` pour les rallumer ; drapeau 64 : le soleil reste
-  connu pour l'occultation) : rafale au soleil sans occultation : **0,0 % de l'image changé pour 3,2 ms**.
-  Les ombres de RDR2 n'en laissent presque aucune à ajouter.
-- Débruitage du masque quand il ne porte que l'occultation : plus d'images accumulées (part courante
-  0,05 à 0,3) et bornage plus large (2 écarts-types).
-- Mesures dans RDR2 (rafales, `results/urti/jeu/rafales/`) :
-  - v50 (occultation partout) : 32,5 % de l'image changé, pixels qui sautent 0,21 %, ombres + occultation
-    6,1 ms ;
-  - v50 occultation plane : 20,2 %, 0,12 %, 5,1 ms ;
-  - v51 (sans ombres du soleil, brouillard) : 8,2 %, 0,08 %, 1,2 ms, 56-58 i/s ;
-  - v52 (bayou au soleil) : 9,4 %, 0,05 %, zone assombrie tremble 1,2 % (4,1 % en v51), 2,3 ms, 44 i/s.
-- Restent :
-  - des flashs d'une image quand des objets entrent ou sortent de la scène RT (images 6, 11-12, 15 de la
-    rafale v52 : 4 à 10 objets ; le jeu ne dessine pas certains objets une image) ;
-  - les reflets sur l'eau qui tremblent (zone de reflets : 17 % tremblent) ;
-  - la reconstruction de la structure à chaque image (3,8 à 5,7 ms) ;
-  - la photo d'avant l'interface encore perdue par moments dans RDR2 (ressemblance des photos maintenant
-    journalisée).
-
-## v53–v55 — URTI : une place fixe par objet : plus de flashs, structure mise à jour au lieu de reconstruite
-
-- Avis du joueur : laisser les ombres au jeu (les siennes sont trop bonnes) ; étape 1 : stabilité et vitesse.
-- Cause des flashs d'une image (rafale v52) : 8 à 9 objets par image entraient ou sortaient de la scène RT,
-  sans refus ni dépassement de budget : le jeu ne dessine pas tout à chaque image (végétation, niveaux de
-  détail, masquage). Et la place de chaque objet dans le flux suivait l'ordre d'enregistrement des dessins,
-  variable : la structure était reconstruite 300 fois sur 300 (3,8 à 5,7 ms).
-- **Places fixes** (`g_livePlaces`, urti.ini `persist=0` pour l'ancienne règle) : chaque objet de l'écran
-  principal garde sa place d'une image à l'autre (premier espace libre assez grand, un quart de marge,
-  espaces libres fusionnés) ; un objet que le jeu ne dessine pas pendant au plus 3 images garde sa dernière
-  géométrie dans la scène RT ; au-delà, sa place est rendue. Les comptes de sommets écrits sont recopiés
-  dans une case par place (`live_counts.hlsl`), que la conversion lit ; la conversion couvre toutes les
-  places tenues (table triée par début). Une place refusée ou plus de 70 % de l'emplacement occupé : tout est
-  redistribué à l'image suivante.
-- Triangles absents : plats (sommets à l'origine) au lieu de NaN : une mise à jour de la structure ne peut
-  pas changer l'état actif / inactif d'un triangle. **Mise à jour tant que la partie convertie garde sa
-  taille** (reconstruction complète au plus toutes les 8 images).
-- v53 : la partie occupée remplissait tout l'emplacement (82 dessins refusés par image, 406 objets dans la
-  scène RT) : d'où la marge, la fusion et la redistribution de v54.
-- Mesures dans RDR2 (v54, Saint-Denis au soleil) : 871 places tenues (71 Mo), partie occupée 81 Mo sur
-  128, 0 nouvelle place par image, 0 redistribution ; **33 reconstructions et 267 mises à jour sur 300** ;
-  étape « soleil et profondeur » 1,3 ms (3,8 à 5,7) ; **0 objet entré ou sorti sur les 30 images de la
-  rafale**, 0,015 % des pixels qui sautent ; 65 i/s. Bac à sable : suite identique au chiffre près avec ou
-  sans places fixes.
-- Occultation ambiante en mouvement (bac à sable, marche) : sautent 0,47 % sans elle, 0,78 % avec ; débruitage
-  du mode occultation seule élargi (flou 5×5 guidé par la profondeur, part de l'image courante en mouvement
-  0,2) : 0,69 % (clignotent 0,84 → 0,71 %). Reste à réduire.
-
-## v56–v66 — URTI : décalques, photo d'avant l'interface impossible dans RDR2, mises à jour de la structure abandonnées
-
-Toutes les mesures ci-dessous sont prises dans RDR2, lancé par URTI ; scènes différentes d'un lancement à
-l'autre (la sauvegarde recharge ailleurs) : les comparaisons valables sont celles d'un même lancement.
-
-- **Occultation en mouvement** : 4 rayons au lieu de 2 là où l'image bouge de plus d'un pixel et demi
-  (vecteurs de mouvement) ; feuillage exclu des surfaces qui la reçoivent (points voisins à 6 pixels vus
-  nettement plus loin : le fond à travers les feuilles).
-- **Reflets sur l'eau** : normale par différence centrée sur 4 pixels de part et d'autre quand les deux côtés
-  sont sur la même surface (vaguelettes lissées) ; pas de rayon de reflet sous 3 % de poids (Fresnel de
-  face), portée 500 m.
-- **v56 : photos supplémentaires de l'écran (1er, 2e, 8e, 32e dessins) : RDR2 plante dès son menu**
-  (erreur fatale « mémoire »), retirées (v57).
-- **Taches sombres au sol à bords droits** (vues par le joueur) : les décalques du jeu (boue, marques,
-  flaques), posés juste au-dessus de la route sans écrire la profondeur, arrêtaient les rayons
-  d'occultation à quelques centimètres. Obstacles à moins de 6 cm ignorés (5 cm pour les reflets) : tache
-  disparue (assombrissement moyen du sol 3,5 → 0,1 niveau).
-- **Photo d'avant l'interface** : rafale enrichie (photo brute, photo gardée). Dans RDR2, **l'écran ne reçoit
-  qu'un seul dessin par image**, qui assemble la scène et l'interface préparées ailleurs : la photo prise
-  avant lui est une image précédente, interface comprise (mini-carte identique à l'image finale) ; aucune
-  photo sans interface n'existe. Pire : la photo « gardée » (v58) ne ressemblait plus qu'à 2 % à l'image
-  courante. Corrections :
-  - dans RDR2, `ui_photo=0` (urti.ini du jeu) ;
-  - plus jamais de photo gardée ;
-  - interface repérée avec une tolérance (grain du jeu d'un ou deux niveaux) ;
-  - **zone d'interface fixe** `ui_zone=0.012,0.69,0.16,0.97` (mini-carte et icônes) : mini-carte modifiée
-    7,5 → 1,7 niveaux.
-  - La photo prise juste après le premier dessin (seulement dans une liste directe) ne fait plus planter
-    le jeu.
-- Convention des vecteurs de mouvement remesurée dans le jeu : la même (n° 2). En mouvement, l'effet suit
-  l'image à **98 %** (`tools/reshade/urti_rafale_decalage.py` : glissement de l'effet / glissement de l'image
-  par corrélation de phase).
-- **Décalage sous-pixel** : compensation coupée dans RDR2 (`jitter=0`) : tremblent 0,19 → 0,13 % ; zone des
-  reflets tremble 2,57 → 1,79 %, saute 0,10 → 0,06 %. Garde la compensation dans le bac à sable.
-- **Mises à jour de la structure** :
-  - v58 : places redistribuées à chaque image (seuil de 70 % dépassé) alors que la mise à jour restait
-    permise : 4,5 i/s. Corrigé (reconstruction obligatoire après une redistribution).
-  - Triangles plats à l'origine (la caméra) : une mise à jour qui les rendait réels étirait des boîtes à
-    travers toute la vue (rayons 10 fois plus lents) ; posés sur le premier sommet de leur place.
-  - Régulateur au coût mesuré (reconstruction contre ralentissement des rayons).
-  - Mesure finale, même scène : mises à jour 1,2 + 3,7 + 6,8 ms (structure, occultation, reflets), 38 i/s ;
-    reconstruction à chaque image 5,7 + 1,2 + 0,5 ms, 45 i/s. Une seule mise à jour rend les reflets
-    quatorze fois plus lents (lots de végétation triés par le GPU : les triangles changent de place).
-  - **Reconstruction à chaque image par défaut** (`blas_refit=0`) ; places sans marge, redistribuées dès
-    qu'un cinquième de la partie occupée est perdu en trous.
-  - Gare de triage, ciel couvert : URTI 3,9 ms au total, 73 i/s.
-- Avis du joueur sur la v66 : « parfait, le rendu est dingue », reste à gagner des images par seconde.
-- **Bac à sable** (`suite/tableau_v66.txt`) :
-  - arbres et personnage nettement mieux (sautent 0,010 → 0 %) ;
-  - **caméra en mouvement moins bonne** : sautent 0,63 → 1,24 % (clignotent 0,68 → 0,55 %), écarts à la vérité
-    plus grands partout. À comprendre : changements des reflets (seuil de poids, portée minimale, normale
-    centrée) ou de la photo d'avant l'interface (photo après le premier dessin, tolérance).
-
-## v67 — URTI : optimisation (budget de géométrie au coût mesuré, occultation au quart, composition allégée)
-
-- Demande : les images par seconde. Coûts mesurés dans RDR2 (v65-v66) : la reconstruction de la scène RT
-  domine (1,8 ms dans la gare de triage, 5,7 à 8,8 ms dans une rue sous la pluie) ; occultation ~1 ms,
-  reflets 0,2-0,5 ms, composition 0,8 ms.
-- **Budget de géométrie réglé sur le coût mesuré de la reconstruction** (`build_ms=2.5`, 0 : budget fixe) :
-  toutes les 30 images, -15 % si la reconstruction dépasse la cible de 10 %, +8 % sous 75 % de la cible,
-  entre 1,5 M sommets et `vertex_budget` (6 M). Les objets de plus petite taille apparente (boîte / distance)
-  sortent d'abord.
-- **Occultation au quart** (`ao_quarter=1`) : un pixel de chaque bloc 2×2 lance ses rayons à chaque image (les
-  quatre en quatre images), deux fois plus de rayons par pixel (4 au repos, 6 en mouvement) ; les autres sont
-  écrits -1 et reconstruits par le débruitage (flou 5×5 sur les seuls pixels calculés, historique seul sans
-  voisin calculé). Bac à sable : passe d'occultation 0,86 → 0,39 ms, mesures de qualité inchangées.
-- **Composition** : masque lu en bilinéaire (4 lectures au lieu de 16) quand il ne porte que l'occultation :
-  0,51 → 0,46 ms (bac à sable).
-- **Recul du bac à sable en caméra mouvante expliqué** (sautent 0,63 → 1,25 % depuis v62) : occultation coupée,
-  0,48 % (le niveau d'avant). La vérité terrain n'a pas d'occultation : un assombrissement qui suit le décor
-  y compte comme des sauts. Avant v62, la comparaison à l'identique de l'interface empêchait l'occultation
-  sur une grande part des pixels (effet plus faible). Dans le jeu, l'effet suit le mouvement à 98 %
-  (`urti_rafale_decalage.py`).
-- À vérifier dans RDR2 par le joueur : images par seconde, coût par étape (journal), objets manquants quand le
-  budget baisse.
-
-## v68 — URTI : optimisation validée dans RDR2 ; sommets aberrants (scène RT invisible depuis v66)
-
-- v67 dans RDR2 : occultation et reflets sans aucun effet (0,0 % de l'image, masque blanc, passe à 0,13 ms).
-  Les rayons ne touchaient rien. Coupable : la combinaison places fixes + reconstruction à chaque image
-  (v66) ; places fixes coupées, ou mises à jour permises : tout revient. Cause : des sommets aberrants (non
-  finis ou immenses, places gardées ou jamais écrites) ; une reconstruction complète étire la boîte de
-  toute la scène et les boîtes intérieures, rangées avec une précision relative à elle, ne valent plus rien.
-  La conversion replie maintenant tout sommet non fini ou à plus de 20 km sur le premier sommet de sa zone.
-  La v66 jugée « parfaite » par le joueur tournait donc sans occultation RT dans certaines scènes.
-- Optimisation mesurée dans le jeu (même partie, Saint-Denis, deux fois de suite) : occultation complète 3,75
-  / 3,88 ms, 54,8 / 52,9 i/s ; **au quart 1,99 / 2,16 ms, 59,1 / 57,3 i/s**. Rafale : 0,001 % des pixels
-  sautent. Reconstruction 2,25 ms (sous la cible de 2,5 ms : budget inchangé ici).
-
-## v69 — URTI : G-buffer de RDR2 décodé, choix du G-buffer corrigé, cache de surfaces, occultation réglée sur son temps
-
-- **G-buffer de RDR2** (relevé des passes, texels bruts `.raw` de tous les canaux, `tools/reshade/urti_gbuffer.py`) :
-  cible 0 = couleur (albedo, RGBA8 sRGB ; alpha : 8 valeurs, un repère de matériau) ; cible 1 = normale du monde
-  (z vers le haut, codée 0..1, longueur 1,00), alpha = repère des personnages ; cible 2 = matériau : r type
-  (0,5 commun, 0,2 feuillage, 0,31 peau), **g lissé** (flaque 0,60, laiton 0,49, peau 0,53, chemise 0,03),
-  **b métal** (boules en laiton 0,80, poteaux de fer 0,57, grilles 0,44, ailleurs 0), a occultation ou
-  humidité (réécrit plus tard dans l'image par une autre passe) ; cible 3 = r presque 1 partout, b
-  diffusion sous la peau (peau 0,53) ; cible 4 = vecteurs de mouvement (RG16F).
-- **Défaut trouvé** : le G-buffer était la dernière liaison de trois cibles ou plus sur la profondeur de
-  l'écran. Une passe plus tardive (transparents : 087, 088, 089 + deux du G-buffer) le remplaçait par
-  moments, et le G-buffer lui-même est lié avec 3 cibles pour une partie des objets (couleur, normale,
-  mouvement) : la « cible 2 » était alors les vecteurs de mouvement, lus comme lissé. Maintenant : le jeu de
-  cibles où le jeu dessine le plus, revu toutes les 30 images, en gardant pour une même première cible la
-  liaison la plus large. Vérifié dans RDR2 : `5 cibles (formats 29 28 28 28 34)`, stable.
-- **Cache de surfaces** (`live_surfcache.hlsl`) : un pixel par bloc 4×4 et par image (tout l'écran en 16
-  images), rayon depuis la caméra jusqu'au triangle vu, couleur de l'image retenue par triangle (RGB9E5 +
-  identité de l'objet, 8 octets, 21 Mo pour 2,8 millions de triangles). Un reflet dont le point touché est
-  caché ou hors de l'écran prend cette couleur au lieu de rester inconnu. Bac à sable : reflets des
-  fenêtres prolongés au bord de l'écran, écart à la vérité inchangé (2,59 %, presque tout y est visible à
-  l'écran). RDR2 : marche, +0,7 ms, gain visible faible dans les scènes vues (reflets RT sur 2 % de l'image).
-- **Constat RDR2** : sol des arcades de Saint-Denis lissé 0,36 (pierre polie, reflet flou), sous le seuil des
-  reflets RT (0,5) : les reflets RT ne couvrent que 2 % de l'image. Des reflets flous (rayons tirés selon la
-  rugosité + débruitage) sont une étape à part.
-- **Occultation : 5,5 ms sous les arcades** (68 i/s sans elle, 48 avec). Le coût ne dépend ni de la portée
-  (0,2 m comme 1,5 m), ni des rayons opaques ou du test des trous, ni de la taille de la scène (3 fois moins
-  de sommets : pareil) ; il double avec le nombre de rayons. Sous des arcades, presque tout l'écran est une
-  surface plane proche (dehors, ciel et lointain sont sautés). Nombre de rayons par pixel calculé maintenant
-  réglé toutes les 30 images sur le temps de la passe (cible 2,5 ms, `ao_ms=`, de 4 à 2 rayons).
-- Table des zones de la scène RT copiée en mémoire vidéo à chaque image (conversion, reflets et cache y
-  cherchaient leur zone à travers le bus PCIe).
-- Outils : `urti_rdr2_rapide.ps1` ne prend plus l'ancien journal ni « première image » pour une partie en
-  cours, reconnaît le menu sans capture d'étalonnage, ne clique pas quand quelqu'un se sert du PC.
-- À vérifier dans RDR2 : réglage des rayons d'occultation et gain d'images par seconde sous les arcades ; coût
-  du cache avec la table en mémoire vidéo.
-
-## v70 — URTI : rebond de lumière (éclairage indirect) ; cache de surfaces enfin actif dans RDR2 ; mini-carte protégée
-
-- **Correction de v69** : dans RDR2, le cache de surfaces n'était jamais lu. Le test « le cache couvre la scène »
-  (triangles × 3 ≥ capacité) échouait de 2 sommets : la capacité (8 388 608) n'est pas un multiple de 3 (dans
-  le bac à sable, si). L'écart mesuré en v69 (0,4 % de pixels) était du bruit. Maintenant : triangles ≥
-  capacité / 3.
-- **Cache par groupes de huit triangles** : dans RDR2, la plupart des triangles sont plus petits qu'un pixel ;
-  un pixel échantillonné par bloc 4×4 ne tombait presque jamais sur le triangle qu'un rayon touche ensuite
-  (un rayon d'occultation sur quatre trouvait une entrée, presque aucune du bon objet). Une entrée couvre huit
-  triangles consécutifs (voisins dans le maillage) ; entrée vide ou d'un autre objet : les entrées voisines
-  du même objet.
-- **Rebond de lumière** (`gi=`, 1 par défaut) : les rayons d'occultation qui touchent un obstacle y prennent la
-  couleur retenue par le cache (la lumière que la surface renvoie), avec le même poids que l'occultation
-  (la lumière du ciel retirée dans cette direction est remplacée par celle de l'obstacle). Trois plans R, G, B
-  au quart, débruités par le même filtre que l'occultation (étendu à trois plans, mêmes poids), reçus selon
-  la couleur propre de la surface (albedo du G-buffer, copiée à chaque image). Pas de rayon de plus.
-  Bac à sable : sable éclairé qui renvoie une lumière chaude au pied des murs et sous les tonneaux,
-  scintillement inchangé ; +0,4 ms. RDR2 : +0,85 ms (61 → 58 i/s sur le quai).
-- **Personnages exclus du rebond** : alpha de la normale du G-buffer (cible 1, copiée) = repère des
-  personnages (0,41 sur Arthur, 0 sur le plancher). Ils bougent, leur historique est rejeté à chaque image et
-  le rebond, plus bruité que l'occultation, y tremblait (rafale : 0,20 % de pixels qui tremblent, tous sur
-  le personnage).
-- **Mini-carte jamais protégée depuis la zone d'interface fixe** : dans la composition, `float4 uiZone` après
-  18 nombres était placé par HLSL à la frontière de 16 octets suivante, 8 octets plus loin que ce que
-  l'add-on écrit (les deux derniers nombres hors des constantes). Même défaut dans le cache de surfaces.
-  Quatre nombres séparés ; vérifié sur tous les shaders (aucun autre).
-- Rechargement à chaud aussi pour le cache de surfaces et le débruitage.
-- **Mesures RDR2** (quai mouillé de Saint-Denis, rafales en régime établi) : sans rebond, effet 10,2 % des
-  pixels (reflets RT du ciel sur le quai : 9,7 %), tremble 0,01 %, saute 0,000 % ; avec rebond, effet 10,8 %,
-  tremble 0,01 %, saute 0,001 %.
-- Pièges de mesure : une rafale prise quelques secondes après un rechargement de `urti.ini` montre les reflets
-  absents par moments (état remis à zéro, à examiner) : attendre 20 s. Un shader de diagnostic rechargé à
-  chaud reste actif après l'effacement de son `.cso` (jusqu'au prochain rechargement ou relancement) : une
-  première rafale « parfaite » avait été prise avec un rebond gris de diagnostic.
-
-## v71 — URTI dans un deuxième jeu : Horizon Forbidden West (moteur Decima, DX12)
-
-Premier essai hors de RDR2, sans rien adapter d'abord : ReShade 6.8 (dxgi.dll) et l'add-on posés dans le
-dossier du jeu (aucun fichier du jeu remplacé), lancement par Steam (lanceur du jeu puis « Continuer » :
-`tools/reshade/urti_hfw_rapide.ps1`).
-
-- **Ce qui marche tout seul** : chargement avec Streamline (DLSS) ; capture de la géométrie (1 600 dessins
-  captés sur 5 800, 3 millions de sommets dans la scène RT) ; loi de profondeur et projection ; occultation RT
-  visible (dessous des planchers, pieds des poteaux) ; G-buffer trouvé (7 cibles, rendu natif 2560×1440).
-- **Coût trop élevé** : 69 i/s sans URTI, 43 avec (désert de la Côte embrasée), soit 9 ms. Les objets de
-  Decima sont lourds (jusqu'à 464 000 sommets, 13 millions à l'écran contre ~2,5 dans RDR2) : la
-  reconstruction de la structure prend 3 à 11 ms, le budget tombe au plancher (1,5 M sommets), 46 dessins
-  seulement dans la scène RT et beaucoup d'entrées et sorties par image (rafale : tremble 1,9 %, saute
-  0,15 %, contre 0,01 % / 0,001 % dans RDR2). Image native 1440p (pas de mise à l'échelle) : occultation et
-  composition plus de deux fois plus chères que dans RDR2 (1707×960).
-- **G-buffer de Decima** (relevé des passes) : cible 0 couleur propre (RGBA8 sRGB) ; cible 2 normale en
-  octaèdre (RG16 UNORM, deux canaux autour de 0,5) ; cible 5 vecteurs de mouvement (RG16F, seul le
-  personnage bouge à l'arrêt) ; cible 6 vide ; cibles 1, 3, 4 réutilisées par le jeu avant la copie de fin
-  d'image (à relever). Les réglages de RDR2 y lisaient de mauvais canaux : lissé des reflets pris dans la
-  normale, repère des personnages dans une cible R11G11B10 sans alpha.
-- **Corrections** : vecteurs de mouvement : avec plusieurs cibles RG16F, la première était prise (presque
-  vide dans Horizon : toutes les conventions à égalité) ; après trois mesures sans vainqueur, la suivante est
-  essayée (gardée dans `urti_calib.ini`, `motion_target=`). Repère des personnages réglable
-  (`person_mask=0` : aucun). Relevé des passes : deux instantanés au plus par image (une image réécrite à
-  chaque étape prenait toutes les places avant le G-buffer), 64 au total.
-- `urti.ini` d'Horizon : `person_mask=0`, `reflect=0` (reflets coupés tant que le canal de lissé n'est pas
-  trouvé).
-- **Génération d'images** (DLSS-FG, signalée par l'utilisateur) : pas active d'après le journal (une image
-  générée arrive sans dessin du jeu : on en verrait une sur deux). Mais une présentation sur six arrive sans
-  dessin compté et certaines captures d'étalonnage tombent sur 0 dessin : Decima enregistre sans doute ses
-  listes de commandes en avance, à cheval sur deux présentations (à examiner : URTI prend ces images pour
-  des images générées et y garde l'image RT précédente).
-- À faire : relever les cibles 1, 3, 4 (rugosité, métal) ; budget de géométrie adapté aux objets lourds
-  (structures par objet gardées d'une image à l'autre plutôt qu'une seule reconstruite) ; comptage des
-  dessins par présentation.
-
-## v72 — URTI : capture rangée dans l'ordre d'exécution ; génération d'images (DLSS-G) reconnue
-
-Suite d'Horizon Forbidden West, vers un URTI qui découvre le fonctionnement de chaque jeu au lieu de le supposer.
-
-- **Diagnostic** (compteur par liste de commandes : présentation de son premier dessin, présentation de son
-  exécution) : Horizon écrit **35 % de ses dessins avant la présentation précédente** (listes de l'image suivante
-  préparées en avance) ; RDR2 : 0 %. Rangés à l'écriture, les dessins mêlaient deux images : rang parmi les
-  dessins de même signature (donc identité) différent à chaque image, zones lues avant d'être remplies,
-  compteurs repris par d'autres dessins. D'où les objets qui entraient et sortaient de la scène RT (60 à 130 par
-  image), 80 à 110 nouvelles places par image, une scène RT gonflée de trous (4,2 M sommets pour 1,5 M de
-  budget, reconstruction 8,7 ms), des captures d'étalonnage à 0 dessin et une présentation sur six prise pour une
-  image générée.
-- **Capture dans l'ordre d'exécution** (événement `execute_command_list` de ReShade). À l'écriture, un dessin
-  capté reçoit seulement une zone dans la partie du flux de sa fenêtre d'écriture (trois parties tournantes par
-  emplacement) et un compteur de cette partie. À l'exécution de sa liste : rang, identité, place dans la scène
-  RT et présentation à laquelle il appartient. La conversion lit chaque place depuis sa zone du flux (les places
-  sont maintenant dans l'espace de la scène RT, plus dans le flux) ; place gardée sans être dessinée : laissée
-  telle quelle ; hors de toute place : triangle plat à l'origine. Compteurs de la partie suivante remis à zéro à
-  la fin de chaque image (avant toute liste écrite dans la nouvelle fenêtre). Liste exécutée plus de deux fenêtres
-  après son écriture : ignorée (jamais vu). Budget de géométrie par maillage (tous ses exemplaires) : l'identité
-  d'un exemplaire n'est connue qu'à l'exécution, le choix de capter se fait à l'écriture.
-- **Génération d'images** : activée par l'utilisateur dans Horizon (DLSS-G). ReShade est sous Streamline : il voit
-  deux présentations par image du jeu, sur la même file (le jeu exécute ses dessins sur une autre). Horizon ne
-  dessine jamais dans l'image présentée (image intermédiaire de Streamline), RDR2 si.
-  Règles :
-  - une présentation sans dessin exécuté n'avance pas la fenêtre de capture ;
-  - image générée = image où le jeu n'a pas dessiné ; sinon, quand les présentations alternent, celle qui suit
-    les dessins du jeu, car une génération par interpolation montre l'image fabriquée avant la vraie (URTI les
-    inversait : le mélange tombait sur la vraie image) ;
-  - le calcul RT se fait dès que les dessins sont exécutés ; l'image fabriquée reçoit le mélange de l'avant-dernier
-    et du dernier résultat, la vraie son résultat ;
-  - le rebond de lumière est gardé sur les images générées (coupé une image sur deux : clignotement).
-  Ordre « fabriquée d'abord » déduit du principe de l'interpolation, pas encore vérifié en mouvement.
-- **Mesures Horizon** (même endroit, génération d'images active) : tremble 1,91 % -> 0,04 %, saute 0,148 % ->
-  0,002 % ; nouvelles places 80-111 -> 9-15 par image ; refusés 100-460 -> 6-11 ; scène RT 4,2 M -> 2,0 M sommets ;
-  coût 9 -> 6 ms par vraie image (97 i/s affichées avec URTI, 137 sans). Mais l'effet tombe à 0,5 % des pixels
-  (8,5 % au premier essai) : 609 maillages et 14 M de sommets à l'écran pour un budget au plancher de 1,5 M, les
-  grandes structures en bois n'y entrent plus. Suite : structures par objet gardées d'une image à l'autre dans un
-  espace stable (mouvement de la caméra mesuré sur notre propre géométrie) au lieu d'une reconstruction à chaque image.
-- **RDR2, vérification de non-régression** (quai mouillé de Saint-Denis) : effet 10,2 %, tremble 0,01 %, saute
-  0,000 % (comme v70) ; 0 dessin en retard, 518 objets stables (0 nouvelle place, 0 entrée ou sortie par image),
-  64,6 i/s.
-- Horizon, restes : vecteurs de mouvement jamais départagés (toutes les cibles RG16F essayées) ; cibles 1, 3, 4 du
-  G-buffer jamais passées en lecture (le relevé ne peut pas les copier) ; touches envoyées ignorées par le jeu
-  (Entrée, F7 : fichiers déclencheurs à la place) ; « Continuer » repéré sur une capture du menu
-  (`urti_hfw_menu.py`, sa place change avec la ligne PlayStation Network), parfois deux clics.
-- Outils : `premier_plan.ps1` (le jeu est-il au premier plan, sans rien lire d'autre).
-
-## v73 — URTI : mouvement de la caméra mesuré sur notre géométrie ; plantage au passage HDR / Alt+Tab ; zone rendue (DLSS, résolution dynamique) ; loi de profondeur NaN
-
-- **Mouvement de la caméra sans le jeu** (module « mouvement » de l'auto-découverte). La conversion relève des
-  paires de sommets : position à l'image précédente et à celle-ci, pour les objets dessinés à la même place dans les
-  deux images. Elle en prend une quinzaine par objet, pour qu'un personnage qui suit la caméra pèse autant qu'un
-  rocher. Seuls comptent les dessins directs d'un seul exemplaire, dont le maillage n'est dessiné qu'une fois dans
-  les deux images : Horizon trie ses dessins, et le n-ième exemplaire d'un maillage n'est pas le même objet d'une
-  image à l'autre. `live_camfit` fait l'ajustement rigide (méthode de Horn), robuste, repris cinq fois en écartant
-  ce qui bouge ; il repart de l'immobilité si la caméra change d'allure. `live_mvsynth` fabrique les vecteurs de
-  mouvement à partir de ce mouvement et de la profondeur (convention 0).
-  - Bascule automatique quand ceux du jeu restent illisibles : deux cibles essayées sans vainqueur, ou 3 s de
-    caméra en mouvement (notre mesure) sans convention trouvée. Réglage `motion_source=` : 0 automatique, 1 jeu,
-    2 nôtres. Gardé dans `urti_calib.ini` (`motion_source=camera`).
-  - Bac à sable (caméra qui marche, vérité connue) : translation mesurée 2,7 cm par image, exactement la marche
-    du script. Accumulation aussi bonne qu'avec les vecteurs du jeu : scintillement ajouté +0,045 % contre
-    +0,046 %, points qui sautent 0,514 % contre 0,522 %.
-  - Horizon : encore trop bruité (caméra presque immobile, 3 à 6 cm par image et 3 à 14 cm d'écart). Le filtre
-    « un seul exemplaire » vient d'être ajouté (écart 34 mm) ; pas encore satisfaisant.
-- **Plantage au passage en HDR ou à l'Alt+Tab** (signalé par l'utilisateur) : l'image d'écran recréée change de
-  format (RGBA8 -> RGB10A2). Les photos d'avant l'interface étaient copiées avec l'ancienne disposition, d'où une
-  copie invalide, une liste de commandes refusée (E_INVALIDARG) et le plantage. La liste des images d'écran gardait
-  aussi les adresses d'images détruites.
-  - Corrigé : disposition reprise à chaque changement de format ou de taille, copie sautée si elle ne correspond
-    pas, liste des images d'écran refaite à chaque image.
-  - Vérifié : Horizon passe en HDR sans planter (plusieurs lancements). L'Alt+Tab lui-même n'est pas encore
-    retesté.
-- **Zone rendue** : avec le DLSS et la résolution dynamique, Horizon dessine en 1280×720 à 1704×960 dans des
-  cibles de 2560×1440. URTI lisait toute la cible : ombres et reflets étirés de 1,5 fois.
-  - La zone rendue est maintenant la plus grande des zones de dessin fréquentes des dessins de l'écran (repères 3D
-    pleine taille et passes à mi-résolution écartés). Elle est comptée à l'exécution et ne change qu'après dix
-    images de suite. Les images restent allouées pleine taille.
-  - Vérifié : 1704×960 stable dans Horizon. Réglage d'essai : `render_area=0`.
-- **Loi de profondeur NaN** dans `urti_calib.ini`, écrite au moment de la bascule des vecteurs de mouvement. Relue
-  au lancement, elle rendait chaque point invalide, et l'envoi du soleil la marquait valide : plus d'occultation
-  ni de reflet dans Horizon (vue de diagnostic toute blanche).
-  - Corrigé : jamais écrite, jamais relue, jamais adoptée si elle n'est pas finie ; l'envoi du soleil ne la
-    marque plus valide. Le fichier d'Horizon est réparé (dernière loi valide).
-  - Retour de l'occultation : pas encore vérifié.
-- **Reflets de l'eau** (demandés par l'utilisateur) : la surface de l'eau n'est pas dans la profondeur que lit URTI.
-  Le marais est dessiné après, transparent : URTI y voit le fond (mode « sol mouillé » : poids mouchetés sur l'eau).
-  Le relevé des passes devant l'eau est fait. Prochaine étape : trouver la couche où le jeu écrit la surface de
-  l'eau (module « surfaces transparentes »).
-- Le script d'Horizon : bonne détection de la partie (motif sans accent : le script est lu en ANSI).
-
-## v74 — URTI : reflets de l'eau (couche des surfaces transparentes planes) ; effet qui disparaissait toutes les cinq secondes ; ombres vérifiées en HDR
-
-- **Effet qui disparaissait et revenait toutes les quelques secondes** (signalé par l'utilisateur) : sans carte
-  d'ombres du soleil reconnue, l'étalonnage complet échouait et recommençait toutes les 480 images ; la capture de
-  la scène RT s'arrêtait pendant ce temps. Il n'est plus relancé quand les ombres RT du soleil sont coupées (réglage
-  par défaut) et la loi de profondeur connue (mesurée aussi à chaque image). Horizon : un seul étalonnage par
-  lancement.
-- **Ombres (occultation) dans Horizon** : vues blanches dans les captures d'écran de Windows, qui écrêtent une image
-  HDR. Les valeurs brutes de la rafale, décodées (PQ), montrent l'occultation (feu de camp, rocher, sol : jusqu'à
-  35 %). La loi de profondeur mesurée à chaque image est valide (1,07e-6 + 0,177 / w) ; elle est maintenant écrite
-  dans le journal.
-- **Reflets de l'eau** (module « surfaces transparentes » de l'auto-découverte). Horizon dessine son eau à
-  mi-résolution, dans ses propres images et sa propre profondeur (relevé des passes devant le marais : 17 dessins
-  en 1280×720, deux images R11G11B10 et une R32F, la surface du marais visible sous une ligne d'horizon). Elle
-  n'est jamais dans la profondeur principale : URTI y voyait le fond.
-  - Capture à part (couche 2 de la scène RT, masque 2) de deux sortes de dessins :
-    - sur la profondeur principale, ceux qui testent la profondeur sans l'écrire, hors du G-buffer choisi ;
-    - tous ceux d'une autre vue de la caméra (même forme que l'écran, résolution réduite).
-  - Conversion dans leur propre tampon (1,5 M sommets au plus) ; ces zones sont adressées dans tout le flux.
-  - `live_planes` garde les surfaces planes (normales alignées, sommets près du plan moyen, plus d'un mètre, pas
-    tournées vers la caméra comme une particule) et rend le reste invisible aux rayons (NaN) : fumée,
-    particules, volumes de lumière, ciel.
-  - Le rayon de la caméra des reflets cherche cette couche devant le point de la profondeur : le reflet part alors
-    de la surface d'eau, avec la normale de son triangle, lisse.
-  - Tous les autres rayons (occultation, ombres, cache, reflets) ne voient que la couche 1.
-  - Horizon, devant le marais : 225 dessins transparents par image, 15 surfaces planes gardées (58 000
-    triangles), eau trouvée sur 9,5 % de l'image (vue des poids), part appliquée pleine sur l'eau.
-  - Essai miroir parfait (`reflect_f0=1`) : le marais renvoie les arbres. Mais le reflet est en gros blocs, et des
-    taches apparaissent sur la berge (sol au niveau de l'eau).
-  - Avec le Fresnel normal de l'eau, de nuit dans la brume, l'effet est discret (le jeu a déjà ses propres
-    reflets) : à revoir de jour.
-  - `urti.ini` d'Horizon : `reflect=1`, `material_slot=7` (pas de canal de matériau : seule l'eau reflète).
-    Réglage `water=0` : pas de couche transparente.
-- Le critère « mélangé à l'image » ne suffisait pas : l'eau d'Horizon calcule sa réfraction elle-même et écrit sa
-  couleur d'un bloc. Relevés en jeu : environ 1 300 dessins « profondeur testée, pas écrite » par image (le passage
-  principal redessine la scène dans le G-buffer après une passe de profondeur), dont 110 mélangés ; pas de
-  tessellation.
-- « Continuer » d'Horizon : repéré par les lignes repères du menu à plusieurs seuils (captures HDR délavées), pas
-  par le nombre de lignes ; l'écran des sauvegardes est refusé (un clic de secours y avait ouvert la liste).
-- Pas encore vérifié : RDR2 avec la couche transparente (non réinstallé ; RDR2 garde la version vérifiée en v72),
-  les blocs du reflet de l'eau.
-
-## v75 — URTI : cache de géométrie (toute la forêt d'Horizon dans la scène RT) ; reflet de l'eau au masque du jeu ; causes du « filtre / pas filtre »
-
-Essais faits dans le jeu, Horizon Forbidden West au feu de camp du marais (nuit, brume, DLSS + DLSS-G + HDR).
-
-- **Mauvaise profondeur choisie pour toujours (bogue de v74)** : les dessins des autres vues passaient en « transparents »
-  et ne comptaient plus pour choisir l'écran principal ; une mauvaise profondeur choisie juste après le menu le restait.
-  La scène RT tenait 15 objets au lieu de la forêt. Choix sur une moyenne glissante, tous les dessins comptés.
-- **Compteurs de capture effacés (cause d'objets vides au hasard)** : la remise à zéro des compteurs de la fenêtre suivante
-  s'exécutait à la fin du calcul, sur la file des présentations, pendant que le jeu dessinait déjà sur la sienne. Remise à
-  zéro une fenêtre à l'avance, quatre parties du flux au lieu de trois. Couche de surfaces : 13 % -> 97 % des fenêtres
-  complètes. Barrière GPU ajoutée entre la file du jeu et celle des présentations (`queue_sync=0` pour la couper).
-- **Cache de géométrie** : le budget par image ne tenait que 37 maillages sur 535 (14 M de sommets à l'écran, reconstruire
-  2,5 M coûte 5 ms). Chaque objet hors du budget, capté à son tour (500 000 sommets par image), a maintenant sa propre
-  structure, gardée dans une réserve de 1 Go (tampon circulaire) et posée dans la structure de tête par la pose de la
-  caméra. Environ 1 000 objets et 3 à 4 M de triangles dans la scène, 250 Mo. `geo=0` pour le couper, `geo_mb=` pour la réserve.
-- **Pose de la caméra sans dérive** : accumuler le mouvement image par image dérivait jusqu'à 0,9 m caméra immobile (chaque
-  image sans mesure perdait un morceau du décalage sous-pixel du jeu). Des témoins (petits objets immobiles, à plus de 4 m,
-  captés à chaque image) gardent seize points de référence dans le repère du cache (`live_refpairs`) ; la pose est recalée sur
-  eux. Immobile : stable à 3 cm près ; 96 témoins, environ 900 paires par image, mouvement mesuré sur 290 images sur 300.
-- **Reflet de l'eau au masque du jeu** : les pistes « couche transparente » (v74) et « nappe plane » étaient fausses : les
-  surfaces planes trouvées sont des tuiles de terrain (19 000 triangles, à 1,89 m sous la caméra), des plaques de brume (les
-  grands rectangles sombres vus à l'écran) et des dalles sous le terrain. Un recensement de tous les dessins montre qu'il n'y a
-  pas de dessin d'eau à part ; le relevé des passes montre que la 5e cible du G-buffer (format 28), à sa dernière écriture
-  (en calcul), vaut exactement 0 sur l'eau, contours de l'herbe compris. `urti.ini` d'Horizon : `material_slot=4`,
-  `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`. La copie du matériau se fait à la fin de la dernière écriture
-  en calcul, sinon la copie du G-buffer de l'image suivante l'écrase. Couche transparente coupée par défaut (`water=1` pour
-  la remettre) : elle coûtait du temps et faisait les faux reflets.
-- **Reflet accepté dans deux cas de plus** : rien de touché et l'écran montre du lointain (plus de 20 m : forêt noyée de brume) ;
-  point touché derrière un autre objet lointain (feuillage en profondeur : même matière, même brume). Le jeu seul fait ici
-  des pavés verts pixelisés ; avec URTI, un miroir continu.
-- **Causes du « filtre / pas filtre »** : (1) le reflet était coupé sur chaque image crue générée, une présentation sur deux ;
-  (2) la loi de profondeur mesurée à chaque image était fausse (0,08 à 0,13 au lieu de 0,19 : elle fait la moyenne de sommets
-  qui n'ont pas tous la même loi), le reflet décrochait sur tout le lac par séries d'images : une loi connue prime maintenant
-  (`depth_law_fixed=`) ; (3) le masque était coupé après 2 présentations sans calcul, le rebond après 1 (8 maintenant) ; (4) le
-  budget tombait de 105 à 27 objets quand une fenêtre contenait deux images du jeu (hausse limitée à 25 % par fenêtre).
-- **Occultation** : réglages d'Horizon `ao=1`, `ao_radius=2.5`, `ao_rough=1` (l'herbe reçoit l'occultation, pente d'ensemble ;
-  surfaces rugueuses à moins de 20 m : au-delà, un grain sombre par-dessus la brume).
-
-Mesures, Horizon, réglages finaux, trois rafales, caméra immobile : effet 23 à 26 % des pixels (ombres 18 à 20 %, reflets 5 à
-7 %), tremble 3,8 à 6,8 %, saute 0,3 à 1,3 % (encore loin de RDR2 : forêt au vent, personnage qui bouge, brume) ; 300 présentations
-sur 300 avec l'effet, reflet jamais coupé (0 sur 120 images relevées). Caméra qui tourne : effet qui suit le lac, sans coupure. Vrai Alt+Tab, aller et retour, deux fois : pas de plantage, effet stable juste
-après (15,4 / 15,5 / 15,5 %, sans `ao_rough`). GPU par image réelle : structure du cache 2,3 ms, structure de l'image et
-soleil 2,9, ombres 5,3, reflets 0,9, composition 1,6, soit 13 ms ; 137 -> environ 77 images présentées par seconde.
-
-RDR2 (mode histoire, quai au crépuscule, autre lumière que la mesure à 10,2 % de v72, donc effet non comparable) : effet 0,9 %,
-tremble 0,09 à 0,13 %, saute 0,04 à 0,06 %, 63,7 images par seconde (64,6 en v72), identique avec `geo=0`, pas d'artefact vu.
-Add-on installé, ancien gardé en `urti.addon64.avant_v75`.
-
-Outils : `urti_hfw_test.sh` : `URTI_FORCE`, `URTI_BURSTS`, `URTI_PASSES`, rafales `tourne*`, captures `ecran*` (au rythme réel, une
-rafale gèle le jeu), `alttab*` ; `urti.ini` toujours remis ; arrêt sans clic si Steam Cloud attend une réponse (une perte de
-connexion de Steam a bloqué un lancement sur « Jouer quand même ») ; `alt_tab.ps1`. Diagnostics : `motion_log=1` (mouvement,
-couche, recensement des dessins, planéité des objets), `reflect_diag=`, `trace_draw=`, vue 5 : rouge = point reflété caché.
-
-Pas encore vérifié : joueur qui marche ou court (le jeu ignore les touches injectées : seule la rotation de la caméra est
-essayée), voyage rapide et cinématiques (vidage du cache), plein jour (ombres du soleil), autres eaux (rivière, mer) ; le masque
-à 0 de la 5e cible n'est relevé que dans ce marais. Le reflet est un miroir plat : pas encore les vaguelettes de la normale du
-G-buffer. Réglages d'Horizon dans `urti.ini` : la reconnaissance automatique du masque d'eau reste à faire pour les autres jeux.
-
-## v76 — URTI : la caméra du jeu lue dans sa mémoire au lieu d'être déduite de la géométrie (Horizon : « tout saute », effet / pas effet)
-
-Retour de jeu après v75 : « tout saute dans tous les sens, effet / pas effet, ça tremble de partout ». Les essais de v75 n'avaient
-vu que la caméra immobile ou qui tourne en rafale ; le journal de la partie du joueur, lui, montre ce qui se passe quand on bouge :
-
-- **Mouvement mesuré sur les témoins** : valide sur 91 à 188 images sur 300, écart de 460 à 870 mm, 46 à 70 % des paires gardées ;
-  encore 320 mm à l'arrêt ensuite (les points de référence relevés pendant une pose fausse restent faux).
-- **Cache de géométrie vidé** une à deux fois par fenêtre de 300 présentations (« mouvement impossible à mesurer ») : effet / pas effet.
-- **Champ de vision « corrigé » huit fois en une minute**, de 39° à 58° (vrai : 43,0°) : à chaque fois, toute la géométrie changeait
-  d'échelle. La condition (assez de rotation) n'est jamais remplie caméra immobile : aucun essai ne pouvait le voir.
-
-Remède : ne plus deviner. Une recherche dans les tampons visibles du processeur (`urti_camscan.inl`, fichier `urti_camscan` à côté
-de l'add-on) a trouvé un tampon de constantes de 512 octets, écrit avant la création de sa vue, plusieurs fois par image :
-`+240` projection par colonnes (`p00 0 0 0`, `0 p11 0 0`, `jx jy a -1`, `0 0 b 0`, avec `jx`, `jy` le décalage sous-pixel du DLSS),
-`+304` caméra vers monde (droite, haut, arrière, position). `urti.ini` : `camera_cb=512` (réglage d'Horizon, lu au chargement) ;
-`camera=0` revient à l'ancienne mesure. Crochet sur `CreateConstantBufferView` : seules les vues de cette taille sont relues (environ
-45 par image). Le dessin capté retient le numéro de la caméra en cours, le calcul prend le plus récent de sa fenêtre.
-
-Pose, mouvement (vecteurs fabriqués), champ de vision et loi de profondeur viennent maintenant de cette caméra, à chaque image. Plus
-de témoins, de vidage pour mesure impossible ni de correction du champ. Le décalage sous-pixel est retiré des sommets mis en cache
-et remis dans la pose de chaque image. `motion_log=1` garde la mesure sur les témoins, à part, comme vérification indépendante.
-
-Le jeu accepte une touche maintenue, par code matériel (`hold_key.ps1`, seulement si le jeu est au premier plan) : les rafales
-`marche*` et `course*` font enfin avancer le personnage.
-
-Mesures, Horizon, marais de nuit, rythme réel, `motion_log=1` (écart de la caméra lue avec les témoins, médiane / 95 %) :
-
-| Phase | Correction | Rotation | Paires gardées | Images par seconde |
+## v35 — URTI: alpha-tested foliage (holes recognised by the camera and by the sun)
+
+- Why RDR2's foliage "jumps" and the sandbox's does not: games draw foliage (grass, fringes, fences) as cards whose
+  texture cuts out the leaves (alpha test). URTI captures the geometry, not the texture: to it, each card is a full
+  rectangle; a ray that hits a hole is rejected (the reflection disappears) or casts a rectangular shadow, and the wind
+  makes it alternate.
+- Sandbox: foliage as crossed cut-out cards (screen, shadow map, ground-truth mirror), `URTI_SANDBOX_LEAVES=blocs` for
+  the old one; the tree test framed with its reflection in the puddle; realistic shadow map (depth over 400 m, bias of
+  40 D16 steps instead of 600: ~25 cm instead of several metres). The defect is reproduced: the tree's reflection full
+  of holes and made of rectangles (`results/urti/bac_a_sable/feuillage/`).
+- Fix (`alpha_screen=1`, default): every triangle a ray meets is examined.
+  - On screen: if the camera sees further than this point (or the sky), it is a hole: the ray goes on.
+  - Off screen (shadows of the canopy above the camera): the game's shadow map is the sun's view, alpha test included;
+    the point is a hole if the first occluder it recorded is at least halfway between it and the receiver (the game
+    records its occluders a bit further than they are: a fixed threshold made every RT shadow disappear, seen in the
+    mask and fixed). The game's map is therefore also copied outside combined mode (+0.17 ms).
+- Measurements (with the cards): walk, jumps 1.294 → 1.177 %, blinking 0.952 → 0.853 %, deviation from truth 1.14 →
+  1.01 %; tree, deviation 2.67 → 2.46 %. The 7 scenes: `suite/tableau_v35.txt` (the sandbox changed: foliage and shadow
+  map, so earlier tables do not compare line by line).
+
+## v36 — URTI: reflection "popping" fixed, acceleration structure half as expensive
+
+- In-game feedback: reflections no longer go in every direction but appear and disappear in a loop, very fast. New
+  diagnostic view 9 (share of the RT reflection actually applied) and a measurement of toggles
+  (`tools/reshade/urti_sandbox_popping.sh`: the share changes by more than 0.3 from one frame to the next; round trip:
+  one way, then straight back). Walk: 0.404 % round trips of reflecting pixels per frame, concentrated in foliage,
+  cables and windows.
+- Cause 1: the "wet floor" mode (on by default in RDR2) made smooth any surface whose depth normal points up; in foliage
+  that normal is noise, and the pixel became reflective every other frame. Wet mode now applies only to a flat surface
+  (points 4 pixels away on each side, on each axis, aligned with it): 0.404 → 0.276 %.
+- Cause 2: a smooth surface whose reflected point is hidden or off screen (a window reflecting the other side of the
+  street at a grazing angle, leaves) dropped to zero, then came back as soon as it was visible again. It is now missing
+  data (negative weight): stabilisation keeps the history, which fades (× 0.9 per frame), and the clamp counts only
+  known neighbours: 0.276 → 0.140 % (−65 % in total). Against ground truth, no trail: walk, jumps 1.177 → 1.133 %,
+  blinking 0.853 → 0.802 %, deviation 1.01 → 0.98 %; other scenes equal or better (`suite/tableau_v36.txt`).
+- Speed: the acceleration structure was built over the whole reserved capacity (8.4 million vertices in RDR2), empty
+  part included; it now covers only the frame's vertices. And as long as the list of draws is the same as at the last
+  build, it is updated (refit) instead of rebuilt, with a rebuild at least every 8 frames (`blas_refit=`, 0: always
+  rebuild). Sandbox: 0.65 → 0.35 ms, identical image; the log now gives vertices per frame and the number of rebuilds
+  and updates.
+
+## v37 — URTI: geometry budget, learned sizes, the game's UI spared
+
+- RDR2's log (v36) showed it: **8,388,605 vertices out of 8,388,608** — the capture slot is full every frame. Later
+  draws are refused, but small ones still get in: the objects in the RT scene change from frame to frame (jumping
+  shadows and reflections), the structure covers the whole capacity (no speed gain) and the list always changes
+  (0 updates). The sandbox (122,000 vertices) could not show it.
+- **ExecuteIndirect**: each draw reserved 65,536 vertices (count unknown before the draw). Size now learned per
+  identity (measured, + 25 % and 64 of margin). Sandbox: demand goes from 122,000 to 60,000 vertices — half of the slot
+  was empty.
+- **Geometry budget** (`vertex_budget=`, 4 million by default; 0: none): each captured object is measured on the GPU
+  (`live_regionstats.hlsl`: minimum distance and size in camera space); only the most important (apparent size) enter
+  the RT scene, with a 30 % bonus for those already in (no back and forth); an object too big for the remaining room is
+  skipped. Objects outside the budget are not captured at all (fewer replayed draws) and are re-measured in rotation in
+  a measurement area at the end of the slot, outside the structure (`probe_budget=`, 1 million vertices per frame): an
+  object you walk toward gets in. The budget applies only to the main screen (a second depth pass, like the sandbox's
+  half-resolution one, changed the main screen); identities are computed before any refusal (they slid when the slot
+  was full).
+- Saturation reproduced (`slot_limit=`: smaller slot): walk, jumps 1.133 → 1.402 % without budget; with the budget, the
+  image is closer to the ideal (deviation 1.16 → 1.08 %, added flicker +0.067 → +0.021 %). In the sandbox the refused
+  draws are always the same; in RDR2 they change, and that instability is what the budget removes: to be confirmed in
+  game (the log now gives reserved vertices, objects in the RT scene, out of budget, re-measured, refused).
+- **The game's UI** (menus reflected on the ground): reflections read their colours from the final image, UI included,
+  and the composition drew shadows and reflections over the menus. URTI now takes a snapshot of the screen at the first
+  draw of each binding of the screen image (up to four per frame); `live_uicompare.hlsl` counts the pixels of each
+  snapshot identical to the final image; the first snapshot more than 60 % identical is the image before the UI.
+  Reflections read their colours from it, and the pixels that differ (the UI) are left untouched. Sandbox with a UI
+  (minimap, bars, a menu open 2 s out of 4): snapshot 0 found on its own (88.7 % identical); without it, the menu is
+  reflected on the ground and the reflected scene goes over it; with it, the menu is clean
+  (`results/urti/bac_a_sable/interface/`). `ui_photo=0` to compare.
+- 7 scenes equal or better (`suite/tableau_v37.txt`); popping 0.138 %.
+
+## v38 — URTI: stable identities, budget respected, without OptiScaler
+
+- Log of the v37 session in RDR2: budget without effect (8.37 million vertices reserved, ~200 draws refused per frame)
+  because of **120,000 identities for ~800 objects on screen**: the identity included the instance count and the first
+  instance, which change every frame (instanced vegetation). It now keeps only the mesh (index or vertex count, start
+  in its buffers); for an ExecuteIndirect, its command signature; plus the rank. Sandbox: 381 measurements in memory.
+- Budget respected: an unknown object enters the RT scene only while the budget allows; beyond that it is measured in
+  the measurement area (within its per-frame limit). Saturation reproduced: 30,697 vertices for a budget of 30,000,
+  0 draws refused.
+- Snapshot before the UI: in RDR2 the rank of the right snapshot changes from frame to frame (the game records its
+  commands on several threads). Chosen on the GPU in the same frame (`live_uiselect.hlsl`): a snapshot of this frame
+  (more than 60 % identical to the final image and closer to it than to the previous displayed image, otherwise it is
+  an old image), the least identical one (the earliest, with the least UI); copied into a buffer that reflections and
+  composition read.
+- "One frame in two": OptiScaler had frame generation on (`FGOutput = DLSSG`); URTI applied only to real frames. The
+  user removed it.
+- **Crash at startup without OptiScaler** (ucrtbase, 0xc0000409): ReShade, loaded directly (`dxgi.dll`), unloads and
+  reloads add-ons for every device RDR2 creates at startup to test the card; the function-table entries replaced by
+  URTI (`CreateRootSignature`, `ExecuteIndirect`) then pointed to the code of an unloaded add-on. They are now restored
+  when the add-on unloads. Checked: the game starts (`tools/reshade/rdr2_demarrage.ps1`: click-free start, watches
+  processes and crashes).
+
+## v39 — URTI: NVIDIA denoisers (NRD / SIGMA) integrated; jitter, cause of the remaining shimmer
+
+- **NRD 4.17.3** (NVIDIA, RTX SDK license, which allows integration into an application; sources and libraries
+  outside the repository, in `urti/third_party/NRD`, built with NRI statically, DXIL shaders only, **without Agility
+  SDK support**: otherwise NRI calls `ID3D12Device15::TryCreate…View`, missing from the system's DirectX 12
+  (`ID3D12Device14`) → writes anywhere, crash in D3D12Core). CMake includes it if it is built (`URTI_NRD`).
+- Integration (`urti_nrd.inl`, setting `nrd=1`): SIGMA (shadows) through the NRDIntegration layer on NRI, which wraps
+  the game's D3D12 device, its command queue and our textures (classic barriers). Inputs: `live_shadow` in SIGMA mode
+  (one ray per pixel, penumbra = occluder distance × tan of the sun's radius, and the weight of URTI's corrections),
+  `live_nrdprep` (linear depth, normals encoded with `NRD_FrontEnd_PackNormalAndRoughness`), the game's motion vectors
+  as they are (scaled according to their convention). NRD runs on its own command list (it installs its descriptor
+  tables: nothing leaks into ReShade's state), submitted between our passes; `live_nrdpost` rebuilds the mask. A crash
+  inside NRD is caught (symbolised call stack in the log) and URTI falls back to its own denoising; debug symbols are
+  generated in Release.
+- Measurements (sandbox): SIGMA is **worse** than URTI's denoising (tree in the wind, blinking 0.115 → 0.301 %; walk
+  0.801 → 0.929 %); disocclusion threshold, number of frames, sun size: no effect. **Without sub-pixel jitter**
+  (`URTI_SANDBOX_JITTER=0`), the tree in the wind becomes almost perfect with both (URTI 0.000 %, SIGMA 0.010 %): the
+  remaining shimmer of a still scene comes from the game's **jitter** (DLSS / TAA). URTI computes on the jittered depth
+  and composes on the already stabilised image; NRD requires that offset (`cameraJitter`), which URTI does not know.
+  SIGMA off by default for now.
+- Lead: the jitter shows up in the frame-to-frame transform measured by the cascades (live_sunvote) as a shear,
+  separable from the rotation (`A[0][2] + A[2][0]`, `A[1][2] + A[2][1]`).
+
+## v40 — URTI: the game's sub-pixel jitter and field of view measured and compensated
+
+- The game's sub-pixel jitter (DLSS / TAA) is measured every frame without knowing anything about the game: the
+  jittered projection adds a shear to camera space, x' = x + a w, y' = y + b w; the frame-to-frame transform measured by
+  the cascades is A = K_prev S R S⁻¹ K_cur⁻¹. To first order, a_prev − a_cur = A[0][2] + s² A[2][0] (b with t²), where
+  s, t are the stretch of URTI's camera space (assumed field of view) relative to the real one. s² and t² are measured
+  by regression (decaying sums) on frames where the camera turns: without them, the rotation leaked into the
+  measurement (~16 pixels of drift while walking). Absolute offset: sum of the differences minus its running mean (a
+  game's sequence is centred); sandbox: ±0.4 pixel, the 8-frame Halton cycle recovered.
+- **The game's field of view measured** (s = tan(true fov / 2) / tan(assumed fov / 2)): sandbox 54.9° to 55.1° for 55°
+  (URTI assumed 50°). Logged; not yet fed back into the projection.
+- Compensation (`jitter=2` by default; 1: the difference only, 0: nothing): the composition reads mask and reflections
+  at the unjittered position (the presented image is stabilised by the TAA), reflections take their colour at the
+  unjittered position, histories are reprojected with the jitter difference. Realigning only the history is worse (it
+  then follows the jitter instead of averaging it).
+- 7 scenes, all better (`suite/tableau_v40.txt`): blinking building 0.077 → 0.003 %, still tree 0.124 → 0.054 %, tree
+  in the wind 0.115 → 0.050 %, character 0.076 → 0.034 %, fixed camera 0.098 → 0.081 %, occlusion 0.126 → 0.081 %,
+  walk 0.801 → 0.803 %.
+- `jitter_log=1`: jitter measured every frame in the log.
+
+## v41 — URTI: ExecuteIndirect geometry reserve learned per signature
+
+- First v40 session in RDR2 (launched by URTI): the game starts, field of view measured 49.5° to 53.8° (it varies:
+  aiming, camera), 49 to 53 fps. New summary of the largest objects: **ExecuteIndirects reserve 65,535 vertices and
+  write 0 to 10,000** (86289/86289 65535/2787 65535/10242 65535/0…): out of 8.3 million reserved vertices, 1.3 to 1.5
+  million written — over 80 % of the slot is empty, hence its saturation (50 to 230 draws refused per frame) and the
+  structure's cost.
+- Learning per identity did not take: the order of ExecuteIndirects changes from frame to frame in RDR2. Size now
+  learned **per command signature**: the largest number of vertices written by its draws (decays by 2 % per frame); a
+  region filled to the end (truncated) doubles the learned size; reserve = learned size × 1.25 + 64. Sandbox unchanged;
+  to be checked in RDR2.
+
+## v42 — URTI: wet floor removed, field of view corrected on its own, ExecuteIndirects identified by their arguments
+
+- In-game feedback: the wet floor added by URTI is buggy (RDR2 has no such look); reflections sometimes seem to "float
+  above" the puddles. Wet floor off by default (`UrtiWet` = 0 in urti.fx; the setting stays for testing).
+- **URTI's projection corrected with the measured field of view** (`fov_auto=1` by default): when the measurement is
+  reliable (enough camera rotation) and differs by more than 3 %, p11 is corrected by 80 % of the difference, the
+  measurement restarts from zero and the next 6 readings (three frames of latency) are ignored. Sandbox: 50.0° → 54.1° →
+  54.9° (true: 55°), stable. In RDR2 the measured field varies from 49.5° to 60.6° (aiming, camera). With exact angles,
+  the floor's normal and the reflection direction are no longer skewed. Suite: walk, deviation from truth 0.96 →
+  0.90 %, added flicker +0.054 → +0.025 %; other scenes equal or better (`suite/tableau_v42.txt`).
+- Log of the v41 session: the reserve was still full ("65536/22176 65536/65535 65536/0"): one command signature serves
+  ExecuteIndirects of every size, and its maximum imposed 65,536 vertices on all of them. Identity of an
+  ExecuteIndirect: signature, argument buffer and position in that buffer (no more rank); size learned per identity
+  (0 included: reserve of 66 vertices); a region filled to the end goes back to the maximum reserve, and the next
+  measurement gives the true size again.
+
+## v43 — URTI: shadows remove only sunlight; the game's shadow map finally read correctly
+
+- Request: a shadow is the sun's visibility; it must remove only direct light, not darken the whole colour
+  (`c *= 1 - strength × (1 - mask)`, same proportion everywhere, even in overcast weather).
+- **Sun share measured in the game's image** (`live_sunlight.hlsl`, on every present, before the composition): one
+  point drawn per 4×4 block of render pixels, facing the sun (N·L > 0.2), closer than 100 m, clearly lit or clearly in
+  shadow in the game's map (5×5 neighbourhood in the same state); a partner 10 pixels away on the same plane, in the
+  other state. Ratio of the image's colours: shadowed / lit = sky / (sky + sun × N·L), hence x = sun / sky per channel
+  and in luminance, accumulated in histograms (log2, quarter octaves) in the sun buffer (bytes 1232 to 1887), median
+  read on the CPU, smoothed in log (5 % per frame). Fewer than 32 pairs: value kept.
+- **Physical shadow**: the mask removes x N·L / (1 + x N·L) of the luminance (instead of the fixed slope
+  min(1, 2.5 N·L)); the composition applies it per channel with the measured tint (the sun is warmer than the sky: the
+  shadow turns blue like the game's). `UrtiStrength` = 1 by default: as dark as the game's shadows. `sun_measure=0`:
+  old rule.
+- **Bug found: the game's shadow map was read wrongly from the start.** RDR2 (and the sandbox) store it as R16 (format
+  53, two bytes per texel); URTI read four bytes as a float: absurd values, reads off the rows. Affected: the mode
+  "only the shadows the game lacks" (decided at random pixel by pixel, moving with the cascades: a likely cause of the
+  wriggling shadows in game, where that mode is chosen) and the off-screen foliage-hole test. 16-bit read added (bit 32
+  of `live_shadow`'s flags).
+- **Combination with the game's shadow**: lit share filtered over 3×3 texels (its penumbra included) and final
+  visibility = the lower of the two (URTI removes max(0, game − RT)), instead of multiplying by a game shadow widened by
+  two texels (all or nothing). Default mode: "only the shadows the game lacks" (`UrtiMode` = 1): "full" mode removes the
+  sun twice where the game already shadows. `game_min=0`, `game_dilate=`: old combination, for testing.
+- Bug avoided: a `float3` in the composition's constants, moved to the next 16-byte boundary, received only red: three
+  separate numbers.
+- **New test** `tools/reshade/urti_sandbox_ombres.sh`: the "game's" map forgets poles, posts, wall, carts and
+  passers-by (`URTI_SANDBOX_GAMESHADOW=partiel`); it is compared with the launch where the game shadows them (dry
+  ground, reflections off). Forgotten shadow recovered, before → after: street 56 → 90 %, occlusion 57 → 91 %, walk
+  55 → 68 %; darkness in the street (RT light / game, red green blue) 2.5 1.9 1.6 → 1.08 1.12 1.11 (right tint);
+  deviation outside the area 1.9 / 1.3 / 0.5 → 0.15 / 0.11 / 0.19 % (no more double shadow); flicker in the area while
+  walking 6.4 → 5.2 % (`ombres/tableau_avant.txt`, `ombres/tableau_v43.txt`). Sun / sky measured in the sandbox: 4.5
+  (red 5.8, green 4.3, blue 3.0).
+- Reflection suite (ground truth = game shadows only): deviation building 2.13 → 0.08 %, passers-by 1.60 → 0.47 %, walk
+  0.90 → 0.60 % (jumping 1.10 → 0.50 %, blinking 0.81 → 0.57 %), occlusion 1.32 → 0.36 % (`suite/tableau_v43.txt`).
+- Left: while walking, thin and distant shadows (poles, cables) are over-smoothed (68 %).
+
+## v44 — URTI: RT reflections only on flat surfaces; RDR2's shadow map does not match
+
+- In-game feedback (v43, a Saint Denis garden in the sun): reflections still shake, things jump, **trees have blurry
+  grey dots that shake**, and shadows make **no difference** on or off. Log: sun / sky measured 0.06 to 0.16 (6 to 13 %
+  of the light removed: invisible shadows) while the scene has sharp shadows; 50 to 115 objects out of ~800 in the RT
+  scene; 48 fps, ~7 ms of URTI per frame. Player's preset at the end: "full RT shadows" mode, strength 1.
+- **Grey dots**: RT reflections landed on every surface the game declares smooth (hair, leaves, skin); the depth
+  normal there is noise, the reflection went anywhere and blinked (seen on the character's neck in a capture). The
+  flatness check (until now reserved for the wet floor) now applies to every reflection: neighbours 2 pixels away (at
+  4, in the distance they fell on another object: jumps while walking 0.50 → 0.91 %), and a surface is refused only if
+  it has relief in both directions (the edge of a puddle against a wall stays flat). Sandbox (exactly reproducible:
+  check off = v43 to the digit): jumping / blinking, walk 0.501 / 0.565 → 0.484 / 0.557 %, trees in the wind
+  0.019 / 0.041 → 0.016 / 0.036 %, fixed street 0.066 / 0.075 → 0.057 / 0.063 %. The game keeps its own reflections on
+  refused surfaces.
+- **RDR2's shadow map does not match** what URTI expects (session launched by URTI in the bayou, overcast): check added
+  in `live_sunlight` (points facing the sun that the map says lit / shadowed / on the edge / outside the cascades, mean
+  luminance of the first two): **100 % on the edge**; the "recomputed game shadow" view is white everywhere. In the
+  sandbox: 65 % lit, 31 % shadowed, luminance ratio 5.9. The depth test in RDR2's map could never be checked (wrong
+  read until v43): the depth URTI's projection gives the point is probably not the one the game writes (viewport depth
+  range, bias…). Added to the log every 300 frames: histogram of the points' depth in the cascade and of the map − point
+  difference (sandbox: points within 0.375 to 0.625; zero difference for lit points, very negative for shadowed ones).
+  To be recorded in RDR2 **in the sun** to fix it.
+- **Safeguard**: the sun / sky measurement is taken only if the map agrees with the image (lit points at least 1.3
+  times brighter than shadowed ones); otherwise the default value stays (2.2: 69 % of the light removed facing the sun,
+  the old look) instead of erasing the shadows.
+- Bug in the check tool: `show_mask=1` in urti.ini ticked "mask only" in the effect and never unticked it: white screen
+  (mask without shadow) after the check. Now unticked when the line is removed. The game, launched by URTI for this
+  check, was closed (no progress played).
+
+## v45–v46 — URTI: measuring in the game (bursts); RDR2's RT scene was drawn at random every frame
+
+- Request: "the reflections jump, you say it's fixed but it never is". Sandbox measurements are not enough: RDR2
+  itself must be measured.
+- **Burst** (F8 key or trigger file `urti_rafale`): 30 consecutive frames saved without URTI (copy of the image before
+  the composition) and with it, in `urti_rafale_N\`. `tools/reshade/urti_rafale.py`: URTI's contribution C = after −
+  before; what jumps = the change of C from one frame to the next (independent of the scene); shadow / reflection
+  areas; objects entering / leaving the RT scene per frame (BURST lines of the log); map of the jumps and a close-up of
+  the worst area. Results in `results/urti/jeu/rafales/`.
+- RDR2's settings re-read (system.xml): RTX 4070, DX12, DLSS, HDR, motion blur off, sharpness at maximum, screen-space
+  water reflections on (the game keeps its reflections where URTI puts none), several shadow sources (cascades, distant,
+  terrain, screen space, long). Nothing that skews URTI.
+- Session in RDR2 launched by URTI (Saint Denis at night, wet cobblestones): URTI changed 0.2 % of the pixels; at the
+  biggest jump, the orange reflection of a street lamp appeared for two or three frames, then disappeared. Log: **0 known
+  objects in the RT scene, 6.1 M vertices never measured, 183,499 measurements in memory for ~930 objects on screen**.
+  Cause: the identity of an ExecuteIndirect (v42) included the address and position of its arguments, which rotate in
+  RDR2: a new identity every frame, never measured, maximum reserve; the unknowns filled the budget in recording order
+  (variable): the RT scene was a different draw every frame. The sandbox (fixed arguments) could not show it.
+- **Stable identity**: command signature, pipeline, bound index and vertex buffers (events `bind_index_buffer` /
+  `bind_vertex_buffers` tracked per command list), maximum command count. In RDR2: 671 objects on screen, **671 in the RT
+  scene, 0 never measured, 785 measurements in memory, 0 out of budget**, 0.4 objects entering or leaving per frame.
+  Fixed-camera burst, URTI's reflection area: shaking 8.2 → 1.5 %, jumping 0.88 → 0.12 %. Budget raised to 6 M vertices
+  (a slot holds 8 M). Sandbox unchanged to the digit.
+- Cost: the RT scene now holds real triangles (4.5 M vertices): structure build 2.6 → 4.1 ms, reflections 0.2 → 1.0 ms;
+  ~51 fps in this night scene (64 before, with a meaningless RT scene). The structure is rebuilt every frame (300 out of
+  300): an update requires the same layout, but each object's place in the stream follows the draws' recording order,
+  which changes from frame to frame (RDR2 records on several threads). To do: a fixed place per object.
+- Not checkable that night: daytime reflections, shadows (no sun). A burst with a moving camera mixes the normal motion
+  of the reflection with jumps: to refine.
+
+## v47 — URTI: F4, full-screen before / after
+
+- Player's request: a button to see the difference live. **F4** switches between the game's image alone and the image
+  with URTI, full screen and instantly: only laying the effect on the image is skipped, the RT computation goes on (so
+  the frame rate does not change: for that, F7 turns everything off). F5 stays the split screen (left without, right
+  with).
+
+## v48 — URTI: "URTI on" checkbox in the menu (all computation off), F7 in sync
+
+- Request: a button that completely turns ray tracing off (no computation at all) and back on. `UrtiOn` checkbox in
+  the ReShade menu: unticked, no more geometry capture, structure, shadows, reflections or composition; ticked again,
+  everything resumes. F7 does the same and the box follows. No effect if urti.ini lacks `live=1` (native sandbox
+  launches stay native; suite unchanged).
+- "No difference" with F4: the player's game was at night (sun tracked on 0 % of frames, no sun shadow map). At night,
+  URTI makes no shadows (only the sun's) and its reflections, limited to flat surfaces, reflect a dark scene: 0.2 % of
+  pixels changed (burst). The reflections visible on wet cobblestones at night are the game's.
+
+## v49 — URTI: no more menus in reflections; no more invisible shadows costing 4 ms
+
+- In-game feedback (Saint Denis, rainy day, ground wet by the game): reflections shake, **menus show up in the
+  reflections on the ground**, reflections come off the ground, no difference for shadows; 20 to 27 fps. Log: sun
+  tracked, matching shadow map (lit points 3.2 times brighter than shadowed ones), but sun / sky measured 0.06 (overcast:
+  6 % of the light removed); GPU: shadows 3.8 ms, reflections 3.1 ms, sun and structure 3.9 ms. "No snapshot before
+  the UI" 27 times in the session.
+- **Menus in reflections**: the snapshot before the UI (the reflections' colours) was kept only if it looked more like
+  the current image than the previous one. Still image (the player looks at the ground, a menu is open): a tie, no
+  snapshot, colours read from the final image, menus included. The GPU now keeps its choice from frame to frame
+  (`live_uiselect`, bytes 64 / 68 of its counters): the previous snapshot stays if it still resembles the final image
+  by at least 30 % (a large menu covers part of it) and is not a copy of the previous displayed image (snapshot taken
+  too early). If no snapshot is safe, RT reflections fade out smoothly (−15 % per frame) and come back with it. Sandbox,
+  still shot without sub-pixel jitter, menu open 2 s every 4 s: snapshot lost 2 times out of 600 frames → 0.
+- **Invisible shadows**: sun / sky measured under 0.15 (less than 13 % of the light removed: overcast, dusk): no more
+  shadow rays (3.8 ms saved in this scene); they resume when direct light comes back (the measurement goes on).
+- Reflection suite unchanged (`suite/tableau_v49.txt`). Not checked in game: to measure (F8 bursts on the wet ground,
+  and one with a menu open).
+
+## v50–v52 — URTI: a single checkbox, RT ambient occlusion, sun shadows off (measured: invisible)
+
+- Player feedback: "0 difference" and many frames per second lost; too many options; asks for RT "the NVIDIA way" (one
+  checkbox, everything automatic), ambient occlusion, even path tracing and Ray Reconstruction; a fine-weather option;
+  a crash when opening the Social Club (Home key, "memory error").
+- Analysis of the session: **reflection strength at 0 in their menu** (`UrtiReflect=0`) and shadows suspended
+  (overcast): URTI could change nothing, while costing 4 to 5 ms (structure, sun tracking).
+- Research: the "ray tracing" seen on RDR2 is made of screen-space ReShade shaders (Pascal Gilcher's RTGI / PTGI,
+  without a sun direction); Ray Reconstruction can be injected (experimental OptiScaler forks) only into games that
+  already have path tracing; fine weather on demand: ScriptHookRDR2 and a trainer (third-party files, not installed
+  without agreement).
+- Social Club crash: not reproduced (Home key sent: no menu, no crash); no crash in the Windows log since 10/31;
+  ReShade opens on Page Down (no conflict); video memory 7.0 / 12 GB. To revisit with the exact error text.
+- **Menu reduced to "URTI on"**: the other settings are hidden and ignored (the preset's old `UrtiReflect=0` no longer
+  turns anything off): reflections at 1, shadows "only those the game lacks", no wet floor; urti.ini still rules for
+  tests.
+- **RT ambient occlusion** (`live_shadow`, ao=0.8, ao_radius=1.5 m): two short rays per pixel (cosine-weighted
+  hemisphere, rotating pattern), occluder at t: occlusion (1 − t / range)²; foliage holes recognised; removes only sky
+  light (all of it in shadow, 1 / (1 + x N·L) in the sun, x = measured sun / sky); denoised with the mask. **Only on flat
+  surfaces** (ground, walls, roads) and closer than 50 m: on grass and fences every blade is geometry, everything
+  darkened (the game already has its occlusion there) and shook.
+- **RT sun shadows off by default** (`shadows=1` to turn them back on; flag 64: the sun stays known for occlusion):
+  burst in the sun without occlusion: **0.0 % of the image changed for 3.2 ms**. RDR2's shadows leave almost none to
+  add.
+- Denoising of the mask when it carries only occlusion: more accumulated frames (current share 0.05 to 0.3) and a wider
+  clamp (2 standard deviations).
+- Measurements in RDR2 (bursts, `results/urti/jeu/rafales/`):
+  - v50 (occlusion everywhere): 32.5 % of the image changed, jumping pixels 0.21 %, shadows + occlusion 6.1 ms;
+  - v50 flat occlusion: 20.2 %, 0.12 %, 5.1 ms;
+  - v51 (no sun shadows, fog): 8.2 %, 0.08 %, 1.2 ms, 56-58 fps;
+  - v52 (bayou in the sun): 9.4 %, 0.05 %, darkened area shakes 1.2 % (4.1 % in v51), 2.3 ms, 44 fps.
+- Left:
+  - one-frame flashes when objects enter or leave the RT scene (frames 6, 11-12, 15 of the v52 burst: 4 to 10 objects;
+    the game skips some objects for a frame);
+  - shaking reflections on water (reflection area: 17 % shake);
+  - the structure rebuilt every frame (3.8 to 5.7 ms);
+  - the snapshot before the UI still lost at times in RDR2 (snapshot resemblance now logged).
+
+## v53–v55 — URTI: a fixed place per object: no more flashes, structure updated instead of rebuilt
+
+- Player's opinion: leave shadows to the game (its own are too good); step 1: stability and speed.
+- Cause of the one-frame flashes (v52 burst): 8 to 9 objects per frame entered or left the RT scene, with no refusal
+  and no budget overflow: the game does not draw everything every frame (vegetation, levels of detail, culling). And
+  each object's place in the stream followed the draws' recording order, which varies: the structure was rebuilt 300
+  times out of 300 (3.8 to 5.7 ms).
+- **Fixed places** (`g_livePlaces`, urti.ini `persist=0` for the old rule): each object of the main screen keeps its
+  place from frame to frame (first free space large enough, a quarter of margin, free spaces merged); an object the
+  game skips for at most 3 frames keeps its last geometry in the RT scene; beyond that, its place is released. The
+  counts of written vertices are copied into one cell per place (`live_counts.hlsl`), which the conversion reads; the
+  conversion covers all held places (table sorted by start). A refused place, or more than 70 % of the slot used:
+  everything is redistributed on the next frame.
+- Missing triangles: flat (vertices at the origin) instead of NaN: an update of the structure cannot change the
+  active / inactive state of a triangle. **Update as long as the converted part keeps its size** (full rebuild at most
+  every 8 frames).
+- v53: the used part filled the whole slot (82 draws refused per frame, 406 objects in the RT scene): hence the
+  margin, merging and redistribution of v54.
+- Measurements in RDR2 (v54, Saint Denis in the sun): 871 places held (71 MB), used part 81 MB out of 128, 0 new places
+  per frame, 0 redistributions; **33 rebuilds and 267 updates out of 300**; "sun and depth" step 1.3 ms (3.8 to 5.7);
+  **0 objects entering or leaving over the 30 frames of the burst**, 0.015 % of pixels jumping; 65 fps. Sandbox: suite
+  identical to the digit with or without fixed places.
+- Ambient occlusion in motion (sandbox, walk): jumping 0.47 % without it, 0.78 % with it; denoising of the
+  occlusion-only mode widened (5×5 blur guided by depth, current-frame share in motion 0.2): 0.69 % (blinking 0.84 →
+  0.71 %). Still to reduce.
+
+## v56–v66 — URTI: decals, snapshot before the UI impossible in RDR2, structure updates abandoned
+
+All measurements below are taken in RDR2, launched by URTI; scenes differ from one launch to the next (the save reloads
+elsewhere): only comparisons within one launch are valid.
+
+- **Occlusion in motion**: 4 rays instead of 2 where the image moves by more than a pixel and a half (motion vectors);
+  foliage excluded from receiving surfaces (neighbouring points 6 pixels away seen clearly further: the background
+  through the leaves).
+- **Reflections on water**: normal from a centred difference 4 pixels on each side when both sides are on the same
+  surface (ripples smoothed); no reflection ray below 3 % weight (Fresnel at normal incidence), range 500 m.
+- **v56: extra screen snapshots (1st, 2nd, 8th, 32nd draws): RDR2 crashes in its menu** (fatal "memory" error),
+  removed (v57).
+- **Dark straight-edged spots on the ground** (seen by the player): the game's decals (mud, marks, puddles), laid just
+  above the road without writing depth, stopped occlusion rays a few centimetres away. Occluders closer than 6 cm
+  ignored (5 cm for reflections): spot gone (mean darkening of the ground 3.5 → 0.1 level).
+- **Snapshot before the UI**: burst extended (raw snapshot, kept snapshot). In RDR2, **the screen receives a single draw
+  per frame**, which assembles the scene and the UI prepared elsewhere: the snapshot taken before it is a previous
+  frame, UI included (minimap identical to the final image); no snapshot without UI exists. Worse: the "kept" snapshot
+  (v58) resembled the current image by only 2 %. Fixes:
+  - in RDR2, `ui_photo=0` (the game's urti.ini);
+  - never a kept snapshot again;
+  - UI detected with a tolerance (the game's grain of one or two levels);
+  - **fixed UI zone** `ui_zone=0.012,0.69,0.16,0.97` (minimap and icons): minimap altered 7.5 → 1.7 levels.
+  - The snapshot taken right after the first draw (only in a direct list) no longer crashes the game.
+- Motion-vector convention re-measured in game: the same (no. 2). In motion, the effect follows the image at **98 %**
+  (`tools/reshade/urti_rafale_decalage.py`: shift of the effect / shift of the image by phase correlation).
+- **Sub-pixel jitter**: compensation off in RDR2 (`jitter=0`): shaking 0.19 → 0.13 %; reflection area shakes 2.57 →
+  1.79 %, jumps 0.10 → 0.06 %. The sandbox keeps the compensation.
+- **Structure updates**:
+  - v58: places redistributed every frame (70 % threshold exceeded) while updates were still allowed: 4.5 fps. Fixed
+    (rebuild required after a redistribution).
+  - Flat triangles at the origin (the camera): an update that made them real stretched boxes across the whole view
+    (rays 10 times slower); now laid on the first vertex of their place.
+  - Regulator based on measured cost (rebuild against slower rays).
+  - Final measurement, same scene: updates 1.2 + 3.7 + 6.8 ms (structure, occlusion, reflections), 38 fps; rebuild
+    every frame 5.7 + 1.2 + 0.5 ms, 45 fps. A single update makes reflections fourteen times slower (vegetation batches
+    sorted by the GPU: triangles change places).
+  - **Rebuild every frame by default** (`blas_refit=0`); places without margin, redistributed as soon as a fifth of the
+    used part is lost to holes.
+  - Rail yard, overcast: URTI 3.9 ms in total, 73 fps.
+- Player's opinion of v66: "perfect, the look is insane"; frames per second still to gain.
+- **Sandbox** (`suite/tableau_v66.txt`):
+  - trees and character clearly better (jumping 0.010 → 0 %);
+  - **moving camera worse**: jumping 0.63 → 1.24 % (blinking 0.68 → 0.55 %), larger deviations from truth everywhere.
+    To understand: reflection changes (weight threshold, minimum range, centred normal) or the snapshot before the UI
+    (snapshot after the first draw, tolerance).
+
+## v67 — URTI: optimisation (geometry budget driven by measured cost, quarter-rate occlusion, lighter composition)
+
+- Request: frames per second. Costs measured in RDR2 (v65-v66): rebuilding the RT scene dominates (1.8 ms in the rail
+  yard, 5.7 to 8.8 ms in a rainy street); occlusion ~1 ms, reflections 0.2-0.5 ms, composition 0.8 ms.
+- **Geometry budget driven by the measured rebuild cost** (`build_ms=2.5`, 0: fixed budget): every 30 frames, −15 % if
+  the rebuild exceeds the target by 10 %, +8 % under 75 % of the target, between 1.5 M vertices and `vertex_budget`
+  (6 M). Objects with the smallest apparent size (box / distance) leave first.
+- **Quarter-rate occlusion** (`ao_quarter=1`): one pixel of each 2×2 block casts its rays each frame (all four in four
+  frames), twice as many rays per pixel (4 at rest, 6 in motion); the others are written −1 and rebuilt by the
+  denoiser (5×5 blur over computed pixels only, history alone without a computed neighbour). Sandbox: occlusion pass
+  0.86 → 0.39 ms, quality measurements unchanged.
+- **Composition**: mask read bilinearly (4 reads instead of 16) when it carries only occlusion: 0.51 → 0.46 ms
+  (sandbox).
+- **Sandbox regression with a moving camera explained** (jumping 0.63 → 1.25 % since v62): occlusion off, 0.48 % (the
+  earlier level). The ground truth has no occlusion: darkening that follows the scenery counts as jumps there. Before
+  v62, the exact UI comparison prevented occlusion on a large share of pixels (weaker effect). In game, the effect
+  follows motion at 98 % (`urti_rafale_decalage.py`).
+- For the player to check in RDR2: frames per second, cost per step (log), missing objects when the budget drops.
+
+## v68 — URTI: optimisation validated in RDR2; aberrant vertices (RT scene invisible since v66)
+
+- v67 in RDR2: occlusion and reflections had no effect at all (0.0 % of the image, white mask, pass at 0.13 ms). Rays
+  hit nothing. Culprit: the combination of fixed places + rebuild every frame (v66); with fixed places off, or updates
+  allowed, everything comes back. Cause: aberrant vertices (non-finite or huge, from kept or never-written places); a
+  full rebuild stretches the whole scene's box, and the inner boxes, stored with a precision relative to it, become
+  worthless. The conversion now folds any non-finite vertex, or one further than 20 km, onto the first vertex of its
+  region. The v66 that the player judged "perfect" therefore ran without RT occlusion in some scenes.
+- Optimisation measured in game (same session, Saint Denis, twice in a row): full occlusion 3.75 / 3.88 ms,
+  54.8 / 52.9 fps; **quarter rate 1.99 / 2.16 ms, 59.1 / 57.3 fps**. Burst: 0.001 % of pixels jump. Rebuild 2.25 ms
+  (under the 2.5 ms target: budget unchanged here).
+
+## v69 — URTI: RDR2's G-buffer decoded, G-buffer choice fixed, surface cache, occlusion tuned on its time
+
+- **RDR2's G-buffer** (pass survey, raw `.raw` texels of every channel, `tools/reshade/urti_gbuffer.py`): target 0 =
+  colour (albedo, RGBA8 sRGB; alpha: 8 values, a material marker); target 1 = world normal (z up, encoded 0..1, length
+  1.00), alpha = character marker; target 2 = material: r type (0.5 common, 0.2 foliage, 0.31 skin), **g smoothness**
+  (puddle 0.60, brass 0.49, skin 0.53, shirt 0.03), **b metalness** (brass balls 0.80, iron poles 0.57, fences 0.44,
+  elsewhere 0), a occlusion or wetness (rewritten later in the frame by another pass); target 3 = r almost 1 everywhere,
+  b subsurface scattering (skin 0.53); target 4 = motion vectors (RG16F).
+- **Defect found**: the G-buffer was the last binding of three or more targets on the screen depth. A later pass
+  (transparents: 087, 088, 089 + two from the G-buffer) replaced it at times, and the G-buffer itself is bound with 3
+  targets for part of the objects (colour, normal, motion): "target 2" was then the motion vectors, read as smoothness.
+  Now: the set of targets the game draws into the most, reviewed every 30 frames, keeping the widest binding for the
+  same first target. Checked in RDR2: `5 targets (formats 29 28 28 28 34)`, stable.
+- **Surface cache** (`live_surfcache.hlsl`): one pixel per 4×4 block per frame (the whole screen in 16 frames), a ray
+  from the camera to the triangle seen, the image's colour kept per triangle (RGB9E5 + object identity, 8 bytes, 21 MB
+  for 2.8 million triangles). A reflection whose hit point is hidden or off screen takes that colour instead of staying
+  unknown. Sandbox: window reflections extended at the edge of the screen, deviation from truth unchanged (2.59 %,
+  almost everything there is visible on screen). RDR2: works, +0.7 ms, small visible gain in the scenes seen (RT
+  reflections on 2 % of the image).
+- **Finding in RDR2**: the floor of Saint Denis's arcades has smoothness 0.36 (polished stone, blurred reflection),
+  under the RT reflection threshold (0.5): RT reflections cover only 2 % of the image. Blurred reflections (rays drawn
+  according to roughness + denoising) are a separate step.
+- **Occlusion: 5.5 ms under the arcades** (68 fps without it, 48 with it). The cost depends neither on the range (0.2 m
+  as 1.5 m), nor on opaque rays or the hole test, nor on the scene's size (3 times fewer vertices: the same); it doubles
+  with the number of rays. Under arcades, almost the whole screen is a close flat surface (outdoors, sky and distance
+  are skipped). The number of rays per computed pixel is now tuned every 30 frames on the pass's time (target 2.5 ms,
+  `ao_ms=`, from 4 to 2 rays).
+- Table of the RT scene's regions copied into video memory every frame (conversion, reflections and cache looked up
+  their region across the PCIe bus).
+- Tools: `urti_rdr2_rapide.ps1` no longer takes the old log or "first frame" for a running game, recognises the menu
+  without a calibration capture, does not click when someone is using the PC.
+- To check in RDR2: tuning of occlusion rays and the frame-rate gain under the arcades; cost of the cache with the table
+  in video memory.
+
+## v70 — URTI: light bounce (indirect lighting); surface cache finally active in RDR2; minimap protected
+
+- **v69 fix**: in RDR2, the surface cache was never read. The test "the cache covers the scene" (triangles × 3 ≥
+  capacity) failed by 2 vertices: the capacity (8,388,608) is not a multiple of 3 (in the sandbox it is). The
+  difference measured in v69 (0.4 % of pixels) was noise. Now: triangles ≥ capacity / 3.
+- **Cache per group of eight triangles**: in RDR2, most triangles are smaller than a pixel; one pixel sampled per 4×4
+  block almost never fell on the triangle a ray later hits (one occlusion ray in four found an entry, almost none of the
+  right object). An entry covers eight consecutive triangles (neighbours in the mesh); empty entry or one from another
+  object: the neighbouring entries of the same object.
+- **Light bounce** (`gi=`, 1 by default): occlusion rays that hit an occluder take the colour the cache holds for it
+  (the light the surface sends back), with the same weight as the occlusion (the sky light removed in that direction is
+  replaced by the occluder's). Three planes R, G, B at quarter rate, denoised by the same filter as the occlusion
+  (extended to three planes, same weights), received according to the surface's own colour (G-buffer albedo, copied
+  every frame). No extra ray. Sandbox: lit sand sending warm light at the foot of walls and under barrels, flicker
+  unchanged; +0.4 ms. RDR2: +0.85 ms (61 → 58 fps on the quay).
+- **Characters excluded from the bounce**: alpha of the G-buffer normal (target 1, copied) = character marker (0.41 on
+  Arthur, 0 on the floor). They move, their history is rejected every frame and the bounce, noisier than the occlusion,
+  shook on them (burst: 0.20 % of pixels shaking, all on the character).
+- **Minimap never protected since the fixed UI zone**: in the composition, `float4 uiZone` after 18 numbers was placed
+  by HLSL at the next 16-byte boundary, 8 bytes further than what the add-on writes (the last two numbers outside the
+  constants). Same defect in the surface cache. Four separate numbers; checked across all shaders (no other).
+- Hot reload for the surface cache and the denoiser too.
+- **RDR2 measurements** (wet quay in Saint Denis, bursts in steady state): without bounce, effect on 10.2 % of pixels
+  (RT reflections of the sky on the quay: 9.7 %), shaking 0.01 %, jumping 0.000 %; with bounce, effect 10.8 %, shaking
+  0.01 %, jumping 0.001 %.
+- Measurement pitfalls: a burst taken a few seconds after reloading `urti.ini` shows reflections missing at times
+  (state reset, to examine): wait 20 s. A diagnostic shader hot-reloaded stays active after its `.cso` is deleted
+  (until the next reload or relaunch): a first "perfect" burst had been taken with a grey diagnostic bounce.
+
+## v71 — URTI in a second game
+
+First test outside RDR2, on a second DX12 game, without adapting anything first: ReShade 6.8 (dxgi.dll) and the add-on
+placed in the game folder (no game file replaced).
+
+- **What works on its own**: loading with Streamline (DLSS); geometry capture (1,600 draws captured out of 5,800, 3
+  million vertices in the RT scene); depth law and projection; visible RT occlusion (under floors, at the foot of
+  posts); G-buffer found (7 targets, native 2560×1440 rendering).
+- **Cost too high**: 9 ms. The game's objects are heavy (up to 464,000 vertices, 13 million on screen against ~2.5 in
+  RDR2): rebuilding the structure takes 3 to 11 ms, the budget drops to the floor (1.5 M vertices), only 46 draws in the
+  RT scene and many entries and exits per frame. Native 1440p image (no upscaling): occlusion and composition more than
+  twice as expensive as in RDR2 (1707×960).
+- **A different G-buffer layout**: colour in target 0, octahedral normal in target 2 (RG16 UNORM), motion vectors in
+  target 5. RDR2's settings read the wrong channels there: smoothness taken from the normal, character marker in a
+  target without alpha.
+- **Fixes**: motion vectors: with several RG16F targets, the first was taken (almost empty here: every convention tied);
+  after three measurements without a winner, the next one is tried (kept in `urti_calib.ini`, `motion_target=`).
+  Character marker configurable (`person_mask=0`: none). Pass survey: at most two snapshots per frame (an image
+  rewritten at each step took every slot before the G-buffer), 64 in total.
+- **Frame generation**: one present in six arrived without a counted draw and some calibration captures got 0 draws:
+  the game probably records its command lists ahead, across two presents (to examine: URTI takes those frames for
+  generated ones and keeps the previous RT image there).
+- To do: per-game material channels; a geometry budget suited to heavy objects (per-object structures kept from frame
+  to frame rather than a single one rebuilt); counting draws per present.
+
+## v72 — URTI: capture ordered by execution; frame generation (DLSS-G) recognised
+
+Towards a URTI that discovers how each game works instead of assuming it.
+
+- **Diagnosis** (a counter per command list: present of its first draw, present of its execution): the second game
+  writes **35 % of its draws before the previous present** (lists of the next frame prepared ahead); RDR2: 0 %. Ordered
+  by writing, the draws mixed two frames: rank among draws with the same signature (hence identity) different every
+  frame, regions read before being filled, counters taken over by other draws. Hence objects entering and leaving the
+  RT scene (60 to 130 per frame), 80 to 110 new places per frame, an RT scene swollen with holes (4.2 M vertices for a
+  1.5 M budget, rebuild 8.7 ms), calibration captures with 0 draws, and one present in six taken for a generated frame.
+- **Capture in execution order** (ReShade's `execute_command_list` event). At writing time, a captured draw only
+  receives a region in the part of the stream of its writing window (three rotating parts per slot) and a counter of
+  that part. When its list executes: rank, identity, place in the RT scene and the present it belongs to. The
+  conversion reads each place from its region of the stream (places now live in the RT scene's space, no longer in the
+  stream); a place kept without being drawn is left as it is; outside any place: a flat triangle at the origin.
+  Counters of the next part are reset at the end of each frame (before any list is written in the new window). A list
+  executed more than two windows after its writing: ignored (never seen). Geometry budget per mesh (all its copies): a
+  copy's identity is only known at execution, while the choice to capture is made at writing.
+- **Frame generation** (DLSS-G): ReShade sits under Streamline: it sees two presents per game frame, on the same queue
+  (the game executes its draws on another). Some games never draw into the presented image (Streamline's intermediate
+  image), RDR2 does. Rules:
+  - a present without any executed draw does not advance the capture window;
+  - generated frame = a frame where the game did not draw; otherwise, when presents alternate, the one that follows
+    the game's draws, because generation by interpolation shows the generated frame before the real one (URTI had them
+    swapped: the blend landed on the real frame);
+  - the RT computation runs as soon as the draws have executed; the generated frame receives the blend of the
+    second-to-last and last results, the real one its own result;
+  - the light bounce is kept on generated frames (off every other frame: blinking).
+  The "generated first" order is deduced from how interpolation works, not yet checked in motion.
+- **Measurements in the second game** (same place, frame generation on): shaking 1.91 % → 0.04 %, jumping 0.148 % →
+  0.002 %; new places 80-111 → 9-15 per frame; refused 100-460 → 6-11; RT scene 4.2 M → 2.0 M vertices; cost 9 → 6 ms
+  per real frame. But the effect drops to 0.5 % of pixels: 609 meshes and 14 M vertices on screen for a budget at its
+  1.5 M floor. Next: per-object structures kept from frame to frame in a stable space (camera motion measured on our
+  own geometry) instead of a rebuild every frame.
+- **RDR2, non-regression check** (wet quay in Saint Denis): effect 10.2 %, shaking 0.01 %, jumping 0.000 % (as in v70);
+  0 late draws, 518 stable objects (0 new places, 0 entries or exits per frame), 64.6 fps.
+- Tools: `premier_plan.ps1` (is the game in the foreground, without reading anything else).
+
+## v73 — URTI: camera motion measured on our geometry; crash on HDR switch / Alt+Tab; rendered area (DLSS, dynamic resolution); NaN depth law
+
+- **Camera motion without the game** (the "motion" module of self-discovery). The conversion records pairs of
+  vertices: position in the previous frame and in this one, for objects drawn at the same place in both frames. It
+  takes about fifteen per object, so that a character following the camera weighs as much as a rock. Only direct draws
+  of a single copy count, whose mesh is drawn only once in both frames: some games sort their draws, and the n-th copy
+  of a mesh is not the same object from one frame to the next. `live_camfit` does the rigid fit (Horn's method),
+  robust, repeated five times while discarding what moves; it restarts from stillness if the camera changes pace.
+  `live_mvsynth` builds motion vectors from that motion and the depth (convention 0).
+  - Automatic switch when the game's own stay unreadable: two targets tried without a winner, or 3 s of moving camera
+    (our measurement) without a convention found. Setting `motion_source=`: 0 automatic, 1 game, 2 ours. Kept in
+    `urti_calib.ini` (`motion_source=camera`).
+  - Sandbox (walking camera, known truth): translation measured at 2.7 cm per frame, exactly the script's walk.
+    Accumulation as good as with the game's vectors: added flicker +0.045 % against +0.046 %, jumping points 0.514 %
+    against 0.522 %.
+- **Crash when switching to HDR or on Alt+Tab** (reported by the user): the recreated screen image changes format
+  (RGBA8 → RGB10A2). The snapshots before the UI were copied with the old layout, hence an invalid copy, a refused
+  command list (E_INVALIDARG) and the crash. The list of screen images also kept addresses of destroyed images.
+  - Fixed: layout taken again at every change of format or size, copy skipped if it does not match, list of screen
+    images rebuilt every frame.
+- **Rendered area**: with DLSS and dynamic resolution, a game may draw 1280×720 to 1704×960 inside 2560×1440 targets.
+  URTI read the whole target: shadows and reflections stretched by 1.5.
+  - The rendered area is now the largest of the frequent viewports of the screen's draws (full-size 3D markers and
+    half-resolution passes discarded). It is counted at execution and changes only after ten frames in a row. Images
+    stay allocated at full size. Test setting: `render_area=0`.
+- **NaN depth law** in `urti_calib.ini`, written when the motion vectors switched. Read back at launch, it made every
+  point invalid, and sending the sun marked it valid: no more occlusion or reflection (all-white diagnostic view).
+  - Fixed: never written, never read back, never adopted if it is not finite; sending the sun no longer marks it valid.
+- **Water reflections**: the water surface is not in the depth URTI reads. Water is drawn afterwards, transparent:
+  URTI saw the bottom through it. Next step: find the layer where the game writes the water surface ("transparent
+  surfaces" module).
+
+## v74 — URTI: water reflections (layer of flat transparent surfaces); effect disappearing every five seconds
+
+- **Effect that disappeared and came back every few seconds** (reported by the user): without a recognised sun shadow
+  map, the full calibration failed and restarted every 480 frames; the RT scene capture stopped meanwhile. It is no
+  longer restarted when RT sun shadows are off (the default) and the depth law is known (also measured every frame).
+- **HDR screenshots**: Windows screenshots clip an HDR image; the burst's raw values, decoded (PQ), are the reference.
+  The depth law measured every frame is now written in the log.
+- **Water reflections** ("transparent surfaces" module of self-discovery). Some games draw their water at half
+  resolution, in their own images and their own depth. It is never in the main depth: URTI saw the bottom.
+  - Separate capture (layer 2 of the RT scene, mask 2) of two kinds of draws:
+    - on the main depth, those that test depth without writing it, outside the chosen G-buffer;
+    - all those of another view of the camera (same shape as the screen, reduced resolution).
+  - Conversion into their own buffer (1.5 M vertices at most); those regions are addressed across the whole stream.
+  - `live_planes` keeps flat surfaces (aligned normals, vertices close to the mean plane, more than a metre, not
+    turned toward the camera like a particle) and makes the rest invisible to rays (NaN): smoke, particles, light
+    volumes, sky.
+  - The camera ray of reflections looks for this layer in front of the depth point: the reflection then starts from the
+    water surface, with its triangle's normal, smooth.
+  - All other rays (occlusion, shadows, cache, reflections) only see layer 1.
+  - A perfect-mirror test (`reflect_f0=1`): the water sends back the trees. But the reflection comes in large blocks,
+    and spots appear on the bank (ground at water level).
+
+- `water=0`: no transparent layer.
+- The "blended into the image" criterion was not enough: some water computes its refraction itself and writes its
+  colour in one block. Measured in game: about 1,300 "depth tested, not written" draws per frame (the main pass redraws
+  the scene into the G-buffer after a depth pre-pass), 110 of them blended; no tessellation.
+- Not yet checked: RDR2 with the transparent layer (not reinstalled; RDR2 keeps the version checked in v72), the blocks
+  of the water reflection.
+
+## v75 — URTI: geometry cache (a whole forest in the RT scene); water reflection from the game's mask; causes of "effect / no effect"
+
+Tests done in the second game, by a lake at night (haze, DLSS + DLSS-G + HDR).
+
+- **Wrong depth chosen forever (v74 bug)**: the draws of other views went to "transparent" and no longer counted when
+  choosing the main screen; a wrong depth chosen right after the menu stayed. The RT scene held 15 objects instead of
+  the forest. Chosen on a running average now, every draw counted.
+- **Capture counters cleared (cause of random empty objects)**: resetting the next window's counters ran at the end of
+  the computation, on the present queue, while the game was already drawing on its own. Reset one window ahead, four
+  parts of the stream instead of three. Surface layer: 13 % → 97 % of complete windows. GPU barrier added between the
+  game's queue and the present queue (`queue_sync=0` to turn it off).
+- **Geometry cache**: the per-frame budget held only 37 meshes out of 535 (14 M vertices on screen; rebuilding 2.5 M
+  costs 5 ms). Each object outside the budget, captured in turn (500,000 vertices per frame), now gets its own
+  structure, kept in a 1 GB reserve (ring buffer) and placed in the top-level structure with the camera's pose. About
+  1,000 objects and 3 to 4 M triangles in the scene, 250 MB. `geo=0` to turn it off, `geo_mb=` for the reserve.
+- **Camera pose without drift**: accumulating motion frame by frame drifted up to 0.9 m with a still camera (each frame
+  without a measurement lost a piece of the game's sub-pixel jitter). Witnesses (small still objects, further than
+  4 m, captured every frame) keep sixteen reference points in the cache's frame (`live_refpairs`); the pose is realigned
+  on them. Still: stable within 3 cm; 96 witnesses, about 900 pairs per frame, motion measured on 290 frames out of 300.
+- **Water reflection from the game's mask**: the "transparent layer" (v74) and "flat sheet" leads were wrong: the flat
+  surfaces found were terrain tiles, haze cards (the large dark rectangles seen on screen) and slabs under the
+  terrain. A census of all draws shows there is no separate water draw; the pass survey shows that one G-buffer target,
+  at its last write (in compute), is exactly 0 on water, grass outlines included. The material copy happens at the end
+  of that last compute write, otherwise the next frame's G-buffer copy overwrites it. Transparent layer off by default
+  (`water=1` to bring it back): it cost time and made the false reflections.
+- **Reflection accepted in two more cases**: nothing hit while the screen shows distance (more than 20 m: forest drowned
+  in haze); hit point behind another distant object (foliage in depth: same material, same haze). The game alone makes
+  pixelated green blocks here; with URTI, a continuous mirror.
+- **Causes of "effect / no effect"**: (1) the reflection was cut on every raw generated frame, one present in two;
+  (2) the depth law measured every frame was wrong (0.08 to 0.13 instead of 0.19: it averages vertices that do not all
+  follow the same law), and the reflection dropped across the whole lake for series of frames: a known law now takes
+  precedence (`depth_law_fixed=`); (3) the mask was cut after 2 presents without a computation, the bounce after 1 (8
+  now); (4) the budget fell from 105 to 27 objects when a window contained two game frames (increase limited to 25 % per
+  window).
+
+Measurements, second game, three bursts, still camera: effect on 23 to 26 % of pixels (shadows 18 to 20 %, reflections
+5 to 7 %), shaking 3.8 to 6.8 %, jumping 0.3 to 1.3 % (still far from RDR2: forest in the wind, moving character, haze);
+300 presents out of 300 with the effect. Real Alt+Tab, back and forth, twice: no crash. GPU per real frame: cache
+structure 2.3 ms, frame structure and sun 2.9, shadows 5.3, reflections 0.9, composition 1.6, i.e. 13 ms.
+
+RDR2 (story mode, quay at dusk, different light from the 10.2 % measurement of v72, so the effect is not comparable):
+effect 0.9 %, shaking 0.09 to 0.13 %, jumping 0.04 to 0.06 %, 63.7 frames per second (64.6 in v72), identical with
+`geo=0`, no artefact seen. Add-on installed, old one kept as `urti.addon64.avant_v75`.
+
+Tools: bursts while turning, real-pace captures (a burst freezes the game), Alt+Tab tests; `urti.ini` always restored;
+stop without clicking if Steam Cloud waits for an answer; `alt_tab.ps1`. Diagnostics: `motion_log=1` (motion, layer,
+draw census, flatness of objects), `reflect_diag=`, `trace_draw=`, view 5: red = hidden reflected point.
+
+## v76 — URTI: the game's camera read from its memory instead of being deduced from geometry
+
+In-game feedback after v75: "everything jumps in every direction, effect / no effect, it shakes everywhere". The v75
+tests had only seen a still camera or one turning in a burst; the log of the player's session showed what happens when
+moving:
+
+- **Motion measured on the witnesses**: valid on 91 to 188 frames out of 300, off by 460 to 870 mm, 46 to 70 % of pairs
+  kept; still 320 mm off when stopped afterwards (reference points recorded during a wrong pose stay wrong).
+- **Geometry cache cleared** once or twice per window of 300 presents ("motion impossible to measure"): effect / no
+  effect.
+- **Field of view "corrected" eight times in a minute**: each time, all the geometry changed scale. The condition
+  (enough rotation) is never met with a still camera: no test could see it.
+
+Remedy: stop guessing. A search through CPU-visible buffers (`urti_camscan.inl`, `urti_camscan` file next to the add-on)
+found a 512-byte constant buffer, written before its view is created, several times per frame: `+240` projection by
+columns (`p00 0 0 0`, `0 p11 0 0`, `jx jy a -1`, `0 0 b 0`, with `jx`, `jy` the DLSS sub-pixel jitter), `+304` camera to
+world (right, up, back, position). `urti.ini`: `camera_cb=512` (per-game setting, read at load); `camera=0` goes back to
+the old measurement. Hook on `CreateConstantBufferView`: only views of that size are re-read (about 45 per frame). A
+captured draw records the number of the current camera; the computation takes the latest of its window.
+
+Pose, motion (synthesised vectors), field of view and depth law now come from that camera, every frame. No more
+witnesses, clearing for impossible measurement, or field correction. The sub-pixel jitter is removed from cached
+vertices and put back into each frame's pose. `motion_log=1` keeps the witness measurement, separately, as an
+independent check.
+
+Measurements, at real pace, `motion_log=1` (deviation of the read camera from the witnesses, median / 95 %):
+
+| Phase | Correction | Rotation | Pairs kept | Frames per second |
 |---|---|---|---|---|
-| Immobile | 0,18 / 0,64 cm | 0° | 95 % | 78 à 80 |
-| Rotation lente | 0,15 / 0,90 cm | 0° | 92 % | 60 à 77 |
-| Rotation rapide | 0,32 / 2,69 cm | 0° | 85 % | 55 à 64 |
-| Marche | 0,27 / 1,40 cm | 0° | 86 % | 51 à 68 |
+| Still | 0.18 / 0.64 cm | 0° | 95 % | 78 to 80 |
+| Slow rotation | 0.15 / 0.90 cm | 0° | 92 % | 60 to 77 |
+| Fast rotation | 0.32 / 2.69 cm | 0° | 85 % | 55 to 64 |
+| Walk | 0.27 / 1.40 cm | 0° | 86 % | 51 to 68 |
 
-300 présentations sur 300 avec l'effet à chaque bilan de 300 présentations de ces phases, aucun vidage du cache, champ fixe à 43,00°, loi
-identique à celle stockée. Rafales (rythme ralenti, sans `motion_log`) : effet continu, immobile 23,5 à 28 %, rotation 22 à 33 %,
-marche 18 à 25 %, course 14 à 30 %.
+300 presents out of 300 with the effect in every 300-present summary of these phases, no cache clearing, field fixed,
+depth law identical to the stored one. Bursts: continuous effect.
 
-Reste à faire : les ombres passent de 4,4 ms à 8 à 15 ms quand on bouge (occultation doublée en mouvement, forêt dense, cache de 7 M
-triangles) ; le tampon reconnu est propre à Horizon (la recherche servira pour les autres jeux) ; course au rythme réel, voyage
-rapide, cinématiques, plein jour, autres eaux pas essayés. RDR2 : `camera_cb` absent, chemin inchangé, pas réessayé en jeu avec ce code.
+Left: shadows go from 4.4 ms to 8 to 15 ms when moving (occlusion doubled in motion, dense forest, 7 M-triangle cache);
+the buffer found is specific to that game (the search will serve other games). RDR2: no `camera_cb`, path unchanged.
 
-## v77 : une image du jeu à la fois (le vrai « effet / pas effet »)
+## v77 — URTI: one game frame at a time (the real "effect / no effect")
 
-Retour de l'utilisateur sur la v76 : « ça saute tout le temps, en pause on voit ombres et reflets apparaître et disparaître ». La v76 avait
-corrigé la caméra, et ses bilans (« 300 présentations sur 300 avec l'effet ») restaient parfaits : ils comptaient les présentations, pas ce
-que le calcul avait réellement vu. Deux outils ont tout changé :
+User feedback on v76: "it jumps all the time; when paused you see shadows and reflections appear and disappear". v76
+had fixed the camera, and its summaries ("300 presents out of 300 with the effect") stayed perfect: they counted
+presents, not what the computation had really seen. Two tools changed everything:
 
-- **la pause du jeu comme banc d'essai** : l'image du jeu n'y bouge plus, tout ce qui varie vient d'URTI (`urti_pause_ana.py`) ; et une rafale
-  se déclenche par fichier, sans toucher au clavier ni à la souris ;
-- **une trace par présentation** (`urti.ini frame_trace=1`, `urti_trace_ana.py`) : dessins exécutés, zones, caméra, et une rangée de profondeur
-  et de masque relue à chaque calcul.
+- **the game's pause as a test bench**: the game's image no longer moves, so everything that varies comes from URTI
+  (`urti_pause_ana.py`); and a burst is triggered by a file, without touching keyboard or mouse;
+- **a trace per present** (`urti.ini frame_trace=1`, `urti_trace_ana.py`): executed draws, regions, camera, and a row of
+  depth and mask read back at each computation.
 
-Caméra immobile, jeu pas en pause, la profondeur moyenne de la rangée sautait de 0,0262 à 0,0188, et l'effet moyen de 0,71 à 0,83 ; en
-pause, rien (0,0208 à 0,0209).
+Still camera, game not paused: the row's mean depth jumped from 0.0262 to 0.0188, and the mean effect from 0.71 to
+0.83; paused, nothing (0.0208 to 0.0209).
 
-**Cause.** Avec DLSS-G, le jeu exécute ses listes sur une autre file que celle des présentations. La profondeur était copiée par ReShade à la
-présentation, à ce moment-là : le jeu avait parfois déjà commencé l'image suivante, la copie était à moitié dessinée. Le calcul n'était pas
-non plus calé sur les images : une fenêtre de capture contenait 0, une partie, une ou deux images du jeu (`princ 1672 3351 0 1 422 1658`).
+**Cause.** With DLSS-G, the game executes its lists on a different queue from the presents. ReShade copied the depth at
+the present, at that moment: the game had sometimes already started the next frame, so the copy was half drawn. The
+computation was not aligned on frames either: a capture window held 0, part of, one or two game frames.
 
-**Remède (`frame_sync`, avec la caméra du jeu seulement).** La profondeur principale est copiée dans la liste du jeu, à chaque fin d'écriture
-(barrière quittant `DEPTH_WRITE`), dans un anneau de 12 tampons en état commun (passent d'une file à l'autre sans barrière). Un repère dans la
-liste, relu à l'exécution, dit si cette copie a vu au moins 60 % des dessins de l'image précédente ; le premier qui le fait ferme la fenêtre, la
-suite attend le calcul suivant. Un calcul par image complète, plus aucun autre. Plus de repère depuis 16 présentations (menus) : ancienne règle.
+**Remedy (`frame_sync`, with the game's camera only).** The main depth is copied inside the game's list, at every end of
+writing (barrier leaving `DEPTH_WRITE`), into a ring of 12 buffers in the common state (they move from one queue to the
+other without a barrier). A marker in the list, read back at execution, tells whether that copy saw at least 60 % of the
+previous frame's draws; the first that does closes the window, the rest waits for the next computation. One
+computation per complete frame, no other. No marker for 16 presents (menus): old rule.
 
-**Autres causes corrigées, vues au banc d'essai :**
+**Other causes fixed, seen on the bench:**
 
-- décalage sous-pixel : mesuré sur les cascades, il n'existait que sur une image sur cinq dans Horizon (le reste du temps l'écart valait 0 et
-  l'absolu restait figé) : masque et reflets posés à côté de l'image, historique relu au mauvais endroit. Il vient maintenant de la caméra du jeu ;
-- scène RT instable au bord du budget : 6 à 7 maillages entraient ou sortaient par image, caméra immobile (le nombre de dessins varie avec le
-  décalage sous-pixel, cycle de 18 images). Un maillage garde sa place dans le budget + 20 %, deux entrées au plus par image, pas de retour
-  dans les deux secondes, et il passe au cache dès l'image suivante : 0,2 à 1,5 par image ;
-- maillages énormes (herbe, feuillage) captés par parts : chaque part écrasait dans le cache celle du tour d'avant (identité = rang parmi les
-  dessins captés). Chaque part a maintenant ses identités ;
-- places gardées sans être dessinées (3 images au plus) : leurs sommets restaient là où la caméra les voyait ; ils suivent maintenant la caméra.
+- sub-pixel jitter: measured on the cascades, it existed on only one frame in five (the rest of the time the difference
+  was 0 and the absolute value stayed frozen): mask and reflections laid next to the image, history read at the wrong
+  place. It now comes from the game's camera;
+- RT scene unstable at the edge of the budget: 6 to 7 meshes entered or left per frame with a still camera (the number
+  of draws varies with the sub-pixel jitter, an 18-frame cycle). A mesh keeps its place in the budget + 20 %, at most
+  two entries per frame, no return within two seconds, and it moves to the cache on the next frame: 0.2 to 1.5 per
+  frame;
+- huge meshes (grass, foliage) captured in parts: each part overwrote the previous round's in the cache (identity =
+  rank among captured draws). Each part now has its own identities;
+- places kept without being drawn (3 frames at most): their vertices stayed where the camera saw them; they now follow
+  the camera.
 
-**Deux plantages en route (`DEVICE_REMOVED`), corrigés :**
+**Two crashes along the way (`DEVICE_REMOVED`), fixed:**
 
-- `INVALID_CALL` : le jeu met sa profondeur en `COPY_SOURCE` (état 0x800), et ma transition allait d'un état vers lui-même ;
-- `DEVICE_HUNG` au chargement, une fois sur trois : l'étalonnage de vérification (capture complète de 512 Mo) tombait pendant que le jeu charge.
-  Inutile avec la caméra du jeu : retiré dans ce cas. Par prudence aussi : tampons retirés détruits après 120 présentations (trois ne font
-  qu'une image et demie avec la génération d'images), attente si une place d'anneau est reprise avant que le GPU l'ait lue (0 attente mesurée).
-  La cause exacte du blocage n'est pas prouvée : le test est passé de 1 plantage sur 3 à 0 sur 4.
+- `INVALID_CALL`: the game puts its depth in `COPY_SOURCE` (state 0x800), and my transition went from a state to itself;
+- `DEVICE_HUNG` at load, one time in three: the verification calibration (full 512 MB capture) fell while the game was
+  loading. Useless with the game's camera: removed in that case. Also, as a precaution: retired buffers destroyed after
+  120 presents (three are only a frame and a half with frame generation), wait if a ring slot is reused before the GPU
+  has read it (0 waits measured). The exact cause of the hang is not proven: the test went from 1 crash in 3 to 0 in 4.
 
-Mesures, Horizon, marais de nuit, rythme réel, génération d'images active ; sauts de plus de 8 % de l'effet moyen de la rangée d'un calcul au
-suivant :
+Measurements at real pace, frame generation on; jumps of more than 8 % of the row's mean effect from one computation to
+the next:
 
-| Phase | Avant | Après |
+| Phase | Before | After |
 |---|---|---|
-| Immobile | 75 sur 412 calculs | 0 sur 510 |
-| Rotation | 36 sur 489 | 0 sur 536 |
-| Marche | 63 sur 322 | 1 sur 402 |
-| Course | 25 sur 320 | 3 sur 442 |
-| Rotation rapide | 22 sur 350 | 1 sur 451 |
+| Still | 75 of 412 computations | 0 of 510 |
+| Rotation | 36 of 489 | 0 of 536 |
+| Walk | 63 of 322 | 1 of 402 |
+| Run | 25 of 320 | 3 of 442 |
+| Fast rotation | 22 of 350 | 1 of 451 |
 
-Calculs sur une rangée à plus de 5 % de ciel : 0 partout (0 à 2 par phase avant). Vue `debug_view=11` (bords de la profondeur en rouge sur
-l'image, capture à rythme réel, caméra qui tourne) : effet à 3 pixels de l'image au plus (écran de 2560, 29 pixels par image du jeu à cette vitesse). 4 lancements de suite sans
-plantage, deux Alt+Tab. Environ 77 images présentées par seconde à l'arrêt (78 à 80 en v76), 51 à 74 en bougeant, trace active.
+View `debug_view=11` (depth edges in red over the image, real-pace capture, turning camera): effect at most 3 pixels from
+the image (2560-wide screen, 29 pixels per game frame at that speed). 4 launches in a row without a crash, two Alt+Tabs.
 
-Reste à faire, vu pendant ces essais : **le HUD et le menu se reflètent dans l'eau** (« 0 / 14 » en double, texte du menu ; pas de photo d'avant
-l'interface dans Horizon, le jeu ne dessine pas dans l'image d'écran avec DLSS-G) : c'est une partie de « les reflets changent en pause », avec
-le menu du jeu qui assombrit et floute l'image d'où viennent les couleurs ; URTI assombrit aussi le texte du menu ; du grain fin reste sur les
-reflets ; 6,5 copies de profondeur par image, à réduire ; plein jour, voyage rapide, cinématiques pas essayés. RDR2 garde la v75 : les changements
-de budget et de parts le concernent, à revérifier avant de l'installer.
+Left, seen during these tests: **the HUD and the menu are reflected in the water** (no snapshot before the UI there: the
+game does not draw into the screen image with DLSS-G); fine grain stays on reflections; 6.5 depth copies per frame, to
+reduce. RDR2 keeps v75: the budget and part changes concern it, to recheck before installing.
 
-## v78 : les éclats des reflets
+## v78 — URTI: sparkles in reflections
 
-Retour de l'utilisateur sur la v77 : « en pause les reflets se calculent au fur et à mesure et deviennent parfaits, mais en jouant ils ne sont pas
-nickel, et des éclats bizarres restent à l'écran ».
+User feedback on v77: "when paused, reflections build up and become perfect, but while playing they are not clean, and
+odd sparkles stay on screen".
 
-Rafales dans le jeu, chaque effet coupé à tour de rôle : sans les reflets, plus un seul point brillant ajouté par URTI. Tout venait des reflets, et
-surtout en bougeant (0,015 % de pixels éclaircis de plus de 5 % à l'arrêt, 0,37 % en marchant, sur le feuillage et les bords d'objets).
+In-game bursts, each effect turned off in turn: without reflections, not a single bright point added by URTI. Everything
+came from reflections, mostly in motion (0.015 % of pixels brightened by more than 5 % at rest, 0.37 % while walking, on
+foliage and object edges).
 
-**Causes et remèdes :**
+**Causes and remedies:**
 
-- **le masque de l'eau d'une autre image que la profondeur** : la cible de matériau est copiée à part, et la copie pouvait être de l'image d'avant
-  (et lue pendant que le jeu écrivait la suivante). En mouvement, un pixel de feuille gardait le matériau du ciel (0, comme l'eau) et recevait un reflet
-  parti au hasard. Copies dans un anneau de 4 tampons, avec un repère à l'exécution : le calcul prend celle de son image, et l'attend deux présentations
-  au plus ;
-- **la normale de l'eau tirée de la profondeur** : décalée à chaque image avec le sous-pixel, elle envoyait le reflet ailleurs à chaque image. D'où le grain
-  qui ne se nettoyait qu'en s'accumulant, jeu en pause. L'eau est plate et horizontale : sa normale est maintenant le haut du monde, lu dans la caméra
-  du jeu (`reflect_up=0` pour l'ancienne règle). Un pixel de matériau « eau » n'est un miroir que s'il regarde à peu près vers le haut et que trois de ses
-  quatre voisins sont aussi de l'eau à la même distance ;
-- **l'historique des reflets sur ce qui n'est pas de l'eau** : relu à côté en mouvement, il posait le reflet d'un pixel d'eau voisin sur les herbes et l'y
-  laissait s'éteindre lentement (ça reste à l'écran). Un pixel sans reflet n'en reçoit plus aucun, un pixel d'eau tout juste découvert prend le reflet tout
-  de suite, le voisinage du bornage ne compte que les pixels qui ont un reflet, et un point très clair (particule lue dans l'image) pèse peu dans
-  l'historique ;
-- **la rotation de la caméra pour reprojeter les reflets** venait des cascades, une image sur dix : elle vient de la caméra du jeu.
+- **the water mask from a different frame than the depth**: the material target is copied separately, and the copy
+  could be from the previous frame (and read while the game was writing the next). In motion, a leaf pixel kept the
+  sky's material (0, like water) and received a reflection going anywhere. Copies in a ring of 4 buffers, with a marker
+  at execution: the computation takes the one from its frame, and waits for it at most two presents;
+- **the water's normal from depth**: shifted every frame with the jitter, it sent the reflection elsewhere every frame.
+  Hence the grain that only cleaned up by accumulating, with the game paused. Water is flat and horizontal: its normal is
+  now the world's up, read from the game's camera (`reflect_up=0` for the old rule). A "water" material pixel is a mirror
+  only if it looks roughly up and three of its four neighbours are water at the same distance too;
+- **the reflection history on what is not water**: read off-target in motion, it laid a neighbouring water pixel's
+  reflection on the grass and let it fade there slowly (it stays on screen). A pixel without reflection no longer
+  receives any, a newly uncovered water pixel takes the reflection right away, the clamp's neighbourhood counts only
+  pixels that have a reflection, and a very bright point (a particle read from the image) weighs little in the history;
+- **the camera rotation used to reproject reflections** came from the cascades, one frame in ten: it now comes from the
+  game's camera.
 
-**Bug trouvé en route, dans le `frame_sync` de la v77 :** après un gros à-coup, le retard sur le jeu ne se rattrapait jamais (un calcul par image), les zones
-du flux étaient reprises avant d'être lues, la scène de l'image restait vide (`3 sommets`), sans aucune erreur. Plusieurs images complètes en attente :
-seule la dernière est gardée. Le journal de la partie de l'utilisateur en v77 ne montre pas ce cas.
+**Bug found along the way, in v77's `frame_sync`:** after a big hitch, the lag behind the game was never caught up (one
+computation per frame), stream regions were reused before being read, and the frame's scene stayed empty (`3 vertices`),
+without any error. With several complete frames waiting, only the last one is kept now.
 
-Mesures, Horizon, rafales (rythme ralenti) ; pixels que les reflets éclaircissent de plus de 5 %, points brillants isolés ajoutés par image :
+Measurements, bursts; pixels brightened by reflections by more than 5 %, isolated bright points added per frame:
 
-| Où | Ancienne règle | Nouvelle |
+| Where | Old rule | New |
 |---|---|---|
-| Forêt, en marchant (v77 / v78) | 0,37 %, 32 points | 0,02 %, 17 points |
-| Bord de l'eau, pas de côté (`reflect_up=0` / 1) | 6,65 %, 2228 points | 0,17 %, 18 points |
-| Bord de l'eau, caméra qui tourne | 1,07 %, 100 points | 0,49 %, 80 points |
-| Bord de l'eau, immobile | 0,34 %, 42 points | 0,93 %, 66 points |
+| Forest, walking (v77 / v78) | 0.37 %, 32 points | 0.02 %, 17 points |
+| Water's edge, side step (`reflect_up=0` / 1) | 6.65 %, 2228 points | 0.17 %, 18 points |
+| Water's edge, turning camera | 1.07 %, 100 points | 0.49 %, 80 points |
+| Water's edge, still | 0.34 %, 42 points | 0.93 %, 66 points |
 
-Les deux règles du bord de l'eau n'ont pas été prises au même endroit (le personnage a bougé entre les deux) : l'ordre de grandeur du pas de côté est
-net, la ligne « immobile » ne prouve rien (cadrage différent, plus de ciel clair reflété). 3 lancements de suite et 2 Alt+Tab sans plantage ; environ 81
-images par seconde à l'arrêt en forêt.
+The two water's-edge rules were not measured at the same place (the character moved in between): the order of magnitude
+of the side step is clear, the "still" line proves nothing (different framing, more bright sky reflected). 3 launches in
+a row and 2 Alt+Tabs without a crash.
 
-Reste à faire : le reflet du jeu lui-même, en gros blocs basse résolution (visible sur l'image sans URTI), reste visible sous le reflet RT là où celui-ci est
-faible ; `reflect_f0` à 0,15 et 0,3 ne change presque rien à l'œil, gardé à 0,04 ; le texte du HUD et du menu se reflète toujours dans l'eau ; l'eau est un
-miroir plat, sans les vaguelettes (normale du G-buffer à essayer) ; les particules n'ont pas été testées à part. RDR2 garde la v75 : à revérifier avant de
-l'installer.
+Left: the game's own low-resolution reflection stays visible under the RT reflection where the latter is weak;
+`reflect_f0` at 0.15 and 0.3 changes almost nothing to the eye, kept at 0.04; HUD text is still reflected in the water;
+the water is a flat mirror, without ripples (G-buffer normal to try). RDR2 keeps v75: to recheck before installing.
 
-## v79 : la caméra perdue quand les reflets du jeu sont coupés
+## v79 — URTI: camera lost when the game's reflections are turned off
 
-Retour de l'utilisateur : « j'ai désactivé les reflets du jeu, et quand je cours c'est une bouillie de pixels, le débruiteur fait mal son travail ». Le journal de sa partie dit autre
-chose : à l'instant où il change l'option, `caméra du jeu : 300 images, 0 nouvelles, 0.00 cm`, et toutes les lectures refusées, alors qu'il court. La dernière caméra restait figée :
-mouvement nul pour le lissage (historique relu au mauvais endroit, d'où la bouillie), objets gardés mal placés. Rien ne le signalait. Au lancement suivant, l'option gardée, le tampon de 512
-octets ne contient plus la caméra du tout : il sert au reflet du jeu lui-même.
+User feedback: "I turned off the game's reflections, and when I run it's a pixel soup, the denoiser does a bad job". The
+session's log said something else: at the moment the option changed, `game camera: 300 frames, 0 new, 0.00 cm`, every
+read refused, while running. The last camera stayed frozen: zero motion for smoothing (history read at the wrong place,
+hence the soup), kept objects misplaced. Nothing reported it. At the next launch, with the option kept, the 512-byte
+buffer no longer held the camera at all: it serves the game's own reflection.
 
-**Corrigé :**
+**Fixed:**
 
-- caméra perdue (plus de valeur depuis 30 présentations) : l'ancienne mesure sur les témoins prend le relais, le cache est vidé, et de même à son retour. Plus de caméra figée ;
-- recherche d'une autre source tant qu'elle manque : vues créées et tampons liés à la racine, deux formes (projection + matrice caméra, vue-projection + vue). Adoption seulement si le décalage
-  sous-pixel change, si la source est vue à au moins 60 % des présentations pendant au moins 30, avec peu de valeurs par image, et sans téléportation (5 m). Ensuite, écartée si elle dépasse six
-  valeurs par présentation ou fait des sauts de plus de 10 m.
+- camera lost (no value for 30 presents): the old witness measurement takes over, the cache is cleared, and the same
+  when it comes back. No more frozen camera;
+- search for another source while it is missing: created views and root-bound buffers, two shapes (projection + camera
+  matrix, view-projection + view). Adopted only if the sub-pixel jitter changes, if the source is seen on at least 60 %
+  of presents for at least 30, with few values per frame, and without teleporting (5 m). Afterwards, dropped if it
+  exceeds six values per present or jumps by more than 10 m.
 
-**Pas résolu : aucune source sûre avec les reflets du jeu coupés.** Il ne reste que les tampons des dessins (monde-vue-projection + monde-vue). Les objets tournés y ont l'allure d'une caméra
-(faux candidats : 256, 768, 4608 octets, 70 000 « caméras » pour 300 images, sauts de centaines de mètres : c'est ce qui a imposé la règle de continuité). Essai de la valeur la plus fréquente de
-chaque image (les objets sans déplacement portent la vraie caméra) : médiane 0,44 cm contre les témoins mais 95 % à 172 cm ; elle alterne avec la caméra vue du repère d'Aloy, puis, ce repère écarté,
-avec celui de gros objets (60 % de continuité). Retirée : une caméra parfois fausse est pire que la mesure sur les témoins.
+**Not solved: no safe source with the game's reflections off.** Only the draws' buffers remain (world-view-projection +
+world-view). Rotated objects look like a camera there (false candidates: 256, 768, 4608 bytes, 70,000 "cameras" for
+300 frames, jumps of hundreds of metres: that is what imposed the continuity rule). Trying the most frequent value of
+each frame (objects without displacement carry the true camera): median 0.44 cm against the witnesses but 95th
+percentile 172 cm; it alternates with the camera seen from the character's frame, then, once that one is discarded,
+with large objects' frames (60 % continuity). Removed: a camera that is sometimes wrong is worse than the witness
+measurement.
 
-Vérifié : avec les reflets du jeu coupés, 2 lancements et 2 Alt+Tab sans plantage, mesure sur les témoins active, scène RT pleine (800 000 à 900 000 sommets), environ 78 images par seconde à
-l'arrêt. Sur une capture en courant, le contour d'Aloy reste en pixels éparpillés dans ce mode ; pas su si cela vient d'URTI ou de la génération d'images (image générée au hasard de la capture).
+Checked: with the game's reflections off, 2 launches and 2 Alt+Tabs without a crash, witness measurement active, full
+RT scene (800,000 to 900,000 vertices).
 
-Pas vérifié : ce build avec les reflets du jeu activés (l'option se change dans le menu du jeu, l'essai automatique ne la touche pas) ; le chemin de lecture du tampon de 512 octets n'a changé que de
-forme (mêmes places, même contrôle). Ni que la bouillie disparaît avec eux : l'utilisateur l'a signalée juste après avoir coupé l'option.
+To do: a safe source without the game's reflections (screen passes that remain: lighting, haze, DLSS); or mask the
+blocks of the game's reflection while keeping it on.
 
-Reste à faire : une source sûre sans les reflets du jeu (passes d'écran qui restent : éclairage, brume, DLSS) ; ou masquer les blocs du reflet du jeu en le gardant actif.
+## v80 — URTI: reflections taken before the HUD, UI left intact, colours learned per object
 
-## v80 : reflets pris avant le HUD, interface laissée intacte, couleurs apprises des objets
+User feedback: "we see the HUD bar and the menus in the water; wouldn't it be smarter to use our own reflections that we
+learn?". URTI's reflections took their colours from the screen's final image, HUD and menus included: no snapshot before
+the UI was possible (`photos 0/0`), the game never draws into the screen image with DLSS-G. And the composition darkened
+the HUD and the menu text like the rest of the image.
 
-Retour de l'utilisateur : « on voit la barre d'affichage et les menus dans l'eau ; ce serait pas plus intelligent d'utiliser nos propres
-reflets qu'on apprend ? ». Les reflets d'URTI prenaient leurs couleurs dans l'image finale de l'écran, HUD et menus compris : aucune
-photo d'avant l'interface dans Horizon (`photos 0/0`), le jeu ne dessine jamais dans l'image d'écran avec DLSS-G. Et la composition
-assombrissait le HUD et le texte du menu comme le reste de l'image.
+**The game's image without its UI.** The pass survey (`urti_passes`) shows, at the end of each frame, a 2560×1440 RGBA
+16-bit float target that the game writes before laying its HUD: the one DLSS-G receives without UI. Its alpha is
+exactly the UI's shape (5.3 % of pixels in the capture: compass, prompts, health; the same as the UI layer written just
+after).
 
-**Image du jeu sans son interface.** Le relevé des passes (`urti_passes`) montre, à la fin de chaque image, une cible 2560×1440 en RGBA
-16 bits flottants que le jeu écrit avant de poser son HUD : celle que DLSS-G reçoit sans interface. Son alpha est exactement la forme de
-l'interface (5,3 % des pixels sur la capture : boussole, invites, santé ; la même que celle du calque d'interface écrit juste après).
+- recognised at execution, without any setting: among screen-sized RGBA 16-bit float images at the end of their
+  writing, the first one finished after the frame's water mask (after the depth if there is no mask). Adopted when it is
+  the same resource at least 8 times out of 10 (in game: 40 out of 40, a single candidate, at every launch);
+- copied inside the game's lists at the end of its writing (ring of 4, common state, like the depth), marker read at
+  execution;
+- converted back into the screen image's layout (`live_hudless.hlsl`), once per new copy (generated frames reuse the
+  last): reflections, the surface cache and the light measurement take their colours from it;
+- UI mask for the composition (left intact): the alpha (the HUD), plus still pixels (identical in the previous copy)
+  clearly different from the final image two conversions in a row (the pause menu, which is not in the alpha).
+  Tolerance 0.06 + 15 % of the value. A moving pixel is not compared;
+- `hudless=0` in urti.ini goes back to the old path; `hudless=2` runs the conversion without using it (to measure its
+  cost).
 
-- reconnue à l'exécution, sans réglage : parmi les images de la taille de l'écran en RGBA 16 bits flottants à la fin de leur écriture,
-  la première finie après le masque de l'eau de l'image (après la profondeur si pas de masque). Adoptée quand c'est la même ressource au
-  moins 8 fois sur 10 (en jeu : 40 sur 40, une seule candidate, à chaque lancement) ;
-- copiée dans les listes du jeu à la fin de son écriture (anneau de 4, état commun, comme la profondeur), repère lu à l'exécution ;
-- remise dans la disposition de l'image d'écran (`live_hudless.hlsl`), une fois par nouvelle copie (les images générées reprennent la
-  dernière) : les reflets, le cache de surfaces et la mesure de la lumière y prennent leurs couleurs ;
-- masque d'interface de la composition (laissée intacte) : l'alpha (le HUD), plus les pixels immobiles (identiques dans la copie
-  précédente) nettement différents de l'image finale deux conversions de suite (le menu de pause, qui n'est pas dans l'alpha). Écart
-  toléré 0,06 + 15 % de la valeur. Un pixel qui bouge n'est pas comparé ;
-- `hudless=0` dans urti.ini revient à l'ancienne voie ; `hudless=2` fait la conversion sans s'en servir (mesure de son coût).
+**Pitfall: the screen image is not encoded like this image.** The target's values match the game's other targets (PQ),
+but the screen image is about twice the target (PQ codes; raw readback of a burst: constant ratio, median error 1.3 %,
+much better than a PQ law or a square root). The game applies that factor afterwards. Copied as is, the snapshot was
+four times too dark in the highlights (reflections darkened the water), and the comparison took 95 % of the image for UI
+(no effect at all, still camera). The ratio is learned continuously on the GPU (`live_hudgain.hlsl`): median of the
+per-pixel ratio over still pixels outside the UI (log2 histogram, 1.1 % per bin), running average. It varies with the
+scene: 2.05 to 2.14 at the water's edge, 1.37 to 1.78 at a campfire and while loading, 1.73 to 1.89 in pause (the game
+darkens the background behind the menu). A first attempt with a sum filtered by the ratio already learned: a wrong ratio
+taken while loading discarded the good pixels and stayed wrong (1.3 to 1.5); the unfiltered median does not trap itself.
 
-**Piège : l'image d'écran n'est pas codée comme cette image.** Les valeurs de la cible correspondent à celles des autres cibles du jeu
-(PQ), mais l'image d'écran vaut environ deux fois la cible (codes PQ ; relevé brut d'une rafale : rapport constant, erreur médiane 1,3 %,
-bien mieux qu'une loi PQ ou une racine). Le jeu applique ce facteur après. Copiée telle quelle, la photo était quatre fois trop sombre dans
-les hautes lumières (les reflets assombrissaient l'eau), et la comparaison prenait 95 % de l'image pour de l'interface (plus d'effet du
-tout, caméra immobile). Le rapport est appris en continu sur le GPU (`live_hudgain.hlsl`) : médiane du rapport pixel par pixel sur les
-pixels immobiles hors interface (histogramme log2, 1,1 % par case), moyenne glissante. Il varie avec la scène : 2,05 à 2,14 au bord de
-l'eau, 1,37 à 1,78 au feu de camp et au chargement, 1,73 à 1,89 en pause (le jeu assombrit le fond derrière le menu). Premier essai avec
-une somme filtrée par le rapport déjà appris : un rapport faux pris au chargement écartait les bons pixels et restait faux (1,3 à 1,5) ;
-la médiane non filtrée ne se piège pas.
+**Colours learned per object of the geometry cache.** A reflection hitting a hidden or off-screen object only had a
+colour for the frame's geometry (per-triangle surface cache); on a cached object, nothing: the game's blocky reflection
+showed underneath. Each cached object now has a place in a table of 256 colours (one per group of neighbouring
+triangles), learned by the surface cache while the object is on screen; the instance identity carries the place and its
+generation, the hit-group field the triangle count. The reflection uses them when the hit point is not visible. No
+separate measurement of its effect.
 
-**Couleurs apprises des objets du cache de géométrie.** Un reflet qui touche un objet caché ou hors de l'écran n'avait de couleur que
-pour la géométrie de l'image (cache de surfaces par triangle) ; sur un objet du cache, rien : le reflet bloqué du jeu se voyait dessous.
-Chaque objet du cache a maintenant une place dans une table de 256 couleurs (une par groupe de triangles voisins), apprises par le cache
-de surfaces quand l'objet est à l'écran ; l'identité de l'instance porte la place et sa génération, le champ du groupe de touche le
-nombre de triangles. Le reflet les reprend quand le point touché n'est pas visible. Pas de mesure séparée de son effet.
+**Measured in game** (day, game camera read, real-pace bursts):
 
-**Mesuré en jeu** (marais, jour, caméra du jeu lue, rafales au rythme réel) :
+- pause-menu text: 97 to 98 % of bright pixels left intact (before: darkened by 15 to 38 levels); in-game HUD with a
+  still camera 64 to 88 % intact (before: 24 %, darkened by 25 levels). The reflections' snapshot no longer contains the
+  menu or the HUD;
+- UI taken for 0.0 to 0.2 % of the screen in game, 1.8 % in pause;
+- change of the effect from one frame to the next (pixels > 0.05), still camera: 0.83 % (old path 0.70 %; without the
+  two conversions in a row 1.38 %, grass made the mask blink); in pause 0.18 % (old path 0.62 %);
+- bright points added: 29 in pause, 86 still, 114 to 120 in motion (old path, another view: 240, 69, 133 to 488);
+- cost at the same place, still camera: composition 1.47 → 1.93 ms per present (conversion 0.25 ms, use 0.25 ms);
+- about ten test launches, then 4 check launches and 4 Alt+Tabs on the final version, without a crash.
 
-- texte du menu de pause : 97 à 98 % des pixels clairs laissés intacts (avant : assombri de 15 à 38 niveaux) ; HUD en jeu caméra immobile
-  64 à 88 % intact (avant : 24 %, assombri de 25 niveaux). La photo des reflets ne contient plus ni le menu ni le HUD ;
-- interface prise pour 0,0 à 0,2 % de l'écran en jeu, 1,8 % en pause ;
-- variation de l'effet d'une image à la suivante (pixels > 0,05), caméra immobile : 0,83 % (ancienne voie 0,70 % ; sans les deux
-  conversions de suite 1,38 %, les herbes faisaient clignoter le masque) ; en pause 0,18 % (ancienne voie 0,62 %) ;
-- points brillants ajoutés : 29 en pause, 86 immobile, 114 à 120 en mouvement (ancienne voie, autre vue : 240, 69, 133 à 488) ;
-- coût au même endroit, caméra immobile : composition 1,47 → 1,93 ms par présentation (conversion 0,25 ms, usage 0,25 ms), environ
-  73 au lieu de 75 images par seconde ;
-- une dizaine de lancements d'essai, puis 4 lancements de vérification et 4 Alt+Tab sur la version finale, sans plantage.
+Not done: the light bounce does not use the learned object colours yet.
 
-Pas fait : le rebond de lumière ne reprend pas encore les couleurs apprises des objets ; masquer le reflet en blocs du jeu.
+## v81 — URTI: the reflection no longer stutters with DLSS-G, faster rays, real-pace films and ꟻLIP
 
-## v81 : le reflet ne saccade plus avec DLSS-G, rayons plus rapides, mesure par film au rythme réel et ꟻLIP
+User feedback on v80: "the fps must be fixed, we lose too much; at rest the reflections build up and look good, but in
+motion they shift, don't follow, the character shifts, it wriggles in the water, it looks like layers above the water;
+we need an image analysis that shows whether it's good or not (the NVIDIA thing)".
 
-Retour de l'utilisateur sur v80 : « il faut corriger les fps, on perd trop ; à l'arrêt les reflets se calculent et deviennent bien, mais en
-mouvement ils se décalent, ne suivent pas, le personnage se décale, ça gigote dans l'eau, on dirait des couches au-dessus de l'eau ;
-il faut une analyse d'image qui montre si c'est bien ou non (le truc de NVIDIA) ».
+**Measurement tools.**
 
-**Outils de mesure.**
+- Real-pace film (`urti_film` file): 30 consecutive presents, generated ones included, before and after URTI, at half
+  resolution, kept in video memory and written only at the end (a burst writes each frame: the game slows down and only
+  computed frames end up in it). One `FILM` line per present (generated, computed); at the end, the depth and the water
+  mask of the last computation (`profondeur.bin`, `materiau.bin`, `FILMCAM` line).
+- `tools/reshade/urti_film_ana.py`: ꟻLIP (NVIDIA, flip-evaluator 1.7) between each present and the next, on the game's
+  image and on the image with URTI; the excess is what URTI adds as perceived change (shaking, jumping). Also the shift
+  of the image and of URTI's layer from one present to the next (phase correlation).
+- `tools/reshade/urti_eau_hauteur.py`: height of each water pixel from the film's depth.
+- Detailed GPU timing ("GPU detail" log): every step of the computation and the composition.
 
-- Film au rythme réel (fichier `urti_film`) : 30 présentations de suite, générées comprises, avant et après URTI, à demi-résolution,
-  gardées en mémoire vidéo et écrites seulement à la fin (une rafale écrit chaque image : le jeu ralentit et seules les images calculées
-  y sont). Une ligne `FILM` par présentation (générée, calculée) ; à la fin, la profondeur et le masque de l'eau du dernier calcul
-  (`profondeur.bin`, `materiau.bin`, ligne `FILMCAM`).
-- `tools/reshade/urti_film_ana.py` : ꟻLIP (NVIDIA, flip-evaluator 1.7, déjà installé) entre chaque présentation et la suivante, sur l'image
-  du jeu et sur l'image avec URTI ; l'excédent est ce qu'URTI ajoute comme changement perçu (tremblement, saut). Aussi le décalage de
-  l'image et de la couche URTI d'une présentation à la suivante (corrélation de phase).
-- `tools/reshade/urti_eau_hauteur.py` : hauteur de chaque pixel d'eau d'après la profondeur du film.
-- Minutage GPU détaillé (journal « GPU détail ») : chaque étape du calcul et de la composition.
+**Cause of the shift in motion: URTI's layer frozen on generated frames.** With DLSS-G, one present in two or three has
+no computation: URTI laid the last computation's shadow and reflection on it as they were. Film of a side step: the
+image moves 1 to 3 px per present, URTI's layer stays at 0.01 px one time in three, then catches up at once (9 presents
+frozen out of 29). Fixed: the reflection resolver keeps, for each pixel, the surface's motion and that of the virtual
+point behind the mirror; on a generated frame, the composition reads shadow and reflection at "here + 0.5 × motion"
+(`fg_shift=`, 0: old rule). Measured in the same session: 1 frozen present out of 29 (instead of 9), the layer follows
+the image on every present (ratio 1.1, constant).
 
-**Cause du décalage en mouvement : la couche d'URTI figée sur les images générées.** Avec DLSS-G, une présentation sur deux ou trois n'a
-pas de calcul : URTI y reposait l'ombre et le reflet du dernier calcul tels quels. Film d'un pas de côté : l'image avance de 1 à 3 px à
-chaque présentation, la couche d'URTI reste à 0,01 px une fois sur trois puis rattrape d'un coup (9 présentations sur 29 figées).
-Corrigé : le résolveur des reflets garde, pour chaque pixel, le mouvement de la surface et celui du point virtuel derrière le miroir ;
-sur une image générée, la composition lit l'ombre et le reflet à « ici + 0,5 × mouvement » (`fg_shift=`, 0 : ancienne règle). Mesuré
-dans la même partie : 1 présentation figée sur 29 (au lieu de 9), la couche suit l'image à chaque présentation (rapport 1,1, constant).
+**Not the cause:**
 
-**Pas la cause :**
+- the mirror's height: on open water, the game's depth is a plane (−1.59 to −1.61 m below the camera): it is indeed the
+  surface;
+- dark spots around the character's legs in the water: they are in the game's image without URTI (frame generation on
+  fast-moving legs). But pieces of the character (gear, hair) could enter the geometry cache, where an object is assumed
+  still: objects closer than 6 m to the camera are excluded from the cache (about 300 discarded per 300 frames).
 
-- la hauteur du miroir : sur l'eau ouverte, la profondeur du jeu est un plan (−1,59 à −1,61 m sous la caméra) : c'est bien la surface ;
-- les taches sombres autour des jambes d'Aloy dans l'eau : elles sont dans l'image du jeu sans URTI (génération d'images sur des
-  jambes qui bougent vite). Mais des morceaux d'Aloy (équipement, cheveux) pouvaient entrer dans le cache de géométrie, où un objet est
-  supposé immobile : objets à moins de 6 m de la caméra exclus du cache (environ 300 écartés par tranche de 300 images).
+**Cost.** Per computation (water's edge): geometry cache 1.9 ms, frame structure 1.8, occlusion 2.2, denoising 2.0,
+reflections 2.3; per present: UI-free image 0.35, stabilised reflections 0.37, composition 0.5.
 
-**Coût.** Sans URTI, au même endroit : 134 images par seconde ; avec v80 : 69 à 85. Détail par calcul (bord de l'eau) : cache de
-géométrie 1,9 ms, structure de l'image 1,8, occultation 2,2, débruitage 2,0, reflets 2,3 ; par présentation : image sans interface 0,35,
-reflets stabilisés 0,37, composition 0,5.
+- Rays: every occlusion and reflection ray examined each triangle it met (ground, rocks, trunks) to know whether it was
+  a leaf hole. Now an opaque ray first (the hardware finds the closest); if it is a hole seen on screen, the next opaque
+  ray starts just after it (up to six), the slow search only beyond. Same result. Measured at the same place (alternated,
+  30 s each): facing the water 80.5 instead of 71 fps (reflections 2.2 instead of 3.9 ms, occlusion 1.95 instead of
+  2.85), facing the forest 86.3 instead of 79.5. `rayons_lents=1` goes back to the old rule.
+- Denoising: occlusion is computed on only one pixel per 2×2 block each frame; the 5×5 blur read 25 pixels to keep only
+  4 to 9. It now reads only those (same result): 2.0 → 1.4 to 1.6 ms.
+- Geometry cache: 80 objects and 400,000 vertices rebuilt every frame; now new ones first (300,000 vertices), objects
+  already kept refreshed at 100,000 vertices per frame (`geo_new=`, `geo_refresh=`): 1.2 → 0.5 ms.
+- Occlusion: no more extra rays where the image moves (`ao_boost=1` to bring them back).
 
-- Rayons : chaque rayon d'occultation et de reflet examinait chaque triangle rencontré (sol, rochers, troncs) pour savoir si c'était un trou
-  de feuille. Maintenant un rayon opaque d'abord (le matériel trouve le plus proche) ; si c'est un trou vu à l'écran, rayon opaque suivant
-  juste après lui (jusqu'à six), la recherche lente seulement au-delà. Même résultat. Mesuré au même endroit (alterné, 30 s chacun) :
-  face à l'eau 80,5 au lieu de 71 images par seconde (reflets 2,2 au lieu de 3,9 ms, occultation 1,95 au lieu de 2,85), face à la forêt
-  86,3 au lieu de 79,5. `rayons_lents=1` revient à l'ancienne règle.
-- Débruitage : l'occultation n'est calculée que sur un pixel par bloc 2×2 à chaque image ; le flou 5×5 lisait 25 pixels pour n'en garder
-  que 4 à 9. Il ne lit plus que ceux-là (même résultat) : 2,0 → 1,4 à 1,6 ms.
-- Cache de géométrie : 80 objets et 400 000 sommets reconstruits à chaque image ; maintenant les nouveaux d'abord (300 000 sommets), les
-  objets déjà gardés remis à jour à 100 000 sommets par image (`geo_new=`, `geo_refresh=`) : 1,2 → 0,5 ms.
-- Occultation : plus de rayons supplémentaires là où l'image bouge (`ao_boost=1` pour les remettre).
+**Left:** the frame structure rebuilt at each computation (2.2 ms), occlusion and reflections in dense foliage (up to
+10 ms while walking), composition on every present. Reflections of hidden or off-screen objects take colours learned
+per triangle or per group of triangles: flat patches (reflected trunks as pale bars), perhaps the "layers" the user
+sees.
 
-Au départ (feu de camp, immobile) : 81 → 92 images par seconde ; au bord de l'eau 69,5 → 80,5 (sans URTI : 134). Une dizaine de lancements
-d'essai, puis 2 lancements et 2 Alt+Tab de vérification sur la version finale, sans plantage.
+## v82 — URTI: a time budget on occlusion and reflections, no more wasted work outside reflective areas
 
-**Reste :** structure de l'image reconstruite à chaque calcul (2,2 ms), occultation et reflets dans le feuillage dense (jusqu'à 10 ms en
-marchant), composition à chaque présentation. Les reflets d'objets cachés ou hors de l'écran prennent des couleurs apprises par
-triangle ou par groupe de triangles : aplats (troncs reflétés en barres pâles), peut-être les « couches » que voit l'utilisateur.
+User feedback on v81: "the water must be optimised, we drop to 15 fps, everything is computed all the time, reflections
+sometimes take time to build up, a huge number of areas are computed for nothing".
 
-## v82 : un budget de temps sur l'occultation et les reflets, plus de travail inutile hors de l'eau
+**What the session's log said.** At times, averaged over 300 frames: occlusion 45 ms, reflections 20 ms (running, 50 cm
+and 1.5° per frame, dense vegetation, cache of 2,400 objects). Before v81 the maximum was 15 to 20 ms: **v81 had made the
+worst case worse**. Hopping from hole to hole (up to six opaque rays) was followed by an unbounded search if the last
+point was still a hole: in dense grass, up to seven traversals per ray. It had only been measured with a still camera.
 
-Retour de l'utilisateur sur v81 : « il faut optimiser l'eau, on descend à 15 fps, tout se calcule tout le temps, les reflets mettent parfois du temps à se calculer,
-énormément de zones sont calculées en trop ».
+**Bugs found:**
 
-**Ce que dit le journal de sa partie.** Par moments, en moyenne sur 300 images : occultation 45 ms, reflets 20 ms (course, 50 cm et 1,5° par image, végétation dense, cache de 2400 objets).
-Avant v81 le maximum était de 15 à 20 ms : **v81 avait aggravé le pire cas**. Le saut de trou en trou (jusqu'à six rayons opaques) était suivi d'une recherche sans limite si le dernier point
-était encore un trou : dans l'herbe dense, jusqu'à sept traversées par rayon. Il n'avait été mesuré que caméra immobile.
+- the occlusion-ray regulator read the wrong interval (markers 2 to 3: the copy of the game's map, 0.02 ms, instead of
+  3 to 4) since a marker had been added: it always believed it had room, and occlusion stayed at four rays whatever its
+  cost;
+- one extra ray per water pixel for reflection anchoring, while anchoring is off (`anchor_alpha=0`);
+- reflections computed normal and flatness over the whole screen before reading the material;
+- occlusion alone (sun shadows off) computed two normals and read the game's map on every pixel, and the flatness plus an
+  8-point neighbourhood (twice) even on the 3 pixels out of 4 without a ray this frame.
 
-**Bugs trouvés :**
+**Fixed:**
 
-- le régulateur des rayons d'occultation lisait le mauvais intervalle (repères 2 à 3 : la copie de la carte du jeu, 0,02 ms, au lieu de 3 à 4) depuis qu'un repère avait été ajouté : il croyait toujours
-  avoir de la marge, l'occultation restait à quatre rayons quel que soit son coût ;
-- un rayon de plus par pixel d'eau pour l'ancrage des reflets, alors que l'ancrage est coupé (`anchor_alpha=0`) ;
-- les reflets calculaient normale et planéité sur tout l'écran avant de lire le matériau ;
-- l'occultation seule (ombres du soleil coupées) calculait deux normales et lisait la carte du jeu sur tous les pixels, et la planéité plus un voisinage de 8 points (deux fois) même sur les 3 pixels sur 4 sans rayon à cette image.
+- bounded rays: a few hops at most (occlusion 0 to 2, reflections 1 to 3), never an unbounded search (`rayons_lents=1` to
+  compare). At the end of the hops: occlusion without an occluder, reflection on the last point hit;
+- material first: outside reflective surfaces, a reflection costs one read; with the game's camera known, reflections
+  on water only (`reflect_all=1` for other smooth surfaces);
+- occlusion: pixels without a ray exit right away;
+- a time budget per pass, held every frame, targets `ao_ms=4` (occlusion and denoising) and `refl_ms=2.5` (0: no
+  budget). The level (0 to 4) rises as soon as the pass exceeds its target and comes down slowly. Occlusion: rays 4 to 1,
+  hops 2 to 0, range 50 to 10 m (faded smoothly). Reflections: hops 3 to 1, range 500 to 100 m, one pixel in 1, 2 or 4
+  gets a ray (the pattern rotates), the others take their neighbours' colour (`live_reflresolve`).
 
-**Corrigé :**
+**Measured in game,** same route (running back and forth through vegetation and along the water, two alternated laps,
+"time budget" log):
 
-- rayons bornés : quelques sauts au plus (occultation 0 à 2, reflets 1 à 3), jamais de recherche sans limite (`rayons_lents=1` pour comparer). Au bout des sauts : occultation sans obstacle, reflet sur le dernier point touché ;
-- matériau d'abord : hors de l'eau, un reflet coûte une lecture ; caméra connue : reflets sur l'eau seulement (`reflect_all=1` pour les autres surfaces lisses) ;
-- occultation : les pixels sans rayon sortent tout de suite ;
-- budget de temps par passe, tenu à chaque image, cibles `ao_ms=4` (occultation et débruitage) et `refl_ms=2,5` (0 : pas de budget). Le niveau (0 à 4) monte dès que la passe dépasse sa cible et redescend lentement.
-  Occultation : rayons 4 à 1, sauts 2 à 0, portée 50 à 10 m (effacée en douceur). Reflets : sauts 3 à 1, portée 500 à 100 m, un pixel sur 1, 2 ou 4 reçoit un rayon (le motif tourne), les autres prennent la couleur de leurs voisins (`live_reflresolve`).
-
-**Mesuré en jeu,** même parcours (course aller-retour dans la végétation et au bord de l'eau, deux tours alternés, journal « budget de temps ») :
-
-| | sans budget | avec budget |
+| | no budget | with budget |
 |---|---|---|
-| passage le plus lourd | 39 à 46 images par seconde (occultation 12 à 17 ms, reflets jusqu'à 12 ms) | 74 à 82 (3,6 ms, 2,7 ms) |
-| pire image, occultation | 32 ms | 5 à 7 ms, un pic à 16 ms en entrant dans la zone |
-| pire image, reflets | 27 ms | 6 ms |
+| heaviest stretch | 39 to 46 fps (occlusion 12 to 17 ms, reflections up to 12 ms) | 74 to 82 (3.6 ms, 2.7 ms) |
+| worst frame, occlusion | 32 ms | 5 to 7 ms, one 16 ms peak when entering the area |
+| worst frame, reflections | 27 ms | 6 ms |
+
+Every reflective area is water (`reflect_stats=1`: 8 to 25 % of the screen, 80,000 to 600,000 rays per frame). Film at
+the water's edge with the budget: clean image (no checkerboard, no blocks), ꟻLIP of the same order as before.
+
+Reflections that take time: at rest, the reflection took only 10 % of the new value per frame; raised to 25 %
+(`refl_alpha_min=`). Measured with ꟻLIP (alternated, twice): at rest, no more shaking (excess 0.0060 and 0.0044 instead of
+0.0058 and 0.0053); after a camera move, less spurious change (0.0156 and 0.0148 instead of 0.0214 and 0.0294).
+
+## v83 — URTI: the game's blocky reflection under URTI's, Red Dead updated
+
+User feedback on v82: some reflection bugs in the second game; "on Red Dead it's clean; on Red Dead, in town when you walk,
+shadow lines appear".
+
+**Measured first: URTI adds no colour cast.** Films, each effect turned off in turn: green share of the image 0.343
+without URTI, 0.341 with it; neither the bounce, nor occlusion, nor reflections add any. The green is the game's water
+colour.
+
+**What made it visible everywhere: v82's budget.** Reflection budget forced to its lowest (`refl_ms=0.4`): half of the
+water turns bright green. The range of reflected rays dropped from 500 to 100 m: the dark reflection of distant trees
+disappeared and let the game's colour through. Fixed: the range never drops any more; the budget acts on hops, and on
+one pixel in two at most (no longer one in four); a pixel without a ray this frame mostly keeps its history (clamped by
+its neighbours), the neighbours' average only corrects it. Occlusion: the range drops to 25 m at most (10 m before),
+and in the distance one or two rays are enough (beyond 25 m, a single one). Reflection target 3.5 ms.
+
+**The "layers": the game's reflection under URTI's.** The game draws its own reflection into the water, in large
+low-resolution blocks; through URTI's sharp reflection (Fresnel weight only), those blocks stayed visible: two
+reflections that do not coincide. Fixed (`live_waterbase.hlsl`, game camera known): the game's water colour smoothed
+(mean of water pixels per block of 8 render pixels, 7×7 blur weighted by the water share), replacing the game's colour
+where the reflection matters. The game's reflection is much stronger than Fresnel alone: smoothed and nothing more, the
+water became dull. URTI's reflection now weighs 3 times Fresnel on water (`water_gain=`, 2 to 4 tried). `water_base=0`
+goes back to the old composition.
+
+**Red Dead.** Shadow lines: not found. Bursts while walking in a Saint Denis courtyard (with and without kept places,
+`persist=0`), installed version then new version: 0 fixed lines, at most one fleeting line per frame. The long thin
+shadows of wires (tram, telegraph) are in the game's image without URTI (v50 split-screen capture). New version
+installed in Red Dead (the old one kept as `urti.addon64.avant_v83`): 76 to 78 fps instead of 71 to 76 at the same
+place, occlusion 1.8 → 1.4 ms, composition 0.9 → 0.6 ms, no crash. The reflection keeps the old smoothing there (10 % per
+frame): without a game camera, its normal comes from depth.
+
+Not checked: Red Dead's wet-ground reflections with this version (dry weather), the sea, night.
+
+## v84 — URTI: world radiance cache, layer realigned on the displayed image, HUD protected in motion
+
+User feedback on v83: "the reflections are broken; we need real ray tracing, we have the information, we just have to
+inject it all properly; use NVIDIA's techniques".
+
+**What the films showed (game on the left, URTI on the right).** URTI's water was dull and grey, the sky was hardly
+reflected any more, and while walking the reflection broke into flat-coloured shards. Cause: a hidden or off-screen
+reflected point received a single colour per 256th of an object (a 200,000-triangle tree: 800 triangles per colour), and
+a ray going off screen toward the sky received nothing (the game's water showed again).
+
+**World radiance cache** (`live_radcache.hlsl`, `live_radhash.hlsli`, after NVIDIA's SHaRC; game camera known). A
+spatial hash table of 2^23 cells (128 MB) in world space: on each computed frame, one pixel in four deposits the colour
+the image shows into the cell it is in, at three levels (a cell of 0.5 % of the distance, i.e. a few pixels, and two
+coarser ones). A reflection hitting a hidden or off-screen point reads back the colour seen there, blended over the
+eight neighbouring cells. Each cell also keeps its solid share: one pixel in sixteen recasts the camera ray into the RT
+scene, and each triangle crossed before the visible surface is a hole (cut-out foliage card); off screen, the reflected
+ray crosses foliage according to that learned share. Sky and distance map (512 × 512 octahedral, per world direction): a
+ray that hits nothing takes its colour there; directions never seen fill in from their neighbours. Extra per-pixel output
+(`reflMix`): colour already known and the share to read from the image. `radcache=0` goes back to per-object colours.
+Counters with `reflect_stats=1`. First try: a 2^22 table full in under a minute (397,000 deposits refused per frame);
+with 2^23 and a cell reclaimed after 2 s unused: 2,000 to 14,000.
+
+**URTI's layer was two game frames ahead of the screen.** Found while redoing the HUD mask: with DLSS-G, the final image
+of a present is not that of the last copy of the UI-free image, but of an older copy (comparison on one pixel in 64: most
+often the oldest of the last three). View 11 while turning: depth edges of the computation 27 to 37 pixels (half
+resolution) away from the image's, for 8 to 9 pixels of motion per present. Fixed: `live_hudgain` tracks which game
+frame each present shows and writes the layer's lead (1.4 to 1.7 game frames on average); `live_composite` slides
+shadow and reflection by that much along the motion (replaces v81's half step on generated frames). Same rotation
+afterwards: 0 to 1 pixel on most presents. `lag=0`: old rule; `lag_bias=`: correction.
+
+**HUD.** The UI-free image's alpha is 0 everywhere in the session (it only covers some screens): the mask held only on a
+still background (v80), and the reflection went over the HUD above the water. Redone: mask = difference between the final
+image and the copy that matches it, UI share from 0 to 1, redone only on presents where a copy matches at 96 % (150 to
+290 out of 300). The law between the two images is not a ratio: final = k × (UI-free)^1.13 to 1.25 per channel
+(measured), learned continuously (medians of dark and bright pixels).
+
+**Composition.** With the real sky in the reflection, v83's weight of 3 × Fresnel made a milky mirror hiding the bottom
+of the water: 1.5 by default (1 to 3 compared at the same place), and the game's water is smoothed only where URTI's
+reflection dominates.
+
+**Measurements (RTX 4070, DLSS + DLSS-G).** 88 to 92 fps at rest by the water, 65 to 80 in motion (v83: 92, 70 to 84);
+world cache about 0.4 ms per present. Two launches, running, two Alt+Tabs: no crash. Left: bright spots or blocks in
+places in the reflection (coarse cells, foliage), a band at the screen's edge without realignment in motion, perfectly
+flat water (no ripples).
+
+## v85 — URTI: layer queue (no more hitches), the game's water left alive
+
+User feedback on v84: "the reflections are gorgeous but it stutters in every direction, the character lags and even the
+ground; near the water the foam pops in and out, the water freezes at times, and we lose a lot of fps".
+
+**Hitches.** v84 slid the last layer by the measured lead (1.5 to 2 game frames) along the motion: right on average,
+wrong as soon as the game's pace varies (film while turning: still image, layer at −3.8 then −7.4 then 0 pixels from one
+present to the next). Matching exactly the computation and its UI-free copy (a marker left in the lists' execution
+order) changed nothing: the computation's copy is the last one 96 % of the time. Fixed with a queue (`live_delay.hlsl`):
+the layer of each computed frame (shadow, stabilised reflection, motion, jitter) is stored in one of three slices with
+the number of its game frame; `live_composite` lays on each present the slice of the game frame it shows, and only
+catches up the remainder along the motion (half a frame, frames made by DLSS-G). Same film afterwards: image −4.70 /
+−12.73 / −5.19 pixels, layer −4.10 / −10.15 / −4.71. Change of the layer from one present to the next while walking: 16
+and 12 levels → 7.4 and 5.9; URTI's ꟻLIP excess: 24 % of what the game changes itself → 15 % (walk), 22 % → 11 %
+(rotation).
+
+**Water.** The game's water smoothed under the reflection (v83) was redone only on computed frames and erased the foam
+where the reflection passed a threshold: water frozen at times, foam popping in and out. `water_base=0` by default: the
+game's water stays as it is under the reflection. Anchoring ray (one extra ray per water pixel, no effect on cached
+objects) removed along with it.
+
+Left: cost of reflections near a large stretch of water (3 to 5 ms, budget at its lowest in the player's session),
+reflections off water (`reflect_all=1`) to validate, coarse colour patches in places in the reflection.
+
+## v86 — URTI: half the reflection rays without flicker, and where the time really goes
+
+User feedback on v85: "much better but there's still quite a lot of noise; we need good performance". Session log:
+occlusion and reflections at level 4 all the time, still 6 ms each, 48 to 55 fps.
+
+**Noise.** Beyond level 2, one water pixel in two had no ray and took half of its neighbours' average: one frame a real
+ray, the next an average, so thin reflected objects flickered. A pixel without a ray now keeps only its history (it got a
+ray the frame before); hence one pixel in two at any level (`refl_full=1`: old rule). Occlusion: never a single ray any
+more, the range drops instead (50 to 12 m). Reflection range reduced when the budget is exceeded (500 to 90 m): with the
+world cache, a shorter ray ends on the sky and distance map, no longer on the game's water. World cache filled on one
+computed frame in two, HUD mask redone on one present in four.
 
-Toutes les zones à reflet sont de l'eau (`reflect_stats=1` : 8 à 25 % de l'écran, 80 000 à 600 000 rayons par image). Film au bord de l'eau avec le budget : image propre (pas de damier ni de blocs), ꟻLIP du même ordre qu'avant.
+**Measurements by the water.** Reflections 2.8 to 3.7 ms → 2.0 to 2.6; composition 1.9 to 2.75 → 1.4 to 1.6. ꟻLIP excess
+at rest 0.0099 → 0.0067; walking and running unchanged (0.019 / 0.021; 0.023 / 0.018).
+
+**Where the time goes (each effect turned off in turn, at rest).** Game alone 131 fps; URTI with occlusion, bounce and
+reflections off: 98; reflections alone off: 93; everything on: 84 to 90. The effects cost only 5 fps each: the bulk is
+fixed, per game frame: frame scene 2.1 ms, denoiser 1.2 ms (even with occlusion off), geometry cache 0.55, scene
+structure 0.3. Lowering the budgets changes almost nothing (occlusion 3.4 ms at level 4 against 3.9 at level 0).
+`blas_refit=1`, `geo_new=100000`, `vertex_budget=200000`: frame structure 2.05 → 1.24 ms, 1 to 2 fps. Next lead: stop
+redoing everything every game frame (the layer queue makes it possible to serve two frames with one computation).
 
-Reflets qui mettent du temps : à l'arrêt, le reflet ne prenait que 10 % de la nouvelle valeur par image ; passé à 25 % (`refl_alpha_min=`). Mesuré avec ꟻLIP (alterné, deux fois) : à l'arrêt, pas plus de tremblement
-(excédent 0,0060 et 0,0044 au lieu de 0,0058 et 0,0053) ; après un mouvement de caméra, moins de changement parasite (0,0156 et 0,0148 au lieu de 0,0214 et 0,0294).
+## v87 — URTI: objects vanishing from reflections, Red Dead checked
 
-Une dizaine de lancements d'essai, puis 2 lancements et 2 Alt+Tab de vérification sur la version finale, sans plantage ; 92 à 94 images par seconde à l'arrêt au feu de camp.
+**Red Dead Redemption 2 with v86** (never tried there): two launches, walking, turning, bursts: correct image, minimap
+intact, 70 to 77 fps (v83: 76 to 78), no crash. Installed (old one: `urti.addon64.avant_v86`). The real-pace film
+(`urti_film`) loses the device there (DXGI_ERROR_INVALID_CALL): do not trigger it in Red Dead.
 
-Pas vérifié : la mer, les grands lacs, la nuit. L'image aux niveaux les plus bas du budget (un rayon d'occultation à moins de 10 m, un pixel de reflet sur quatre) n'a été regardée que sur les films du marais.
-
-## v83 : le vert du marais, les blocs du reflet du jeu, Red Dead mis à jour
-
-Retour de l'utilisateur sur v82 : « dans Horizon c'est full bug, le vert du marais partout c'est dégueulasse ; sur Red Dead c'est clean ; on a des fps mais c'est full bug,
-les reflets bug ; sur Red Dead, en ville quand tu marches il y a des traits d'ombres qui apparaissent ».
-
-**Mesuré d'abord : URTI n'ajoute pas de vert.** Films au marais, chaque effet coupé à tour de rôle : part du vert dans l'image 0,343 sans URTI, 0,341 avec ; ni le rebond, ni
-l'occultation, ni les reflets n'en ajoutent. Le vert est la couleur de l'eau du jeu.
-
-**Ce qui le rendait visible partout : le budget de v82.** Budget des reflets forcé au plus bas (`refl_ms=0,4`) : la moitié droite de l'eau devient vert vif. La portée des rayons
-réfléchis descendait de 500 à 100 m : le reflet sombre des arbres lointains disparaissait et laissait voir le vert du jeu. Dans sa partie, le niveau des reflets était souvent à 2 ou 3.
-Corrigé : la portée ne baisse plus jamais ; le budget joue sur les sauts, et sur un pixel sur deux au plus (plus un sur quatre) ; un pixel sans rayon à cette image garde surtout
-son historique (borné par ses voisins), la moyenne des voisins ne fait que le corriger. Occultation : la portée descend au plus à 25 m (10 m avant), et au loin un ou deux rayons
-suffisent (au-delà de 25 m, un seul). Cible des reflets 3,5 ms.
-
-**Les « couches » : le reflet du jeu sous celui d'URTI.** Le jeu dessine dans l'eau son propre reflet, en gros blocs basse résolution ; à travers le reflet net d'URTI (poids de
-Fresnel seul), ces blocs restaient visibles : deux reflets qui ne coïncident pas. Corrigé (`live_waterbase.hlsl`, caméra du jeu connue) : couleur de l'eau du jeu lissée (moyenne des
-pixels d'eau par bloc de 8 pixels de rendu, flou 7×7 pondéré par la part d'eau), qui remplace la couleur du jeu là où le reflet compte. Le reflet du jeu est bien plus fort que le
-seul Fresnel : lissée sans plus, l'eau devenait terne. Le reflet d'URTI pèse maintenant 3 fois Fresnel sur l'eau (`water_gain=`, 2 à 4 essayés) : l'eau reflète la forêt en sombre,
-le vert vif disparaît, les cailloux du premier plan restent visibles. `water_base=0` revient à l'ancienne composition.
-
-**Red Dead.** Traits d'ombre : pas retrouvés. Rafales en marchant dans la cour de Saint-Denis (avec et sans les places gardées, `persist=0`), version installée puis nouvelle version :
-0 trait fixe, au plus un trait fugitif par image. Les longues ombres fines des fils (tram, télégraphe) sont dans l'image du jeu sans URTI (capture v50 en écran partagé). Nouvelle
-version installée dans Red Dead (l'ancienne gardée, `urti.addon64.avant_v83`) : 76 à 78 images par seconde au lieu de 71 à 76 au même endroit, occultation 1,8 → 1,4 ms,
-composition 0,9 → 0,6 ms, pas de plantage. Le reflet y garde l'ancien lissage (10 % par image) : sans caméra du jeu, sa normale vient de la profondeur.
-
-**Mesures de la version finale (Horizon, marais) :** saccades : 2 présentations figées sur 29 en pas de côté (9 avant v81). Avec un reflet trois fois plus présent, l'excédent ꟻLIP
-d'URTI monte en mouvement (pas de côté 0,030, marche 0,018) : sa parallaxe se voit davantage ; à l'arrêt 0,008, surtout sur les bords des arbres reflétés. `refl_alpha_min` 0,12
-essayé contre 0,25 (alterné, deux fois) : pas mieux (0,0086 et 0,0083 contre 0,0080 et 0,0079) : 0,25 gardé. Sans URTI 124 images par seconde au même endroit, avec 77 à 87.
-2 lancements et 2 Alt+Tab sans plantage dans Horizon, un lancement dans Red Dead, même version installée dans les deux jeux.
-
-Images avant / après du README (`docs/images/`) tirées des films de cette version.
-
-Pas vérifié : les reflets sur sol mouillé de Red Dead avec cette version (temps sec), la mer, la nuit.
-
-## v84 : cache de radiance du monde, calque recalé sur l'image affichée, HUD protégé en mouvement
-
-Retour de l'utilisateur sur v83 : « les reflets sont cassés dans Horizon ; il nous faut du vrai ray tracing, on possède les informations, il faut juste tout injecter
-comme il faut ; utilise des techniques de NVIDIA ».
-
-**Ce que montraient les films (jeu à gauche, URTI à droite).** L'eau d'URTI était terne et grise, le ciel ne s'y reflétait presque plus, et en marchant le reflet se
-morcelait en éclats de couleur plate et en taches vertes. Cause : un point reflété caché ou hors de l'écran recevait une seule couleur par 256e d'objet (un arbre de
-200 000 triangles : 800 triangles par couleur), et un rayon parti vers le ciel hors de l'écran ne recevait rien (l'eau du jeu réapparaissait).
-
-**Cache de radiance du monde** (`live_radcache.hlsl`, `live_radhash.hlsli`, d'après SHaRC de NVIDIA ; caméra du jeu connue). Table de hachage spatiale de 2^23 cases
-(128 Mo) dans le repère du monde : à chaque image calculée, un pixel sur quatre dépose la couleur que l'image montre dans la case où il se trouve, à trois niveaux (case
-de 0,5 % de la distance, soit quelques pixels, et deux plus grossières). Un reflet qui touche un point caché ou hors de l'écran y relit la couleur vue là, mêlée sur les
-huit cases voisines. Chaque case retient aussi sa part pleine : un pixel sur seize relance le rayon de la caméra dans la scène RT, chaque triangle traversé avant la
-surface visible est un trou (plaque découpée du feuillage) ; hors de l'écran, le rayon réfléchi traverse les feuillages selon cette part apprise. Carte du ciel et du
-lointain (octaèdre 512 × 512, par direction du monde) : un rayon qui ne touche rien y prend sa couleur ; les directions jamais vues se remplissent de proche en proche.
-Sortie en plus par pixel (`reflMix`) : couleur déjà connue et part à lire dans l'image. `radcache=0` revient aux couleurs par objet. Comptes avec `reflect_stats=1`.
-Premier essai : table de 2^22 pleine en moins d'une minute (397 000 dépôts refusés par image) ; avec 2^23 et une case reprise après 2 s sans usage : 2 000 à 14 000.
-
-**Le calque d'URTI avait deux images du jeu d'avance sur l'écran.** Trouvé en refaisant le masque du HUD : avec DLSS-G, l'image finale d'une présentation n'est pas
-celle de la dernière copie de l'image sans interface, mais d'une copie plus ancienne (comparaison sur un pixel sur 64 : la plus ancienne des trois dernières le plus
-souvent). Vue 11 en tournant : bords de la profondeur du calcul à 27 à 37 pixels (demi-résolution) de ceux de l'image, pour 8 à 9 pixels de mouvement par présentation.
-Corrigé : `live_hudgain` suit quelle image du jeu chaque présentation montre et écrit l'avance du calque (1,4 à 1,7 image du jeu en moyenne) ; `live_composite` fait
-glisser l'ombre et le reflet d'autant le long du mouvement (remplace le demi-pas des images générées de v81). Même rotation après : 0 à 1 pixel sur la plupart des
-présentations. `lag=0` : ancienne règle ; `lag_bias=` : correction.
-
-**HUD.** L'alpha de l'image sans interface vaut 0 partout dans la partie (il ne couvre que certains écrans) : le masque ne tenait que sur fond immobile (v80), le
-reflet passait sur le HUD au-dessus de l'eau. Refait : masque = écart entre l'image finale et la copie qui lui correspond, part d'interface de 0 à 1, refait seulement
-aux présentations où une copie concorde à 96 % (150 à 290 sur 300). La loi entre les deux images n'est pas un rapport : final = k × (sans interface)^1,13 à 1,25 par
-canal (mesuré), apprise en continu (médianes des pixels sombres et des pixels clairs).
-
-**Composition.** Avec le vrai ciel dans le reflet, le poids de 3 × Fresnel de v83 faisait un miroir laiteux qui cachait le fond de l'eau : 1,5 par défaut (1 à 3
-comparés au même endroit), et l'eau du jeu n'est lissée que là où le reflet d'URTI domine.
-
-**Mesures (marais, RTX 4070, DLSS + DLSS-G).** 88 à 92 images par seconde à l'arrêt au bord de l'eau, 65 à 80 en mouvement (v83 : 92, 70 à 84) ; cache du monde
-environ 0,4 ms par présentation. Deux lancements, course, deux Alt+Tab : pas de plantage. Reste : taches claires ou blocs par endroits dans le reflet (cases grossières,
-feuillages), bande au bord de l'écran sans recalage en mouvement, eau parfaitement plate (pas de vaguelettes), Red Dead pas encore essayé avec cette version (v83 y reste).
-
-## v85 : file d'attente des calques (plus d'à-coups), eau du jeu laissée vivante
-
-Retour de l'utilisateur sur v84 : « les reflets sont magnifiques mais ça saccade dans tous les sens, le personnage lag et même le sol ; près de l'eau la mousse pop et
-dépop, l'eau se fige par moments, et on perd énormément de fps ».
-
-**À-coups.** v84 faisait glisser le dernier calque de l'avance mesurée (1,5 à 2 images du jeu) le long du mouvement : juste en moyenne, faux dès que le rythme du jeu
-varie (film en rotation : image immobile, calque à -3,8 puis -7,4 puis 0 pixel d'une présentation à l'autre). L'appariement exact du calcul et de sa copie sans
-interface (repère laissé dans l'ordre d'exécution des listes) n'y changeait rien : la copie du calcul est la dernière 96 % du temps. Corrigé par une file d'attente
-(`live_delay.hlsl`) : le calque de chaque image calculée (ombre, reflet stabilisé, mouvement, décalage sous-pixel) est rangé dans une de trois tranches avec le numéro
-de son image du jeu ; `live_composite` pose sur chaque présentation la tranche de l'image du jeu qu'elle montre, et ne rattrape le long du mouvement que le reste (une
-demi-image, images fabriquées par DLSS-G). Même film après : image -4,70 / -12,73 / -5,19 pixels, calque -4,10 / -10,15 / -4,71. Variation du calque d'une présentation
-à l'autre en marchant : 16 et 12 niveaux -> 7,4 et 5,9 ; excédent ꟻLIP d'URTI : 24 % de ce que le jeu change lui-même -> 15 % (marche), 22 % -> 11 % (rotation).
-
-**Eau.** L'eau du jeu lissée sous le reflet (v83) n'était refaite qu'aux images calculées et effaçait la mousse là où le reflet passait un seuil : eau figée par
-moments, mousse qui apparaît et disparaît. `water_base=0` par défaut : l'eau du jeu reste telle quelle sous le reflet. Rayon d'ancrage (un rayon de plus par pixel
-d'eau, sans effet sur les objets du cache de géométrie) supprimé avec le cache du monde.
-
-Reste : coût des reflets près d'une grande étendue d'eau (3 à 5 ms, budget au plus bas dans la partie du joueur), reflets hors de l'eau (`reflect_all=1`) à valider,
-taches de couleur grossières par endroits dans le reflet.
-
-## v86 : moitié moins de rayons de reflet sans scintillement, et où part vraiment le temps
-
-Retour de l'utilisateur sur v85 : « c'est beaucoup mieux mais il y a encore pas mal de bruit ; il faut de bonnes performances ». Journal de sa partie : occultation et
-reflets au niveau 4 en permanence, 6 ms chacun quand même, 48 à 55 images par seconde.
-
-**Bruit.** Au-delà du niveau 2, un pixel d'eau sur deux n'avait pas de rayon et prenait pour moitié la moyenne de ses voisins : une image sur deux un vrai rayon, la
-suivante une moyenne, les objets fins du reflet scintillaient. Un pixel sans rayon garde maintenant son seul historique (il a reçu un rayon à l'image d'avant) ; du
-coup un pixel sur deux à tout niveau (`refl_full=1` : ancienne règle). Occultation : plus jamais un seul rayon, c'est la portée qui baisse (50 à 12 m). Portée des
-reflets réduite quand le budget est dépassé (500 à 90 m) : avec le cache du monde, un rayon plus court finit sur la carte du ciel et du lointain, plus sur l'eau verte.
-Cache du monde rempli une image calculée sur deux, masque du HUD refait une présentation sur quatre.
-
-**Mesures au bord de l'eau.** Reflets 2,8 à 3,7 ms -> 2,0 à 2,6 ; composition 1,9 à 2,75 -> 1,4 à 1,6. Excédent ꟻLIP à l'arrêt 0,0099 -> 0,0067 ; en marche et en
-course inchangé (0,019 / 0,021 ; 0,023 / 0,018).
-
-**Où part le temps (chaque effet coupé à tour de rôle, à l'arrêt).** Jeu seul 131 images par seconde ; URTI avec occultation, rebond et reflets coupés : 98 ; reflets
-seuls coupés : 93 ; tout actif : 84 à 90. Les effets ne coûtent que 5 images par seconde chacun : le gros est fixe, par image du jeu : structure de l'image 2,1 ms,
-débruitage 1,2 ms (même occultation coupée), cache de géométrie 0,55, structure de la scène 0,3. Baisser les budgets ne change presque rien (occultation 3,4 ms au
-niveau 4 contre 3,9 au niveau 0). `blas_refit=1`, `geo_new=100000`, `vertex_budget=200000` : structure de l'image 2,05 -> 1,24 ms, 1 à 2 images par seconde.
-Prochaine piste : ne plus tout refaire à chaque image du jeu (la file d'attente des calques permet de servir deux images avec un calcul).
-
-## v87 : objets qui disparaissaient des reflets, Red Dead vérifié
-
-**Red Dead Redemption 2 avec v86** (jamais essayée là) : deux lancements, marche, rotation, rafales : image correcte, mini-carte intacte, 70 à 77 images par seconde
-(v83 : 76 à 78), pas de plantage. Installée (ancienne : `urti.addon64.avant_v86`). Le film au rythme réel (`urti_film`, outil de mesure fait pour Horizon) y fait
-perdre le périphérique (DXGI_ERROR_INVALID_CALL) : ne pas l'y déclencher.
-
-**Objets qui apparaissent et disparaissent (Horizon).** Journal du joueur : 975 objets chassés de la réserve du cache de géométrie en 300 présentations, réserve à
-moitié vide. La réserve est un tampon circulaire : en mouvement (300 000 sommets nouveaux par image) sa tête en fait le tour en quelques secondes et chassait ce
-qu'elle rencontrait, objets visibles compris, qui manquaient aux reflets et à l'occultation jusqu'à leur prochaine capture. La tête saute maintenant les objets captés
-depuis moins de 600 images. Même course : 315 à 333 chassés (les anciens). Sommets mesurés par image : 500 000 -> 250 000.
-
-`reflect_all=1` en forêt : aucune différence visible (pas de surface lisse hors de l'eau à cet endroit), 0,4 ms : laissé coupé.
-
-## v88 : flashs de toute la couche après un à-coup, reflets des objets fins, essais du débruiteur
-
-Retour de l'utilisateur : « du bruit sur les objets fins dans les deux jeux, il faut bien gérer le débruiteur ».
-
-**Où est le bruit (mesuré).** Red Dead, rafale à l'arrêt : l'excédent d'URTI d'une image à l'autre est sur 0,3 % des pixels. Horizon, film à l'arrêt : presque tout
-dans le reflet de l'eau, sur les objets fins reflétés et la ligne de la berge. Les moyennes par film variaient du simple au triple pour un même réglage : un événement
-intermittent dominait.
-
-**Flashs de toute la couche.** Trois films sur dix à l'arrêt contenaient un saut : pendant une présentation, tout le calque change (reflet absent ou d'une autre
-teinte, occultation du personnage), puis revient. Trace : chaque fois après un à-coup du jeu (présentation à 37 ms au lieu de 12), URTI enchaîne trois calculs de
-rattrapage dont les calques diffèrent des autres, montrés deux images plus tard par la file d'attente. Un calque calculé dans les trois calculs qui suivent une
-présentation plus de 2,2 fois plus longue que d'habitude n'est plus rangé dans la file : le précédent reste, recalé sur le mouvement (jusqu'à quatre images d'écart).
-Seize films à l'arrêt ensuite : aucun saut au-dessus de 0,05 (avant : 0,10 à 0,16), moyenne 0,005 à 0,008 (avant 0,007 à 0,018). Première règle essayée (calcul sur
-la présentation qui suit un calcul) : écartait jusqu'à 80 calques sur 300 présentations en mouvement, le calque ne suivait plus l'image en rotation ; abandonnée.
-
-**Reflets.** Couleur reflétée lue sur une petite zone (quatre lectures, grille tournée, 1 pixel : `refl_soft=`) au lieu d'un point : avec le décalage sous-pixel de
-chaque image, un miroir parfait tombait tantôt sur une branche, tantôt à côté. Pire saut à l'arrêt 0,06 à 0,13 -> 0,016 à 0,034. Pré-filtre spatial avant
-l'accumulation (`refl_spatial=0.5` : le pixel mêlé à la moyenne de ses voisins à reflet) : petit gain.
-
-**Débruiteur de l'occultation.** Longueur d'historique par pixel (`denoise_len=`) : un pixel découvert fait la moyenne vraie de ses premiers échantillons. Gain non
-mesurable sur les films ; gardé (sans coût). Flou élargi tant que l'historique est court : +2 ms, retiré. Objets fins remplis avec l'occultation de leur voisinage :
-huit fois plus de bruit dans le feuillage de Red Dead (2,8 % des pixels au lieu de 0,3 %), retiré.
-
-**Vérifié.** Horizon : deux lancements, course, deux Alt+Tab, pas de plantage ; 88 à 94 images par seconde à l'arrêt. Red Dead : marche, rotation, rafales, pas de
-plantage, 67 à 71 images par seconde, bruit inchangé (0,34 % des pixels). Installée dans les deux jeux.
-
-## v89 : scènes lourdes, relecture du cache du monde à une case
-
-Journal de la partie du joueur (v88) : à un endroit chargé, occultation et reflets au palier d'économie maximal en permanence, et quand même jusqu'à 14,5 et
-17,4 ms (142 images sur 300 au-dessus de 8 ms pour les reflets), 41 à 71 images par seconde. Deux causes : la relecture du cache du monde lisait les huit cases
-voisines (jusqu'à quarante lectures en mémoire par point, à chaque traversée de feuillage) ; le dernier palier ne descendait pas assez.
-
-Relecture à une seule case, à une position tirée au hasard dans un voisinage de la taille d'une case, nouvelle à chaque image (comme SHaRC de NVIDIA) : le lissage
-se fait par l'accumulation des reflets. Dernier palier : reflets un pixel sur quatre et sans saut de feuillage, occultation sans saut. Au bord de l'eau, même endroit,
-contre v88 : reflets stabilisés 1,2 -> 0,9 ms ; palier maximal forcé : reflets 0,55-0,9 -> 0,26-0,69 ms. Scintillement inchangé (à l'arrêt 0,0055-0,0071 contre
-0,0061-0,0069 ; en marchant 0,0155 contre 0,0160). Pas pu retourner à l'endroit lourd du joueur (la partie repart au feu de camp).
-
-Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead marche, rotation, rafales, 62 à 70 images par seconde, bruit inchangé (0,35 % des pixels).
-Installée dans les deux jeux.
-
-## v90 : traits qui scintillent dans les rues de Red Dead, calques d'images presque vides
-
-**Red Dead, « traits » en ville.** Rafales à l'arrêt sur le balcon de Saint-Denis, chaque effet coupé à tour de rôle : pixels qui scintillent (plus de 3 niveaux
-d'une image à l'autre, en plus du jeu) 0,46 % tout actif, 0,11 % sans les reflets, 0,38 % sans le rebond, 0,38 % sans l'occultation. Les reflets en font l'essentiel,
-et la carte montre des traits en diagonale dans la rue : rails du tram, bords de pavés, trottoirs. Un pixel lisse isolé recevait un reflet dont la direction, tirée de
-la profondeur (pas de caméra du jeu dans Red Dead), changeait à chaque image. Reflet maintenant seulement sur une surface lisse étendue : au moins 5 des 8 voisins à
-2 pixels lisses aussi et sur la même surface (`refl_coherent=0` : ancienne règle). Même endroit, deux fois chacun : 0,19-0,20 % -> 0,06 %.
-
-**Horizon, flashs restants.** Un film à l'arrêt montrait encore deux sauts forts (0,10-0,12) : un calcul dont l'image n'avait que 13 dessins du jeu exécutés avant
-la présentation (d'habitude 3 800 ; les listes du jeu étaient passées dans la fenêtre d'avant), sans à-coup assez long pour la règle de v88. Un calcul avec moins
-d'un dixième des dessins habituels n'est plus rangé dans la file d'attente des calques. Seize films à l'arrêt : plus aucun saut au-dessus de 0,06 ; trois petits
-(0,05-0,06, couche 7 niveaux au lieu de 15 à 28).
-
-Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead marche, rotation, rafales, 67 à 72 images par seconde. Installée dans les deux jeux.
-
-## v91 : reflets qui tremblent, régulateur du budget qui suivait les pics
-
-Retour de l'utilisateur : « énormément de bruit sur les textures, scintillement sur les endroits fins, les reflets tremblent ; ça bug beaucoup sur Horizon ».
-
-**Qui fait le bruit dans Horizon.** Même aller-retour au bord de l'eau, chaque effet coupé (excédent ꟻLIP moyen, à l'arrêt / en marchant) : tout 0,0091 / 0,0180 ;
-sans occultation ni rebond 0,0104 / 0,0230 ; sans rebond 0,0093 / 0,0191 ; sans reflets 0,0057 / 0,0120 ; occultation sans l'herbe 0,0082 / 0,0180. Les reflets.
-
-**Reflets.** À l'arrêt, deux fois chacun : base 0,0069 et 0,0059 ; 10 % de neuf par image (au lieu de 25) 0,0045 et 0,0053 ; un rayon par pixel 0,0044 ; les deux
-0,0040. En marchant, pas de différence (0,010-0,011). Gardés les deux (`refl_alpha_min` 0,1, `refl_full=1` : un pixel sur deux seulement quand le budget le demande).
-Coût des reflets au bord de l'eau 2,4 -> jusqu'à 3,5 ms (le budget s'en charge).
-
-**Régulateur.** Journal du joueur : pics d'« occultation » de 25 à 50 ms (le jeu prend la file au même moment), un pic montait le palier de deux, la qualité ne
-revenait qu'un palier toutes les 40 images : occultation au palier 2 à 3,7 en moyenne, donc moins de rayons et de portée, plus de bruit. Décision maintenant sur la
-médiane des 9 dernières images (montée d'un palier si elle dépasse la cible de 25 %, retour si elle est sous 65 %, toutes les 30 images).
-
-Vérifié : Horizon deux lancements, course, deux Alt+Tab ; Red Dead rafales, 67 à 70 images par seconde, bruit 0,10 % des pixels. Installée dans les deux jeux.
-
-## v92 : où part le coût fixe (mesures), compteurs au journal
-
-Nouvelles lignes du journal toutes les 300 présentations : durée des présentations (médiane, P95, P99, pire), temps processeur passé à intercepter les dessins,
-dessins et sommets rejoués par sorte (écran principal, carte du soleil, transparents, autres écrans, zone de mesure).
-
-**Horizon, au bord de l'eau, à l'arrêt** (durée médiane d'une présentation) : URTI coupé 7,5 ms (131 images par seconde) ; URTI sans effets, presque rien rejoué
-9,2-9,3 ms (108) ; sans effets 10,1-10,5 ms (98-101) ; tout actif 13,0-14,3 ms (74-80).
-
-- Interception des dessins : 3,2 à 4,5 ms de processeur par présentation (~2 µs par dessin, ~2 000 dessins). Supprimer le verrou global des événements de
-  liaison (état de chaque liste lu sans verrou) n'a rien changé : ni le temps de capture ni les images par seconde. Retiré.
-- Sommets rejoués : 1,4 million par présentation, dont 1 million pour la carte du soleil, inutile dans Horizon (ombres du soleil coupées, et direction du soleil
-  mesurée sur 0 % des images). Rejouée par huitièmes (`sun_eighth=1`) : 0,6 million, gain dans le bruit de mesure (± 3 images par seconde). Laissé coupé par défaut.
-- Le coût fixe s'explique par le travail GPU chronométré : par image du jeu, scène de l'image ~2 ms, passe d'ombres et débruiteur ~1,2 ms (même occultation
-  coupée), composition ~0,45 ms par présentation, structure 0,6 ms : ~5,2 ms, l'écart mesuré (98 contre 131 images par seconde).
-- Scène de l'image : 822 000 sommets -> 2,0 ms ; budget 250 000 -> 533 000 sommets, 1,56 ms, ~80 images par seconde ; budget 120 000 -> 241 000 sommets, 1,30 ms mais
-  66 images par seconde (occultation et composition plus chères) ; mise à jour au lieu de reconstruction : la scène change presque à chaque image, gain nul. Environ
-  1,1 ms de la reconstruction ne dépend pas de la taille.
-
-Red Dead : 70 à 71 images par seconde, 3 800 dessins vus par présentation, 5,1 ms de processeur à les intercepter, 1,55 million de sommets rejoués (écran principal).
-
-## v93 : débruiteur hors de portée sauté ; deux pistes fermées
-
-- Débruiteur de l'occultation et du rebond : les pixels au-delà de la portée de l'occultation (la passe des rayons y écrit « rien ») ne sont plus filtrés
-  (`denoise_far=0` : ancienne règle). 1,18-1,26 -> 0,94-1,05 ms par image du jeu, image inchangée.
-- Essayé et retiré : sommets inutilisés de la scène de l'image marqués inactifs (NaN) au lieu de triangles plats. Reconstruction 2,1 -> 1,9 ms, mais rayons un peu
-  plus lents (occultation 1,54 -> 1,64-1,80 ms, reflets 2,36 -> 2,67-2,95) : rien de gagné.
-
-Bilan du coût d'URTI dans Horizon (tout actif, par image du jeu, ~10,5 ms, deux présentations par image avec DLSS-G) : scène de l'image ~2 ms, occultation ~1,5 ms,
-débruiteur ~1 ms, reflets 2,3-2,7 ms, composition et reflets stabilisés ~2,1 ms, structure 0,65 ms. Pas de gros gaspillage isolé : la suite passe par moins de
-travail par image (effets calculés à tour de rôle) plutôt que par des économies de 0,2 ms.
-
-Vérifié : Horizon deux lancements, deux Alt+Tab ; Red Dead 71 images par seconde, bruit 0,17 % des pixels. Installée dans les deux jeux.
-
-## v94 : normales du G-buffer pour les reflets ; orientation de la caméra de Red Dead
-
-- Normales exactes du jeu lues dans le G-buffer (`gnormal_slot=`, `gnormal=`, `gnormal_signs=`) : Horizon les range en octaèdre RG16, repère de la caméra, z inversé
-  (`gnormal_slot=2`, `gnormal=1`, `gnormal_signs=4`, accord 0,73-0,84 avec la normale tirée de la profondeur) ; Red Dead en RGB8 dans le repère du monde (`gnormal_slot=1`, `gnormal=2`).
-- Red Dead : la caméra du jeu n'est pas lue, l'orientation est donc résolue à chaque image sur la carte graphique (`live_rotfit`, méthode de Horn) à partir de
-  ~13 000 pixels plans : elle suit la souris, le haut de la caméra retombe sur le Z du monde. Accord 0,46-0,82 selon la scène (le relief des textures est dans
-  ces normales) ; la mauvaise rotation donnerait ~0 : seuil 0,35. Un échantillonnage tombait une image sur quatre (occultation au quart) : corrigé.
-- Reflets : la normale du jeu remplace celle de la profondeur quand elle regarde la caméra et s'accorde à peu près avec elle (`gnormal_reflect=1`, actif dès que
-  `gnormal=` est réglé).
-- Mesuré (rafales, part des pixels à plus de 3 niveaux) : Red Dead 0,09 / 0,04 / 0,04 % avec contre 0,04 / 0,05 % sans, rien de gagné (le relief des pavés bouge
-  avec le décalage sous-pixel) ; Horizon : résultats mêlés (0,22 contre 1,16 % à l'arrêt, puis 4,64 contre 2,72 %). Laissé coupé par défaut dans les deux jeux.
-- Bruit d'URTI dans Red Dead, effet par effet (rafales à l'arrêt et en tournant la caméra) : 0,00 à 0,06 % des pixels, alors que l'image du jeu varie elle-même de
-  2 à 5,5 niveaux par image (vent dans le feuillage, lissage temporel du jeu). Dans Horizon en marchant, l'excédent est surtout sur l'eau (reflets nets qui défilent,
-  à départager du vrai scintillement).
-
-Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Social Club), Horizon un lancement. Installée dans les deux jeux (réglages par défaut : comme v93).
-
-## v95 : soleil retrouvé dans Red Dead, cases du menu de ReShade
-
-- **Soleil perdu depuis la v74 dans Red Dead** (0 % des images) : un étalonnage avait pris pour carte du soleil une profondeur 1024 × 1024 vue dans l'axe
-  de la caméra (soleil (0,002 0,059 0,998)) et l'avait enregistrée dans `urti_calib.ini` ; comme les ombres RT du soleil sont coupées, plus aucun
-  étalonnage ne la remplaçait. Corrigé : une direction à moins de 14° de l'axe de la caméra est refusée ; dans un jeu sans caméra lue, le soleil est
-  recherché tant qu'il n'est pas suivi, **seulement en partie** (scène RT d'au moins 20 dessins), de plus en plus espacé sans soleil (jusqu'à 32 intervalles).
-  Un essai qui cherchait dès le menu, toutes les 120 images, a mené Red Dead à « mémoire saturée » : écarté. Mesuré : soleil suivi sur 100 % des images,
-  46 paires par image, 4 cascades, 0,04° d'une image à l'autre ; soleil / ciel mesuré 0,21-0,25 (soir couvert). 60 images par seconde.
-- **Menu de ReShade** : cases « Reflets ray tracing », « Occultation ambiante ray tracing (RTAO) » (force, portée en mètres, 2,5 par défaut : 1,5 avant
-  dans Red Dead), « Éclairage indirect ray tracing (RTGI) » (force) ; relues à chaque présentation, elles multiplient les réglages d'urti.ini. Le rebond
-  garde ses rayons même si l'occultation est décochée. Pas encore de case pour les ombres du soleil (le mode actuel coupe le rebond).
-- Constat (rafale, même image avant / après) : URTI assombrit 3,5 % des pixels de plus de 5 % (lierre, coins du mur, pied du mur), 0,3 % de plus de 15 % ;
-  le rebond n'éclaircit rien de visible. Point de départ de l'audit pour un vrai éclairage RT.
-
-## v96 : occultation RT sur toutes les surfaces et visibilité du ciel à grande portée
-
-- **Normales exactes du jeu pour l'occultation** (`gnormal_use=1`) : dans Red Dead, celles du G-buffer (repère du monde) tournées par l'orientation de la
-  caméra résolue à l'image précédente (live_rotfit). L'occultation vaut maintenant aussi pour les surfaces qui ne sont pas planes (troncs, rochers,
-  objets, personnages), où la normale tirée de la profondeur n'était que du bruit. Le feuillage vu à travers reste exclu. La comparaison et la rotation
-  ne se mesurent que sur les surfaces planes (sinon le bruit de la profondeur les fausserait).
-- **Visibilité du ciel à grande portée** (`ao_sky=0.6`, `ao_sky_range=12` m ; curseur « Ombre d'ambiance à grande portée » dans ReShade) : un ou deux
-  rayons longs par pixel calculé disent si la canopée, un toit, une falaise cache le ciel ; ne retirent que la lumière du ciel. **Seules les directions
-  au-dessus de l'horizon comptent** (renvoyées par symétrie, pondérées par leur hauteur) : un premier essai comptait le sol sous les faces verticales comme
-  du ciel caché et assombrissait en bloc murs et personnages (26,7 % des pixels de plus de 5 %, mur uniformément gris). Le haut du monde vient de
-  l'orientation de la caméra : sans elle (Horizon pour l'instant), pas de rayons longs.
-- Mesures dans Red Dead (rafales, même image avant / après, part des pixels assombris de plus de 5 % / 15 %) : v95 4,2 / 0,4 % ; contact avec les
-  normales du jeu 6,6 / 0,5 % ; avec le ciel 13,2 / 3,1 % (pied du mur, dessous de la charrette, arbres, sol abrité). Scintillement ajouté 0,11 % des
-  pixels à l'arrêt, 0,00 % en tournant la caméra. Passe d'occultation 1,2 -> 2,5 ms. Horizon vérifié (pas de plantage, 62-67 images par seconde).
-- Réglages de Red Dead ajoutés : `gnormal_slot=1`, `gnormal=2`, `gnormal_use=1`, `gnormal_reflect=0` (urti.ini d'avant gardé en `urti.ini.avant_v96`).
-
-## v97 : occultation « franche » par défaut, objets fins écartés
-
-- Choix du joueur : un effet franc. Valeurs physiques au lieu des valeurs prudentes : `ao=1` (0,8 avant), `ao_sky=1` (0,6), `ao_sky_range=16` m (12).
-- Premier essai : 15-19 % des pixels assombris de plus de 5 %, mais scintillement ajouté 0,37-0,78 % des pixels à l'arrêt (0,07 % sans les rayons longs),
-  sur les branches, le lierre, la grille : objets fins qui bougent au vent, où un ou deux rayons longs passent ou non entre les feuilles.
-- **Surfaces continues seulement** pour l'occultation par les normales du jeu et pour les rayons longs : à 3 pixels dans les quatre directions la
-  profondeur reste proche (sol, murs, troncs, rochers, personnages) ; branches, brindilles, bords de feuillage écartés.
-- Mesures (Red Dead, rafales) : 14-19 % des pixels assombris de plus de 5 %, 4,5-6,2 % de plus de 15 % (v95 au même endroit : 8,4 / 1,8 %) ;
-  scintillement ajouté 0,01-0,16 % à l'arrêt, 0,01 % en tournant. Passe d'occultation 2,7 ms.
-
-## v98 : occultation et rebond décochés par défaut, carte du soleil plus rejouée sans emploi
-
-- Verdict du joueur sur la v97 : l'occultation laisse des **traînées partout** (son accumulation dans le temps ne suit pas le mouvement), le résultat
-  « vraiment pas ouf » ; seuls les reflets sont bons. Les rafales mesuraient le scintillement, pas ces traînées en mouvement : le chiffre ne les voyait pas.
-- Cases « Occultation » et « Rebond » décochées par défaut dans urti.fx et dans les préréglages des deux jeux (copies `ReShadePreset.ini.avant_v98`).
-- Sans occultation, sans rebond et sans ombres du soleil, **la carte du soleil n'est plus rejouée** et le soleil plus cherché (il revient dès qu'une case
-  est recochée) : Red Dead 3,8 -> 1,7 millions de sommets rejoués par présentation, capture 5,9 -> 4,8 ms de processeur ; passe d'ombres 0,3 ms.
-- Horizon : scintillement ajouté 0,34 -> 0,05 % des pixels (l'occultation en était aussi la source), 66 images par seconde.
-
-## v99 : reflets sur les surfaces brillantes (parquet, bois ciré, métal, pavés)
-
-- Demande du joueur : les reflets sont ce qui marche ; les étendre. Jusqu'ici seules les surfaces au lissé ≥ `smooth_min` (0,5 dans Red Dead) avaient
-  un reflet RT ; les sols de Red Dead (~0,36) en étaient exclus.
-- `gloss_min=` (0 : coupé ; 0,2 dans Red Dead) : de ce lissé à `smooth_min`, le reflet entre en douceur (poids Fresnel × rampe × `gloss=`, 1 par défaut) ;
-  au-dessus de `smooth_min`, rien ne change. Case « Reflets sur les surfaces brillantes » dans ReShade.
-- **Flou selon la rugosité** : demi-angle du lobe ~ alpha = rugosité², empreinte au point reflété = distance × alpha / (distance de l'œil + distance),
-  au plus 60 pixels de rendu ; rangé avec la distance du point reflété (w = distance + 20 000 × rayon : la passe des reflets n'a plus de place dans sa
-  signature racine) ; lu par live_reflresolve sur un disque de huit lectures (spirale de Vogel tournée par pixel). Approximation nommée : un rayon miroir
-  puis une lecture floue, pas de rayons tirés dans le lobe (pas de bruit ; le flou ignore ce qui est caché à l'écran).
-- Mesures (Red Dead, Saint-Denis, rafales) : 20,7 % de l'écran à reflet ; image changée de plus de 5 % sur 6,5 % des pixels (0,2 % sans ; 3,6 % au seuil
-  0,3) ; scintillement ajouté 0,12 % à l'arrêt, 0,07 % en tournant ; reflets 0,69 ms, composition +0,5 ms ; 63 images par seconde. Horizon : coupé.
-- Verdict du joueur : « beaucoup trop », des reflets à trop d'endroits et trop loin. Remis comme avant : `gloss_min` retiré des réglages de Red Dead, case
-  « Reflets sur les surfaces brillantes » décochée par défaut (le code reste, coupé). Demande suivante : mieux décider quelles surfaces méritent un reflet.
-
-## v100 : reflets brillants triés (sols proches seulement)
-
-- Tri des surfaces brillantes (lissé entre `gloss_min` et `smooth_min`) avec les données du jeu, au lieu d'un seuil seul : **un sol** (normale à moins de
-  32° du haut du monde, donné par l'orientation de la caméra dans Red Dead), plan et étendu (règles des miroirs), **pas du feuillage ni de la peau**
-  (type de matériau de Red Dead, canal rouge de sa cible de matériau : 0,2 et 0,31), **proche** (effacé de 10 à 18 m). Red Dead : `gloss_min=0.3`,
-  `gloss=0.6`. Un réseau de neurones a été écarté : pas de données d'entraînement, plusieurs ms par image, et il devinerait ce que le G-buffer donne exactement.
-- Mesures (balcon de Saint-Denis, rue en contrebas) : 1,2 % de l'écran à reflet (20,7 % en v99) ; image changée de plus de 5 % sur 0,4 % des pixels ;
-  scintillement ajouté 0,01 % ; reflets 0,22 ms. À juger dans un intérieur ou sous les arcades (pierre polie 0,36).
-
-## v101 : flaques de nouveau nettes, sols brillants vraiment actifs, règle des miroirs remise
-
-- **Régression de v99-v100** (signalée par le joueur : « on distingue mal ce qui est reflété, avant les flaques avaient de plus gros reflets ») : le flou
-  selon la rugosité s'appliquait à toute surface sous un lissé de ~0,86, flaques comprises (0,60). Il ne vaut plus que pour la bande brillante (sous
-  `smooth_min`) : les miroirs, l'eau et les flaques sont de nouveau nets.
-- **Sols brillants jamais actifs en v100** : le tri prenait le haut du monde dans l'orientation de la caméra, résolue seulement quand l'occultation tourne
-  (coupée depuis v98). Le sol se reconnaît maintenant à la normale du monde du G-buffer de Red Dead (z > 0,85), liée aux reflets dès qu'elle existe.
-- **Règle des miroirs (v90) affaiblie** quand les reflets brillants étaient actifs : un miroir comptait des voisins seulement « brillants » ; des poutres
-  du plafond des arcades recevaient un reflet. Un miroir exige de nouveau des voisins miroirs.
-- Essayé et retiré : sauter la passe d'ombres sans occultation (0,3 ms) : le masque restait à zéro, toute l'image assombrie (95 % des pixels changés).
-- Mesures sous les arcades de Saint-Denis : sol de pierre polie reflétant le couloir éclairé, plafond inchangé ; scintillement ajouté 0,06 % à l'arrêt,
-  0,00 % en tournant ; reflets 0,25 ms, 71 images par seconde. Scintillement des fenêtres et câbles au loin : dans l'image du jeu seule (11,5 % des pixels
-  varient de plus de 3 niveaux d'une image à l'autre au balcon), pas ajouté par URTI (0,05 %).
-
-## v102 : une seule case dans le menu, occultation propre (sans personnages ni feuillage, débruiteur réactif)
-
-- Demande du joueur : plus de réglages affichés, tout actif par défaut avec les meilleurs réglages ; l'occultation peut être belle si elle ne traîne et
-  ne scintille pas. Menu de ReShade : seule la case « URTI » visible ; reflets, sols brillants proches, occultation et ombre d'ambiance actifs ; rebond de
-  lumière coupé (invisible, ~0,9 ms). Valeurs enregistrées dans les préréglages effacées (copies `ReShadePreset.ini.avant_v102`).
-- **Mesure des traînées** (`trainee.py`) : rafales en tournant la caméra ; décalage de la carte d'assombrissement d'URTI comparé à celui de l'image du jeu
-  (retard 0 : accrochée) et écart qui reste une fois la carte précédente recalée sur le mouvement de l'image.
-- Causes trouvées : occultation sur les personnages, chevaux (animés) et la canopée (au vent) ; rayons longs sur les branches ; bornage de l'historique
-  trop large en mouvement.
-- Corrigé : **pas d'occultation sur les personnages** (alpha des normales du G-buffer de Red Dead) **ni sur le feuillage et la peau** (type de matériau,
-  cible de matériau liée maintenant à la passe d'occultation, t10) ; rayons longs réservés aux grandes surfaces continues (continuité à 6 pixels) ;
-  `ao_sky` 1 -> 0,7 ; bornage de l'historique resserré en mouvement (moitié à 4 pixels par image et plus).
-- Mesures (Red Dead, rue arborée de Saint-Denis) : écart après recalage en tournant 4,0-4,7 % -> 1,5-1,7 % ; scintillement ajouté à l'arrêt 1,49 % ->
-  0,22 % des pixels ; assombrissement moyen 4-6 % de l'image ; retard 0,00-0,14. Horizon : occultation 0,24 % (0,15 % sans), 67 images par seconde.
-
-## v103 : le terrain de Red Dead dans la scène RT (dessins tessellés)
-
-- Étape 1 du « transport de lumière » demandé par le joueur (rebond du soleil en nature) : le terrain, dessiné par tessellation, manquait à la scène RT.
-- Capture : les pipelines à hull + domain shader (sans géométrie ni mesh shader, qui écrivent la profondeur) gardent leur code ; leur pipeline de capture
-  rejoue VS + HS + DS (topologie PATCH) et la sortie de flux prend la position après le domain shader. Taille de sortie inconnue d'avance : 32 sommets par
-  point de contrôle d'abord, puis la taille apprise du maillage (comme les ExecuteIndirect), 196 608 sommets au plus. Réglage `tess=1` (Red Dead seulement ;
-  Horizon garde ses dessins tessellés à l'écart).
-- Mesures (rue de Saint-Denis) : dessins tessellés ignorés 11 -> 6 par présentation (les autres n'écrivent pas la profondeur de l'écran) ; structure de
-  l'image 1,19 -> 1,71 M sommets, reconstruction 1,72 -> 2,14 ms ; pas de plantage ; scintillement ajouté 0,25 -> 0,35 % ; traînées : écart en tournant
-  1,44 %. Effet visible faible en ville ; à juger en nature.
-
-## v104 : l'occultation suit le mouvement (pixels qui bougent calculés à chaque image)
-
-- Retour du joueur : en bougeant, l'occultation « pétille » sur les objets, suit mal le mouvement et laisse des traits d'ombre sur eux.
-- Cause : l'occultation au quart (un pixel par bloc 2 × 2 à chaque image, à tour de rôle) ; en mouvement, un pixel n'avait une valeur neuve qu'une image
-  sur quatre, le reste était de l'ancien recollé par les vecteurs de mouvement. Les vecteurs du jeu n'étaient même pas lus par la passe (lus seulement
-  avec `ao_boost=1`).
-- Corrigé : la passe lit le mouvement de chaque pixel ; **un pixel qui bouge de plus d'un pixel par image est calculé à chaque image** (deux rayons de
-  contact, un rayon long), les autres restent au quart. Débruiteur : en mouvement, la moitié de neuf (0,3 avant). `ao_motion=0` : ancien calcul.
-- Mesures (Red Dead, Saint-Denis, même lancement, réglage changé à chaud) : en marchant, scintillement ajouté 0,10-0,21 % des pixels contre 0,88-1,85 %
-  (une rafale à 1,79 %, la première marche, la plus agitée) ; en tournant, part de l'occultation qui ne suit pas 0,36-0,52 × l'assombrissement moyen
-  contre 0,75. Passe d'occultation ~1,2 ms en mouvement (0,8 à l'arrêt).
-- Horizon : le calcul à chaque image en mouvement y est coupé (`ao_motion=0`) ; mesure à l'arrêt troublée par la météo (pluie puis soleil d'un lancement
-  à l'autre). Au soleil, l'occultation y scintillait sur le sol clair (0,57-2,6 %) : le soleil n'y est pas connu, elle retire toute la lumière, même au
-  soleil. `ao=0.5` dans Horizon : 0,16 % (0,14 % sans occultation). `ao_rough=0` : sans effet.
-
-## v105 : la projection de Red Dead enfin juste (38° et pas 50°), occultation stable et posée, double historique, rayons à faible discrépance
-
-Demande : une occultation RT viable dans Red Dead, sans décalage, mesurée avec des outils précis ; vérifier si Red Dead était mieux avant Horizon.
-
-**Outils**
-- `decalage.py` (rafales avant / après) : mouvement de l'image et de la carte d'assombrissement par corrélation de phase au dixième de pixel ;
-  **suivi** (1 : accrochée, 0 : figée), **décalage fixe** de la carte par rapport aux contours de l'image, **instabilité** (écart de la carte à la
-  précédente recalée sur le mouvement, rapporté à l'assombrissement moyen), part assombrie. `rdr2_regress.sh` : même séance de mesure pour n'importe
-  quelle version de l'add-on.
-
-**Régressions trouvées**
-1. **Champ de vision** : la v70 le mesurait (37,9°) et corrigeait la projection ; depuis, URTI travaillait à **50°** dans Red Dead. La mesure (s², t²
-   des cascades) donnait toujours 37,7-37,8°, mais la correction exigeait une rotation cumulée (4e-4) jamais atteinte, et chaque étalonnage (recherche du
-   soleil, v95) remettait 50°. Espace caméra étiré de 31 % : normale du sol, direction des reflets, forme de l'occultation faussées. Corrigé : seuil
-   1e-4, étirements horizontal et vertical concordants à 15 %, **même mesure à 5 % près 30 images plus tard**, **caméra immobile depuis 220 images**
-   (en marchant la mesure partait : 37,9° -> 60,8° -> 91,2°), pas plus de ~25 % par correction, 25° à 75° ; l'étalonnage ne remet plus 50° ;
-   champ mesuré enregistré (`fov_v=` dans urti_calib.ini) et relu au lancement.
-2. **Herbe** : « feuillage » (type de matériau de Red Dead) couvre aussi l'herbe : exclue en v102, parcs et nature sans occultation (0,5-1,3 % de
-   l'image contre 18-27 % en v70 / v83). Seule l'herbe tournée vers le haut (normale du monde, z > 0,6) la garde ; les feuilles des arbres restent exclues.
-3. **Réglages du débruiteur décalés en v104** (commentaire en milieu de ligne : bornage 0,9 au lieu de 2, flou 3×3, sans longueur d'historique).
-   Corrigé, et **C4838 (conversion qui rétrécit dans une liste d'initialisation) est maintenant une erreur de compilation**.
-4. **Soleil et occultation** : la part du soleil venait de la carte d'ombres du jeu, qui ne concorde pas dans Red Dead (v44), et du rapport soleil / ciel
-   mesuré avec elle (0,04 en plein soleil : soleil « trop faible », coupé). Murs au soleil assombris comme à l'ombre. Corrigé : **un rayon RT vers le soleil**
-   (trous des feuilles traversés) décide si le point est éclairé (`ao_sunray=1`) ; rapport soleil / ciel peu crédible (< 0,3) -> 2,2 ;
-   `sun_measure=0` dans Red Dead.
-
-**Techniques ajoutées (recherche : NRD / ReBLUR, brevets NVIDIA sur l'historique borné, bruit bleu spatio-temporel)**
-- **Double historique** (`denoise_dual=1`) : historique rapide (2-3 images, au moins la moitié de neuf) rangé avec la longueur d'historique ;
-  l'historique lent est borné autour de lui (fenêtre 0,5 σ + 0,04, resserrée en mouvement), plus autour du voisinage courant bruité.
-- **Rayons à faible discrépance** (`ao_ign=1`) : bruit à gradient entrelacé déplacé à chaque image, rotation commune et strates en azimut, nombre d'or
-  entre les rayons d'un pixel (contact et rayons longs).
-
-**Mesures (Red Dead, rue arborée et parc de Saint-Denis, au soleil)**
-- v70 / v83 / v105 : instabilité à l'arrêt 0,19 / 0,20 / **0,11** ; en tournant 0,22-0,50 / 0,43 / **0,20-0,23** ; suivi 0,90-0,91 / 0,91-0,95 /
-  **0,94-0,95** ; décalage fixe 0,02 / 0,02 / **0,00-0,02 px** ; part assombrie de plus de 5 % 18-21 % / 23-27 % / 24-27 % ; scintillement ajouté à
-  l'arrêt 0,39 / 0,66 / 0,40 %, en marchant 0,09-1,04 / 0,26-1,15 / 0,30-0,67 %.
-- Murs au soleil : seule la part du ciel retirée ; taches de soleil au sol intactes, ombre des arbres assombrie.
-- Horizon : scintillement ajouté par l'occultation 0,06 % à l'arrêt, 0,08 % en marchant ; 99 images par seconde.
-
-## v106 : les personnages ne font plus d'ombre d'ambiance, occultation en mouvement au damier (performances)
-
-- Retour du joueur (captures dans une ruelle de Saint-Denis) : des « dessins d'ombre » sombres et flous restent collés aux murs et suivent l'écran ; les
-  ombres ajoutées coûtent trop d'images par seconde.
-- Cause probable des taches : le personnage du joueur est dans la scène RT ; collé à un mur, il cache le « ciel » des rayons longs (16 m) à une grande zone
-  du mur, et cette tache le suit, donc suit l'écran. Corrigé : un point touché qui, projeté à l'écran, tombe sur un personnage (alpha des normales du
-  G-buffer de Red Dead) à peu près à la même profondeur est traversé, comme un trou de feuille (occultation, rayons longs, rayon vers le soleil).
-- Performances : en v104, un pixel en mouvement était calculé à chaque image ; quand la caméra bouge, presque tout l'écran l'est, coût de la passe
-  multiplié jusqu'à quatre. Maintenant une image sur deux, en damier (même coût par bloc 2 × 2 qu'à l'arrêt). Cible du régulateur d'occultation
-  `ao_ms` 4 -> 2,5 ms.
-- Installé dans Red Dead à la demande du joueur, qui teste lui-même ; pas encore mesuré par URTI. Champ de vision : pendant sa partie, mesuré 55-69° et
-  corrigé à 56,1° (garde-fous respectés : caméra immobile, mesure stable) ; Red Dead change probablement de champ selon la caméra (ruelle, mode).
-
-## v107 : reflets seuls, documentation complète, dépôt publié
-
-- Décision du joueur : l'occultation (« le système d'ombre ») est trop instable en jeu, on garde uniquement les reflets, « déjà exceptionnels ». Case
-  « Occultation » décochée par défaut dans urti.fx (le code reste, `UrtiOcclusion` caché). Le suivi du soleil reste actif dans un jeu sans caméra lue :
-  ses cascades mesurent le champ de vision, dont les reflets ont besoin (Red Dead). Champ de vision stocké remis à 37,92°.
-- Documentation : `README.md` réécrit (état actuel : reflets, sols brillants, une seule case, réglages par jeu, outils de mesure) et
-  `docs/HOW_IT_WORKS.md` (toute la chaîne : capture, scène RT, mesures, matériaux, rayons, stabilisation, composition, occultation optionnelle, méthode
-  de mesure, leçons, limites).
-
-## v108 : Red Dead revient aux reflets nets (sans sols brillants ni terrain)
-
-- Retour du joueur : les reflets semblent de moins bonne qualité qu'avant. Comparaison en jeu (`fov_force=` ajouté pour imposer le champ de vision) :
-  le personnage changeait de lieu pendant la séance, pas de comparaison propre ; mais les rafales montrent les sols brillants (v99-v101) qui donnent à
-  tout le pavage sec un reflet flou et brillant, l'air mouillé et brouillé, là où il n'y avait avant que des miroirs nets. Champ de vision 38° : plus de
-  surfaces passent les tests de planéité (21,5 / 11,5 % de l'écran à reflet contre 9,8 / 7,7 % à 50°, même moment).
-- Réglages de Red Dead remis à ceux des reflets d'avant : plus de `gloss_min`, `gloss`, `tess`, `gnormal_*` (copie `urti.ini.avant_v108`). Champ de vision
-  mesuré gardé (angles justes). Si l'ancien rendu à 50° plaisait davantage : `fov_force=50`.
-- Images du README remplacées par trois captures du joueur en v108 (salle au parquet, flaque devant la maison, ruelle aux dalles mouillées) ;
-  les anciennes images avant / après (Horizon, Red Dead) sont retirées.
+**Objects appearing and disappearing.** Player's log: 975 objects evicted from the geometry cache's reserve in 300
+presents, reserve half empty. The reserve is a ring buffer: in motion (300,000 new vertices per frame) its head goes
+round it in a few seconds and evicted whatever it met, visible objects included, which were then missing from
+reflections and occlusion until their next capture. The head now skips objects captured within the last 600 frames.
+Same run: 315 to 333 evicted (the old ones). Vertices measured per frame: 500,000 → 250,000.
+
+`reflect_all=1` in a forest: no visible difference (no smooth surface off water there), 0.4 ms: left off.
+
+## v88 — URTI: whole-layer flashes after a hitch, reflections of thin objects, denoiser tests
+
+User feedback: "noise on thin objects in both games, the denoiser must be handled well".
+
+**Where the noise is (measured).** Red Dead, burst at rest: URTI's frame-to-frame excess is on 0.3 % of pixels. Second
+game, film at rest: almost all of it in the water reflection, on thin reflected objects and the bank line. Averages per
+film varied threefold for the same setting: an intermittent event dominated.
+
+**Whole-layer flashes.** Three films out of ten at rest held a jump: for one present, the whole layer changes (reflection
+missing or of another tint, occlusion of the character), then comes back. Trace: each time after a game hitch (a present
+at 37 ms instead of 12), URTI chains three catch-up computations whose layers differ from the others, shown two frames
+later by the queue. A layer computed in the three computations following a present more than 2.2 times longer than usual
+is no longer stored in the queue: the previous one stays, realigned on the motion (up to four frames apart). Sixteen
+films at rest afterwards: no jump above 0.05 (before: 0.10 to 0.16), mean 0.005 to 0.008 (before 0.007 to 0.018). A first
+rule tried (computation on the present following a computation) discarded up to 80 layers out of 300 presents in motion,
+and the layer no longer followed the image while turning; abandoned.
+
+**Reflections.** Reflected colour read over a small area (four reads, rotated grid, 1 pixel: `refl_soft=`) instead of a
+point: with the per-frame sub-pixel jitter, a perfect mirror fell sometimes on a branch, sometimes next to it. Worst jump
+at rest 0.06 to 0.13 → 0.016 to 0.034. Spatial pre-filter before accumulation (`refl_spatial=0.5`: the pixel blended with
+the average of its reflecting neighbours): small gain.
+
+**Occlusion denoiser.** History length per pixel (`denoise_len=`): a newly uncovered pixel takes the true average of its
+first samples. Gain not measurable on the films; kept (free). Blur widened while the history is short: +2 ms, removed.
+Thin objects filled with their neighbourhood's occlusion: eight times more noise in Red Dead's foliage (2.8 % of pixels
+instead of 0.3 %), removed.
+
+**Checked.** Red Dead: walking, turning, bursts, no crash, 67 to 71 fps, noise unchanged (0.34 % of pixels).
+
+## v89 — URTI: heavy scenes, single-cell world-cache lookup
+
+Player's log (v88): at a busy place, occlusion and reflections permanently at the maximum saving level, and still up to
+14.5 and 17.4 ms (142 frames out of 300 above 8 ms for reflections), 41 to 71 fps. Two causes: the world-cache lookup read
+the eight neighbouring cells (up to forty memory reads per point, at every foliage crossing); the last level did not go
+down far enough.
+
+Lookup in a single cell, at a position drawn at random within a neighbourhood the size of a cell, new every frame (as in
+NVIDIA's SHaRC): smoothing comes from the reflections' accumulation. Last level: reflections on one pixel in four and
+without foliage hops, occlusion without hops. Same place by the water, against v88: stabilised reflections 1.2 → 0.9 ms;
+maximum level forced: reflections 0.55-0.9 → 0.26-0.69 ms. Flicker unchanged (at rest 0.0055-0.0071 against
+0.0061-0.0069; walking 0.0155 against 0.0160).
+
+Checked: Red Dead walking, turning, bursts, 62 to 70 fps, noise unchanged (0.35 % of pixels).
+
+## v90 — URTI: flickering lines in Red Dead's streets, nearly empty frame layers
+
+**Red Dead, "lines" in town.** Bursts at rest on a Saint Denis balcony, each effect turned off in turn: flickering pixels
+(more than 3 levels from one frame to the next, on top of the game) 0.46 % all on, 0.11 % without reflections, 0.38 %
+without the bounce, 0.38 % without occlusion. Reflections make most of it, and the map shows diagonal lines in the
+street: tram rails, cobblestone edges, kerbs. An isolated smooth pixel received a reflection whose direction, derived
+from depth (no game camera in Red Dead), changed every frame. Reflections now only on an extended smooth surface: at
+least 5 of the 8 neighbours 2 pixels away smooth too and on the same surface (`refl_coherent=0`: old rule). Same place,
+twice each: 0.19-0.20 % → 0.06 %.
+
+**Remaining flashes.** A film at rest still showed two strong jumps (0.10-0.12): a computation whose frame had only 13
+game draws executed before the present (usually 3,800; the game's lists had gone into the previous window), without a
+hitch long enough for v88's rule. A computation with less than a tenth of the usual draws is no longer stored in the
+layer queue. Sixteen films at rest: no jump above 0.06 any more; three small ones (0.05-0.06, layer 7 levels instead of
+15 to 28).
+
+Checked: Red Dead walking, turning, bursts, 67 to 72 fps.
+
+## v91 — URTI: shaking reflections, budget regulator that followed peaks
+
+User feedback: "a lot of noise on textures, flicker on thin places, reflections shake".
+
+**Who makes the noise.** Same back-and-forth by the water, each effect turned off (mean ꟻLIP excess, at rest / walking):
+all 0.0091 / 0.0180; without occlusion or bounce 0.0104 / 0.0230; without bounce 0.0093 / 0.0191; without reflections
+0.0057 / 0.0120; occlusion without grass 0.0082 / 0.0180. The reflections.
+
+**Reflections.** At rest, twice each: baseline 0.0069 and 0.0059; 10 % new per frame (instead of 25) 0.0045 and 0.0053;
+one ray per pixel 0.0044; both 0.0040. Walking, no difference (0.010-0.011). Both kept (`refl_alpha_min` 0.1,
+`refl_full=1`: one pixel in two only when the budget asks for it). Reflection cost by the water 2.4 → up to 3.5 ms (the
+budget handles it).
+
+**Regulator.** Player's log: "occlusion" peaks of 25 to 50 ms (the game takes the queue at the same moment); one peak
+raised the level by two, and quality came back only one level every 40 frames: occlusion at level 2 to 3.7 on average,
+so fewer rays and less range, more noise. The decision is now made on the median of the last 9 frames (up one level if it
+exceeds the target by 25 %, back down if it is under 65 %, every 30 frames).
+
+Checked: Red Dead bursts, 67 to 70 fps, noise 0.10 % of pixels.
+
+## v92 — URTI: where the fixed cost goes (measurements), counters in the log
+
+New log lines every 300 presents: present durations (median, P95, P99, worst), CPU time spent intercepting draws, draws
+and vertices replayed by kind (main screen, sun map, transparents, other screens, measurement area).
+
+**Second game, by the water, at rest** (median present duration): URTI off 7.5 ms (131 fps); URTI without effects, almost
+nothing replayed 9.2-9.3 ms (108); without effects 10.1-10.5 ms (98-101); everything on 13.0-14.3 ms (74-80).
+
+- Draw interception: 3.2 to 4.5 ms of CPU per present (~2 µs per draw, ~2,000 draws). Removing the global lock of the
+  binding events (each list's state read without a lock) changed nothing: neither the capture time nor the frame rate.
+  Removed.
+- Replayed vertices: 1.4 million per present, 1 million of them for the sun map, useless there (sun shadows off, and the
+  sun direction measured on 0 % of frames). Replayed by eighths (`sun_eighth=1`): 0.6 million, a gain within measurement
+  noise (± 3 fps). Left off by default.
+- The fixed cost is explained by the timed GPU work: per game frame, frame scene ~2 ms, shadow pass and denoiser ~1.2 ms
+  (even with occlusion off), composition ~0.45 ms per present, structure 0.6 ms: ~5.2 ms, the measured gap (98 against
+  131 fps).
+- Frame scene: 822,000 vertices → 2.0 ms; budget 250,000 → 533,000 vertices, 1.56 ms, ~80 fps; budget 120,000 → 241,000
+  vertices, 1.30 ms but 66 fps (occlusion and composition more expensive); update instead of rebuild: the scene changes
+  almost every frame, no gain. About 1.1 ms of the rebuild does not depend on size.
+
+Red Dead: 70 to 71 fps, 3,800 draws seen per present, 5.1 ms of CPU to intercept them, 1.55 million vertices replayed
+(main screen).
+
+## v93 — URTI: denoiser skipped out of range; two leads closed
+
+- Occlusion and bounce denoiser: pixels beyond the occlusion range (where the ray pass writes "nothing") are no longer
+  filtered (`denoise_far=0`: old rule). 1.18-1.26 → 0.94-1.05 ms per game frame, image unchanged.
+- Tried and removed: unused vertices of the frame scene marked inactive (NaN) instead of flat triangles. Rebuild 2.1 →
+  1.9 ms, but rays slightly slower (occlusion 1.54 → 1.64-1.80 ms, reflections 2.36 → 2.67-2.95): nothing gained.
+
+URTI's cost summary (everything on, per game frame, ~10.5 ms, two presents per frame with DLSS-G): frame scene ~2 ms,
+occlusion ~1.5 ms, denoiser ~1 ms, reflections 2.3-2.7 ms, composition and stabilised reflections ~2.1 ms, structure
+0.65 ms. No single big waste: the next gains come from less work per frame (effects computed in turn) rather than 0.2 ms
+savings.
+
+Checked: Red Dead 71 fps, noise 0.17 % of pixels.
+
+## v94 — URTI: G-buffer normals for reflections; Red Dead's camera orientation
+
+- The game's exact normals read from the G-buffer (`gnormal_slot=`, `gnormal=`, `gnormal_signs=`): either octahedral RG16
+  in camera space (`gnormal=1`), or RGB8 in world space as in Red Dead (`gnormal_slot=1`, `gnormal=2`).
+- Red Dead: the game's camera is not read, so its orientation is solved every frame on the GPU (`live_rotfit`, Horn's
+  method) from ~13,000 flat pixels: it follows the mouse, and the camera's up falls back on the world's Z. Agreement
+  0.46-0.82 depending on the scene (texture relief is in those normals); the wrong rotation would give ~0: threshold
+  0.35. A sampling ran only one frame in four (quarter-rate occlusion): fixed.
+- Reflections: the game's normal replaces the depth normal when it faces the camera and roughly agrees with it
+  (`gnormal_reflect=1`, active as soon as `gnormal=` is set).
+- Measured (bursts, share of pixels changing by more than 3 levels): Red Dead 0.09 / 0.04 / 0.04 % with it against
+  0.04 / 0.05 % without, nothing gained (the cobblestones' relief moves with the jitter). Left off by default.
+- URTI's noise in Red Dead, effect by effect (bursts at rest and while turning the camera): 0.00 to 0.06 % of pixels,
+  while the game's own image varies by 2 to 5.5 levels per frame (wind in the foliage, the game's temporal smoothing).
+
+Checked: Red Dead five launches (one crash caused by opening the Social Club).
+
+## v95 — URTI: sun found again in Red Dead, ReShade menu checkboxes
+
+- **Sun lost in Red Dead since v74** (0 % of frames): a calibration had taken for the sun map a 1024 × 1024 depth seen
+  along the camera's axis (sun (0.002 0.059 0.998)) and stored it in `urti_calib.ini`; since RT sun shadows are off, no
+  calibration replaced it any more. Fixed: a direction within 14° of the camera axis is refused; in a game without a read
+  camera, the sun is searched for as long as it is not tracked, **only in game** (an RT scene of at least 20 draws),
+  more and more spaced out without a sun (up to 32 intervals). A test that searched from the menu, every 120 frames, led
+  Red Dead to "out of memory": discarded. Measured: sun tracked on 100 % of frames, 46 pairs per frame, 4 cascades, 0.04°
+  from one frame to the next; sun / sky measured 0.21-0.25 (overcast evening). 60 fps.
+- **ReShade menu**: checkboxes "Ray-traced reflections", "Ray-traced ambient occlusion (RTAO)" (strength, range in
+  metres, 2.5 by default: 1.5 before in Red Dead), "Ray-traced indirect lighting (RTGI)" (strength); read on every
+  present, they multiply the urti.ini settings. The bounce keeps its rays even if occlusion is unticked. No checkbox yet
+  for sun shadows (the current mode turns the bounce off).
+- Finding (burst, same image before / after): URTI darkens 3.5 % of pixels by more than 5 % (ivy, wall corners, foot of
+  the wall), 0.3 % by more than 15 %; the bounce brightens nothing visible. Starting point of the audit for real RT
+  lighting.
+
+## v96 — URTI: RT occlusion on every surface and long-range sky visibility
+
+- **The game's exact normals for occlusion** (`gnormal_use=1`): in Red Dead, those of the G-buffer (world space) rotated
+  by the camera orientation solved in the previous frame (live_rotfit). Occlusion now also applies to surfaces that are
+  not flat (trunks, rocks, objects, characters), where the depth normal was only noise. Foliage seen through stays
+  excluded. Comparison and rotation are measured only on flat surfaces (otherwise depth noise would skew them).
+- **Long-range sky visibility** (`ao_sky=0.6`, `ao_sky_range=12` m; "Long-range ambient shadow" slider in ReShade): one or
+  two long rays per computed pixel tell whether the canopy, a roof or a cliff hides the sky; they remove only sky light.
+  **Only directions above the horizon count** (reflected by symmetry, weighted by their height): a first try counted the
+  ground below vertical faces as hidden sky and darkened walls and characters in one block (26.7 % of pixels by more than
+  5 %, a uniformly grey wall). The world's up comes from the camera orientation: without it, no long rays.
+- Measurements in Red Dead (bursts, same image before / after, share of pixels darkened by more than 5 % / 15 %): v95
+  4.2 / 0.4 %; contact with the game's normals 6.6 / 0.5 %; with the sky 13.2 / 3.1 % (foot of the wall, under the cart,
+  trees, sheltered ground). Added flicker 0.11 % of pixels at rest, 0.00 % while turning the camera. Occlusion pass 1.2 →
+  2.5 ms.
+- Red Dead settings added: `gnormal_slot=1`, `gnormal=2`, `gnormal_use=1`, `gnormal_reflect=0` (previous urti.ini kept as
+  `urti.ini.avant_v96`).
+
+## v97 — URTI: "bold" occlusion by default, thin objects discarded
+
+- Player's choice: a bold effect. Physical values instead of cautious ones: `ao=1` (0.8 before), `ao_sky=1` (0.6),
+  `ao_sky_range=16` m (12).
+- First try: 15-19 % of pixels darkened by more than 5 %, but added flicker 0.37-0.78 % of pixels at rest (0.07 % without
+  the long rays), on branches, ivy, fences: thin objects moving in the wind, where one or two long rays pass between the
+  leaves or not.
+- **Continuous surfaces only** for occlusion with the game's normals and for long rays: 3 pixels away in all four
+  directions the depth stays close (ground, walls, trunks, rocks, characters); branches, twigs, foliage edges discarded.
+- Measurements (Red Dead, bursts): 14-19 % of pixels darkened by more than 5 %, 4.5-6.2 % by more than 15 % (v95 at the
+  same place: 8.4 / 1.8 %); added flicker 0.01-0.16 % at rest, 0.01 % while turning. Occlusion pass 2.7 ms.
+
+## v98 — URTI: occlusion and bounce unticked by default, sun map no longer replayed for nothing
+
+- Player's verdict on v97: occlusion leaves **trails everywhere** (its accumulation over time does not follow motion),
+  the result is "really not great"; only reflections are good. The bursts measured flicker, not those trails in motion:
+  the number did not see them.
+- "Occlusion" and "Bounce" checkboxes unticked by default in urti.fx and in the presets (copies
+  `ReShadePreset.ini.avant_v98`).
+- Without occlusion, bounce or sun shadows, **the sun map is no longer replayed** and the sun no longer searched for (it
+  comes back as soon as a box is ticked again): Red Dead 3.8 → 1.7 million vertices replayed per present, capture 5.9 →
+  4.8 ms of CPU; shadow pass 0.3 ms.
+
+## v99 — URTI: reflections on glossy surfaces (parquet, waxed wood, metal, cobblestones)
+
+- Player's request: reflections are what works; extend them. Until now only surfaces with smoothness ≥ `smooth_min` (0.5
+  in Red Dead) had an RT reflection; Red Dead's floors (~0.36) were excluded.
+- `gloss_min=` (0: off; 0.2 in Red Dead): from that smoothness up to `smooth_min`, the reflection fades in (weight
+  Fresnel × ramp × `gloss=`, 1 by default); above `smooth_min`, nothing changes. "Reflections on glossy surfaces"
+  checkbox in ReShade.
+- **Blur by roughness**: lobe half-angle ~ alpha = roughness², footprint at the reflected point = distance × alpha / (eye
+  distance + distance), at most 60 render pixels; stored with the reflected point's distance (w = distance + 20,000 ×
+  radius: the reflection pass has no room left in its root signature); read by live_reflresolve over an eight-tap disk
+  (Vogel spiral rotated per pixel). A named approximation: one mirror ray, then a blurred read, no rays drawn in the lobe
+  (no noise; the blur ignores what is hidden on screen).
+- Measurements (Red Dead, Saint Denis, bursts): 20.7 % of the screen with a reflection; image changed by more than 5 % on
+  6.5 % of pixels (0.2 % without; 3.6 % at threshold 0.3); added flicker 0.12 % at rest, 0.07 % while turning;
+  reflections 0.69 ms, composition +0.5 ms; 63 fps.
+- Player's verdict: "way too much", reflections in too many places and too far. Put back as before: `gloss_min` removed
+  from Red Dead's settings, "Reflections on glossy surfaces" unticked by default (the code stays, off). Next request:
+  decide better which surfaces deserve a reflection.
+
+## v100 — URTI: glossy reflections sorted (close floors only)
+
+- Glossy surfaces (smoothness between `gloss_min` and `smooth_min`) sorted with the game's data instead of a threshold
+  alone: **a floor** (normal within 32° of the world's up, given by the camera orientation in Red Dead), flat and extended
+  (mirror rules), **not foliage or skin** (Red Dead's material type, red channel of its material target: 0.2 and 0.31),
+  **close** (faded from 10 to 18 m). Red Dead: `gloss_min=0.3`, `gloss=0.6`. A neural network was ruled out: no training
+  data, several ms per frame, and it would guess what the G-buffer gives exactly.
+- Measurements (a Saint Denis balcony, street below): 1.2 % of the screen with a reflection (20.7 % in v99); image changed
+  by more than 5 % on 0.4 % of pixels; added flicker 0.01 %; reflections 0.22 ms. To judge indoors or under the arcades
+  (polished stone 0.36).
+
+## v101 — URTI: puddles sharp again, glossy floors really active, mirror rule restored
+
+- **Regression in v99-v100** (reported by the player: "you can hardly tell what is reflected, puddles used to have bigger
+  reflections"): the roughness blur applied to every surface below a smoothness of ~0.86, puddles included (0.60). It now
+  applies only to the glossy band (below `smooth_min`): mirrors, water and puddles are sharp again.
+- **Glossy floors never active in v100**: the sorting took the world's up from the camera orientation, solved only when
+  occlusion runs (off since v98). The floor is now recognised from the world normal of Red Dead's G-buffer (z > 0.85),
+  bound to the reflections as soon as it exists.
+- **Mirror rule (v90) weakened** when glossy reflections were on: a mirror counted neighbours that were only "glossy";
+  ceiling beams of the arcades received a reflection. A mirror again requires mirror neighbours.
+- Tried and removed: skipping the shadow pass without occlusion (0.3 ms): the mask stayed at zero, the whole image
+  darkened (95 % of pixels changed).
+- Measurements under the Saint Denis arcades: polished stone floor reflecting the lit corridor, ceiling unchanged; added
+  flicker 0.06 % at rest, 0.00 % while turning; reflections 0.25 ms, 71 fps. Flicker of distant windows and cables: in
+  the game's own image (11.5 % of pixels vary by more than 3 levels from one frame to the next on the balcony), not added
+  by URTI (0.05 %).
+
+## v102 — URTI: a single menu checkbox, clean occlusion (without characters or foliage, responsive denoiser)
+
+- Player's request: no more visible settings, everything on by default with the best settings; occlusion can be
+  beautiful if it neither trails nor flickers. ReShade menu: only the "URTI" checkbox visible; reflections, close glossy
+  floors, occlusion and ambient shadow on; light bounce off (invisible, ~0.9 ms). Values stored in the presets cleared
+  (copies `ReShadePreset.ini.avant_v102`).
+- **Trail measurement** (`trainee.py`): bursts while turning the camera; shift of URTI's darkening map compared with the
+  game image's (lag 0: attached) and the deviation left once the previous map is realigned on the image's motion.
+- Causes found: occlusion on characters, horses (animated) and the canopy (in the wind); long rays on branches; history
+  clamp too wide in motion.
+- Fixed: **no occlusion on characters** (alpha of Red Dead's G-buffer normals) **nor on foliage and skin** (material type;
+  the material target is now bound to the occlusion pass, t10); long rays reserved for large continuous surfaces
+  (continuity at 6 pixels); `ao_sky` 1 → 0.7; history clamp tightened in motion (half at 4 pixels per frame and more).
+- Measurements (Red Dead, a tree-lined Saint Denis street): deviation after realignment while turning 4.0-4.7 % →
+  1.5-1.7 %; added flicker at rest 1.49 % → 0.22 % of pixels; mean darkening 4-6 % of the image; lag 0.00-0.14.
+
+## v103 — URTI: Red Dead's terrain in the RT scene (tessellated draws)
+
+- Step 1 of the "light transport" the player asked for (sun bounce in nature): the terrain, drawn with tessellation, was
+  missing from the RT scene.
+- Capture: pipelines with hull + domain shaders (without geometry or mesh shaders, writing depth) keep their code; their
+  capture pipeline replays VS + HS + DS (PATCH topology) and stream output takes the position after the domain shader.
+  Output size unknown in advance: 32 vertices per control point first, then the mesh's learned size (like
+  ExecuteIndirects), 196,608 vertices at most. Setting `tess=1`.
+- Measurements (Saint Denis street): tessellated draws ignored 11 → 6 per present (the others do not write the screen
+  depth); frame structure 1.19 → 1.71 M vertices, rebuild 1.72 → 2.14 ms; no crash; added flicker 0.25 → 0.35 %; trails:
+  deviation while turning 1.44 %. Small visible effect in town; to judge in nature.
+
+## v104 — URTI: occlusion follows motion (moving pixels computed every frame)
+
+- Player feedback: when moving, occlusion "fizzes" on objects, follows motion badly and leaves shadow lines on them.
+- Cause: quarter-rate occlusion (one pixel per 2 × 2 block each frame, in turn); in motion, a pixel had a fresh value
+  only one frame in four, the rest was old data pasted back with the motion vectors. The pass did not even read the
+  game's vectors (only with `ao_boost=1`).
+- Fixed: the pass reads each pixel's motion; **a pixel moving by more than one pixel per frame is computed every frame**
+  (two contact rays, one long ray), the others stay at quarter rate. Denoiser: in motion, half new (0.3 before).
+  `ao_motion=0`: old computation.
+- Measurements (Red Dead, Saint Denis, same launch, setting changed on the fly): walking, added flicker 0.10-0.21 % of
+  pixels against 0.88-1.85 % (one burst at 1.79 %, the first and most agitated walk); turning, share of the occlusion that
+  does not follow 0.36-0.52 × the mean darkening against 0.75. Occlusion pass ~1.2 ms in motion (0.8 at rest).
+
+## v105 — URTI: Red Dead's projection finally right (38°, not 50°), stable and anchored occlusion, dual history, low-discrepancy rays
+
+Request: viable RT occlusion in Red Dead, without offset, measured with precise tools; check whether Red Dead was better
+before.
+
+**Tools**
+- `decalage.py` (bursts before / after): motion of the image and of the darkening map by phase correlation at a tenth of a
+  pixel; **follow** (1: attached, 0: frozen), **fixed offset** of the map relative to the image's edges, **instability**
+  (deviation of the map from the previous one realigned on the motion, relative to the mean darkening), darkened share.
+  `rdr2_regress.sh`: the same measurement session for any version of the add-on.
+
+**Regressions found**
+1. **Field of view**: v70 measured it (37.9°) and corrected the projection; since then, URTI worked at **50°** in Red
+   Dead. The measurement (s², t² of the cascades) still gave 37.7-37.8°, but the correction required an accumulated
+   rotation (4e-4) never reached, and every calibration (sun search, v95) put 50° back. A camera space stretched by 31 %:
+   floor normal, reflection direction and occlusion shape skewed. Fixed: threshold 1e-4, horizontal and vertical stretches
+   agreeing within 15 %, **the same measurement within 5 % 30 frames later**, **camera still for 220 frames** (while
+   walking the measurement drifted: 37.9° → 60.8° → 91.2°), no more than ~25 % per correction, 25° to 75°; calibration no
+   longer puts 50° back; measured field stored (`fov_v=` in urti_calib.ini) and read back at launch.
+2. **Grass**: "foliage" (Red Dead's material type) also covers grass: excluded in v102, parks and nature had no occlusion
+   (0.5-1.3 % of the image against 18-27 % in v70 / v83). Only grass facing up (world normal, z > 0.6) keeps it; tree
+   leaves stay excluded.
+3. **Denoiser settings shifted in v104** (a comment in the middle of a line: clamp 0.9 instead of 2, 3×3 blur, no history
+   length). Fixed, and **C4838 (narrowing conversion in an initializer list) is now a compile error**.
+4. **Sun and occlusion**: the sun's share came from the game's shadow map, which does not match in Red Dead (v44), and
+   from the sun / sky ratio measured with it (0.04 in full sun: sun "too weak", cut). Sunlit walls darkened as if in
+   shadow. Fixed: **an RT ray toward the sun** (leaf holes crossed) decides whether the point is lit (`ao_sunray=1`); an
+   implausible sun / sky ratio (< 0.3) → 2.2; `sun_measure=0` in Red Dead.
+
+**Techniques added (research: NRD / ReBLUR, NVIDIA patents on bounded history, spatio-temporal blue noise)**
+- **Dual history** (`denoise_dual=1`): a fast history (2-3 frames, at least half new) stored with the history length;
+  the slow history is clamped around it (window 0.5 σ + 0.04, tightened in motion), as well as around the noisy current
+  neighbourhood.
+- **Low-discrepancy rays** (`ao_ign=1`): interleaved gradient noise shifted every frame, shared rotation and azimuth
+  strata, golden ratio between a pixel's rays (contact and long rays).
+
+**Measurements (Red Dead, tree-lined street and park in Saint Denis, in the sun)**
+- v70 / v83 / v105: instability at rest 0.19 / 0.20 / **0.11**; while turning 0.22-0.50 / 0.43 / **0.20-0.23**; follow
+  0.90-0.91 / 0.91-0.95 / **0.94-0.95**; fixed offset 0.02 / 0.02 / **0.00-0.02 px**; share darkened by more than 5 %
+  18-21 % / 23-27 % / 24-27 %; added flicker at rest 0.39 / 0.66 / 0.40 %, walking 0.09-1.04 / 0.26-1.15 / 0.30-0.67 %.
+- Sunlit walls: only the sky's share removed; sun patches on the ground intact, tree shadows darkened.
+
+## v106 — URTI: characters no longer cast ambient shadow, checkerboard occlusion in motion (performance)
+
+- Player feedback (captures in a Saint Denis alley): dark, blurry "shadow drawings" stay stuck to the walls and follow the
+  screen; the added shadows cost too many frames per second.
+- Likely cause of the spots: the player's character is in the RT scene; standing against a wall, it hides the "sky" of
+  the long rays (16 m) from a large area of the wall, and that spot follows it, hence follows the screen. Fixed: a hit
+  point that, projected on screen, falls on a character (alpha of Red Dead's G-buffer normals) at about the same depth is
+  crossed, like a leaf hole (occlusion, long rays, sun ray).
+- Performance: in v104, a moving pixel was computed every frame; when the camera moves, almost the whole screen is, and
+  the pass's cost was multiplied by up to four. Now every other frame, in a checkerboard (same cost per 2 × 2 block as at
+  rest). Occlusion regulator target `ao_ms` 4 → 2.5 ms.
+- Installed in Red Dead at the player's request, who tests it themself; not yet measured by URTI. Field of view: during
+  their session, measured 55-69° and corrected to 56.1° (safeguards respected: still camera, stable measurement); Red Dead
+  probably changes its field depending on the camera (alley, mode).
+
+## v107 — URTI: reflections only, full documentation, repository published
+
+- Player's decision: occlusion ("the shadow system") is too unstable in game; only reflections are kept, "already
+  exceptional". "Occlusion" checkbox unticked by default in urti.fx (the code stays, `UrtiOcclusion` hidden). Sun tracking
+  stays active in a game without a read camera: its cascades measure the field of view, which reflections need (Red Dead).
+  Stored field of view reset to 37.92°.
+- Documentation: `README.md` rewritten (current state: reflections, glossy floors, a single checkbox, per-game settings,
+  measurement tools) and `docs/HOW_IT_WORKS.md` (the whole chain: capture, RT scene, measurements, materials, rays,
+  stabilisation, composition, optional occlusion, measurement method, lessons, limits).
+
+## v108 — URTI: Red Dead back to sharp reflections (no glossy floors or terrain)
+
+- Player feedback: reflections seem lower quality than before. In-game comparison (`fov_force=` added to impose the field
+  of view): the character changed place during the session, so no clean comparison; but the bursts show the glossy floors
+  (v99-v101) giving all the dry pavement a blurred, shiny reflection, looking wet and smeared, where before there were
+  only sharp mirrors. Field of view 38°: more surfaces pass the flatness tests (21.5 / 11.5 % of the screen with a
+  reflection against 9.8 / 7.7 % at 50°, same moment).
+- Red Dead's settings put back to those of the earlier reflections: no more `gloss_min`, `gloss`, `tess`, `gnormal_*`
+  (copy `urti.ini.avant_v108`). Measured field of view kept (correct angles). If the old look at 50° was preferred:
+  `fov_force=50`.
+- README images replaced by three of the player's v108 captures (parquet hall, puddle in front of a house, alley with wet
+  flagstones); the old before / after images removed.

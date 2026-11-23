@@ -1,22 +1,19 @@
-# URTI : plan et avis de faisabilité (octobre 2026)
+# URTI: plan and feasibility assessment (October 2026)
 
-Idée de Skynizz : une couche intermédiaire qui observe un jeu DirectX 12 sans ray tracing, fabrique
-une représentation géométrique parallèle et persistante (cache géométrique temporel, classes
-statique / rigide / déformé / inconnu, niveaux de confiance), et ajoute ombres, reflets puis
-éclairage indirect en RT, composés avec l'image d'origine.
+Skynizz's idea: an intermediate layer that watches a DirectX 12 game without ray tracing, builds a parallel and
+persistent geometric representation (temporal geometry cache; static / rigid / deformed / unknown classes; confidence
+levels), and adds RT shadows, reflections and then indirect lighting, composed with the original image.
 
-Avis : faisable en prototype sur un jeu, par étapes avec critères d'arrêt ; « universel et
-robuste » n'est pas réaliste sans un petit profil par jeu (comme RTX Remix). Risques, du plus
-grave au moins grave :
-1. La géométrie en espace monde : ne pas décoder les buffers mais capter la sortie des vertex
-   shaders (sortie de flux) ; reste à retrouver la caméra. Les mesh shaders y échappent.
-2. La composition : on ne peut pas retirer de l'image finale les ombres et reflets du jeu ; sans
-   intervenir dans sa passe d'éclairage, le RT ne peut qu'ajouter.
-3. Les matériaux hors champ : plutôt que les décoder, garder la lumière des surfaces vues dans un
-   cache en espace monde (KRC) et la relire aux points touchés par les rayons.
-4. Les lampes : le soleil à partir des passes de cartes d'ombres ; les autres plus tard.
-5. Anti-triche : solo uniquement.
+Assessment: feasible as a prototype on one game, in steps with stop criteria. "Universal and robust" is not realistic
+without a small per-game profile (like RTX Remix). Risks, from most to least serious:
+1. World-space geometry: do not decode the buffers, capture the vertex shaders' output (stream output) instead. The
+   camera still has to be found. Mesh shaders escape this.
+2. Composition: the game's own shadows and reflections cannot be removed from the final image. Without stepping into
+   its lighting pass, RT can only add.
+3. Off-screen materials: rather than decoding them, keep the light of the surfaces seen in a world-space cache (KRC)
+   and read it back where rays land.
+4. Lights: the sun from the shadow-map passes; the others later.
+5. Anti-cheat: single player only.
 
-Étapes : 0 banc à vérité terrain ; 1 capture et couverture (> 95 % de la profondeur du jeu
-expliquée, sinon arrêt) ; 2 ombres RT du soleil ; 3 cache de lumière, reflets, indirect.
-Suivi : urti/README.md.
+Steps: 0, a bench with ground truth; 1, capture and coverage (> 95 % of the game's depth explained, otherwise stop);
+2, RT sun shadows; 3, light cache, reflections, indirect. Tracking: urti/README.md.
