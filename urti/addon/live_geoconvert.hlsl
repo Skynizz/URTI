@@ -1,15 +1,15 @@
-// URTI en direct : cache de géométrie. Les objets captés à leur tour (zone de mesure du flux) sont convertis dans le
-// repère fixe du cache (espace caméra de la dernière remise à zéro) : sommet = R^T (espace caméra - t), avec la pose de
-// la caméra accumulée par live_camfit. Chaque objet a ensuite sa propre structure d'accélération, gardée d'une image à
-// l'autre et posée dans la scène RT par cette même pose. Un groupe par objet. Sommets non écrits ou aberrants : NaN
-// (triangle inactif).
+// Live URTI: geometry cache. Objects captured in turn (measurement area of the stream) are converted into the
+// cache's fixed frame (camera space of the last reset): vertex = R^T (camera space - t), with the camera
+// pose accumulated by live_camfit. Each object then gets its own acceleration structure, kept from one frame to
+// the next and placed in the RT scene by that same pose. One group per object. Unwritten or aberrant vertices: NaN
+// (inactive triangle).
 
-StructuredBuffer<float4> clip : register(t0);   // flux de l'écran (début de son emplacement)
-ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
-StructuredBuffer<uint4> regions : register(t2); // par objet : début dans le flux (octets), taille (octets), compteur,
-                                                // début dans view (octets)
-RWByteAddressBuffer view : register(u0);        // float3 par sommet, repère du cache
-RWByteAddressBuffer motion : register(u1);      // octets 128 à 175 : pose (R par lignes, t) du repère du cache vers la caméra
+StructuredBuffer<float4> clip : register(t0);   // the screen's stream (start of its slot)
+ByteAddressBuffer counters : register(t1);      // bytes written per draw
+StructuredBuffer<uint4> regions : register(t2); // per object: start in the stream (bytes), size (bytes), counter,
+                                                // start in view (bytes)
+RWByteAddressBuffer view : register(u0);        // float3 per vertex, cache frame
+RWByteAddressBuffer motion : register(u1);      // bytes 128 to 175: pose (R by rows, t) from the cache's frame to the camera
 
 cbuffer Constants : register(b0)
 {
@@ -28,7 +28,7 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
     const uint first = r.x / 16, total = r.y / 16 / 3 * 3, filled = min(counters.Load(r.z * 8), r.y) / 16 / 3 * 3;
     const float3 r0 = asfloat(motion.Load3(128)), r1 = asfloat(motion.Load3(140)), r2 = asfloat(motion.Load3(152)), t = asfloat(motion.Load3(164));
     const float nan = asfloat(0x7FC00000);
-    const float2 shear = asfloat(motion.Load2(176)); // décalage sous-pixel du jeu dans cette image (caméra du jeu lue)
+    const float2 shear = asfloat(motion.Load2(176)); // the game's sub-pixel jitter in this frame (game camera read)
     for (uint i = ti; i < total; i += 64)
     {
         float3 v = float3(nan, nan, nan);

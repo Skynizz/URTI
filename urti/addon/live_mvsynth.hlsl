@@ -1,14 +1,14 @@
-// URTI en direct : vecteurs de mouvement fabriqués à partir du mouvement de la caméra mesuré sur notre géométrie
-// (live_camfit) et de la profondeur de cette image, quand ceux du jeu restent illisibles (Horizon Forbidden West :
-// aucune convention ne se départage). Pour chaque pixel : son point dans l'espace caméra de cette image, ramené
-// dans celui de l'image précédente (p = R^T (q - t)), projeté : là où il était. Ciel : la rotation seule. Juste
-// pour ce qui est immobile ; un personnage qui bouge est rejeté par les historiques (écart de profondeur).
-// Écrit au format du jeu attendu par les passes qui les lisent : deux demi-flottants, convention 0 (position
-// précédente = uv + vecteur, unités de l'écran 0..1).
+// Live URTI: motion vectors built from the camera motion measured on our geometry
+// (live_camfit) and this frame's depth, when the game's stay unreadable (seen in one game:
+// no convention could be told apart). For each pixel: its point in this frame's camera space, brought back
+// into the previous frame's (p = R^T (q - t)), projected: where it was. Sky: rotation only. Correct
+// for what is still; a moving character is rejected by the histories (depth difference).
+// Written in the game format expected by the passes that read them: two half floats, convention 0 (previous
+// position = uv + vector, screen units 0..1).
 
 ByteAddressBuffer depth : register(t0);
-ByteAddressBuffer sunBuf : register(t1); // loi de profondeur (octets 36 à 47)
-ByteAddressBuffer motion : register(t2); // R (par lignes), t, validité (live_camfit)
+ByteAddressBuffer sunBuf : register(t1); // depth law (bytes 36 to 47)
+ByteAddressBuffer motion : register(t2); // R (by rows), t, validity (live_camfit)
 RWByteAddressBuffer mv : register(u0);
 
 cbuffer Constants : register(b0)
@@ -44,7 +44,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const bool sky = !(d != clearValue && w > 0 && w < 1e6);
         if (!sky)
             q *= w;
-        // R^T (q - t) : les colonnes de R ; le ciel (à l'infini) ne suit que la rotation
+        // R^T (q - t): the columns of R; the sky (at infinity) follows only the rotation
         const float3 a = sky ? q : q - t;
         const float3 p = float3(r0.x * a.x + r1.x * a.y + r2.x * a.z, r0.y * a.x + r1.y * a.y + r2.y * a.z, r0.z * a.x + r1.z * a.y + r2.z * a.z);
         if (p.z > 1e-3)

@@ -1,21 +1,21 @@
-// URTI en direct : mouvement de la caméra d'une image à l'autre, mesuré sur notre propre géométrie, sans rien
-// demander au jeu. La conversion (live_convert) relève, pour les objets dessinés à la même place dans les deux
-// images, des paires de sommets : position dans l'espace caméra de l'image précédente (p) et de celle-ci (q),
-// une quinzaine par objet (un personnage qui suit la caméra pèse autant qu'un rocher, pas plus). Pour un objet
-// immobile, q = R p + t (R, t : mouvement de la caméra). Ajustement par la méthode de Horn (quaternion propre de
-// la matrice de corrélation), repris quatre fois en ne gardant que les paires proches de l'estimation précédente :
-// ce qui bouge pour de bon (personnages, animaux, feuillage au vent) est écarté.
-// Sortie (motion) : R (9 nombres, par lignes), t (3), validité, paires gardées, paires reçues, écart quadratique
-// moyen des paires gardées (m) ; octets 64 à 111 : l'estimation de l'image précédente (point de départ) ; octets 128
-// à 175 : pose accumulée (R par lignes, t) du repère fixe du cache de géométrie vers la caméra de cette image.
+// Live URTI: camera motion from one frame to the next, measured on our own geometry, without asking
+// the game anything. The conversion (live_convert) records, for objects drawn at the same place in both
+// frames, vertex pairs: position in the previous frame's camera space (p) and in this one's (q),
+// about fifteen per object (a character following the camera weighs as much as a rock, no more). For a
+// still object, q = R p + t (R, t: camera motion). Fit by Horn's method (eigen-quaternion of
+// the correlation matrix), repeated four times keeping only the pairs close to the previous estimate:
+// what really moves (characters, animals, foliage in the wind) is discarded.
+// Output (motion): R (9 numbers, by rows), t (3), validity, pairs kept, pairs received, root mean square
+// deviation of the kept pairs (m); bytes 64 to 111: the previous frame's estimate (starting point); bytes 128
+// to 175: accumulated pose (R by rows, t) from the geometry cache's fixed frame to this frame's camera.
 
 RWByteAddressBuffer motion : register(u0);
-RWByteAddressBuffer pairs : register(u1); // nombre de paires, puis par paire : p.xyz, q.xyz (float) ; compte remis à zéro
+RWByteAddressBuffer pairs : register(u1); // number of pairs, then per pair: p.xyz, q.xyz (float); count reset
 
 cbuffer Constants : register(b0)
 {
     uint maxPairs;
-    uint resetPose; // 1 : le repère du cache de géométrie repart de la caméra de cette image
+    uint resetPose; // 1: the geometry cache's frame restarts from this frame's camera
     uint pad1;
     uint pad2;
 };
@@ -23,7 +23,7 @@ cbuffer Constants : register(b0)
 #define T 512
 groupshared float sAcc[T][10];
 groupshared float sR[9], sT[3];
-groupshared float sTau, sRel, sWeight; // tolérance : absolue (m) et relative à la distance
+groupshared float sTau, sRel, sWeight; // tolerance: absolute (m) and relative to the distance
 
 void Reduce(uint ti, uint count)
 {
@@ -48,14 +48,14 @@ void main(uint ti : SV_GroupIndex)
     const uint n = min(pairs.Load(0), maxPairs);
     if (ti == 0)
     {
-        // départ : le mouvement de l'image précédente s'il était valide (la caméra bouge sans à-coups)
+        // start: the previous frame's motion if it was valid (the camera moves without jolts)
         const bool prevValid = asfloat(motion.Load(48)) > 0.5;
         for (uint k = 0; k < 9; k++)
             sR[k] = prevValid ? asfloat(motion.Load(k * 4)) : (k % 4 == 0 ? 1.0 : 0.0);
         for (uint k2 = 0; k2 < 3; k2++)
             sT[k2] = prevValid ? asfloat(motion.Load(36 + k2 * 4)) : 0.0;
         sTau = prevValid ? 0.25 : 2.0, sRel = 0.01;
-        // sauvegarde de l'estimation précédente (octets 64 à 111)
+        // backup of the previous estimate (bytes 64 to 111)
         for (uint k3 = 0; k3 < 12; k3++)
             motion.Store(64 + k3 * 4, motion.Load(k3 * 4));
     }
@@ -64,7 +64,7 @@ void main(uint ti : SV_GroupIndex)
     bool ok = n >= 64;
     for (uint iter = 0; iter < 7 && ok; iter++)
     {
-        // poids : paire proche de l'estimation en cours (tolérance absolue + 1 % de la distance)
+        // weight: pair close to the current estimate (absolute tolerance + 1 % of the distance)
         float acc[7] = { 0, 0, 0, 0, 0, 0, 0 };
         for (uint i = ti; i < n; i += T)
         {
@@ -79,17 +79,17 @@ void main(uint ti : SV_GroupIndex)
         const float w = sAcc[0][0];
         if (iter == 0 && w < 0.3 * n && sTau < 1.0)
         {
-            // la caméra a changé d'allure : on repart de l'immobilité, avec une large tolérance
+            // the camera changed pace: restart from stillness, with a wide tolerance
             GroupMemoryBarrierWithGroupSync();
             if (ti == 0)
             {
                 for (uint k = 0; k < 9; k++)
                     sR[k] = k % 4 == 0 ? 1.0 : 0.0;
-                // large : un quart de tour par seconde, c'est déjà plusieurs mètres par image pour un arbre à 50 m
+                // wide: a quarter turn per second is already several metres per frame for a tree 50 m away
                 sT[0] = sT[1] = sT[2] = 0, sTau = 5.0, sRel = 0.15;
             }
             GroupMemoryBarrierWithGroupSync();
-            iter = ~0u; // la boucle reprend à 0
+            iter = ~0u; // the loop restarts at 0
             continue;
         }
         if (w < 32)
@@ -99,7 +99,7 @@ void main(uint ti : SV_GroupIndex)
         }
         const float3 pm = float3(sAcc[0][1], sAcc[0][2], sAcc[0][3]) / w, qm = float3(sAcc[0][4], sAcc[0][5], sAcc[0][6]) / w;
         GroupMemoryBarrierWithGroupSync();
-        // corrélation centrée S = somme (p - pm)(q - qm)^T
+        // centred correlation S = sum (p - pm)(q - qm)^T
         float s[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         for (uint i2 = ti; i2 < n; i2 += T)
         {
@@ -124,7 +124,7 @@ void main(uint ti : SV_GroupIndex)
                                   Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz,
                                   Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy,
                                   Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz };
-            // plus grande valeur propre : itérations de puissance sur N + c I (toutes les valeurs propres positives)
+            // largest eigenvalue: power iterations on N + c I (all eigenvalues positive)
             float c = 0;
             for (uint k5 = 0; k5 < 16; k5++)
                 c += abs(N[k5]);
@@ -146,7 +146,7 @@ void main(uint ti : SV_GroupIndex)
             sWeight = w;
         }
         GroupMemoryBarrierWithGroupSync();
-        // écart des paires gardées avec ce mouvement : la tolérance suivante (trois écarts, 2 cm au moins)
+        // deviation of the kept pairs with this motion: the next tolerance (three deviations, 2 cm at least)
         float e2 = 0, cnt = 0;
         for (uint i3 = ti; i3 < n; i3 += T)
         {
@@ -159,17 +159,17 @@ void main(uint ti : SV_GroupIndex)
         Reduce(ti, 2);
         rms = sqrt(sAcc[0][0] / max(sAcc[0][1], 1.0));
         kept = sAcc[0][1];
-        // tolérance suivante : elle ne fait que se resserrer (2,5 écarts, 1,5 cm au moins). Dans une forêt au vent
-        // (Horizon), ce qui bouge est majoritaire : une tolérance qui suivait l'écart restait large et le mouvement
-        // mesuré était un compromis (3 à 6 cm par image, caméra immobile) ; resserrée, il ne reste que le noyau
-        // immobile (sol, rochers, troncs)
+        // next tolerance: it only tightens (2.5 deviations, 1.5 cm at least). In a forest in the wind
+        // what moves is the majority: a tolerance that followed the deviation stayed wide and the measured motion
+        // was a compromise (3 to 6 cm per frame, still camera); tightened, only the still core
+        // remains (ground, rocks, trunks)
         if (ti == 0)
             sTau = max(0.015, min(sTau, 2.5 * rms)), sRel = 0.004;
         GroupMemoryBarrierWithGroupSync();
     }
     if (ti == 0)
     {
-        // validité : assez de paires gardées (un tiers au moins), mouvement plausible pour une image
+        // validity: enough pairs kept (a third at least), a plausible motion for one frame
         const float3 t = float3(sT[0], sT[1], sT[2]);
         const bool valid = ok && kept >= max(64.0, 0.33 * n) && length(t) < 20.0 && sR[0] + sR[4] + sR[8] > 2.0;
         for (uint k = 0; k < 9; k++)
@@ -180,9 +180,9 @@ void main(uint ti : SV_GroupIndex)
         motion.Store(52, asuint(kept));
         motion.Store(56, asuint(float(n)));
         motion.Store(60, asuint(rms));
-        // pose accumulée : caméra = R repère + t ; mouvement non mesuré : la caméra est supposée immobile. Rotation
-        // remise d'équerre à chaque image (les erreurs d'arrondi s'ajouteraient). Le décalage sous-pixel du jeu (TAA)
-        // n'y laisse pas de dérive : il s'annule d'une image à l'autre dans la somme
+        // accumulated pose: camera = R frame + t; motion not measured: the camera is assumed still. Rotation
+        // re-orthogonalised every frame (rounding errors would add up). The game's sub-pixel jitter (TAA)
+        // leaves no drift: it cancels out from one frame to the next in the sum
         float3 x0 = asfloat(motion.Load3(128)), x1 = asfloat(motion.Load3(140)), x2 = asfloat(motion.Load3(152)), xt = asfloat(motion.Load3(164));
         if (resetPose != 0 || !all(isfinite(x0 + x1 + x2 + xt)) || dot(x0, x0) < 0.5)
             x0 = float3(1, 0, 0), x1 = float3(0, 1, 0), x2 = float3(0, 0, 1), xt = 0;
@@ -197,7 +197,7 @@ void main(uint ti : SV_GroupIndex)
             x2 = cross(x0, x1);
         }
         motion.Store3(128, asuint(x0)), motion.Store3(140, asuint(x1)), motion.Store3(152, asuint(x2)), motion.Store3(164, asuint(xt));
-        motion.Store2(176, uint2(0, 0)); // pas de décalage sous-pixel connu (caméra du jeu non lue)
+        motion.Store2(176, uint2(0, 0)); // no known sub-pixel jitter (game camera not read)
         pairs.Store(0, 0);
     }
 }

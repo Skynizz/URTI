@@ -1,19 +1,19 @@
-// URTI en direct : direction du soleil à chaque image, sur le GPU. Un groupe par paire de dessins
-// (le même maillage vu par la caméra et dans la carte d'ombres du soleil, même signature) : ajustement
-// affine (moindres carrés) des sommets de la caméra vers ceux de la carte (projection parallèle), puis
-// la direction que l'application envoie sur l'axe de profondeur de la carte. Les paires mal
-// appariées (autre objet, animé) sont rejetées par leur résidu.
+// Live URTI: sun direction every frame, on the GPU. One group per pair of draws
+// (the same mesh seen by the camera and in the sun's shadow map, same signature): affine fit
+// (least squares) from the camera's vertices to the map's (parallel projection), then
+// the direction the mapping sends onto the map's depth axis. Badly
+// matched pairs (another object, animated) are rejected through their residual.
 
-ByteAddressBuffer so : register(t0);       // flux de sortie, tous les emplacements
-ByteAddressBuffer counters : register(t1); // octets écrits par dessin (chaque dessin a sa zone du flux)
+ByteAddressBuffer so : register(t0);       // output stream, every slot
+ByteAddressBuffer counters : register(t1); // bytes written per draw (each draw has its region of the stream)
 struct Pair
 {
-    uint4 ids;       // début (octets dans le flux) du dessin caméra, du dessin carte, leurs compteurs
-    float4 viewport; // du dessin dans la carte : sa cascade
-    uint4 extra;     // facteur de poids (float), tailles des deux zones
+    uint4 ids;       // start (bytes in the stream) of the camera draw, of the map draw, their counters
+    float4 viewport; // of the draw in the map: its cascade
+    uint4 extra;     // weight factor (float), sizes of both regions
 };
 StructuredBuffer<Pair> pairs : register(t2);
-RWByteAddressBuffer dirs : register(u0);   // par paire (80 octets) : direction et poids (0 : rejetée), application (12 float), viewport
+RWByteAddressBuffer dirs : register(u0);   // per pair (80 bytes): direction and weight (0: rejected), mapping (12 floats), viewport
 
 cbuffer Constants : register(b0)
 {
@@ -46,7 +46,7 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
     const uint4 x = pairs[gid.x].extra;
     const uint cFilled = min(counters.Load(p.z * 8), x.y), lFilled = min(counters.Load(p.w * 8), x.z);
     const uint n = cFilled / 16;
-    // même nombre de sommets, rien de tronqué par une zone trop petite
+    // same number of vertices, nothing truncated by a region that is too small
     if (n < 24 || lFilled / 16 != n || cFilled >= x.y + 16 || lFilled >= x.z + 16)
     {
         if (t == 0)
@@ -56,7 +56,7 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
     const uint cBase = p.x, lBase = p.y;
     const uint step = max(1u, n / 256);
 
-    // équations normales : N = XᵀX (10 termes), R = XᵀS (12 termes)
+    // normal equations: N = XᵀX (10 terms), R = XᵀS (12 terms)
     double acc[22];
     for (uint i = 0; i < 22; i++)
         acc[i] = 0;
@@ -94,8 +94,8 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
         for (uint a2 = 0; a2 < 4; a2++)
             for (uint c = 0; c < 3; c++)
                 R[a2][c] = sAcc[0][10 + a2 * 3 + c];
-        bool ok = N[3][3] >= 24; // N[3][3] : nombre de sommets retenus
-        for (uint col = 0; col < 4 && ok; col++) // Gauss avec pivot partiel
+        bool ok = N[3][3] >= 24; // N[3][3]: number of vertices kept
+        for (uint col = 0; col < 4 && ok; col++) // Gauss with partial pivoting
         {
             uint pv = col;
             for (uint r = col + 1; r < 4; r++)
@@ -139,7 +139,7 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
                     M[a3][c2] = R[a3][c2] / N[a3][a3];
                     sM[a3 * 3 + c2] = float(M[a3][c2]);
                 }
-            // d tel que A d = (0, 0, 1), A[r][c] = M[c][r] : troisième colonne de l'inverse
+            // d such that A d = (0, 0, 1), A[r][c] = M[c][r]: third column of the inverse
             const double a00 = M[0][0], a01 = M[1][0], a02 = M[2][0];
             const double a10 = M[0][1], a11 = M[1][1], a12 = M[2][1];
             const double a20 = M[0][2], a21 = M[1][2], a22 = M[2][2];
@@ -163,7 +163,7 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupThreadID)
         return;
     }
 
-    // résidu moyen de l'ajustement, rapporté à l'étendue des sommets dans la carte
+    // mean residual of the fit, relative to the extent of the vertices in the map
     float r[8] = { 0, 0, 1e30, 1e30, 1e30, -1e30, -1e30, -1e30 };
     for (uint v2 = t * step; v2 < n; v2 += T * step)
     {

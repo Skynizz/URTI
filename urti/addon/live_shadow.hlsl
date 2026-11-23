@@ -1,65 +1,65 @@
-// URTI en direct : ombres du soleil en ray tracing (requêtes en ligne). Un fil par pixel de la
-// profondeur du jeu : point reconstruit (profondeur = A + B / w), rayon vers le soleil.
+// Live URTI: ray-traced sun shadows and ambient occlusion (inline ray queries). One thread per pixel of the
+// game's depth: point rebuilt (depth = A + B / w), rays toward the sun and the sky.
 
 RaytracingAccelerationStructure scene : register(t0);
-ByteAddressBuffer depth : register(t1);   // copie de la profondeur (32 bits par texel, lignes alignées)
-ByteAddressBuffer sunBuf : register(t2);  // soleil de cette image (live_sunvote), espace caméra, cascades
-ByteAddressBuffer atlas : register(t3);   // copie de la carte d'ombres du jeu (32 bits par texel, lignes alignées)
-ByteAddressBuffer prevShadow : register(t4); // masque de l'image précédente (accumulation)
-ByteAddressBuffer depthPrev : register(t5);  // profondeur de l'image précédente
-ByteAddressBuffer motion : register(t6);     // vecteurs de mouvement du jeu (R16G16 flottants)
-RWByteAddressBuffer shadow : register(u0); // 1 éclairé, 0 à l'ombre (float, lignes alignées)
+ByteAddressBuffer depth : register(t1);   // copy of the depth (32 bits per texel, aligned rows)
+ByteAddressBuffer sunBuf : register(t2);  // this frame's sun (live_sunvote), camera space, cascades
+ByteAddressBuffer atlas : register(t3);   // copy of the game's shadow map (32 bits per texel, aligned rows)
+ByteAddressBuffer prevShadow : register(t4); // previous frame's mask (accumulation)
+ByteAddressBuffer depthPrev : register(t5);  // previous frame's depth
+ByteAddressBuffer motion : register(t6);     // the game's motion vectors (R16G16 floats)
+RWByteAddressBuffer shadow : register(u0); // 1 lit, 0 in shadow (float, aligned rows)
 
 cbuffer Constants : register(b0)
 {
-    float sunSign;     // +1 : la profondeur de la carte croît en s'éloignant du soleil
-    float gameBias;    // tolérance du test de profondeur de la carte du jeu
-    float sunRadius;   // rayon apparent du soleil (radians) : pénombre
+    float sunSign;     // +1: the map's depth grows away from the sun
+    float gameBias;    // tolerance of the depth test in the game's map
+    float sunRadius;   // apparent radius of the sun (radians): penumbra
     float bias;
     uint width;
     uint height;
-    uint depthPitch;   // octets par ligne
+    uint depthPitch;   // bytes per row
     uint shadowPitch;
     float A;
     float B;
     float p00;
     float p11;
     float clearDepth;
-    uint depth24;      // 1 : D24S8 (24 bits de profondeur)
+    uint depth24;      // 1: D24S8 (24 bits of depth)
     uint atlasPitch;
-    uint flags;        // 1 carte du jeu lue, 2 carte en D24, 4 combiner avec l'ombre du jeu, 8 afficher l'ombre du jeu, 16 pas de soleil,
-                       // 32 carte en 16 bits (R16, RDR2), 64 pas de rayons d'ombre du soleil (le soleil reste connu :
-                       // l'occultation ambiante s'en sert), 128 occultation au quart (un pixel sur quatre par image,
-                       // les autres écrits -1 : live_shadowtemporal les reconstruit), bits 16 à 18 : rayons d'occultation
-                       // par pixel calculé à l'arrêt (0 : règle fixe ; l'add-on les règle sur le temps de la passe),
-                       // 2048 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le soleil ;
-                       // 4096 : sortie pour SIGMA (débruiteur d'ombres de NVIDIA) : pénombre dans penumbra, poids des
-                       // corrections (ombre du jeu, N·L, brume) dans shadow ; le débruitage se fait après ;
-                       // 1 << 20 : rebond de lumière (bounce)
+    uint flags;        // 1 game map read, 2 map in D24, 4 combine with the game's shadow, 8 show the game's shadow, 16 no sun,
+                       // 32 map in 16 bits (R16, RDR2), 64 no sun shadow rays (the sun stays known:
+                       // ambient occlusion uses it), 128 quarter-rate occlusion (one pixel in four per frame,
+                       // the others written -1: live_shadowtemporal rebuilds them), bits 16 to 18: occlusion rays
+                       // per computed pixel at rest (0: fixed rule; the add-on tunes them on the pass's time),
+                       // 2048: holes of cut-out cards (seen through on screen) let the sun through;
+                       // 4096: output for SIGMA (NVIDIA's shadow denoiser): penumbra in penumbra, weight of the
+                       // corrections (game shadow, N·L, haze) in shadow; denoising happens afterwards;
+                       // 1 << 20: light bounce
     uint motionPitch;
-    uint motionConvention; // 0..15 (live_mvcal), 255 : pas d'accumulation
-    float temporalAlpha;   // part de l'image courante (0,3 : environ trois images accumulées)
-    uint debugMode;        // 1 ombre brute (sans accumulation), 2 vecteurs de mouvement, 3 historique gardé
-    uint frameIndex;       // fait tourner le motif des rayons d'une image à l'autre (l'accumulation le moyenne)
-    float sunSky;          // rapport soleil / ciel mesuré dans l'image du jeu (live_sunlight) ; 0 : non mesuré
-    uint gameDilate;       // voisinage lu dans la carte du jeu (rayon en texels)
-    uint gameMin;          // 1 : part éclairée filtrée, visibilité la plus faible des deux ; 0 : ombre du jeu élargie, produit
-    float aoAmount;        // occultation ambiante RT : part de la lumière du ciel retirée par un obstacle tout proche (0 : coupée)
-    float aoRadius;        // portée des rayons d'occultation (mètres)
-    uint aoMotion;         // convention des vecteurs de mouvement (live_mvcal) pour l'occultation ; 255 : inconnue
-    uint cacheTriangles;   // triangles tenus par le cache de surfaces (rebond de lumière)
-    uint regionCount;      // zones de la scène RT (regions)
-    float aoMaxDist;       // budget de temps : occultation calculée jusqu'à cette distance (mètres)
-    uint gnMode;           // normales du G-buffer : bits 0-1 encodage (1 octaèdre RG16 en repère caméra, 2 RGB8 * 2 - 1), bits 8-10 signes (x, y, z inversés),
-                           // bit 12 : l'occultation les prend, bit 13 : comparaison à la normale de la profondeur (journal)
-    uint gnPitchPacked;    // bits 0-15 : octets par ligne de la copie des normales ; 16-31 : de la cible de matériau (Red Dead, t10 ; 0 : absente)
-    float skyAmount;       // visibilité du ciel à grande portée : part de la lumière du ciel retirée quand un obstacle la cache (0 : coupée)
-    float skyRange;        // portée de ces rayons (mètres)
+    uint motionConvention; // 0..15 (live_mvcal), 255: no accumulation
+    float temporalAlpha;   // share of the current frame (0.3: about three frames accumulated)
+    uint debugMode;        // 1 raw shadow (without accumulation), 2 motion vectors, 3 history kept
+    uint frameIndex;       // rotates the ray pattern from one frame to the next (accumulation averages it)
+    float sunSky;          // sun / sky ratio measured in the game's image (live_sunlight); 0: not measured
+    uint gameDilate;       // neighbourhood read in the game's map (radius in texels)
+    uint gameMin;          // 1: filtered lit share, the lower visibility of the two; 0: game shadow widened, product
+    float aoAmount;        // RT ambient occlusion: share of sky light removed by a very close occluder (0: off)
+    float aoRadius;        // range of occlusion rays (metres)
+    uint aoMotion;         // motion-vector convention (live_mvcal) for occlusion; 255: unknown
+    uint cacheTriangles;   // triangles held by the surface cache (light bounce)
+    uint regionCount;      // regions of the RT scene
+    float aoMaxDist;       // time budget: occlusion computed up to this distance (metres)
+    uint gnMode;           // G-buffer normals: bits 0-1 encoding (1 octahedral RG16 in camera space, 2 RGB8 * 2 - 1), bits 8-10 signs (x, y, z flipped),
+                           // bit 12: occlusion uses them, bit 13: comparison with the depth normal (log)
+    uint gnPitchPacked;    // bits 0-15: bytes per row of the normals copy; 16-31: of the material target (Red Dead, t10; 0: absent)
+    float skyAmount;       // long-range sky visibility: share of sky light removed when an occluder hides it (0: off)
+    float skyRange;        // range of those rays (metres)
 };
 
-// bruit à gradient entrelacé (Jimenez 2014), déplacé à chaque image de 5,588238 pixels : à faible discrépance dans l'espace (deux pixels voisins tirent
-// des directions éloignées, le flou du débruiteur les moyenne vite) et dans le temps. Le bruit blanc (hachage) laissait des amas de directions
-// semblables : grain qui ne se moyennait qu'en beaucoup d'images (la documentation de NRD exige un bruit à faible discrépance pour l'occultation)
+// interleaved gradient noise (Jimenez 2014), shifted every frame by 5.588238 pixels: low discrepancy in space (two neighbouring pixels draw
+// distant directions, the denoiser's blur averages them fast) and in time. White noise (hashing) left clusters of similar
+// directions: grain that only averaged out over many frames (NRD's documentation requires low-discrepancy noise for occlusion)
 float Ign(float2 p, uint frame)
 {
     p += 5.588238 * float(frame & 63);
@@ -74,20 +74,20 @@ uint AoHash(uint x)
 
 static float gA, gB, gClear;
 
-// SIGMA : rayon de la pénombre au point (distance à l'obstacle × tangente du rayon apparent du soleil) ;
-// NRD_FP16_MAX : rien ne bloque (même formule que SIGMA_FrontEnd_PackPenumbra de NRD)
+// SIGMA: penumbra radius at the point (distance to the occluder × tangent of the sun's apparent radius);
+// NRD_FP16_MAX: nothing blocks (same formula as NRD's SIGMA_FrontEnd_PackPenumbra)
 static const float kFp16Max = 65504.0;
 float PackPenumbra(float distanceToOccluder, float tanOfLightAngularRadius)
 {
     return distanceToOccluder >= kFp16Max ? kFp16Max : min(distanceToOccluder * tanOfLightAngularRadius * 0.5, 32768.0);
 }
-RWByteAddressBuffer penumbra : register(u1); // float par pixel (pas : shadowPitch), mode SIGMA
-ByteAddressBuffer gnormal : register(t9);     // copie de la cible des normales du G-buffer (gnMode)
+RWByteAddressBuffer penumbra : register(u1); // float per pixel (pitch: shadowPitch), SIGMA mode
+ByteAddressBuffer gnormal : register(t9);     // copy of the G-buffer normals target (gnMode)
 RWByteAddressBuffer nstats : register(u3);
-ByteAddressBuffer materialTarget : register(t10); // cible de matériau de Red Dead (r : type, 0,2 feuillage, 0,31 peau ; g : lissé)
-static uint gnPitch;    // comparaison : par combinaison de signes, somme des produits scalaires (×1000) et nombre de pixels
+ByteAddressBuffer materialTarget : register(t10); // Red Dead's material target (r: type, 0.2 foliage, 0.31 skin; g: smoothness)
+static uint gnPitch;    // comparison: per sign combination, sum of dot products (×1000) and number of pixels
 
-// normale du G-buffer en espace caméra d'URTI (x droite, y haut, z vers la scène), selon l'encodage et les signes ; 0 si absente
+// G-buffer normal in URTI's camera space (x right, y up, z into the scene), according to encoding and signs; 0 if absent
 float3 GNormal(int2 t, uint signs)
 {
     const uint enc = gnMode & 3;
@@ -114,8 +114,8 @@ float3 GNormal(int2 t, uint signs)
     return l > 1e-3 && all(isfinite(n)) ? n / l : 0;
 }
 
-// normale du G-buffer dans l'espace caméra d'URTI, prête pour les rayons : celle de Red Dead (repère du monde) tournée par l'orientation de la caméra
-// que live_rotfit a résolue (image précédente : sunBuf 2048 à 2095, valide en 2092) ; 0 si absente ou pas encore résolue
+// G-buffer normal in URTI's camera space, ready for rays: Red Dead's (world space) rotated by the camera orientation
+// that live_rotfit solved (previous frame: sunBuf 2048 to 2095, valid at 2092); 0 if absent or not solved yet
 float3 GNormalCam(int2 t)
 {
     float3 n = GNormal(int2(t), (gnMode >> 8) & 7);
@@ -130,11 +130,11 @@ float3 GNormalCam(int2 t)
     return n;
 }
 
-// rebond de lumière (éclairage indirect, bit 20 de flags) : les rayons d'occultation qui touchent un triangle y
-// prennent la couleur que le cache de surfaces a retenue (live_surfcache) : la lumière que cette surface renvoie.
-// Sortie : trois plans R, G, B (float, pas shadowPitch, l'un après l'autre), -1 aux pixels non calculés (au quart)
-ByteAddressBuffer surfCache : register(t7);     // par triangle : couleur (RGB9E5), identité de l'objet et mesures
-StructuredBuffer<uint4> regions : register(t8); // zones de la scène RT : début (octets), taille, compteur, identité
+// light bounce (indirect lighting, bit 20 of flags): occlusion rays that hit a triangle take
+// the colour the surface cache kept for it (live_surfcache): the light that surface sends back.
+// Output: three planes R, G, B (float, pitch shadowPitch, one after the other), -1 on pixels not computed (quarter rate)
+ByteAddressBuffer surfCache : register(t7);     // per triangle: colour (RGB9E5), object identity and measurements
+StructuredBuffer<uint4> regions : register(t8); // regions of the RT scene: start (bytes), size, counter, identity
 RWByteAddressBuffer bounce : register(u2);
 
 uint RegionIndex(uint prim)
@@ -152,10 +152,10 @@ uint RegionIndex(uint prim)
     return lo;
 }
 
-// couleur retenue pour ce triangle, si elle est à son objet actuel.
-// Une entrée pour huit triangles consécutifs (voisins dans le maillage) : dans RDR2, la plupart des triangles
-// sont plus petits qu'un pixel et une entrée par triangle n'était presque jamais remplie (un rayon d'occultation
-// sur quatre trouvait sa couleur). Entrée vide ou d'un autre objet : les entrées voisines du même objet
+// colour kept for this triangle, if it belongs to its current object.
+// One entry per eight consecutive triangles (neighbours in the mesh): in RDR2, most triangles
+// are smaller than a pixel and one entry per triangle was almost never filled (one occlusion ray
+// in four found its colour). Empty entry or one from another object: the neighbouring entries of the same object
 bool Cached(uint prim, out float3 c)
 {
     c = 0;
@@ -179,8 +179,8 @@ bool Cached(uint prim, out float3 c)
     return false;
 }
 
-// profondeur d'un texel de la carte d'ombres du jeu : 32 bits flottants, D24 (bit 2 de flags) ou 16 bits
-// normalisés (bit 32 : RDR2, deux octets par texel)
+// depth of a texel of the game's shadow map: 32-bit float, D24 (bit 2 of flags) or 16-bit
+// normalised (bit 32: RDR2, two bytes per texel)
 float AtlasDepth(uint2 t)
 {
     if (flags & 32)
@@ -193,7 +193,7 @@ float AtlasDepth(uint2 t)
     return (flags & 2) ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
 }
 
-// éclairement du point par le soleil selon la carte d'ombres du jeu (1 si aucune cascade ne le couvre)
+// sunlight on the point according to the game's shadow map (1 if no cascade covers it)
 float GameLit(float3 p)
 {
     const uint count = min(sunBuf.Load(32), 8u);
@@ -209,8 +209,8 @@ float GameLit(float3 p)
         if (abs(s.x) > 0.98 || abs(s.y) > 0.98 || s.z <= 0 || s.z >= 1)
             continue;
         const float2 texel = vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw;
-        // gameMin : part éclairée du voisinage (comme le filtrage du jeu : sa pénombre comprise) ; sinon
-        // éclairé seulement si tout le voisinage l'est (ombre du jeu élargie de gameDilate texels)
+        // gameMin: lit share of the neighbourhood (like the game's filtering: its penumbra included); otherwise
+        // lit only if the whole neighbourhood is (game shadow widened by gameDilate texels)
         const int r = int(gameDilate);
         float litCount = 0;
         for (int dy = -r; dy <= r; dy++)
@@ -227,11 +227,11 @@ float GameLit(float3 p)
     return 1.0;
 }
 
-// le soleil voit-il à travers ce point h, sur le rayon qui part du récepteur ? La carte d'ombres du jeu
-// est la vue du soleil, alpha test compris. Le jeu y note chaque obstacle un peu plus loin du soleil
-// qu'il n'est (son décalage contre l'acné) : h n'est un trou que si le premier obstacle noté à son texel
-// est au moins à mi-chemin entre h et le récepteur (feuillage découpé, le soleil passe jusqu'au sol).
-// Trop près du récepteur pour trancher, ou hors des cascades : on ne sait pas.
+// does the sun see through this point h, on the ray leaving the receiver? The game's shadow map
+// is the sun's view, alpha test included. The game records each occluder a bit further from the sun
+// than it is (its bias against acne): h is a hole only if the first occluder recorded at its texel
+// is at least halfway between h and the receiver (cut-out foliage, the sun goes through to the ground).
+// Too close to the receiver to decide, or outside the cascades: unknown.
 bool SunSeesThrough(float3 h, float3 receiver)
 {
     if ((flags & 1) == 0)
@@ -251,7 +251,7 @@ bool SunSeesThrough(float3 h, float3 receiver)
         }
         if (abs(s.x) > 0.98 || abs(s.y) > 0.98 || s.z <= 0 || s.z >= 1)
             continue;
-        const float gap = sunSign * (r.z - s.z); // > 0 : h entre le soleil et le récepteur
+        const float gap = sunSign * (r.z - s.z); // > 0: h between the sun and the receiver
         if (gap <= 2.0 * gameBias)
             return false;
         const float stored = AtlasDepth(uint2(vp.xy + float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * vp.zw));
@@ -260,7 +260,7 @@ bool SunSeesThrough(float3 h, float3 receiver)
     return false;
 }
 
-// point de l'espace caméra du pixel (z = w ; w <= 0 si ciel ou hors image)
+// camera-space point of the pixel (z = w; w <= 0 if sky or outside the image)
 float3 PointAt(int2 t)
 {
     if (t.x < 0 || t.y < 0 || t.x >= int(width) || t.y >= int(height))
@@ -274,10 +274,10 @@ float3 PointAt(int2 t)
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
 }
 
-// normale de la surface tirée de la profondeur : côté le plus proche de chaque axe (bords d'objets)
-// un point que la caméra voit à travers (elle voit plus loin que lui, ou le ciel) n'est pas solide : c'est
-// un trou d'une plaque découpée par alpha test (feuillage, herbe, grillage, franges), dont la géométrie
-// captée n'a que le rectangle. 1 : trou ; 0 : plein ; -1 : hors de l'écran, la caméra ne sait pas.
+// surface normal from depth: the nearest side on each axis (object edges)
+// a point the camera sees through (it sees further than it, or the sky) is not solid: it is
+// a hole of an alpha-tested card (foliage, grass, fences, fringes), whose captured
+// geometry is just the rectangle. 1: hole; 0: solid; -1: off screen, the camera does not know.
 int ScreenSees(float3 h)
 {
     if (h.z <= 1e-3)
@@ -290,10 +290,10 @@ int ScreenSees(float3 h)
     return (seen.z <= 0 || seen.z > h.z * 1.03 + 0.05) ? 1 : 0;
 }
 
-// point touché qui appartient à un personnage (Red Dead : repère des personnages dans l'alpha des normales du G-buffer) : il ne fait ni occultation ni
-// ombre d'ambiance. Le personnage du joueur, collé à un mur, cachait le « ciel » à une grande zone de ce mur (rayons longs de 16 m) : une tache sombre et
-// floue qui le suivait, donc suivait l'écran (signalé par le joueur). Projeté à l'écran : le pixel montre un personnage à peu près à cette profondeur
-// (son dos caché est à quelques dizaines de centimètres derrière ce que la caméra voit). Hors de l'écran : inconnu, gardé
+// hit point belonging to a character (Red Dead: character marker in the alpha of the G-buffer normals): it casts neither occlusion nor
+// ambient shadow. The player's character, standing against a wall, hid the "sky" from a large area of that wall (16 m long rays): a dark, blurry
+// spot that followed it, hence followed the screen (reported by the player). Projected on screen: the pixel shows a character at about this depth
+// (its hidden back is a few tens of centimetres behind what the camera sees). Off screen: unknown, kept
 bool CharacterAt(float3 h)
 {
     if ((gnMode & 3) != 2 || gnPitch == 0 || h.z <= 1e-3)
@@ -309,15 +309,15 @@ bool CharacterAt(float3 h)
     return float(gnormal.Load(t.y * gnPitch + t.x * 4) >> 24) / 255.0 > 0.25;
 }
 
-// trou d'une plaque découpée : la caméra le voit à travers ; hors de l'écran, le soleil (sa carte)
+// hole of a cut-out card: the camera sees through it; off screen, the sun (its map)
 bool Hole(float3 h, float3 receiver)
 {
     const int screen = ScreenSees(h);
     return screen >= 0 ? screen == 1 : SunSeesThrough(h, receiver);
 }
 
-// surface plane autour du pixel (comme live_reflect) : les points à 2 pixels de part et d'autre sont alignés
-// avec lui sur au moins un axe ; faux pour l'herbe, le feuillage, une grille (la profondeur saute)
+// flat surface around the pixel (like live_reflect): the points 2 pixels away on each side are aligned
+// with it on at least one axis; false for grass, foliage, a fence (the depth jumps)
 float Flatness(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(2, 0)), r = PointAt(t + int2(2, 0)), u = PointAt(t - int2(0, 2)), b = PointAt(t + int2(0, 2));
@@ -329,8 +329,8 @@ float Flatness(int2 t, float3 p)
     return saturate(1.0 - min(eh, ev) / (0.004 * p.z + 0.002));
 }
 
-// surface continue autour du pixel (tronc, rocher, personnage, mur) : à 3 pixels dans les quatre directions, la profondeur reste proche ;
-// faux pour une branche, une brindille, un bord de feuillage, qui bougent au vent et où une occultation tremblait
+// continuous surface around the pixel (trunk, rock, character, wall): 3 pixels away in all four directions, the depth stays close;
+// false for a branch, a twig, a foliage edge, which move in the wind and where occlusion shook
 bool DepthContinuous(int2 t, float3 p, int k0 = 3)
 {
     const int2 kSide[4] = { int2(k0, 0), int2(-k0, 0), int2(0, k0), int2(0, -k0) };
@@ -343,8 +343,8 @@ bool DepthContinuous(int2 t, float3 p, int k0 = 3)
     return true;
 }
 
-// feuillage (plaques découpées, planes donc acceptées par Flatness) : autour du pixel, à 6 pixels, la caméra
-// voit nettement plus loin (le fond à travers les trous des feuilles)
+// foliage (cut-out cards, flat and therefore accepted by Flatness): around the pixel, 6 pixels away, the camera
+// sees clearly further (the background through the holes of the leaves)
 bool SeesThroughAround(int2 t, float3 p)
 {
     static const int2 kAround[8] = { int2(6, 0), int2(-6, 0), int2(0, 6), int2(0, -6), int2(4, 4), int2(-4, 4), int2(4, -4), int2(-4, -4) };
@@ -357,8 +357,8 @@ bool SeesThroughAround(int2 t, float3 p)
     return false;
 }
 
-// normale d'ensemble d'une surface rugueuse (herbe, fougères sur le sol) : pente du terrain prise à 8 pixels de part
-// et d'autre ; 0 si un voisin manque ou saute trop (bord d'objet)
+// overall normal of a rough surface (grass, ferns on the ground): slope of the terrain taken 8 pixels away on each
+// side; 0 if a neighbour is missing or jumps too much (object edge)
 float3 MacroNormal(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(8, 0)), r = PointAt(t + int2(8, 0)), u = PointAt(t - int2(0, 8)), b = PointAt(t + int2(0, 8));
@@ -376,7 +376,7 @@ float3 NormalAt(int2 t, float3 p)
     const float3 dx = (r.z > 0 && (l.z <= 0 || abs(r.z - p.z) < abs(l.z - p.z))) ? r - p : p - l;
     const float3 dy = (b.z > 0 && (u.z <= 0 || abs(b.z - p.z) < abs(u.z - p.z))) ? b - p : p - u;
     float3 n = normalize(cross(dx, dy));
-    return dot(n, p) > 0 ? -n : n; // tournée vers la caméra
+    return dot(n, p) > 0 ? -n : n; // facing the camera
 }
 
 [numthreads(8, 8, 1)]
@@ -385,25 +385,25 @@ void main(uint2 id : SV_DispatchThreadID)
     if (id.x >= width || id.y >= height)
         return;
     gnPitch = gnPitchPacked & 0xFFFF;
-    // loi de profondeur mesurée dans cette image (live_depthfit), sinon celle des constantes
+    // depth law measured in this frame (live_depthfit), otherwise the constants'
     const float3 law = asfloat(sunBuf.Load3(36));
     gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
-    gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
+    gClear = gB > 0 ? 0.0 : 1.0; // reversed depth: the sky at 0
     const uint raw = depth.Load(id.y * depthPitch + id.x * 4);
     const float d = depth24 != 0 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
     const float3 sun = asfloat(sunBuf.Load3(0));
     float lit = 1.0;
-    float hitDistance = kFp16Max; // mode SIGMA : distance de l'obstacle du premier rayon
-    float weight = 0.0;           // mode SIGMA : part de l'ombre gardée par les corrections (0 : aucune ombre RT)
+    float hitDistance = kFp16Max; // SIGMA mode: distance to the first ray's occluder
+    float weight = 0.0;           // SIGMA mode: share of the shadow kept by the corrections (0: no RT shadow)
     const float w = gB / (d - gA);
-    float gameVis = 1.0; // soleil reçu selon la carte du jeu (occultation ambiante : part du ciel dans la lumière)
-    // occultation seule (ombres du soleil coupées, flags 64) : un pixel sans rayon à cette image (3 sur 4), le ciel ou ce qui est au-delà de la portée sortent ici, sans normale,
-    // planéité ni carte du jeu (toute cette préparation coûtait plusieurs millisecondes, quel que soit le nombre de rayons)
+    float gameVis = 1.0; // sun received according to the game's map (ambient occlusion: sky share of the light)
+    // occlusion only (sun shadows off, flags 64): a pixel without a ray this frame (3 out of 4), the sky or what is beyond the range exit here, without a normal,
+    // flatness or the game's map (all that preparation cost several milliseconds, whatever the number of rays)
     const bool aoOnly = (flags & 64) != 0 && (flags & (8u | 4096u)) == 0 && debugMode == 0;
     static const uint2 kQuarter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
-    // mouvement de ce pixel (vecteurs du jeu) : un pixel qui bouge de plus d'un pixel par image est calculé à chaque image, pas au quart. Au quart, en
-    // mouvement, il n'avait une valeur neuve qu'une image sur quatre et le reste était de l'ancien recollé : l'occultation pétillait et laissait des
-    // traits aux bords des objets (signalé par le joueur)
+    // motion of this pixel (the game's vectors): a pixel moving by more than one pixel per frame is computed every frame, not at quarter rate. At quarter rate, in
+    // motion, it got a fresh value only one frame in four and the rest was old data pasted back: occlusion fizzed and left
+    // lines at the edges of objects (reported by the player)
     float motionPxAo = 0;
     if (aoMotion < 16 && w > 0)
     {
@@ -413,12 +413,12 @@ void main(uint2 id : SV_DispatchThreadID)
         motionPxAo = all(isfinite(mvA)) ? length(mvA * float2(width, height)) : 0.0;
     }
     const bool movingHere = motionPxAo > 1.0;
-    // (en mouvement : une image sur deux, en damier, plutôt qu'à chaque image comme en v104 : même coût par bloc 2×2 qu'à l'arrêt ; quand la caméra
-    // bouge, tout l'écran bouge, et le calcul à chaque image quadruplait le coût de la passe)
+    // (in motion: every other frame, in a checkerboard, rather than every frame as in v104: same cost per 2×2 block as at rest; when the camera
+    // moves, the whole screen moves, and computing every frame quadrupled the pass's cost)
     const bool notThisFrame = (flags & 128) != 0 && (movingHere ? ((id.x + id.y + frameIndex) & 1u) != 0 : any((id & 1u) != kQuarter[frameIndex & 3]));
     if (aoOnly && (d == gClear || !(w > 0) || w >= aoMaxDist || aoAmount <= 0 || notThisFrame))
     {
-        const bool later = notThisFrame && d != gClear && w > 0 && w < aoMaxDist && aoAmount > 0; // calculé à une autre image : -1, reconstruit par live_shadowtemporal
+        const bool later = notThisFrame && d != gClear && w > 0 && w < aoMaxDist && aoAmount > 0; // computed on another frame: -1, rebuilt by live_shadowtemporal
         shadow.Store(id.y * shadowPitch + id.x * 4, asuint(later ? -1.0 : 1.0));
         if (flags & (1u << 20))
         {
@@ -433,14 +433,14 @@ void main(uint2 id : SV_DispatchThreadID)
         const float2 ndc = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
         const float3 p = float3(ndc.x * w / p00, ndc.y * w / p11, w);
         const float dist = length(p);
-        // quatre rayons répartis dans le disque solaire (strates 2×2 tournées par pixel) : pénombre lisse
+        // four rays spread over the sun disc (2×2 strata rotated per pixel): smooth penumbra
         const float3 t1 = normalize(abs(sun.y) < 0.99 ? cross(sun, float3(0, 1, 0)) : cross(sun, float3(1, 0, 0)));
         const float3 t2 = cross(sun, t1);
         const float rot = 6.2831853 * frac(52.9829189 * frac(dot(float2(id), float2(0.06711056, 0.00583715))) + 0.61803399 * float(frameIndex & 1023));
         hitDistance = kFp16Max;
         lit = (flags & 64) ? 1.0 : 0.0;
-        // SIGMA veut un rayon par pixel (il débruite lui-même) et la distance de l'obstacle
-        const uint rays = (flags & 64) ? 0u : (flags & 4096) ? 1u : clamp((flags >> 8) & 7, 1u, 4u); // 1 à 4 rayons (réglage shadow_rays)
+        // SIGMA wants one ray per pixel (it denoises itself) and the occluder's distance
+        const uint rays = (flags & 64) ? 0u : (flags & 4096) ? 1u : clamp((flags >> 8) & 7, 1u, 4u); // 1 to 4 rays (shadow_rays setting)
         for (uint k = 0; k < rays; k++)
         {
             const float u = rays == 1 ? 0.0 : (float(k & 1) + 0.5) * 0.5, v = (float(k >> 1) + 0.5) * 0.5;
@@ -450,7 +450,7 @@ void main(uint2 id : SV_DispatchThreadID)
             ray.Direction = normalize(sun + t1 * (r * cos(a)) + t2 * (r * sin(a)));
             ray.TMin = 0.0;
             ray.TMax = 1e5;
-            // premier triangle qui n'est pas un trou vu à travers par la caméra ou par le soleil : ombre
+            // first triangle that is not a hole seen through by the camera or by the sun: shadow
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
             bool blocked = false;
@@ -465,8 +465,8 @@ void main(uint2 id : SV_DispatchThreadID)
                 }
             lit += blocked ? 0.0 : 1.0 / rays;
         }
-        // face tournée à l'opposé du soleil : le jeu l'assombrit déjà par son éclairage ; une ombre RT en
-        // plus y ferait des taches (le test de sa carte la voit éclairée, la surface étant son propre écran)
+        // face turned away from the sun: the game already darkens it through its lighting; an extra RT shadow
+        // would make spots there (its map's test sees it lit, the surface being its own occluder)
         const float ndl = dot(NormalAt(int2(id), p), sun);
         const bool facesSun = ndl > 0.08;
         weight = 1.0;
@@ -477,22 +477,22 @@ void main(uint2 id : SV_DispatchThreadID)
             const float game = GameLit(p);
             gameVis = facesSun ? game : 0.0;
             if (flags & 8)
-                lit = game; // contrôle : l'ombre du jeu telle que recalculée
+                lit = game; // check: the game's shadow as recomputed
             else if (flags & 4)
             {
-                // n'ajouter de l'ombre que là où le jeu éclaire : le soleil restant est sa visibilité « game » ;
-                // la visibilité voulue est la plus faible des deux, URTI retire la différence
+                // add shadow only where the game lights: the remaining sun is its visibility "game";
+                // the wanted visibility is the lower of the two, URTI removes the difference
                 lit = gameMin ? 1.0 - max(0.0, game - lit) : 1.0 - game * (1.0 - lit);
                 weight *= game;
             }
         }
         if (ndl <= 0)
-            hitDistance = 0; // SIGMA : surface dos au soleil, à l'ombre d'elle-même
+            hitDistance = 0; // SIGMA: surface turned away from the sun, in its own shadow
     }
-    // une ombre ne retire que la lumière directe du soleil, proportionnelle à l'angle de la surface face à lui
-    // (N·L) ; le reste (lumière du ciel, rebonds) demeure. Le point éclairé reçoit ciel + soleil × N·L : la
-    // part du soleil y est x N·L / (1 + x N·L), x = soleil / ciel mesuré dans l'image (live_sunlight) ;
-    // midi : ombres franches, temps couvert : presque rien. Non mesuré : pente fixe (ancienne règle).
+    // a shadow removes only the sun's direct light, proportional to the surface's angle toward it
+    // (N·L); the rest (sky light, bounces) remains. The lit point receives sky + sun × N·L: the
+    // sun's share there is x N·L / (1 + x N·L), x = sun / sky measured in the image (live_sunlight);
+    // noon: sharp shadows, overcast: almost nothing. Not measured: fixed slope (old rule).
     if (!aoOnly && (flags & 16) == 0 && d != gClear && w > 0 && w < 1e6)
     {
         const float2 ndc2 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
@@ -502,40 +502,40 @@ void main(uint2 id : SV_DispatchThreadID)
         lit = 1.0 - (1.0 - lit) * ndlWeight;
         weight *= ndlWeight;
     }
-    // occultation ambiante RT : un rayon court par pixel et par image (hémisphère pondéré par le cosinus, motif
-    // qui tourne d'une image à l'autre, moyenné par le débruitage), dans la vraie géométrie de la scène (hors
-    // de l'écran comprise) ; obstacle à la distance t : occultation 1 - t / portée. Elle ne retire que la
-    // lumière du ciel : toute celle d'un point à l'ombre, 1 / (1 + x N·L) de celle d'un point au soleil.
-    // Seulement sur les surfaces planes (sol, murs, routes) : l'herbe et le feuillage, où chaque brin est de la
-    // géométrie, s'assombrissaient en entier (le jeu y a déjà son occultation) et tremblaient au vent
+    // RT ambient occlusion: one short ray per pixel per frame (cosine-weighted hemisphere, pattern
+    // rotating from one frame to the next, averaged by denoising), in the scene's real geometry (off
+    // screen included); occluder at distance t: occlusion 1 - t / range. It removes only
+    // sky light: all of it for a point in shadow, 1 / (1 + x N·L) of it for a sunlit point.
+    // Only on flat surfaces (ground, walls, roads): grass and foliage, where every blade is
+    // geometry, darkened entirely (the game already has its occlusion there) and shook in the wind
     const float2 ndc3 = float2((id.x + 0.5) / width * 2 - 1, 1 - (id.y + 0.5) / height * 2);
     const float3 p3 = float3(ndc3.x * w / p00, ndc3.y * w / p11, w);
-    bool aoSkipped = false; // occultation au quart : ce pixel n'est pas calculé à cette image
-    float3 bounceSum = 0;   // rebond de lumière : couleur des surfaces touchées, pondérée comme l'occultation
-    // surface rugueuse (bit 21) : herbe, fougères qui couvrent le sol ; l'occultation y part de la pente d'ensemble,
-    // au-dessus des brins (sinon le pied des troncs et des rochers posés dans l'herbe n'en recevait aucune)
+    bool aoSkipped = false; // quarter-rate occlusion: this pixel is not computed this frame
+    float3 bounceSum = 0;   // light bounce: colour of the surfaces hit, weighted like the occlusion
+    // rough surface (bit 21): grass, ferns covering the ground; occlusion starts there from the overall slope,
+    // above the blades (otherwise the foot of trunks and rocks standing in the grass got none)
     const bool flatHere = Flatness(int2(id), p3) > 0.5;
-    // (à moins de 20 m : au-delà, c'est du feuillage lointain, derrière la brume du jeu ; l'occultation y faisait un grain sombre
-    // par-dessus le brouillard)
+    // (closer than 20 m: beyond, it is distant foliage, behind the game's haze; occlusion made a dark grain there
+    // on top of the fog)
     const float3 macroN = (!flatHere && (flags & (1u << 21)) && w < 20.0) ? MacroNormal(int2(id), p3) : float3(0, 0, 0);
     const bool rough = any(macroN != 0);
-    // personnages, chevaux (repère du G-buffer de Red Dead, alpha de ses normales) et feuillage, peau (type de matériau) : pas d'occultation.
-    // Ils bougent sans cesse (animation, vent) : leur occultation traînait derrière eux et scintillait (mesuré : le scintillement à l'arrêt venait
-    // surtout de la canopée)
+    // characters, horses (Red Dead's G-buffer marker, alpha of its normals) and foliage, skin (material type): no occlusion.
+    // They move all the time (animation, wind): their occlusion trailed behind them and flickered (measured: the flicker at rest came
+    // mostly from the canopy)
     bool aoExcluded = false;
     if ((gnMode & 3) == 2 && gnPitch != 0 && float(gnormal.Load(id.y * gnPitch + id.x * 4) >> 24) / 255.0 > 0.25)
         aoExcluded = true;
     if ((gnPitchPacked >> 16) != 0)
     {
         const float kind = float(materialTarget.Load(id.y * (gnPitchPacked >> 16) + id.x * 4) & 255) / 255.0;
-        // (« feuillage » couvre aussi l'herbe : exclue en v102, les pelouses et la nature avaient perdu toute occultation. L'herbe au sol, normale du
-        // monde tournée vers le haut, la garde ; seules les feuilles des arbres et des buissons, orientées en tous sens, restent exclues)
+        // ("foliage" also covers grass: excluded in v102, lawns and nature had lost all occlusion. Grass on the ground, with a world normal
+        // facing up, keeps it; only the leaves of trees and bushes, oriented every which way, stay excluded)
         const float3 gwUp = (gnMode & 3) == 2 ? GNormal(int2(id), (gnMode >> 8) & 7) : float3(0, 0, 0);
         if ((abs(kind - 0.2) < 0.04 && !(gwUp.z > 0.6)) || abs(kind - 0.31) < 0.04)
             aoExcluded = true;
     }
-    // normale exacte du jeu (gnMode bit 12) : l'occultation vaut aussi pour les surfaces qui ne sont pas planes (troncs, rochers, objets,
-    // personnages), où celle de la profondeur n'était que du bruit ; elle regarde la caméra
+    // the game's exact normal (gnMode bit 12): occlusion also applies to surfaces that are not flat (trunks, rocks, objects,
+    // characters), where the depth normal was only noise; it faces the camera
     float3 gnHere = 0;
     if ((gnMode & 0x1000) && !rough && w > 0 && w < aoMaxDist)
     {
@@ -545,12 +545,12 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     const bool gnOk = any(gnHere != 0);
     if (!aoOnly && aoAmount > 0 && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) && !aoExcluded && !SeesThroughAround(int2(id), p3))
-        aoSkipped = notThisFrame; // au quart : le pixel du bloc 2×2 désigné pour cette image (les quatre en quatre images)
+        aoSkipped = notThisFrame; // quarter rate: the pixel of the 2×2 block assigned to this frame (all four in four frames)
     if (aoAmount > 0 && !aoSkipped && (flags & 4096) == 0 && d != gClear && w > 0 && w < aoMaxDist && (flatHere || rough || gnOk) && !aoExcluded &&
         !SeesThroughAround(int2(id), p3))
     {
         float3 n = rough ? macroN : NormalAt(int2(id), p3);
-        // comparaison des normales du G-buffer à celle de la profondeur (surface plane, un pixel sur 64) : le bon décodage est celui qui colle
+        // comparison of the G-buffer normals with the depth normal (flat surface, one pixel in 64): the right decoding is the one that fits
         if ((gnMode & 0x2000) && !rough && flatHere && (id.x & 7) == 0 && (id.y & 7) == 0)
             for (uint sv = 0; sv < 8; sv++)
             {
@@ -561,8 +561,8 @@ void main(uint2 id : SV_DispatchThreadID)
                 nstats.InterlockedAdd(sv * 8, uint(int(round(dot(g, n) * 1000.0))), unused);
                 nstats.InterlockedAdd(sv * 8 + 4, 1, unused);
             }
-        // orientation de la caméra (normales du monde, gnMode bit 14) : sommes de la normale du monde par celle de la caméra (live_rotfit)
-        if ((gnMode & 0x4000) && !rough && flatHere && (id.x & 6) == 0 && (id.y & 6) == 0) // (au quart : un des quatre pixels du bloc à chaque image)
+        // camera orientation (world normals, gnMode bit 14): sums of the world normal times the camera one (live_rotfit)
+        if ((gnMode & 0x4000) && !rough && flatHere && (id.x & 6) == 0 && (id.y & 6) == 0) // (quarter rate: one of the block's four pixels each frame)
         {
             const float3 a = GNormal(int2(id), 0);
             if (any(a != 0))
@@ -574,17 +574,17 @@ void main(uint2 id : SV_DispatchThreadID)
                 nstats.InterlockedAdd(100, 1, unused);
             }
         }
-        // normale exacte du jeu (surface plane : la profondeur ne fait que la deviner, avec le grain du décalage sous-pixel)
+        // the game's exact normal (flat surface: the depth only guesses it, with the sub-pixel jitter's grain)
         if (gnOk)
             n = gnHere;
         const float3 b1 = normalize(abs(n.y) < 0.99 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
         const float3 b2 = cross(n, b1);
-        // deux rayons (strates en azimut) ; quatre là où l'image bouge de plus d'un pixel et demi : l'historique y
-        // est rejeté ou à peine gardé, le bruit de deux rayons tremblerait. Au quart : deux fois plus (quatre fois
-        // moins de pixels : moitié moins de rayons au total)
+        // two rays (azimuth strata); four where the image moves by more than a pixel and a half: the history there
+        // is rejected or barely kept, the noise of two rays would shake. Quarter rate: twice as many (four times
+        // fewer pixels: half as many rays in total)
         const uint aoBase = (flags & 128) ? 2u : 1u;
-        // nombre réglé par l'add-on (bits 16 à 18) : sous des arcades, presque tout l'écran reçoit de l'occultation
-        // et le coût de la passe, proportionnel aux rayons, triplait (5,5 ms dans RDR2)
+        // number tuned by the add-on (bits 16 to 18): under arcades, almost the whole screen receives occlusion
+        // and the pass's cost, proportional to the rays, tripled (5.5 ms in RDR2)
         const uint aoRest = (flags >> 16) & 7;
         uint aoRays = aoRest ? aoRest : 2 * aoBase;
         // far away the occlusion is smooth and accumulated over many frames: fewer rays cost nothing visible
@@ -592,14 +592,14 @@ void main(uint2 id : SV_DispatchThreadID)
             aoRays = 1;
         else if (w > 12.0)
             aoRays = min(aoRays, 2u);
-        // en mouvement : calculé à chaque image (plus au quart), deux rayons suffisent (le coût par bloc 2×2 reste du même ordre)
+        // in motion: computed every frame (no longer quarter rate), two rays are enough (the cost per 2×2 block stays of the same order)
         if (movingHere && (flags & 128))
             aoRays = min(aoRays, 2u);
         uint h = AoHash(id.x * 1973u + id.y * 9277u + frameIndex * 26699u);
         float occlusion = 0;
         for (uint k = 0; k < aoRays; k++, h = AoHash(h))
         {
-            // (bit 27 : faible discrépance ; sinon hachage) rayon k : rotation commune du pixel en azimut (strates), rayon par la suite du nombre d'or
+            // (bit 27: low discrepancy; otherwise hashing) ray k: shared rotation of the pixel in azimuth (strata), radius from the golden-ratio sequence
             const float n0 = Ign(float2(id), frameIndex), n1 = Ign(float2(id.yx) + 17.0, frameIndex + 7u);
             const float u1 = (flags & (1u << 27)) ? frac(n0 + 0.618034 * float(k)) : float(h & 0xFFFF) / 65536.0;
             const float u2 = (flags & (1u << 27)) ? (frac(n1) + float(k)) / float(aoRays) : (float(h >> 16) / 65536.0 + float(k)) / float(aoRays);
@@ -607,17 +607,17 @@ void main(uint2 id : SV_DispatchThreadID)
             RayDesc ray;
             ray.Origin = p3 + n * (rough ? max(0.08, 0.004 * length(p3)) : max(0.01, 0.002 * length(p3)));
             ray.Direction = normalize(b1 * (r * cos(phi)) + b2 * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
-            // obstacles à moins de 6 cm ignorés : les décalques du jeu (boue, marques, flaques), posés juste au-dessus
-            // du sol sans écrire la profondeur, faisaient des taches sombres à leur forme exacte
-            ray.TMin = rough ? 0.25 : 0.06; // surface rugueuse : pas les brins eux-mêmes
+            // occluders closer than 6 cm ignored: the game's decals (mud, marks, puddles), laid just above
+            // the ground without writing depth, made dark spots of their exact shape
+            ray.TMin = rough ? 0.25 : 0.06; // rough surface: not the blades themselves
             ray.TMax = aoRadius;
-            // rayon opaque d'abord (le matériel trouve seul le plus proche) ; recherche lente, triangle par triangle, seulement si ce point
-            // est un trou d'une plaque découpée (même résultat, sans examiner chaque triangle du sol et des rochers)
+            // opaque ray first (the hardware alone finds the closest); slow search, triangle by triangle, only if that point
+            // is a hole of a cut-out card (same result, without examining each triangle of the ground and rocks)
             bool aoHit = false;
             float aoT = 0;
             uint aoInst = 0, aoPrim = 0;
-            // trou d'une feuille : rayon opaque suivant, juste après lui, au plus quelques fois (budget, bits 24 à 26), puis pas d'obstacle. Le coût d'un rayon est borné :
-            // six sauts suivis d'une recherche sans limite faisaient 45 ms d'occultation dans l'herbe dense
+            // hole of a leaf: next opaque ray, right after it, at most a few times (budget, bits 24 to 26), then no occluder. A ray's cost is bounded:
+            // six hops followed by an unbounded search made 45 ms of occlusion in dense grass
             bool aoHole = false;
             RayDesc stepRay = ray;
             const uint maxHops = (flags >> 24) & 7;
@@ -635,7 +635,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     break;
                 stepRay.TMin = aoT + max(1e-3, 1e-4 * aoT);
             }
-            // (flags bit 23 : ancienne règle, chaque triangle examiné, pour comparer)
+            // (flags bit 23: old rule, every triangle examined, to compare)
             if (aoHit && aoHole && (flags & (1u << 23)) == 0)
                 aoHit = false;
             if ((flags & 2048) && (flags & (1u << 23)))
@@ -644,33 +644,33 @@ void main(uint2 id : SV_DispatchThreadID)
                 q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, ray);
                 while (q.Proceed())
                     if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && !Hole(ray.Origin + ray.Direction * q.CandidateTriangleRayT(), p3))
-                        q.CommitNonOpaqueTriangleHit(); // le plus proche reste (les candidats plus loin sont écartés)
+                        q.CommitNonOpaqueTriangleHit(); // the closest stays (further candidates are discarded)
                 aoHit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
                 if (aoHit)
                     aoT = q.CommittedRayT(), aoInst = q.CommittedInstanceID(), aoPrim = q.CommittedPrimitiveIndex();
             }
-            // obstacle proche : occultation forte ; vers la portée, elle s'éteint en douceur
+            // close occluder: strong occlusion; toward the range, it fades out smoothly
             const float t = aoHit ? aoT / aoRadius : 1.0;
             occlusion += (1.0 - t) * (1.0 - t) / float(aoRays) * (rough ? 0.75 : 1.0);
-            // la lumière du ciel retirée dans cette direction est remplacée par celle que renvoie l'obstacle (même
-            // poids) ; obstacle jamais vu à l'écran : rien (le jeu garde son propre éclairage d'ambiance au loin)
+            // the sky light removed in that direction is replaced by the light the occluder sends back (same
+            // weight); occluder never seen on screen: nothing (the game keeps its own ambient lighting in the distance)
             float3 hc;
-            // (exemplaire 0 : scène de l'image ; le cache de géométrie n'a pas de couleurs par triangle)
+            // (copy 0: the frame's scene; the geometry cache has no per-triangle colours)
             if ((flags & (1u << 20)) && aoHit && aoInst == 0 && Cached(aoPrim, hc))
                 bounceSum += hc * ((1.0 - t) * (1.0 - t) / float(aoRays));
         }
-        // visibilité du ciel à grande portée : un ou deux rayons longs (skyRange, 12 m par défaut) disent si un obstacle cache le ciel dans
-        // cette direction : canopée au-dessus du sous-bois, auvent profond, falaise, ruelle étroite. Ils ne retirent que la lumière du ciel,
-        // comme l'occultation de contact ; un obstacle lointain compte moins (1 - t / portée). Les trous des feuilles laissent passer le rayon
-        // (même règle que l'occultation). Approximation nommée : le ciel est supposé uniforme (pas de direction privilégiée de la lumière d'ambiance)
-        // Seules les directions au-dessus de l'horizon portent la lumière du ciel : un rayon qui descend touche le sol, ce qui n'en cache aucune
-        // (le jeu éclaire déjà moins une face verticale). Il est renvoyé au-dessus de l'horizon (symétrie par le plan horizontal) et pondéré par sa
-        // hauteur dans le ciel. Le haut du monde vient de l'orientation de la caméra (Red Dead : normales du monde, live_rotfit) ; inconnu : pas de rayons longs
+        // long-range sky visibility: one or two long rays (skyRange, 12 m by default) tell whether an occluder hides the sky in
+        // that direction: canopy above the undergrowth, deep awning, cliff, narrow alley. They remove only sky light,
+        // like contact occlusion; a distant occluder counts less (1 - t / range). Leaf holes let the ray through
+        // (same rule as occlusion). Named approximation: the sky is assumed uniform (no preferred direction for ambient light)
+        // Only directions above the horizon carry sky light: a ray going down hits the ground, which hides none of it
+        // (the game already lights a vertical face less). It is sent back above the horizon (mirrored across the horizontal plane) and weighted by its
+        // height in the sky. The world's up comes from the camera orientation (Red Dead: world normals, live_rotfit); unknown: no long rays
         float skyOcc = 0, skyW = 0;
         float3 upCam = 0;
         if ((gnMode & 3) == 2 && sunBuf.Load(2092) != 0)
             upCam = float3(asfloat(sunBuf.Load(2056)), asfloat(sunBuf.Load(2068)), asfloat(sunBuf.Load(2080)));
-        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5 && DepthContinuous(int2(id), p3, 6)) // (grandes surfaces : pas une branche au vent)
+        if (skyAmount > 0 && skyRange > aoRadius && !rough && dot(upCam, upCam) > 0.5 && DepthContinuous(int2(id), p3, 6)) // (large surfaces: not a branch in the wind)
         {
             upCam = normalize(upCam);
             const uint skyRays = (w > 25.0 || (movingHere && (flags & 128))) ? 1u : 2u;
@@ -715,9 +715,9 @@ void main(uint2 id : SV_DispatchThreadID)
             skyOcc = skyW > 0 ? skyOcc / skyW : 0.0;
             occlusion = 1.0 - (1.0 - saturate(occlusion)) * (1.0 - skyAmount * skyOcc);
         }
-        // ce point reçoit-il le soleil ? (l'occultation ne retire que la lumière du ciel ; au soleil, elle n'en est qu'une petite part)
-        // bit 28 : un rayon RT vers le soleil (trous des feuilles traversés comme pour l'occultation). La carte d'ombres du jeu, lue sinon, ne concorde
-        // pas dans Red Dead (v44 : tout « au bord ») : les murs au soleil étaient assombris comme s'ils étaient à l'ombre
+        // does this point receive the sun? (occlusion removes only sky light; in the sun, that is only a small share)
+        // bit 28: an RT ray toward the sun (leaf holes crossed as for occlusion). The game's shadow map, read otherwise, does not match
+        // in Red Dead (v44: everything "on the edge"): sunlit walls were darkened as if they were in shadow
         if (aoOnly && (flags & 16) == 0 && (flags & (1u << 28)))
         {
             gameVis = 0.0;
@@ -751,16 +751,16 @@ void main(uint2 id : SV_DispatchThreadID)
             gameVis = dot(n, sun) > 0.08 ? GameLit(p3) : 0.0;
         const float ndlSky = (flags & 16) ? 0.0 : saturate(dot(n, sun)) * gameVis;
         const float skyShare = sunSky > 0 ? 1.0 / (1.0 + sunSky * ndlSky) : 1.0 - 0.6 * ndlSky;
-        // (le dernier tiers de la portée : effacée en douceur, la portée change avec le budget de temps)
+        // (the last third of the range: faded out smoothly, the range changes with the time budget)
         lit = max(0.0, lit - aoAmount * occlusion * skyShare * saturate((aoMaxDist - w) / (0.3 * aoMaxDist)));
     }
-    // au loin, le jeu noie le paysage dans la brume : une ombre RT pleine y fait des taches noires ; elle
-    // s'efface entre 120 et 300 unités (mètres dans RDR2)
+    // in the distance, the game drowns the landscape in haze: a full RT shadow makes black spots there; it
+    // fades out between 120 and 300 units (metres in RDR2)
     if (w > 0)
         lit = lerp(lit, 1.0, saturate((w - 120.0) / 180.0)), weight *= 1.0 - saturate((w - 120.0) / 180.0);
     if (flags & 4096)
     {
-        // SIGMA débruite la visibilité seule ; les corrections s'appliquent après (live_nrdpost)
+        // SIGMA denoises the visibility alone; the corrections are applied afterwards (live_nrdpost)
         penumbra.Store(id.y * shadowPitch + id.x * 4, asuint(PackPenumbra(hitDistance, tan(sunRadius))));
         shadow.Store(id.y * shadowPitch + id.x * 4, asuint(weight));
         return;
@@ -768,8 +768,8 @@ void main(uint2 id : SV_DispatchThreadID)
     const float rawLit = lit;
     float motionPixels = 0;
     bool historyUsed = false;
-    // accumulation dans le temps : le masque de l'image précédente, lu là où le vecteur de mouvement du jeu
-    // dit que ce point se trouvait, si la profondeur y correspond (sinon : point découvert, rien à reprendre)
+    // accumulation over time: the previous frame's mask, read where the game's motion vector
+    // says this point was, if the depth matches there (otherwise: newly uncovered point, nothing to reuse)
     if (motionConvention < 16 && w > 0 && w < 1e5)
     {
         const uint raw = motion.Load(id.y * motionPitch + id.x * 4);
@@ -802,13 +802,13 @@ void main(uint2 id : SV_DispatchThreadID)
                 lit = lerp(hist / wsum, lit, temporalAlpha), historyUsed = true;
         }
     }
-    // vues de diagnostic (affichées par la vue « masque »)
+    // diagnostic views (shown by the "mask" view)
     if (debugMode == 1)
         lit = rawLit;
     else if (debugMode == 2)
-        lit = saturate(motionPixels / 20.0); // blanc : 20 pixels de mouvement ou plus
+        lit = saturate(motionPixels / 20.0); // white: 20 pixels of motion or more
     else if (debugMode == 3)
-        lit = historyUsed ? 1.0 : 0.0;       // noir : historique rejeté (point découvert, profondeur changée)
+        lit = historyUsed ? 1.0 : 0.0;       // black: history rejected (newly uncovered point, depth changed)
     shadow.Store(id.y * shadowPitch + id.x * 4, asuint(aoSkipped && debugMode == 0 ? -1.0 : lit));
     if (flags & (1u << 20))
     {

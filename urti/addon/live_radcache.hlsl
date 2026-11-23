@@ -1,23 +1,23 @@
-// URTI en direct : remplissage du cache de radiance du monde (live_radhash.hlsli) à partir de l'image que le jeu montre.
-// Mode 0, à chaque image calculée : un pixel de rendu sur quatre (à tour de rôle) dépose sa couleur dans la case du monde où il se
-// trouve, à trois niveaux (le sien et deux plus grossiers : un reflet le relit de plus loin) ; le ciel et le lointain vont dans la carte
-// du ciel, par direction. Un pixel sur seize lance en plus le rayon de la caméra dans la scène RT : chaque triangle traversé avant la
-// surface que l'image montre est un trou (plaque découpée du feuillage), celui qui tombe à sa profondeur est plein.
-// Mode 1 : la carte du ciel s'étend de proche en proche aux directions jamais vues, et vieillit.
+// Live URTI: filling of the world radiance cache (live_radhash.hlsli) from the image the game shows.
+// Mode 0, on every computed frame: one render pixel in four (in turn) deposits its colour into the world cell where it
+// is, at three levels (its own and two coarser ones: a reflection reads it back from further away); the sky and the distance go into the sky
+// map, by direction. One pixel in sixteen also casts the camera ray into the RT scene: each triangle crossed before the
+// surface the image shows is a hole (cut-out foliage card), the one that falls at its depth is solid.
+// Mode 1: the sky map spreads step by step to directions never seen, and ages.
 
 RaytracingAccelerationStructure scene : register(t0);
-ByteAddressBuffer image : register(t1);       // image présentée, sans l'interface si le jeu la donne (lignes alignées)
-ByteAddressBuffer depth : register(t2);       // profondeur de rendu (cette image)
-ByteAddressBuffer sunBuf : register(t3);      // loi de profondeur (36 à 47), décalage sous-pixel (1184)
-ByteAddressBuffer reflection : register(t4);  // live_reflect : poids non nul = surface à reflet (eau), dont la couleur n'est pas la sienne
+ByteAddressBuffer image : register(t1);       // presented image, without the UI if the game provides it (aligned rows)
+ByteAddressBuffer depth : register(t2);       // render depth (this frame)
+ByteAddressBuffer sunBuf : register(t3);      // depth law (36 to 47), sub-pixel jitter (1184)
+ByteAddressBuffer reflection : register(t4);  // live_reflect: non-zero weight = reflecting surface (water), whose colour is not its own
 ByteAddressBuffer radParams : register(t5);
 RWByteAddressBuffer radHash : register(u0);
 RWByteAddressBuffer envMap : register(u1);
-RWByteAddressBuffer radStats : register(u2);  // flags 2 : couleurs déposées, refusées (table pleine), trous, pleins, ciel, cases créées, cases reprises
+RWByteAddressBuffer radStats : register(u2);  // flags 2: colours deposited, refused (table full), holes, solids, sky, cells created, cells reclaimed
 
 cbuffer Constants : register(b0)
 {
-    uint width;        // image présentée
+    uint width;        // presented image
     uint height;
     uint pitch;
     uint format;       // 0 RGBA8, 1 BGRA8, 2 HDR10 PQ, 3 RGBA16F
@@ -28,8 +28,8 @@ cbuffer Constants : register(b0)
     float p00;
     float p11;
     uint mode;
-    uint flags;        // 1 : scène RT de cette image disponible (part pleine apprise) ; 2 : comptes
-    float uiX0;        // zone d'interface fixe (uv), sautée
+    uint flags;        // 1: this frame's RT scene available (solid share learned); 2: counters
+    float uiX0;        // fixed UI zone (uv), skipped
     float uiY0;
     float uiX1;
     float uiY1;
@@ -76,7 +76,7 @@ float2 JitterPixels(float2 ab, float2 size) { return float2(ab.x * p00, -ab.y * 
 
 static float gA, gB, gClear;
 
-// point vu par un pixel de rendu ; z = -1 : hors de l'écran ; z = 0 : le ciel
+// point seen by a render pixel; z = -1: off screen; z = 0: the sky
 float3 PointAt(int2 t)
 {
     if (t.x < 0 || t.y < 0 || t.x >= int(renderWidth) || t.y >= int(renderHeight))
@@ -99,8 +99,8 @@ void Count(uint at)
     }
 }
 
-// place de la case (octets), prise si elle n'existe pas ; table pleine à cet endroit : la plus ancienne des quatre est reprise si elle
-// n'a pas servi depuis deux secondes ; sinon -1
+// place of the cell (bytes), taken if it does not exist; table full at that place: the oldest of the four is reclaimed if it
+// has not been used for two seconds; otherwise -1
 int RadClaim(float3 world, uint level)
 {
     uint bucket, tag;
@@ -137,7 +137,7 @@ int RadClaim(float3 world, uint level)
     return int(at);
 }
 
-// couleur vue en ce point (moyenne des premières mesures, puis glissante) ; solid : la scène RT a bien un triangle plein ici
+// colour seen at this point (average of the first measurements, then running); solid: the RT scene really has a solid triangle here
 void RadColor(float3 world, uint level, float3 c, bool solid)
 {
     if (level >= kRadLevels)
@@ -168,7 +168,7 @@ void RadColor(float3 world, uint level, float3 c, bool solid)
     Count(0);
 }
 
-// un triangle de la scène RT traversé ici par le regard : un trou
+// an RT-scene triangle crossed here by the view: a hole
 void RadHole(float3 world, uint level)
 {
     if (level >= kRadLevels)
@@ -188,8 +188,8 @@ void main(uint2 id : SV_DispatchThreadID)
     RadLoadParams();
     if (mode == 1)
     {
-        // carte du ciel : chaque direction vieillit ; une direction jamais vue, ou vue il y a longtemps, prend la moyenne de ses voisines
-        // plus sûres qu'elle (le ciel connu s'étend de proche en proche à toute la carte)
+        // sky map: each direction ages; a direction never seen, or seen long ago, takes the average of its neighbours
+        // more certain than itself (the known sky spreads step by step to the whole map)
         if (id.x >= gEnvSize || id.y >= gEnvSize)
             return;
         const uint at = (id.y * gEnvSize + id.x) * 16;
@@ -217,7 +217,7 @@ void main(uint2 id : SV_DispatchThreadID)
         envMap.Store4(at, asuint(v));
         return;
     }
-    // un pixel par bloc 2×2, à tour de rôle
+    // one pixel per 2×2 block, in turn
     static const uint2 kFour[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
     const int2 t = int2(id * 2 + kFour[(gRadFrame >> 1) & 3]);
     if (t.x >= int(renderWidth) || t.y >= int(renderHeight))
@@ -241,7 +241,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     if (lum > maxLuminance)
         c *= maxLuminance / lum;
-    // ciel et lointain (au-delà de la portée des rayons) : par direction
+    // sky and distance (beyond the rays' range): by direction
     if (p.z == 0 || p.z > gEnvFar)
     {
         const float2 ndc = float2((t.x + 0.5) / renderWidth * 2 - 1, 1 - (t.y + 0.5) / renderHeight * 2);
@@ -256,10 +256,10 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     if (p.z <= 0)
         return;
-    // surface à reflet (eau) : ce que l'image y montre est un reflet, pas sa couleur
+    // reflecting surface (water): what the image shows there is a reflection, not its colour
     if (asfloat(reflection.Load((uint(t.y) * renderWidth + uint(t.x)) * 16 + 8)) != 0)
         return;
-    // bord d'objet contre le ciel ou contre un objet bien plus loin : la couleur de l'image y mêle deux surfaces (mise à l'échelle, anticrénelage)
+    // object edge against the sky or against a much further object: the image's colour mixes two surfaces there (upscaling, anti-aliasing)
     for (uint j = 0; j < 4; j++)
     {
         const int2 o = j == 0 ? int2(1, 0) : j == 1 ? int2(-1, 0) : j == 2 ? int2(0, 1) : int2(0, -1);

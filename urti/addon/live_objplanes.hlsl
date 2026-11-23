@@ -1,11 +1,11 @@
-// URTI en direct : planéité de chaque objet capté (scène de l'image et objets captés à leur tour), un groupe par objet :
-// normale moyenne, cohérence des facettes, écart des sommets au plan moyen, taille, distance de la caméra au plan. Sert à
-// reconnaître une surface d'eau parmi les objets opaques. Espace caméra de cette image.
+// Live URTI: flatness of each captured object (the frame's scene and objects captured in turn), one group per object:
+// mean normal, coherence of the facets, deviation of the vertices from the mean plane, size, distance from the camera to the plane. Used to
+// recognise a water surface among opaque objects. This frame's camera space.
 
-StructuredBuffer<float4> clip : register(t0);   // flux de l'écran (début de son emplacement)
-ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
-StructuredBuffer<uint4> regions : register(t2); // par objet : début (octets), taille, compteur, identité
-RWByteAddressBuffer result : register(u0);      // 32 octets par objet : triangles, cohérence, écart, taille, normale, distance
+StructuredBuffer<float4> clip : register(t0);   // the screen's stream (start of its slot)
+ByteAddressBuffer counters : register(t1);      // bytes written per draw
+StructuredBuffer<uint4> regions : register(t2); // per object: start (bytes), size, counter, identity
+RWByteAddressBuffer result : register(u0);      // 32 bytes per object: triangles, coherence, deviation, size, normal, distance
 
 cbuffer Constants : register(b0)
 {
@@ -32,7 +32,7 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
         return;
     const uint4 r = regions[group.x];
     const uint triangles = min(counters.Load(r.z * 8), r.y) / 48, first = r.x / 16;
-    const uint skip = max(1u, triangles / 4096); // gros objet : un triangle sur skip
+    const uint skip = max(1u, triangles / 4096); // big object: one triangle in skip
     float3 n = 0, c = 0, lo = 1e30, hi = -1e30;
     float area = 0;
     for (uint t = ti * skip; t < triangles; t += T * skip)

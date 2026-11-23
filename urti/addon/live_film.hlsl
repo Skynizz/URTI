@@ -1,7 +1,7 @@
-// URTI en direct : film au rythme réel (fichier urti_film). Une image d'écran (disposition de l'image d'écran) réduite de moitié,
-// moyenne de quatre pixels dans les valeurs codées, rangée à sa place dans l'anneau du film. Rien n'est écrit sur le disque pendant le
-// film : les images restent en mémoire vidéo jusqu'à la fin (une rafale, qui écrit chaque image, ralentit le jeu et ne garde que les
-// images calculées).
+// Live URTI: real-pace film (urti_film file). A screen image (screen-image layout) halved,
+// average of four pixels in encoded values, stored at its place in the film's ring. Nothing is written to disk during the
+// film: the images stay in video memory until the end (a burst, which writes every frame, slows the game down and keeps only
+// computed frames).
 
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer film : register(u0);
@@ -11,7 +11,7 @@ cbuffer Constants : register(b0)
     uint width;     // demi-largeur
     uint height;    // demi-hauteur
     uint srcPitch;
-    uint dstOffset; // octets, début de cette image dans l'anneau
+    uint dstOffset; // bytes, start of this image in the ring
     uint format;    // 0 RGBA8, 1 BGRA8, 2 RGB10A2
     uint pad0;
     uint pad1;

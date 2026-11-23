@@ -1,10 +1,10 @@
-// URTI : relevé des passes (inclus dans urti_addon.cpp). F8 ou fichier urti_passes à côté de l'add-on :
-// pendant une image du jeu, toutes les images où il dessine (cibles de rendu) ou écrit en calcul (UAV,
-// vues par leurs transitions d'état) sont relevées : taille, format, liaisons, dessins, dessins plein
-// écran. À la fin, journal trié par ordre d'apparition et copie de chaque candidate de la taille de
-// l'écran en image (urti_passe_NNN.ppm). Sert à trouver le masque d'ombre du soleil du jeu : une image
-// à un ou deux canaux, de la taille de l'écran, écrite après la carte d'ombres et avant l'éclairage.
-// Rien n'est modifié dans le rendu du jeu.
+// URTI: pass survey (included in urti_addon.cpp). F8 or the urti_passes file next to the add-on:
+// during one game frame, every image it draws into (render targets) or writes in compute (UAV,
+// seen through their state transitions) is recorded: size, format, bindings, draws, full-screen
+// draws. At the end, a log sorted by order of appearance and a copy of each screen-sized candidate
+// as an image (urti_pass_NNN.ppm). Used to find the game's sun shadow mask: an image
+// with one or two channels, the size of the screen, written after the shadow map and before lighting.
+// Nothing in the game's rendering is modified.
 
 struct PassTarget
 {
@@ -15,13 +15,13 @@ struct PassTarget
 
 struct PassSurvey
 {
-    std::atomic<int> state{ 0 }; // 0 rien, 1 armé, 2 relevé en cours
+    std::atomic<int> state{ 0 }; // 0 nothing, 1 armed, 2 survey in progress
     uint32_t presents = 0, order = 0, draws = 0, dispatchLike = 0;
     std::unordered_map<uint64_t, PassTarget> targets;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> current; // liste de commandes -> cibles liées
-    std::unordered_map<uint64_t, uint32_t> states;               // dernier état connu de chaque ressource
-    // instantanés : copie d'une image de la taille de l'écran au moment où le jeu finit de l'écrire
-    // (passage cible de rendu / UAV -> lecture), avant que sa mémoire ne serve à autre chose
+    std::unordered_map<uint64_t, std::vector<uint64_t>> current; // command list -> bound targets
+    std::unordered_map<uint64_t, uint32_t> states;               // last known state of each resource
+    // snapshots: copy of a screen-sized image when the game finishes writing it
+    // (render target / UAV -> read transition), before its memory serves something else
     struct Snapshot { ComPtr<ID3D12Resource> copy; uint32_t order, format, width, height; };
     std::vector<Snapshot> snapshots;
 } g_pass;
@@ -79,7 +79,7 @@ void PassDraw(uint64_t list, bool fullscreen)
     }
 }
 
-// état de ReShade -> état D3D12 (present et general ont des valeurs propres à ReShade)
+// ReShade state -> D3D12 state (present and general have values specific to ReShade)
 uint32_t PassD3D12State(uint32_t usage)
 {
     if (usage & 0x80000000u) // present, general
@@ -100,7 +100,7 @@ void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, c
     std::lock_guard<std::mutex> lock(g_mutex);
     for (uint32_t i = 0; i < count; i++)
     {
-        if (!resources[i].handle) // barrière UAV globale ou d'alias : sans ressource
+        if (!resources[i].handle) // global or aliasing UAV barrier: no resource
             continue;
         const uint32_t s = PassD3D12State(static_cast<uint32_t>(newStates[i]));
         const uint32_t before = PassD3D12State(static_cast<uint32_t>(oldStates[i]));
@@ -108,7 +108,7 @@ void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, c
         PassTarget& t = PassTargetFor(resources[i].handle);
         if (s & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
             t.uavTransitions++;
-        // fin d'écriture d'une image de la taille de l'écran : instantané
+        // end of writing of a screen-sized image: snapshot
         const bool written = (before & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) &&
                              (s & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) &&
                              !(s & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
@@ -116,8 +116,8 @@ void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, c
                                  std::fabs(double(t.width) / t.height - double(g.screenW) / g.screenH) < 0.1;
         if (!written || !screenSized || g_pass.snapshots.size() >= kPassMaxSnapshots)
             continue;
-        // deux instantanés au plus par image : une image réécrite à chaque étape (flou, accumulation) prenait toutes
-        // les places avant les cibles du G-buffer (Horizon Forbidden West)
+        // two snapshots at most per frame: an image rewritten at every step (blur, accumulation) took every
+        // slot before the G-buffer targets (seen in one game)
         if (std::count_if(g_pass.snapshots.begin(), g_pass.snapshots.end(), [&](const PassSurvey::Snapshot& n) { return n.order == t.order; }) >= 2)
             continue;
         ID3D12Resource* res = reinterpret_cast<ID3D12Resource*>(resources[i].handle);
@@ -139,7 +139,7 @@ void PassBarrier(command_list* cmd, uint32_t count, const resource* resources, c
     }
 }
 
-// un texel -> rgb (canaux utiles), faux si format non lu
+// a texel -> rgb (useful channels), false if the format is not read
 bool PassDecode(uint32_t fmt, const uint8_t* p, float rgb[3], int& channels)
 {
     auto half = [](uint16_t h) {
@@ -147,7 +147,7 @@ bool PassDecode(uint32_t fmt, const uint8_t* p, float rgb[3], int& channels)
         const float v = e ? std::ldexp(1.0f + m / 1024.0f, int(e) - 15) : std::ldexp(m / 1024.0f, -14);
         return (h & 0x8000) ? -v : v;
     };
-    auto packedFloat = [](uint32_t bits, int mb) { // flottant 11 ou 10 bits sans signe
+    auto packedFloat = [](uint32_t bits, int mb) { // unsigned 11- or 10-bit float
         const uint32_t m = bits & ((1u << mb) - 1), e = bits >> mb;
         return e ? std::ldexp(1.0f + float(m) / (1 << mb), int(e) - 15) : std::ldexp(float(m) / (1 << mb), -14);
     };
@@ -204,12 +204,12 @@ uint32_t PassTexelBytes(uint32_t fmt)
     }
 }
 
-// copie de la ressource (sous-ressource 0, demi-résolution) en image : valeurs ramenées à [0, 1] par le
-// maximum de l'image (formats flottants), canaux inutilisés à zéro
+// copy of the resource (subresource 0, half resolution) as an image: values brought to [0, 1] by the
+// image's maximum (float formats), unused channels at zero
 bool PassSave(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STATES state, const std::string& path)
 {
     const D3D12_RESOURCE_DESC desc = res->GetDesc();
-    // ni multi-échantillons, ni profondeur, ni format inconnu
+    // no multisampling, no depth, no unknown format
     float probe[3];
     int probeChannels = 0;
     const uint8_t zero[16] = {};
@@ -236,7 +236,7 @@ bool PassSave(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STA
     if (FAILED(readback->Map(0, nullptr, (void**)&data)))
         return false;
     const uint32_t w = uint32_t(desc.Width) / 2, h = desc.Height / 2, texel = PassTexelBytes(uint32_t(desc.Format));
-    // texels bruts à côté (même demi-résolution, tous les canaux, alpha compris) : étude du G-buffer
+    // raw texels next to it (same half resolution, every channel, alpha included): G-buffer study
     // (tools/reshade/urti_gbuffer.py)
     if (FILE* raw = std::fopen((path.substr(0, path.size() - 4) + ".raw").c_str(), "wb"))
     {
@@ -272,7 +272,7 @@ bool PassSave(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STA
         for (uint32_t x = 0; x < w; x++)
             for (int c = 0; c < 3; c++)
             {
-                // un canal : gris ; deux : rouge et vert
+                // one channel: grey; two: red and green
                 const int sc = channels == 1 ? 0 : c;
                 const float v = (channels == 2 && c == 2) ? 0.0f : img[(size_t(y) * w + x) * 3 + sc] / (peak[sc] > 1.0f ? peak[sc] : 1.0f);
                 row[size_t(x) * 3 + c] = uint8_t(std::min(255.0f, 255.0f * std::pow(std::min(v, 1.0f), 1.0f / 2.2f)));
@@ -283,7 +283,7 @@ bool PassSave(ID3D12CommandQueue* queue, ID3D12Resource* res, D3D12_RESOURCE_STA
     return true;
 }
 
-// à chaque présentation : armement (F8, fichier), puis fin du relevé et écriture
+// on every present: arming (F8, file), then end of the survey and writing
 void PassPresent(ID3D12CommandQueue* queue)
 {
     const std::string trigger = g_dir + "\\urti_passes";
@@ -294,18 +294,18 @@ void PassPresent(ID3D12CommandQueue* queue)
         g_pass.targets.clear(), g_pass.current.clear(), g_pass.states.clear(), g_pass.snapshots.clear();
         g_pass.presents = g_pass.order = g_pass.draws = 0;
         g_pass.state = 2;
-        Log("URTI : relevé des passes commencé");
+        Log("URTI: pass survey started");
         return;
     }
     if (g_pass.state != 2)
         return;
-    // une présentation avec des dessins du jeu (la génération d'images en intercale sans)
+    // a present with game draws (frame generation inserts some without)
     if (++g_pass.presents < 2 || (g_pass.draws < 50 && g_pass.presents < 12))
         return;
     g_pass.state = 0;
     std::vector<std::pair<uint64_t, PassTarget>> list(g_pass.targets.begin(), g_pass.targets.end());
     std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second.order < b.second.order; });
-    Log("URTI : relevé des passes : %u dessins, %zu images (cibles de rendu ou UAV)", g_pass.draws, list.size());
+    Log("URTI: pass survey: %u draws, %zu images (render targets or UAV)", g_pass.draws, list.size());
     uint32_t saved = 0;
     for (const auto& [res, t] : list)
     {
@@ -320,29 +320,29 @@ void PassPresent(ID3D12CommandQueue* queue)
             if (st != g_pass.states.end())
             {
                 char name[64];
-                std::snprintf(name, sizeof(name), "urti_passe_%03u.ppm", t.order);
+                std::snprintf(name, sizeof(name), "urti_pass_%03u.ppm", t.order);
                 if (PassSave(queue, reinterpret_cast<ID3D12Resource*>(res), D3D12_RESOURCE_STATES(st->second), g_dir + "\\" + name))
                     file = name, saved++;
             }
             else
-                file = "(état inconnu, non copiée)";
+                file = "(unknown state, not copied)";
         }
-        Log("URTI : passe %03u : %ux%u format %u, %u liaisons, %u dessins dont %u plein écran, %u passages en UAV%s %s", t.order, t.width,
-            t.height, t.format, t.binds, t.draws, t.fullscreen, t.uavTransitions, t.withSunDepth ? ", avec la carte d'ombres" : "", file.c_str());
+        Log("URTI: pass %03u: %ux%u format %u, %u bindings, %u draws of which %u full screen, %u UAV transitions%s %s", t.order, t.width,
+            t.height, t.format, t.binds, t.draws, t.fullscreen, t.uavTransitions, t.withSunDepth ? ", with the shadow map" : "", file.c_str());
     }
-    // instantanés pris à la fin de l'écriture de chaque image (dans l'ordre de l'image)
+    // snapshots taken at the end of the writing of each image (in the frame's order)
     uint32_t index = 0;
     for (const auto& snap : g_pass.snapshots)
     {
         char name[64];
-        std::snprintf(name, sizeof(name), "urti_instant_%02u_passe_%03u.ppm", index++, snap.order);
+        std::snprintf(name, sizeof(name), "urti_snapshot_%02u_pass_%03u.ppm", index++, snap.order);
         const bool ok = PassSave(queue, snap.copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST, g_dir + "\\" + name);
-        Log("URTI : instantané %s : %ux%u format %u%s", name, snap.width, snap.height, snap.format, ok ? "" : " (non écrit)");
+        Log("URTI: snapshot %s: %ux%u format %u%s", name, snap.width, snap.height, snap.format, ok ? "" : " (not written)");
     }
     g_pass.snapshots.clear();
-    // cibles du G-buffer repéré (liées ensemble avec la profondeur de l'écran)
+    // targets of the detected G-buffer (bound together with the screen depth)
     for (uint32_t k = 0; k < g_liveGbufferCount; k++)
         if (auto it = g_pass.targets.find(g_liveGbuffer[k]); g_liveGbuffer[k] && it != g_pass.targets.end())
-            Log("URTI : G-buffer cible %u = passe %03u (%ux%u format %u)", k, it->second.order, it->second.width, it->second.height, it->second.format);
-    Log("URTI : relevé des passes fini, %u images copiées, %u instantanés", saved, index);
+            Log("URTI: G-buffer target %u = pass %03u (%ux%u format %u)", k, it->second.order, it->second.width, it->second.height, it->second.format);
+    Log("URTI: pass survey done, %u images copied, %u snapshots", saved, index);
 }

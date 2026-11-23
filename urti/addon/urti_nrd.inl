@@ -1,28 +1,28 @@
-// URTI : débruiteurs de NVIDIA (NRD, couche d'intégration sur NRI) — inclus dans urti_live.inl.
+// URTI: NVIDIA denoisers (NRD, integration layer on NRI) — included in urti_live.inl.
 //
-// SIGMA débruite les ombres du soleil comme dans les jeux RTX : à partir d'un rayon par pixel et de la
-// distance de l'obstacle (la pénombre), il reconstruit des ombres douces et stables d'une image à l'autre,
-// guidé par la profondeur, les normales et les vecteurs de mouvement du jeu.
+// SIGMA denoises sun shadows as in RTX games: from one ray per pixel and the
+// occluder's distance (the penumbra), it rebuilds soft shadows that are stable from frame to frame,
+// guided by the game's depth, normals and motion vectors.
 //
-// Déroulé par image (OnBeginEffects) :
-//  1. live_shadow (mode SIGMA) : pénombre d'un rayon par pixel + poids des corrections d'URTI ;
-//  2. live_nrdprep : profondeur linéaire, normales encodées comme NRD l'attend ; copies vers les textures
-//     de NRD (vecteurs de mouvement du jeu pris tels quels, l'échelle suit leur convention) ;
-//  3. la liste de commandes de ReShade est soumise ; NRD enregistre ses passes sur une liste à lui (il
-//     installe ses propres tables de descripteurs : rien ne fuit dans l'état de ReShade) ;
-//  4. live_nrdpost : masque d'ombres = visibilité de SIGMA, puis les corrections (ombre du jeu, N·L, brume).
+// Sequence per frame (OnBeginEffects):
+//  1. live_shadow (SIGMA mode): penumbra from one ray per pixel + weight of URTI's corrections;
+//  2. live_nrdprep: linear depth, normals encoded the way NRD expects; copies into NRD's
+//     textures (the game's motion vectors taken as they are, the scale follows their convention);
+//  3. ReShade's command list is submitted; NRD records its passes on a list of its own (it
+//     installs its own descriptor tables: nothing leaks into ReShade's state);
+//  4. live_nrdpost: shadow mask = SIGMA's visibility, then the corrections (game shadow, N·L, haze).
 //
-// L'espace « monde » donné à NRD est l'espace caméra de chaque image (matrices identité) : les mouvements
-// passent par les vecteurs de mouvement du jeu.
+// The "world" space given to NRD is each frame's camera space (identity matrices): motions
+// go through the game's motion vectors.
 
 #if URTI_NRD
-// (en-tetes de NRD et NRI inclus au debut de urti_addon.cpp, hors de l'espace de noms anonyme)
+// (NRD and NRI headers included at the start of urti_addon.cpp, outside the anonymous namespace)
 #include "live_nrdpost_cs.h" // g_live_nrdpost
 #include "live_nrdprep_cs.h" // g_live_nrdprep
 
 struct NrdState
 {
-    nrd::Integration* integration = nullptr; // détruit avec l'appareil (jamais à la sortie du processus)
+    nrd::Integration* integration = nullptr; // destroyed with the device (never at process exit)
     bool failed = false, restart = true;
     uint32_t width = 0, height = 0, frameIndex = 0, sigmaPitch = 0;
     ComPtr<ID3D12Resource> mvTex, normalTex, viewZTex, penumbraTex, shadowTex; // textures de NRD
@@ -67,7 +67,7 @@ ComPtr<ID3D12Resource> NrdTexture(ID3D12Device* device, uint32_t w, uint32_t h, 
     return r;
 }
 
-// pipeline de calcul à descripteurs racine : SRV t0…, UAV u0…, constantes b0
+// compute pipeline with root descriptors: SRV t0…, UAV u0…, constants b0
 bool NrdPipeline(const void* code, size_t size, int srvCount, int uavCount, uint32_t constants, ComPtr<ID3D12RootSignature>& rs, ComPtr<ID3D12PipelineState>& pso)
 {
     D3D12_ROOT_PARAMETER p[8] = {};
@@ -88,7 +88,7 @@ bool NrdPipeline(const void* code, size_t size, int srvCount, int uavCount, uint
     return SUCCEEDED(g.device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso)));
 }
 
-// textures, tampons, liste de commandes et instance de NRD à la taille de rendu
+// textures, buffers, command list and NRD instance at render size
 bool NrdEnsure(effect_runtime* runtime)
 {
     if (g_nrd.failed)
@@ -98,13 +98,13 @@ bool NrdEnsure(effect_runtime* runtime)
     ID3D12CommandQueue* queue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
     const uint32_t w = live.width, h = live.height;
     auto fail = [](const char* what) {
-        Log("URTI direct : débruiteur NVIDIA (SIGMA) indisponible : %s ; débruitage d'URTI à la place", what);
+        Log("URTI live: NVIDIA denoiser (SIGMA) unavailable: %s; URTI's denoising instead", what);
         g_nrd.failed = true;
         return false;
     };
     if (!g_nrd.prepPso && (!NrdPipeline(g_live_nrdprep, sizeof(g_live_nrdprep), 2, 2, 12, g_nrd.prepRs, g_nrd.prepPso) ||
                            !NrdPipeline(g_live_nrdpost, sizeof(g_live_nrdpost), 2, 1, 8, g_nrd.postRs, g_nrd.postPso)))
-        return fail("shaders refusés");
+        return fail("shaders refused");
     if (!g_nrd.list)
     {
         for (auto& a : g_nrd.allocators)
@@ -116,7 +116,7 @@ bool NrdEnsure(effect_runtime* runtime)
         g_nrd.list->Close();
         g_nrd.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     }
-    // entrées (recopiées depuis nos tampons à chaque image) et sortie (aussi l'historique de SIGMA)
+    // inputs (copied from our buffers every frame) and output (also SIGMA's history)
     g_nrd.mvTex = NrdTexture(g.device, w, h, DXGI_FORMAT_R16G16_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
     g_nrd.normalTex = NrdTexture(g.device, w, h, DXGI_FORMAT_R10G10B10A2_UNORM, false, D3D12_RESOURCE_STATE_COPY_DEST);
     g_nrd.viewZTex = NrdTexture(g.device, w, h, DXGI_FORMAT_R32_FLOAT, false, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -130,7 +130,7 @@ bool NrdEnsure(effect_runtime* runtime)
     g_nrd.sigmaBuf = UavBuffer(g.device, uint64_t(g_nrd.sigmaPitch) * h, D3D12_RESOURCE_STATE_COPY_DEST);
     if (!g_nrd.mvTex || !g_nrd.normalTex || !g_nrd.viewZTex || !g_nrd.penumbraTex || !g_nrd.shadowTex || !g_nrd.viewZBuf || !g_nrd.normalBuf ||
         !g_nrd.penumbraBuf || !g_nrd.sigmaBuf)
-        return fail("mémoire");
+        return fail("memory");
     if (!g_nrd.integration)
         g_nrd.integration = new nrd::Integration();
     nrd::IntegrationCreationDesc idesc = {};
@@ -146,25 +146,25 @@ bool NrdEnsure(effect_runtime* runtime)
     nri::DeviceCreationD3D12Desc dd = {};
     dd.d3d12Device = g.device;
     dd.queueFamilies = &family, dd.queueFamilyNum = 1;
-    dd.disableD3D12EnhancedBarriers = true; // le jeu et URTI utilisent les barrières classiques
+    dd.disableD3D12EnhancedBarriers = true; // the game and URTI use classic barriers
     dd.disableNVAPIInitialization = true;
     if (g_nrd.integration->RecreateD3D12(idesc, instance, dd) != nrd::Result::SUCCESS)
-        return fail("création de l'instance NRD");
+        return fail("NRD instance creation");
     g_nrd.width = w, g_nrd.height = h, g_nrd.restart = true;
-    Log("URTI direct : débruiteur d'ombres NVIDIA SIGMA (NRD %u.%u.%u) prêt, %ux%u, %.0f Mo", NRD_VERSION_MAJOR, NRD_VERSION_MINOR, NRD_VERSION_BUILD, w,
+    Log("URTI live: NVIDIA SIGMA shadow denoiser (NRD %u.%u.%u) ready, %ux%u, %.0f MB", NRD_VERSION_MAJOR, NRD_VERSION_MINOR, NRD_VERSION_BUILD, w,
         h, g_nrd.integration->GetTotalMemoryUsageInMb());
     return true;
 }
 
-// plantage dans NRD / NRI : fonction fautive et pile d'appels dans le journal (symboles de l'add-on), puis
-// débruitage d'URTI à la place (le jeu continue)
+// crash inside NRD / NRI: faulty function and call stack in the log (the add-on's symbols), then
+// URTI's denoising instead (the game goes on)
 LONG NrdCrashFilter(EXCEPTION_POINTERS* e)
 {
     HANDLE process = GetCurrentProcess();
     static bool symbols = false;
     if (!symbols)
         symbols = SymInitialize(process, (g_dir + ";F:/NewrAYTRACING/urti/build/Release").c_str(), TRUE) != FALSE;
-    Log("URTI direct : plantage dans le débruiteur NVIDIA (code 0x%08lx à %p)", e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
+    Log("URTI live: crash in the NVIDIA denoiser (code 0x%08lx at %p)", e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
     CONTEXT context = *e->ContextRecord;
     for (int i = 0; i < 24 && context.Rip; i++)
     {
@@ -184,7 +184,7 @@ LONG NrdCrashFilter(EXCEPTION_POINTERS* e)
         const char* file = std::strrchr(path, '\\');
         Log("  %d %s+0x%llx %s +0x%llx %s:%lu", i, file ? file + 1 : path, (unsigned long long)(context.Rip - reinterpret_cast<DWORD64>(module)),
             named ? sym->Name : "?", (unsigned long long)displacement, lined ? line.FileName : "", lined ? line.LineNumber : 0);
-        // déroulement x64 natif (tables d'exceptions des modules)
+        // native x64 unwinding (the modules' exception tables)
         DWORD64 imageBase = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
         if (!fn)
@@ -213,7 +213,7 @@ bool NrdDenoiseGuarded(const nrd::Identifier* ids, uint32_t count, const nri::Co
     }
 }
 
-// tampon aux lignes alignées -> texture
+// buffer with aligned rows -> texture
 void NrdCopyIn(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer, uint32_t pitch, ID3D12Resource* texture, DXGI_FORMAT format)
 {
     D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
@@ -225,8 +225,8 @@ void NrdCopyIn(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer, uint32_t
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 }
 
-// ombres RT débruitées par SIGMA dans live.shadowBuf ; shadowRawBuf contient les poids (live_shadow en
-// mode SIGMA), g_nrd.penumbraBuf la pénombre. Faux : rien n'a été fait (débruitage d'URTI à la place).
+// RT shadows denoised by SIGMA into live.shadowBuf; shadowRawBuf holds the weights (live_shadow in
+// SIGMA mode), g_nrd.penumbraBuf the penumbra. False: nothing was done (URTI's denoising instead).
 bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool d24, bool motionOk)
 {
     if (!motionOk || !g_nrd.integration || g_nrd.width != live.width || g_nrd.height != live.height)
@@ -234,7 +234,7 @@ bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool 
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceCounter(&t0);
     const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    // 2. profondeur linéaire et normales
+    // 2. linear depth and normals
     Transition(list, live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootSignature(g_nrd.prepRs.Get());
     list->SetPipelineState(g_nrd.prepPso.Get());
@@ -259,7 +259,7 @@ bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool 
     NrdCopyIn(list, g_nrd.viewZBuf.Get(), live.shadowPitch, g_nrd.viewZTex.Get(), DXGI_FORMAT_R32_FLOAT);
     NrdCopyIn(list, g_nrd.normalBuf.Get(), live.shadowPitch, g_nrd.normalTex.Get(), DXGI_FORMAT_R10G10B10A2_UNORM);
     NrdCopyIn(list, g_nrd.penumbraBuf.Get(), live.shadowPitch, g_nrd.penumbraTex.Get(), DXGI_FORMAT_R32_FLOAT);
-    // vecteurs de mouvement du jeu, tels quels (en lecture pour les ombres à ce moment de l'image)
+    // the game's motion vectors, as they are (in read state for the shadows at this point of the frame)
     Transition(list, live.mvBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
     NrdCopyIn(list, live.mvBuf.Get(), live.mvPitch, g_nrd.mvTex.Get(), DXGI_FORMAT_R16G16_FLOAT);
     Transition(list, live.mvBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, srv);
@@ -269,7 +269,7 @@ bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool 
     for (ID3D12Resource* t : inputs)
         Transition(list, t, D3D12_RESOURCE_STATE_COPY_DEST, srv);
 
-    // 3. NRD sur sa propre liste, après ce qui précède
+    // 3. NRD on its own list, after what precedes
     runtime->get_command_queue()->flush_immediate_command_list();
     const uint32_t k = g_nrd.frameIndex % 3;
     if (g_nrd.fence->GetCompletedValue() < g_nrd.allocatorFence[k])
@@ -281,12 +281,12 @@ bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool 
     g_nrd.list->Reset(g_nrd.allocators[k].Get(), nullptr);
     g_nrd.integration->NewFrame();
     nrd::CommonSettings cs = {};
-    // projection supposée d'URTI (profondeur inversée, plan lointain à l'infini), colonne par colonne
+    // URTI's assumed projection (reversed depth, far plane at infinity), column by column
     cs.viewToClipMatrix[0] = live.p00, cs.viewToClipMatrix[5] = live.p11, cs.viewToClipMatrix[11] = 1.0f, cs.viewToClipMatrix[14] = 0.1f;
     std::memcpy(cs.viewToClipMatrixPrev, cs.viewToClipMatrix, sizeof(cs.viewToClipMatrix));
     for (int i = 0; i < 4; i++)
         cs.worldToViewMatrix[i * 5] = cs.worldToViewMatrixPrev[i * 5] = 1.0f;
-    // vecteurs de mouvement : « précédent - courant » en uv ; la convention du jeu (live_mvcal) donne l'échelle
+    // motion vectors: "previous - current" in uv; the game's convention (live_mvcal) gives the scale
     const uint32_t mvc = live.mvConvention;
     const float base = (mvc & 3) == 0 ? 1.0f : (mvc & 3) == 1 ? 0.5f : (mvc & 3) == 3 ? 2.0f : 0.0f;
     float sx = (mvc & 3) == 2 ? 1.0f / live.width : base, sy = (mvc & 3) == 2 ? 1.0f / live.height : base;
@@ -329,7 +329,7 @@ bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool 
     {
         g_nrd.list->Close();
         g_nrd.failed = true;
-        Log("URTI direct : débruiteur NVIDIA coupé après un plantage ; débruitage d'URTI à la place");
+        Log("URTI live: NVIDIA denoiser off after a crash; URTI's denoising instead");
         return false;
     }
     g_nrd.list->Close();
@@ -340,7 +340,7 @@ bool NrdShadows(effect_runtime* runtime, ID3D12GraphicsCommandList4* list, bool 
     g_nrd.allocatorFence[k] = g_nrd.fenceValue;
     g_nrd.frameIndex++, g_nrd.restart = false;
 
-    // 4. retour sur la liste de ReShade : sortie de SIGMA -> masque d'ombres
+    // 4. back on ReShade's list: SIGMA's output -> shadow mask
     for (ID3D12Resource* t : inputs)
         Transition(list, t, srv, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(list, g_nrd.shadowTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);

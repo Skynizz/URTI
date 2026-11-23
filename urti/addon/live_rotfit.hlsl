@@ -1,15 +1,15 @@
-// URTI en direct : orientation de la caméra tirée des normales du G-buffer, pour un jeu qui les range dans le repère du monde (Red Dead Redemption 2).
-// La passe d'ombres somme, sur les surfaces planes, le produit de la normale du monde (G-buffer) par la normale de la caméra (tirée de la profondeur) :
-// H = somme de a b^T. La rotation R qui envoie le monde sur la caméra (b = R a) maximise somme b . R a : méthode de Horn (quaternion, plus grand vecteur
-// propre d'une matrice 4 × 4 symétrique, ici par itérations de puissance). Écrite dans sunBuf (octets 2048 à 2095) : R par lignes, accord moyen, pixels, valide.
-// Un seul fil, à chaque image calculée, après la passe d'ombres et avant les reflets.
+// Live URTI: camera orientation from the G-buffer normals, for a game that stores them in world space (Red Dead Redemption 2).
+// The shadow pass sums, over flat surfaces, the product of the world normal (G-buffer) by the camera normal (from depth):
+// H = sum of a b^T. The rotation R sending the world onto the camera (b = R a) maximises sum b . R a: Horn's method (quaternion, largest
+// eigenvector of a symmetric 4 × 4 matrix, here through power iterations). Written into sunBuf (bytes 2048 to 2095): R by rows, mean agreement, pixels, valid.
+// A single thread, on every computed frame, after the shadow pass and before the reflections.
 
-RWByteAddressBuffer stats : register(u0); // octets 64 à 103 : H (9 entiers ×1000, ligne = composante du monde), nombre de pixels
+RWByteAddressBuffer stats : register(u0); // bytes 64 to 103: H (9 integers ×1000, row = world component), number of pixels
 RWByteAddressBuffer sunBuf : register(u1);
 
 cbuffer Constants : register(b0)
 {
-    uint minPixels; // en dessous : pas de rotation (valide 0)
+    uint minPixels; // below: no rotation (valid 0)
     float minAgreement;
     uint pad0;
     uint pad1;
@@ -38,7 +38,7 @@ void main()
     for (uint r = 0; r < 4; r++)
         for (uint c = 0; c < r; c++)
             N[r][c] = N[c][r];
-    // itérations de puissance sur N + s I (s : borne du spectre, toutes les valeurs propres deviennent positives) ; départ : la rotation précédente
+    // power iterations on N + s I (s: bound of the spectrum, every eigenvalue becomes positive); start: the previous rotation
     float s = 0;
     for (uint r2 = 0; r2 < 4; r2++)
         for (uint c2 = 0; c2 < 4; c2++)
@@ -56,7 +56,7 @@ void main()
             break;
         q = nq / l;
     }
-    // valeur propre : q . N q = somme des b . R a ; accord moyen = elle / pixels
+    // eigenvalue: q . N q = sum of b . R a; mean agreement = it / pixels
     float lambda = 0;
     for (uint r4 = 0; r4 < 4; r4++)
         lambda += q[r4] * (N[r4][0] * q[0] + N[r4][1] * q[1] + N[r4][2] * q[2] + N[r4][3] * q[3]);

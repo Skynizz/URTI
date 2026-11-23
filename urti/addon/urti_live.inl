@@ -1,14 +1,14 @@
-// URTI en direct (inclus dans urti_addon.cpp) : ombres du soleil en ray tracing à chaque image.
+// Live URTI (included in urti_addon.cpp): ray-traced effects on every frame.
 //
-// À chaque image : les dessins sur la profondeur de l'écran sont rejoués dans le flux (comme une
-// capture) ; avant les effets de ReShade, sur sa liste de commandes : sommets vers l'espace caméra,
-// structure d'accélération, un rayon par pixel vers le soleil, image d'ombres lue par l'effet urti.fx.
-// La loi de profondeur et la carte d'ombres du soleil viennent d'un étalonnage (capture complète,
-// cartes d'ombres comprises) fait à l'activation et sur F6 ; ensuite la direction du soleil est
-// mesurée à chaque image sur le GPU (paires de dessins écran / carte d'ombres), sans relecture.
+// Every frame: the draws on the screen depth are replayed into the stream (like a
+// capture); before ReShade's effects, on its command list: vertices to camera space,
+// acceleration structure, rays from each pixel, effect layers read by the urti.fx effect.
+// The depth law and the sun's shadow map come from a calibration (full capture,
+// shadow maps included) done at activation and on F6; afterwards the sun direction is
+// measured every frame on the GPU (pairs of draws screen / shadow map), without readback.
 //
-// Touches : F7 active / coupe ; F6 refait l'étalonnage. Fichier urti_photo à côté de l'add-on : image de
-// l'écran après les effets (urti_photoN.ppm).
+// Keys: F7 on / off; F6 recalibrates. File urti_photo next to the add-on: image of
+// the screen after the effects (urti_photoN.ppm).
 
 #include "live_convert_cs.h" // g_live_convert
 #include "live_shadow_cs.h"  // g_live_shadow
@@ -44,8 +44,8 @@
 struct LiveState
 {
     bool enabled = false, calibrated = false, bound = false;
-    bool depthReady = false; // loi de profondeur connue (reflets) ; calibrated : soleil connu (ombres)
-    // étalonnage stocké (urti_calib.ini) : propre au jeu, relu au lancement -> ombres dès la première image
+    bool depthReady = false; // depth law known (reflections); calibrated: sun known (shadows)
+    // stored calibration (urti_calib.ini): per game, read back at launch -> effects from the first frame
     bool fromStore = false, verified = false, storeLoaded = false;
     uint32_t sunMapWidth = 0, sunMapHeight = 0, sunMapFormat = 0;
     float sun[3] = { 0, 1, 0 }, A = 0, B = 0.1f, p00 = 1, p11 = 1;
@@ -55,35 +55,35 @@ struct LiveState
     ComPtr<ID3D12RootSignature> convertRs, shadowRs;
     ComPtr<ID3D12PipelineState> convertPso, shadowPso;
     ComPtr<ID3D12Resource> view, blas, blasScratch, tlas, tlasScratch, instances, depthBuf, shadowBuf, mask, counterReadback[3];
-    ComPtr<ID3D12Resource> prevShadowBuf; // masque de l'image réelle précédente (images générées : mélange)
-    ComPtr<ID3D12Resource> shadowRawBuf;  // masque brut de cette image (avant débruitage)
+    ComPtr<ID3D12Resource> prevShadowBuf; // mask of the previous real frame (generated frames: blend)
+    ComPtr<ID3D12Resource> shadowRawBuf;  // raw mask of this frame (before denoising)
     ComPtr<ID3D12RootSignature> denoiseRs;
     ComPtr<ID3D12PipelineState> denoisePso;
-    // budget de géométrie : chaque objet capté est mesuré (distance, taille) ; seuls les plus importants
-    // entrent dans la scène RT, jusqu'à vertexBudget sommets ; les autres sont re-mesurés par roulement
-    // (probeBudget sommets par image, hors de la structure)
-    // photo d'avant l'interface : photos de l'écran (urti_addon.cpp), comparaison, choix
+    // geometry budget: each captured object is measured (distance, size); only the most important
+    // enter the RT scene, up to vertexBudget vertices; the others are re-measured in rotation
+    // (probeBudget vertices per frame, outside the structure)
+    // snapshot before the UI: screen snapshots (urti_addon.cpp), comparison, choice
     ComPtr<ID3D12Resource> snaps[kLiveSnaps], uiCounts, uiReadback[3], preUiBuf;
     ComPtr<ID3D12RootSignature> uiRs, uiSelRs;
     ComPtr<ID3D12PipelineState> uiPso, uiSelPso;
     uint64_t snapBytes = 0, uiFrame = 0;
     uint32_t uiCountAt[3] = {};
-    int uiChoice = -1; // rang de la photo d'avant l'interface (-1 : aucune sûre), lu trois images plus tard
+    int uiChoice = -1; // rank of the snapshot before the UI (-1: none safe), read three frames later
     uint32_t uiParity[3] = {};
-    float uiReflGate = 1.0f; // reflets RT effacés en douceur quand aucune photo sûre (sinon l'interface s'y reflète)
-    uint32_t uiBadReadbacks = 0; // photos périmées de suite (lues trois images plus tard)
-    float uiZone[4] = {}; // urti.ini ui_zone=x0,y0,x1,y1 (fractions de l'écran) : zone d'interface jamais retouchée
-    ComPtr<ID3D12Resource> uiMaskBuf; // pixels d'interface retenus de la dernière photo sûre (live_composite)
+    float uiReflGate = 1.0f; // RT reflections faded out smoothly when no snapshot is safe (otherwise the UI is reflected)
+    uint32_t uiBadReadbacks = 0; // stale snapshots in a row (read three frames later)
+    float uiZone[4] = {}; // urti.ini ui_zone=x0,y0,x1,y1 (fractions of the screen): UI zone never touched
+    ComPtr<ID3D12Resource> uiMaskBuf; // UI pixels kept from the last safe snapshot (live_composite)
     uint64_t uiMaskBytes = 0;
-    bool uiPhoto = true; // urti.ini ui_photo=0 : sans la photo d'avant l'interface (contrôle)
-    // image du jeu sans son interface copiée dans ses listes (urti.ini hudless=0 : sans), remise dans la disposition de l'écran
+    bool uiPhoto = true; // urti.ini ui_photo=0: without the snapshot before the UI (control)
+    // the game's image without its UI, copied inside its lists (urti.ini hudless=0: without), put back into the screen's layout
     static constexpr uint32_t kHudSnaps = 4;
     ComPtr<ID3D12Resource> hudSnap[kHudSnaps];
     uint64_t hudBytes = 0;
     uint32_t hudPitch = 0, hudWidth = 0, hudHeight = 0, statHudless = 0, statHudConverted = 0, statShifted = 0, statHudMatched = 0;
     double statHudMatchSum = 0;
     uint32_t statHudLag[3] = {}, statHudConvBack[4] = {};
-    // file d'attente des calques (live_delay) : trois tranches, celle de chaque image calculée rangée avec son numéro
+    // layer queue (live_delay): three slices, each computed frame's layer stored with its number
     ComPtr<ID3D12Resource> delayRing;
     ComPtr<ID3D12RootSignature> delayRs;
     ComPtr<ID3D12PipelineState> delayPso;
@@ -94,38 +94,38 @@ struct LiveState
     double presentDrawsAvg = 0;
     bool layerSuspect = false;
     uint32_t statSuspect = 0;
-    uint64_t layerHudSerial = 0;   // numéro de la dernière copie de l'image sans interface au moment du dernier calcul
-    float lagBias = 0;             // urti.ini lag_bias= : correction de l'avance du calque (images du jeu)
-    bool lagOn = true, hudLeadNow = false; // urti.ini lag=0 : calque posé tel quel (ancienne règle)
+    uint64_t layerHudSerial = 0;   // number of the last copy of the UI-free image at the time of the last computation
+    float lagBias = 0;             // urti.ini lag_bias=: correction of the layer's lead (game frames)
+    bool lagOn = true, hudLeadNow = false; // urti.ini lag=0: layer laid as it is (old rule)
     double statLeadSum = 0;
     float hudSlopeNow = 0;
-    uint64_t hudConverted = ~0ull; // numéro de la copie remise dans la disposition de l'écran (preUiBuf, masque) ; ~0 : aucune
+    uint64_t hudConverted = ~0ull; // number of the copy put back into the screen's layout (preUiBuf, mask); ~0: none
     bool hudlessOn = true;
-    uint32_t hudlessMode = 1; // urti.ini hudless=2 : conversion faite mais pas utilisée (mesure de son coût)
+    uint32_t hudlessMode = 1; // urti.ini hudless=2: conversion done but not used (to measure its cost)
     ComPtr<ID3D12RootSignature> hudRs, hudGainRs;
     ComPtr<ID3D12PipelineState> hudPso, hudGainPso;
-    ComPtr<ID3D12Resource> hudGain, hudGainReadback[3]; // rapport image finale / image sans interface (live_hudgain), lu pour le journal
+    ComPtr<ID3D12Resource> hudGain, hudGainReadback[3]; // final image / UI-free image ratio (live_hudgain), read for the log
     ComPtr<ID3D12RootSignature> statsRs;
     ComPtr<ID3D12PipelineState> statsPso;
     ComPtr<ID3D12Resource> statsBuf, statsUpload[3], statsReadback[3];
     uint64_t statsBytes = 0;
-    std::vector<uint32_t> statsIds[3], statsCaps[3]; // identités mesurées et leur place réservée (sommets)
-    std::unordered_map<uint32_t, uint32_t> idSig;        // ExecuteIndirect : identité -> signature de commande
-    std::unordered_map<uint32_t, float> sigVertices;     // signature -> plus grand nombre de sommets écrits (décroît)
+    std::vector<uint32_t> statsIds[3], statsCaps[3]; // measured identities and their reserved room (vertices)
+    std::unordered_map<uint32_t, uint32_t> idSig;        // ExecuteIndirect: identity -> command signature
+    std::unordered_map<uint32_t, float> sigVertices;     // signature -> largest number of vertices written (decays)
     struct ObjectStat
     {
-        float importance;  // taille / distance (taille apparente)
-        uint64_t frame;    // image de la dernière mesure
-        uint32_t vertices; // sommets réellement écrits (mesurés)
-        float minZ;        // distance au plus près de la caméra
+        float importance;  // size / distance (apparent size)
+        uint64_t frame;    // frame of the last measurement
+        uint32_t vertices; // vertices really written (measured)
+        float minZ;        // closest distance to the camera
     };
     std::unordered_map<uint32_t, ObjectStat> objects;
     std::unordered_map<uint32_t, uint32_t> seenNow;
     std::unordered_set<uint32_t> admitted;
-    uint32_t churnIn = 0, churnOut = 0; // objets entrés dans la scène RT / sortis, à cette image
-    uint32_t burst = 0, burstIndex = 0, burstCount = 0; // rafale d'images avant / après URTI en cours (images restantes)
-    // film au rythme réel (fichier urti_film) : chaque présentation, avant et après URTI, à demi-résolution, gardée en mémoire vidéo
-    // jusqu'à la fin, puis écrite (urti_film_N\avant_k.raw, apres_k.raw) ; une ligne FILM par présentation
+    uint32_t churnIn = 0, churnOut = 0; // objects that entered / left the RT scene this frame
+    uint32_t burst = 0, burstIndex = 0, burstCount = 0; // burst of frames before / after URTI in progress (frames left)
+    // real-pace film (urti_film file): every present, before and after URTI, at half resolution, kept in video memory
+    // until the end, then written (urti_film_N\before_k.raw, after_k.raw); one FILM line per present
     static constexpr uint32_t kFilmFrames = 30;
     uint32_t film = 0, filmIndex = 0, filmCount = 0;
     std::string filmFolder;
@@ -135,44 +135,44 @@ struct LiveState
     ComPtr<ID3D12RootSignature> filmRs;
     ComPtr<ID3D12PipelineState> filmPso;
     std::string burstFolder;
-    uint64_t statChurn = 0; // objets entrés ou sortis de la scène RT (bilan par 300 images)
-    bool composedNow = false;           // la composition d'URTI a eu lieu à cette présentation
-    std::atomic<bool> showGameOnly{ false }; // F4 : image du jeu seule (comparaison avant / après en plein écran)
-    int menuOn = -1; // case « URTI activé » du menu (UrtiOn) telle que lue à la dernière présentation ; -1 : pas encore lue
+    uint64_t statChurn = 0; // objects that entered or left the RT scene (summary every 300 frames)
+    bool composedNow = false;           // URTI's composition happened on this present
+    std::atomic<bool> showGameOnly{ false }; // F4: the game's image alone (full-screen before / after comparison)
+    int menuOn = -1; // "URTI" menu checkbox (UrtiOn) as read on the last present; -1: not read yet
     uint64_t vertexBudget = 6000000, probeBudget = 1000000, slotLimit = 0;
     uint64_t statDraws = 0, statOverflow = 0, statOutOfBudget = 0, statProbes = 0, statBudgetFrames = 0, statReserved = 0;
-    // accumulation dans le temps : vecteurs de mouvement du jeu (G-buffer), profondeur précédente
+    // accumulation over time: the game's motion vectors (G-buffer), previous depth
     ComPtr<ID3D12Resource> mvBuf, depthPrevBuf, mvErrors, mvErrorsReadback[3];
     ComPtr<ID3D12RootSignature> mvcalRs;
     ComPtr<ID3D12PipelineState> mvcalPso;
     uint64_t mvBytes = 0, mvFrame = ~0ull;
     uint32_t mvPitch = 0, mvWidth = 0, mvHeight = 0, mvConvention = 255, mvMovingFrames = 0;
-    // cible essayée parmi celles du G-buffer en deux flottants 16 bits (Horizon Forbidden West en a deux, la
-    // première presque vide : toutes les conventions y restaient à égalité) ; mesures sans vainqueur sur celle-ci
+    // target tried among the G-buffer's two-half-float targets (some games have two, the first
+    // almost empty: every convention stayed tied there); measurements without a winner on this one
     uint32_t mvCandidate = 0, mvUndecided = 0;
-    // mouvement de la caméra mesuré sur notre géométrie (live_camfit) et vecteurs de mouvement fabriqués avec lui
-    // (live_mvsynth) quand ceux du jeu restent illisibles ; urti.ini motion_source= 0 : choix automatique, 1 : ceux
-    // du jeu seulement, 2 : les nôtres
+    // camera motion measured on our geometry (live_camfit) and motion vectors built from it
+    // (live_mvsynth) when the game's stay unreadable; urti.ini motion_source= 0: automatic choice, 1: the
+    // game's only, 2: ours
     ComPtr<ID3D12RootSignature> camfitRs, mvsynthRs;
     ComPtr<ID3D12PipelineState> camfitPso, mvsynthPso;
     ComPtr<ID3D12Resource> pairsBuf, motionBuf, motionReadback[3];
     bool mvSynthetic = false;
-    // couche des surfaces transparentes planes (eau, vitres : reflets) ; état de son tampon de sommets
+    // layer of flat transparent surfaces (water, glass: reflections); state of its vertex buffer
     ComPtr<ID3D12RootSignature> planesRs;
     ComPtr<ID3D12PipelineState> planesPso;
     ComPtr<ID3D12Resource> viewT, blasT, blasTScratch, transpUpload[3], transpSrcUpload[3], planeStats, planeReadback[3];
     bool viewTRead = false, transpBuilt = false, waterOn = false;
-    uint32_t transpMiss = 0; // fenêtres de suite sans surface transparente (image du jeu coupée entre deux présentations)
-    // cache de géométrie : chaque objet hors du budget de l'image, capté à son tour, a sa structure gardée dans une
-    // réserve (tampon circulaire), posée dans la structure de tête par la pose de la caméra (live_camfit)
+    uint32_t transpMiss = 0; // windows in a row without a transparent surface (game frame split between two presents)
+    // geometry cache: each object outside the frame's budget, captured in turn, has its structure kept in a
+    // reserve (ring buffer), placed in the top-level structure with the camera's pose (live_camfit)
     struct GeoEntry
     {
         uint64_t offset = 0, size = 0, frame = 0;
         uint32_t triangles = 0;
-        uint32_t slot = ~0u, gen = 0; // place dans la table des couleurs apprises (live_surfcache), génération de cette place
+        uint32_t slot = ~0u, gen = 0; // place in the table of learned colours (live_surfcache), generation of that place
     };
-    // couleurs apprises des objets du cache : 256 par objet (un groupe de triangles voisins chacun), vues à l'écran quand l'objet l'est ; un reflet qui le
-    // touche caché ou hors de l'écran les reprend au lieu de rester inconnu (le reflet du jeu, en blocs, se voyait alors dessous)
+    // learned colours of cached objects: 256 per object (one group of neighbouring triangles each), seen on screen when the object is; a reflection that
+    // hits it hidden or off screen takes them instead of staying unknown (the game's blocky reflection showed underneath otherwise)
     static constexpr uint32_t kGeoColorBins = 256;
     std::vector<uint32_t> geoSlotOwner;
     std::vector<uint8_t> geoSlotGen;
@@ -180,31 +180,31 @@ struct LiveState
     ComPtr<ID3D12Resource> geoColors;
     std::unordered_map<uint32_t, GeoEntry> geo;
     std::map<uint64_t, uint32_t> geoByOffset;
-    std::unordered_map<uint32_t, uint64_t> meshProbed; // dernier tour de chaque maillage
-    // témoins : petits objets à leur place, loin de la caméra, captés à chaque image : le mouvement de la caméra se mesure
-    // sur eux (la scène de l'image ne garde plus que le proche : le personnage, que la caméra suit)
+    std::unordered_map<uint32_t, uint64_t> meshProbed; // last round of each mesh
+    // witnesses: small objects in place, far from the camera, captured every frame: the camera's motion is measured
+    // on them (the frame's scene only keeps what is near: the character, whom the camera follows)
     std::unordered_set<uint32_t> stableMeshes, sentinels;
-    // leurs points de référence dans le repère du cache (live_refpairs) : place de chaque témoin, places libres
+    // their reference points in the cache's frame (live_refpairs): place of each witness, free places
     std::unordered_map<uint32_t, uint32_t> sentinelRef;
     std::vector<uint32_t> sentinelFree;
     ComPtr<ID3D12Resource> sentRefs, sentUpload[3];
     ComPtr<ID3D12RootSignature> refpairsRs, objplanesRs;
     ComPtr<ID3D12PipelineState> refpairsPso, objplanesPso;
-    // planéité de chaque objet capté (live_objplanes), lue trois images plus tard : ce qui peut être de l'eau
+    // flatness of each captured object (live_objplanes), read three frames later: what may be water
     ComPtr<ID3D12Resource> objPlanes, objPlanesRead[3], objPlanesUpload[3];
     std::vector<uint32_t> objPlanesIds[3];
     uint64_t objPlanesBytes = 0;
     std::unordered_set<uint32_t> flatLogged;
     uint64_t motPairs = 0;
-    bool motionLog = false; // urti.ini motion_log=1 : mouvement mesuré à chaque image (journal)
-    uint32_t reflectDiag = 0; // urti.ini reflect_diag= : vue 7 = direction du rayon réfléchi, normale
-    int depthLawFixed = -1;   // urti.ini depth_law_fixed= : -1 la loi connue dès qu'il y en a une, 0 la mesure, 1 la loi connue
-    float diagReflStrength = 0; // valeurs de la dernière composition (lignes RAFALE du journal)
+    bool motionLog = false; // urti.ini motion_log=1: motion measured every frame (log)
+    uint32_t reflectDiag = 0; // urti.ini reflect_diag=: view 7 = reflected ray direction, normal
+    int depthLawFixed = -1;   // urti.ini depth_law_fixed=: -1 the known law as soon as there is one, 0 the measurement, 1 the known law
+    float diagReflStrength = 0; // values of the last composition (BURST lines of the log)
     uint32_t diagDebugReflect = 0, diagSnaps = 0;
     int diagHistOut = -1;
     bool diagPreUi = false;
     ComPtr<ID3D12Resource> lawUpload[3];
-    // barrière entre les files du jeu et celle des présentations : par file du jeu, sa barrière et sa dernière valeur
+    // fence between the game's queues and the present queue: per game queue, its fence and its last value
     struct QueueSync
     {
         ComPtr<ID3D12Fence> fence;
@@ -213,8 +213,8 @@ struct LiveState
     std::unordered_map<uint64_t, QueueSync> queueSync;
     bool queueSyncOn = true;
     uint64_t statSyncWaits = 0;
-    // sommets réservés de chaque maillage, gardés quelques fenêtres : une fenêtre de capture ne contient parfois qu'une
-    // partie d'une image du jeu, et un maillage non vu n'est pas sorti de l'écran
+    // reserved vertices of each mesh, kept for a few windows: a capture window sometimes holds only part
+    // of a game frame, and a mesh not seen has not left the screen
     struct SeenMesh
     {
         uint32_t vertices = 0;
@@ -225,8 +225,8 @@ struct LiveState
     ComPtr<ID3D12RootSignature> geoconvRs, geoinstRs;
     ComPtr<ID3D12PipelineState> geoconvPso, geoinstPso;
     bool geoOn = true, geoResetPose = true;
-    // caméra du jeu lue dans sa mémoire (urti_camscan.inl) : pose exacte, sans mesure sur la géométrie. camLive : au moins une
-    // caméra vue ; camCur : celle de l'image en cours de calcul ; camRef : celle du repère fixe du cache de géométrie
+    // the game's camera read from its memory (urti_camscan.inl): exact pose, without measuring the geometry. camLive: at least one
+    // camera seen; camCur: the one of the frame being computed; camRef: the one of the geometry cache's fixed frame
     bool cameraOn = true, camLive = false, camHaveCur = false, camHaveRef = false;
     uint32_t camSerialNow = 0, camSerialDone = 0, statCamFrames = 0, statCamNew = 0, statCamJumps = 0;
     uint32_t camSeenSerial = 0;
@@ -240,32 +240,32 @@ struct LiveState
     uint32_t statGeoFlushes = 0, statGeoBadFit = 0;
     double geoPoseDistance = 0.0;
     uint64_t planeFrames = 0, planeKept = 0, planeTris = 0, planeSeen = 0;
-    uint32_t mvGiveUps = 0, motionSource = 0, motMovingNoGame = 0; // images où la caméra bougeait sans convention du jeu trouvée
+    uint32_t mvGiveUps = 0, motionSource = 0, motMovingNoGame = 0; // frames where the camera moved without a game convention found
     double motRot = 0, motTrans = 0, motKept = 0, motRms = 0;
     uint32_t motFrames = 0, motValid = 0;
     double mvErr[16] = {}, mvCount[16] = {};
     float temporalAlpha = 0.3f;
-    float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f; // reflets : part de l'image courante, à l'arrêt et en mouvement rapide
-    float reflGamma = 1.0f, reflDepthTol = 0.1f;    // reflets : largeur du bornage (écarts-types), tolérance de profondeur
-    uint32_t debugView = 0;    // vue de diagnostic (menu UrtiDebug ou urti.ini debug_view=)
+    float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f; // reflections: share of the current frame, at rest and in fast motion
+    float reflGamma = 1.0f, reflDepthTol = 0.1f;    // reflections: clamp width (standard deviations), depth tolerance
+    uint32_t debugView = 0;    // diagnostic view (UrtiDebug menu or urti.ini debug_view=)
     int iniDebugView = -1;
-    // reflets stabilisés : historique à la résolution de rendu (deux tampons alternés)
+    // stabilised reflections: history at render resolution (two alternating buffers)
     ComPtr<ID3D12RootSignature> resolveRs;
     ComPtr<ID3D12PipelineState> resolvePso;
     ComPtr<ID3D12Resource> reflHist[2];
     uint64_t reflHistBytes = 0;
-    int reflHistLast = -1; // tampon écrit à la dernière image réelle
-    uint32_t fgMode = 0;                  // images générées : 0 même masque, 1 sans RT, 2 mélange des deux dernières
-    // images générées : l'ombre et le reflet du dernier calcul glissent de cette part du mouvement d'une image (urti.ini fg_shift=, 0 : figés)
+    int reflHistLast = -1; // buffer written on the last real frame
+    uint32_t fgMode = 0;                  // generated frames: 0 same mask, 1 without RT, 2 blend of the last two
+    // generated frames: the last computation's shadow and reflection slide by this share of one frame's motion (urti.ini fg_shift=, 0: frozen)
     float fgShift = 0.5f;
-    // cache de géométrie : sommets construits par image, objets nouveaux d'abord (urti.ini geo_new=), objets déjà gardés remis à jour ensuite
-    // (urti.ini geo_refresh=) ; avant : jusqu'à 2 millions, 80 objets et 400 000 sommets reconstruits à chaque image (1,9 ms)
+    // geometry cache: vertices built per frame, new objects first (urti.ini geo_new=), objects already kept refreshed afterwards
+    // (urti.ini geo_refresh=); before: up to 2 million, 80 objects and 400,000 vertices rebuilt every frame (1.9 ms)
     uint32_t geoNewVerts = 300000, geoRefreshVerts = 100000;
-    // occultation : plus de rayons là où l'image bouge (urti.ini ao_boost=1) ; coupé : en marchant, tout l'écran bouge et la passe coûtait
-    // moitié plus
+    // occlusion: more rays where the image moves (urti.ini ao_boost=1); off: while walking, the whole screen moves and the pass cost
+    // half as much again
     bool aoBoost = false;
-    // budget de temps par passe, tenu image par image : le niveau monte dès que la passe dépasse sa cible (rayons, sauts, portée, pixels traités) et redescend lentement.
-    // urti.ini ao_ms= (occultation et débruitage), refl_ms= (reflets), 0 : pas de budget
+    // time budget per pass, held frame by frame: the level rises as soon as the pass exceeds its target (rays, hops, range, pixels processed) and comes down slowly.
+    // urti.ini ao_ms= (occlusion and denoising), refl_ms= (reflections), 0: no budget
     int aoLevel = 0, reflLevel = 0;
     uint32_t aoCool = 0, reflCool = 0;
     float reflTarget = 3.5f;
@@ -282,137 +282,137 @@ struct LiveState
     uint32_t statAoSpikes = 0, statReflSpikes = 0, statAoLevelSum = 0, statReflLevelSum = 0;
     float aoDistNow = 50.0f, reflTMaxNow = 500.0f;
     uint32_t reflStrideNow = 2, reflHopsNow = 3, aoHopsNow = 2;
-    ComPtr<ID3D12Resource> denoiseLen[2]; // longueur d'historique par pixel (live_shadowtemporal), une image sur deux chacun
+    ComPtr<ID3D12Resource> denoiseLen[2]; // history length per pixel (live_shadowtemporal), every other frame each
     uint32_t denoiseLenNext = 0;
-    float reflSpatial = 0.5f; // urti.ini refl_spatial= : part de la moyenne des voisins dans le reflet courant (0 : ancienne règle)
-    bool reflCoherent = true; // urti.ini refl_coherent=0 : reflets aussi sur les pixels lisses isolés (ancienne règle)
-    float reflSoft = 1.0f;    // urti.ini refl_soft= : rayon (pixels) de la zone où la couleur reflétée est lue (0 : un point, ancienne règle)
-    bool denoiseLenOn = true; // urti.ini denoise_len=0 : ancienne règle (pas de longueur d'historique)
+    float reflSpatial = 0.5f; // urti.ini refl_spatial=: share of the neighbours' average in the current reflection (0: old rule)
+    bool reflCoherent = true; // urti.ini refl_coherent=0: reflections on isolated smooth pixels too (old rule)
+    float reflSoft = 1.0f;    // urti.ini refl_soft=: radius (pixels) of the area where the reflected colour is read (0: a point, old rule)
+    bool denoiseLenOn = true; // urti.ini denoise_len=0: old rule (no history length)
     bool reflFull = true;  // urti.ini refl_full=0
-    bool denoiseFarSkip = true; // urti.ini denoise_far=0 : débruiteur sur tous les pixels (ancienne règle)
-    bool sunEighth = false; // urti.ini sun_eighth=1 : carte du soleil captée par huitièmes quand les ombres du soleil sont coupées (essai : 1,4 -> 0,6 M sommets rejoués, gain non mesurable)
-    uint64_t geoProbe = 2000000; // urti.ini geo_probe= : plafond par image de la zone de mesure quand le cache de géométrie est actif (sommets rejoués) : un rayon de reflet par pixel tant que le budget tient (ancienne règle)
-    bool waterOnly = true;     // urti.ini reflect_all=1 : reflets aussi sur les surfaces lisses qui ne sont pas de l'eau
-    bool reflStatsOn = false;  // urti.ini reflect_stats=1 : pixels à reflet et rayons comptés
+    bool denoiseFarSkip = true; // urti.ini denoise_far=0: denoiser on every pixel (old rule)
+    bool sunEighth = false; // urti.ini sun_eighth=1: sun map captured in eighths when sun shadows are off (test: 1.4 -> 0.6 M vertices replayed, gain not measurable)
+    uint64_t geoProbe = 2000000; // urti.ini geo_probe=: per-frame cap of the measurement area when the geometry cache is active (vertices replayed): one reflection ray per pixel while the budget holds (old rule)
+    bool waterOnly = true;     // urti.ini reflect_all=1: reflections also on smooth surfaces that are not water
+    bool reflStatsOn = false;  // urti.ini reflect_stats=1: reflecting pixels and rays counted
     ComPtr<ID3D12Resource> reflStats, reflStatsRb[3];
     uint64_t statRs[8] = {};
     uint32_t statRsFrames = 0;
-    bool slowRays = false; // urti.ini rayons_lents=1 : chaque triangle rencontré examiné (ancienne règle, pour comparer le coût)
-    // cache de radiance du monde (live_radcache, live_radhash.hlsli ; caméra du jeu connue) : table de hachage spatiale des couleurs vues à l'écran,
-    // carte du ciel et du lointain ; reflMix : par pixel de rendu, couleur déjà connue du reflet et part à lire dans l'image
-    bool radOn = true;          // urti.ini radcache=0 : couleurs apprises par objet (ancienne règle)
-    float radVoxel = 0.005f;    // urti.ini rad_voxel= : taille d'une case, en part de la distance
-    uint32_t radBits = 23;      // 2^23 cases de 16 octets (128 Mo)
+    bool slowRays = false; // urti.ini rayons_lents=1: every triangle met is examined (old rule, to compare the cost)
+    // world radiance cache (live_radcache, live_radhash.hlsli; game camera known): spatial hash table of the colours seen on screen,
+    // sky and distance map; reflMix: per render pixel, colour of the reflection already known and share to read from the image
+    bool radOn = true;          // urti.ini radcache=0: colours learned per object (old rule)
+    float radVoxel = 0.005f;    // urti.ini rad_voxel=: size of a cell, as a share of the distance
+    uint32_t radBits = 23;      // 2^23 cells of 16 bytes (128 MB)
     uint32_t radEnvSize = 512;
     ComPtr<ID3D12Resource> radHash, radEnv, reflMix, radUpload[3], radStats, radStatsRb[3];
     ComPtr<ID3D12RootSignature> radRs;
     ComPtr<ID3D12PipelineState> radPso;
-    ID3D12Resource* radParamsNow = nullptr; // réglages de l'image calculée (anneau radUpload), relus à la composition
+    ID3D12Resource* radParamsNow = nullptr; // settings of the computed frame (radUpload ring), read again at composition
     uint64_t radStamp = ~0ull, reflMixBytes = 0, radStatFrames = 0, statRad[7] = {};
-    bool reflMixValid = false;  // le dernier calcul des reflets a écrit reflMix
+    bool reflMixValid = false;  // the last reflection computation wrote reflMix
     int worldUpAxis = 2;
     float worldUpSign = 1.0f;
     LARGE_INTEGER radClock0 = {};
-    ComPtr<ID3D12Resource> reflMotion; // live_reflresolve -> live_composite : mouvement de la surface et du reflet par pixel de rendu
+    ComPtr<ID3D12Resource> reflMotion; // live_reflresolve -> live_composite: motion of the surface and of the reflection per render pixel
     uint64_t reflMotionBytes = 0, reflMotionFrame = ~0ull;
-    // stabilité du soleil : écart d'une image mesurée à la suivante
+    // sun stability: difference from one measured frame to the next
     float lastSun[3] = {};
     double sunJitterSum = 0, sunJitterMax = 0;
     uint32_t sunJitterCount = 0;
-    uint64_t capacity = 0; // sommets de la structure
-    uint32_t width = 0, height = 0, depthPitch = 0, shadowPitch = 0; // width, height : zone rendue (résolution de rendu)
-    uint32_t allocWidth = 0, allocHeight = 0; // taille de la profondeur (images allouées à cette taille)
-    float viewMax[2] = {};                    // zone de dessin du jeu mesurée (dernière fenêtre)
+    uint64_t capacity = 0; // vertices of the structure
+    uint32_t width = 0, height = 0, depthPitch = 0, shadowPitch = 0; // width, height: rendered area (render resolution)
+    uint32_t allocWidth = 0, allocHeight = 0; // size of the depth (images allocated at that size)
+    float viewMax[2] = {};                    // the game's measured viewport (last window)
     uint32_t viewLogCount = 0, viewCandidate = 0, viewStreak = 0;
-    bool renderAreaOn = true; // urti.ini render_area=0 : toute la profondeur (essai)
-    bool aoRough = false;     // urti.ini ao_rough=1 : occultation aussi sur les surfaces rugueuses (herbe), pente d'ensemble
+    bool renderAreaOn = true; // urti.ini render_area=0: the whole depth (test)
+    bool aoRough = false;     // urti.ini ao_rough=1: occlusion also on rough surfaces (grass), overall slope
     DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
     resource_view maskSrv = {};
     uint64_t frame = 0, lastFilled = 0;
-    // structure d'accélération : mise à jour (refit, plusieurs fois moins chère) tant que la liste des
-    // dessins est la même qu'à la dernière construction, reconstruite au plus tous les blasRefit images
+    // acceleration structure: updated (refit, several times cheaper) as long as the list of
+    // draws is the same as at the last build, rebuilt at least every blasRefit frames
     uint64_t blasLayout = 0;
-    // blasRefit : mises à jour de suite au plus ; 0 par défaut : dans RDR2 une seule mise à jour rendait les rayons
-    // de reflet quatorze fois plus lents (lots de végétation triés par le GPU : les triangles changent de place)
+    // blasRefit: at most this many updates in a row; 0 by default: in RDR2 a single update made reflection
+    // rays fourteen times slower (vegetation batches sorted by the GPU: triangles change places)
     uint32_t blasAge = ~0u, blasRefit = 0, statRebuilds = 0, statUpdates = 0;
     uint64_t statVertices = 0;
-    std::vector<ComPtr<ID3D12Resource>> retired[3]; // libérées trois images plus tard
+    std::vector<ComPtr<ID3D12Resource>> retired[3]; // released three frames later
     uint32_t photoIndex = 0;
-    // mémoire géométrique : sommets de l'image précédente (espace caméra de cette image-là) et, par
-    // identité d'objet, où commençait sa zone ; un point touché retrouve ainsi sa position précédente,
-    // déformations comprises (vent, animation : les sommets sont captés après le vertex shader)
+    // geometric memory: vertices of the previous frame (in that frame's camera space) and, per
+    // object identity, where its region started; a hit point thus finds its previous position,
+    // deformations included (wind, animation: vertices are captured after the vertex shader)
     ComPtr<ID3D12Resource> viewPrev, linkUpload[3], anchor[2];
     std::unordered_map<uint32_t, uint32_t> prevStart, pendingStart;
     bool prevValid = false;
-    int anchorOut = -1; // ancrage écrit à cette image (anchor[anchorOut]), l'autre est celui de la précédente
+    int anchorOut = -1; // anchoring written this frame (anchor[anchorOut]), the other is the previous frame's
     uint64_t anchorFrame = ~0ull;
-    bool anchorPrevOk = false; // l'autre tampon a bien été écrit à l'image précédente
+    bool anchorPrevOk = false; // the other buffer was indeed written on the previous frame
     uint64_t anchorBytes = 0;
-    // ancrage coupé par défaut : mesuré sur le bac à sable, il ne réduit pas le clignotement (le passage
-    // d'un filtre à l'autre selon les pixels en ajoute) ; anchor_alpha=0.1 dans urti.ini pour l'essayer
+    // anchoring off by default: measured on the sandbox, it does not reduce blinking (switching from one
+    // filter to the other depending on the pixel adds some); anchor_alpha=0.1 in urti.ini to try it
     float anchorAlpha = 0.0f, anchorGamma = 2.5f;
-    bool alphaScreen = true; // trous des plaques découpées reconnus à l'écran (urti.ini alpha_screen=0 : coupé)
-    // ombres débruitées par SIGMA de NVIDIA (urti.ini nrd=1) si l'add-on a NRD ; coupé par défaut tant qu'il ne bat pas
-    // le débruitage d'URTI sur le bac à sable (il lui manque le décalage sous-pixel du jeu, inconnu pour l'instant)
+    bool alphaScreen = true; // holes of cut-out cards recognised on screen (urti.ini alpha_screen=0: off)
+    // shadows denoised by NVIDIA's SIGMA (urti.ini nrd=1) if the add-on has NRD; off by default as long as it does not beat
+    // URTI's denoising on the sandbox (it lacks the game's sub-pixel jitter, unknown for now)
     bool nrdShadows = false;
     uint32_t statNrd = 0;
     float nrdDisocclusion = 0.01f, nrdFrames = 5.0f;
     bool jitterLog = false;
-    float fovStretch = 0; // t² mesuré par live_sunvote (étirement de la projection supposée)
-    bool fovAuto = true;  // projection corrigée par le champ de vision mesuré (urti.ini fov_auto=0 : 50° supposés)
-    bool fovReset = false; // sommes de la mesure à remettre à zéro (projection changée)
-    // champ de vision mesuré (corrigé au moins une fois, ou relu dans urti_calib.ini) : l'étalonnage ne remet plus les 50° supposés. De la v95 à la v105,
-    // chaque recherche du soleil dans Red Dead les remettait, et la correction ne repassait jamais (seuil de rotation trop haut) : URTI travaillait à 50°
-    // pour un jeu à 38°, angles faux (normale du sol, direction des reflets, forme de l'occultation : reflets « décalés »)
+    float fovStretch = 0; // t² measured by live_sunvote (stretch of the assumed projection)
+    bool fovAuto = true;  // projection corrected by the measured field of view (urti.ini fov_auto=0: assumed 50°)
+    bool fovReset = false; // the measurement's sums to reset (projection changed)
+    // measured field of view (corrected at least once, or read back from urti_calib.ini): calibration no longer puts back the assumed 50°. From v95 to v105,
+    // every sun search in Red Dead put them back, and the correction never ran again (rotation threshold too high): URTI worked at 50°
+    // for a game at 38°, wrong angles (floor normal, reflection direction, occlusion shape: "shifted" reflections)
     bool fovMeasured = false;
-    float fovK2Ref = 0; // mesure de référence (stabilité dans le temps)
-    uint64_t motLastMoveFrame = 0; // dernière image où la caméra avançait (notre mesure sur la géométrie)
+    float fovK2Ref = 0; // reference measurement (stability over time)
+    uint64_t motLastMoveFrame = 0; // last frame where the camera moved forward (our measurement on the geometry)
     uint64_t fovK2RefFrame = 0;
-    float fovStored = 0; // champ vertical relu (degrés), 0 : aucun
-    float fovForce = 0;  // fov_force= : champ vertical imposé (degrés, comparaisons), 0 : mesuré
-    uint32_t fovHold = 0;  // images à ignorer après une correction (mesures lues avec trois images de retard)
-    // part du soleil dans l'image du jeu (live_sunlight) : rapport soleil / ciel par canal (rouge, vert, bleu,
-    // luminance), lissé ; les ombres RT ne retirent que cette part (urti.ini sun_measure=0 : pente fixe)
+    float fovStored = 0; // vertical field read back (degrees), 0: none
+    float fovForce = 0;  // fov_force=: imposed vertical field (degrees, comparisons), 0: measured
+    uint32_t fovHold = 0;  // frames to ignore after a correction (measurements read three frames late)
+    // sun share in the game's image (live_sunlight): sun / sky ratio per channel (red, green, blue,
+    // luminance), smoothed; RT shadows remove only that share (urti.ini sun_measure=0: fixed slope)
     bool sunMeasure = true;
-    uint32_t gameDilate = 1; // urti.ini game_dilate= : voisinage lu dans la carte du jeu (rayon en texels)
+    uint32_t gameDilate = 1; // urti.ini game_dilate=: neighbourhood read in the game's map (radius in texels)
     bool gameMin = true;
-    float aoAmount = 0.8f, aoRadius = 1.5f; // occultation ambiante RT (urti.ini ao=, ao_radius= ; ao=0 : coupée)
-    // ombres du soleil RT : coupées par défaut (urti.ini shadows=1) : dans RDR2, ses ombres déjà excellentes n'en
-    // laissent presque aucune à ajouter (rafale au soleil : 0,0 % de l'image changé pour 3,2 ms par image)
+    float aoAmount = 0.8f, aoRadius = 1.5f; // RT ambient occlusion (urti.ini ao=, ao_radius=; ao=0: off)
+    // RT sun shadows: off by default (urti.ini shadows=1): in RDR2, its already excellent shadows leave
+    // almost none to add (burst in the sun: 0.0 % of the image changed for 3.2 ms per frame)
     bool sunShadows = false;
-    bool aoQuarter = true; // urti.ini ao_quarter=0 : occultation calculée sur chaque pixel à chaque image
-    // rayons d'occultation par pixel calculé (au quart), de 2 à 4, réglés toutes les 30 images sur le temps mesuré
-    // de la passe des ombres (urti.ini ao_ms=, 0 : toujours 4)
+    bool aoQuarter = true; // urti.ini ao_quarter=0: occlusion computed on every pixel every frame
+    // occlusion rays per computed pixel (quarter rate), from 2 to 4, tuned every 30 frames on the measured time
+    // of the shadow pass (urti.ini ao_ms=, 0: always 4)
     float aoTarget = 4.0f;
     uint32_t aoRays = 4;
     double shadowMs = 0;
-    // budget de géométrie réglé sur le coût mesuré de la reconstruction (urti.ini build_ms=, 0 : budget fixe) :
-    // au-dessus de la cible, il baisse (les objets de plus petite taille apparente sortent d'abord), en dessous
-    // il remonte jusqu'à vertex_budget
+    // geometry budget driven by the measured rebuild cost (urti.ini build_ms=, 0: fixed budget):
+    // above the target, it drops (objects with the smallest apparent size leave first), below it
+    // rises again up to vertex_budget
     float buildTarget = 2.5f;
-    uint64_t budgetMax = 6000000;     // urti.ini game_min=0 : ombre du jeu élargie (tout ou rien) et produit des visibilités
+    uint64_t budgetMax = 6000000;     // urti.ini game_min=0: game shadow widened (all or nothing) and product of visibilities
     float sunSky[4] = { 2.2f, 2.2f, 2.2f, 2.2f };
     uint32_t sunSkyFrames = 0, sunSkyLogged = 0;
     bool sunWeakLogged = false;
     uint64_t sunSkyPairs = 0, atlasFrame = ~0ull;
-    uint64_t mapCheck[6] = {}; // contrôle de la carte du jeu : points éclairés, à l'ombre, au bord, hors des cascades ; luminances (× 1024)
-    uint64_t depthHist[16] = {}, gapHist[16] = {}; // profondeur des points dans la cascade, écart carte - point
+    uint64_t mapCheck[6] = {}; // check of the game's map: lit points, shadowed, on the edge, outside the cascades; luminances (× 1024)
+    uint64_t depthHist[16] = {}, gapHist[16] = {}; // depth of the points in the cascade, map - point difference
     ComPtr<ID3D12RootSignature> sunlightRs;
     ComPtr<ID3D12PipelineState> sunlightPso;
-    uint32_t jitterMode = 2; // décalage sous-pixel du jeu compensé : 0 non, 1 écart d'une image à l'autre, 2 aussi l'absolu // SIGMA : seuil de disocclusion, images stabilisees
+    uint32_t jitterMode = 2; // the game's sub-pixel jitter compensated: 0 no, 1 frame-to-frame difference, 2 the absolute value too // SIGMA: disocclusion threshold, stabilised frames
     uint64_t boundFrame = 0;
 
-    // suivi du soleil à chaque image
+    // sun tracking every frame
     bool forceCalibration = false, sunDirty = false;
-    int iniCombine = -1; // urti.ini combine= : 0 ou 1 impose le mode ; -1 : menu de ReShade (UrtiMode)
-    std::atomic<bool> overlayOpen{ false }; // menu de ReShade ouvert : pas de passe RT (le menu doit rester visible)
-    uint32_t shadowRays = 4;                // urti.ini shadow_rays= (1 à 4)
-    // minutage GPU par étape (horodatages), moyenné sur 300 images
+    int iniCombine = -1; // urti.ini combine=: 0 or 1 imposes the mode; -1: ReShade menu (UrtiMode)
+    std::atomic<bool> overlayOpen{ false }; // ReShade menu open: no RT pass (the menu must stay visible)
+    uint32_t shadowRays = 4;                // urti.ini shadow_rays= (1 to 4)
+    // GPU timing per step (timestamps), averaged over 300 frames
     ComPtr<ID3D12QueryHeap> timeHeap;
     ComPtr<ID3D12Resource> timeReadback[3];
     double timeSum[8] = {};
-    // minutage détaillé (journal « GPU détail ») : calcul, repères 0 à 11 (une fois par calcul) ; composition, repères 12 à 17 (à chaque
-    // présentation, son propre compteur)
+    // detailed timing ("GPU detail" log): computation, markers 0 to 11 (once per computation); composition, markers 12 to 17 (on every
+    // present, its own counter)
     static constexpr uint32_t kTimeD = 24;
     ComPtr<ID3D12QueryHeap> timeDHeap;
     ComPtr<ID3D12Resource> timeDRb[3], timeCRb[3];
@@ -420,106 +420,106 @@ struct LiveState
     uint32_t timeDFrames = 0, timeCFrames = 0;
     uint64_t compCounter = 0;
     uint32_t timeFrames = 0;
-    uint32_t lastPresentDraws = 1; // dessins du jeu exécutés avant cette présentation (0 : rien de neuf à calculer)
-    int lastMainSlot = -2;         // écran principal de la dernière image calculée (journal quand il change)
+    uint32_t lastPresentDraws = 1; // game draws executed before this present (0: nothing new to compute)
+    int lastMainSlot = -2;         // main screen of the last computed frame (logged when it changes)
     uint32_t lastDrawsThisFrame = 0;
-    // présentations récentes où le jeu avait dessiné dans l'image présentée (bit 0 : celle-ci) ; image présentée
-    // fabriquée par la génération d'images (pas par le jeu)
-    uint32_t backBufferDrawn = 0, presentNoDraw = 0; // et présentations récentes sans dessin du jeu exécuté
+    // recent presents where the game had drawn into the presented image (bit 0: this one); presented image
+    // made by frame generation (not by the game)
+    uint32_t backBufferDrawn = 0, presentNoDraw = 0; // and recent presents without any game draw executed
     bool imageGenerated = false;
-    // reflets : matériau du G-buffer copié à chaque image, rayons réfléchis
+    // reflections: G-buffer material copied every frame, reflected rays
     ComPtr<ID3D12RootSignature> reflectRs, depthfitRs;
     ComPtr<ID3D12PipelineState> reflectPso, depthfitPso;
     ComPtr<ID3D12Resource> materialBuf, reflectBuf;
     uint64_t materialBytes = 0, materialFrame = ~0ull, reflectBytes = 0;
     uint32_t materialPitch = 0, materialWidth = 0, materialHeight = 0, materialFormat = 0;
-    bool materialAfterCompute = false; // la cible de matériau est finie par une écriture en calcul
+    bool materialAfterCompute = false; // the material target is finished by a compute write
     float reflStrength = 1.0f, smoothMin = 0.5f, f0 = 0.04f, reflEffective = 1.0f;
     uint32_t reflChannel = 1, reflInvert = 0, debugReflect = 0, materialSlot = 2, reflEverywhere = 0;
-    // cache de surfaces (live_surfcache) : couleur vue à l'écran de chaque triangle de la scène RT, pour les
-    // reflets qui touchent un objet caché ou hors de l'écran (urti.ini surf_cache=0 : coupé)
+    // surface cache (live_surfcache): colour seen on screen of each triangle of the RT scene, for
+    // reflections hitting a hidden or off-screen object (urti.ini surf_cache=0: off)
     ComPtr<ID3D12RootSignature> surfRs;
     ComPtr<ID3D12PipelineState> surfPso;
     ComPtr<ID3D12Resource> surfCache;
-    uint64_t surfTriangles = 0, surfFilled = 0; // triangles tenus ; images où le cache a été rempli
+    uint64_t surfTriangles = 0, surfFilled = 0; // triangles held; frames where the cache was filled
     bool surfCacheOn = true;
-    // scène RT de cette image, pour le remplissage du cache à la composition : table des zones (tampon
-    // d'envoi tournant sur trois images), nombre de zones, image où elle a servi
+    // RT scene of this frame, for filling the cache at composition: region table (upload buffer
+    // rotating over three frames), number of regions, frame where it was used
     ID3D12Resource* sceneTable = nullptr;
     uint32_t sceneCount = 0;
-    ComPtr<ID3D12Resource> sceneGpu; // la table copiée en mémoire vidéo à chaque image (lue en SRV jusqu'à la suivante)
+    ComPtr<ID3D12Resource> sceneGpu; // the table copied into video memory every frame (read as an SRV until the next)
     bool sceneGpuReadable = false;
-    // rebond de lumière (éclairage indirect, urti.ini gi=, 0 : coupé) : couleur des surfaces touchées par les rayons
-    // d'occultation, tirée du cache de surfaces ; trois plans R, G, B à la résolution de rendu : brut (live_shadow),
-    // débruité (live_shadowtemporal), précédent (historique). Reçu selon la couleur propre des surfaces (albedo du
-    // G-buffer, copiée à chaque image)
+    // light bounce (indirect lighting, urti.ini gi=, 0: off): colour of the surfaces hit by the occlusion
+    // rays, taken from the surface cache; three planes R, G, B at render resolution: raw (live_shadow),
+    // denoised (live_shadowtemporal), previous (history). Received according to the surfaces' own colour (G-buffer
+    // albedo, copied every frame)
     float giStrength = 1.0f;
-    // cases et curseurs du menu de ReShade (urti.fx), relus à chaque présentation : multiplient les réglages d'urti.ini
+    // ReShade menu checkboxes and sliders (urti.fx), read on every present: they multiply the urti.ini settings
     bool menuRefl = true, menuAo = true, menuGi = true;
-    float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (portée 0 : celle d'urti.ini)
+    float menuAoForce = 1.0f, menuAoRadius = 0.0f, menuGiForce = 1.0f; // (range 0: urti.ini's)
     float menuSky = 1.0f;                                               // (multiplie ao_sky=)
-    bool menuGloss = true; // case « reflets sur les sols brillants proches »
+    bool menuGloss = true; // "reflections on close glossy floors" checkbox
     bool aoMotionFull = true;
     bool denoiseDual = true;
     bool aoIgn = true;
-    bool aoSunRay = true; // ao_sunray= : visibilité du soleil par un rayon RT pour l'occultation (bit 28), au lieu de la carte d'ombres du jeu // ao_ign= : directions des rayons d'occultation à faible discrépance (bit 27 des drapeaux de live_shadow) // denoise_dual= : double historique (rapide + lent) dans le débruiteur de l'occultation // ao_motion= : pixels en mouvement calculés à chaque image (0 : au quart comme avant)
-    float glossMin = 0.0f, glossAmount = 1.0f;                          // reflets brillants (gloss_min=, gloss=) : lissé minimal (0 : coupés), force
-    float skyAmount = 0.7f, skyRange = 16.0f;                           // visibilité du ciel à grande portée (ao_sky=, ao_sky_range=)
-    bool personMask = true;     // urti.ini person_mask= : alpha de la normale du G-buffer = personnages (RDR2) ; 0 : pas de repère
+    bool aoSunRay = true; // ao_sunray=: sun visibility through an RT ray for occlusion (bit 28), instead of the game's shadow map // ao_ign=: low-discrepancy occlusion ray directions (bit 27 of live_shadow's flags) // denoise_dual=: dual history (fast + slow) in the occlusion denoiser // ao_motion=: moving pixels computed every frame (0: quarter rate as before)
+    float glossMin = 0.0f, glossAmount = 1.0f;                          // glossy reflections (gloss_min=, gloss=): minimum smoothness (0: off), strength
+    float skyAmount = 0.7f, skyRange = 16.0f;                           // long-range sky visibility (ao_sky=, ao_sky_range=)
+    bool personMask = true;     // urti.ini person_mask=: alpha of the G-buffer normal = characters (RDR2); 0: no marker
     ComPtr<ID3D12Resource> giRaw, giBuf, giPrev;
-    bool giValid = false;       // giBuf écrit à la dernière image (sinon pas d'historique, pas de pose)
+    bool giValid = false;       // giBuf written on the last frame (otherwise no history, no composition)
     uint64_t giStamp = ~0ull;
     ComPtr<ID3D12Resource> albedoBuf;
     uint64_t albedoBytes = 0, albedoFrame = ~0ull;
     uint32_t albedoPitch = 0, albedoWidth = 0, albedoHeight = 0, albedoFormat = 0;
-    // normale du G-buffer (cible 1) ; son alpha repère les personnages (RDR2), qui ne reçoivent pas le rebond : ils
-    // bougent, leur historique est rejeté à chaque image et le rebond, plus bruité que l'occultation, y tremblait
+    // G-buffer normal (target 1); its alpha marks characters (RDR2), who do not receive the bounce: they
+    // move, their history is rejected every frame and the bounce, noisier than the occlusion, shook on them
     ComPtr<ID3D12Resource> normalBuf;
     uint64_t normalBytes = 0, normalFrame = ~0ull;
     uint32_t normalPitch = 0, normalWidth = 0, normalHeight = 0, normalFormat = 0;
     uint64_t sceneStamp = ~0ull;
-    uint64_t maskFrame = ~0ull;    // image où le masque d'ombres a été calculé (sinon il ne suit plus la caméra)
+    uint64_t maskFrame = ~0ull;    // frame where the shadow mask was computed (otherwise it no longer follows the camera)
     int lastMode = -1;
     float lastStrength = -1;
     bool lastSplit = false, lastShowMask = false, lastTechnique = true, iniMaskSet = false;
-    std::atomic<bool> toggleSplit{ false }; // F5 : écran partagé (gauche jeu seul, droite avec ombres RT)
-    float sunSign = 1; // sens du soleil par rapport à la profondeur des cartes (convention du jeu)
+    std::atomic<bool> toggleSplit{ false }; // F5: split screen (left game alone, right with URTI)
+    float sunSign = 1; // sun orientation relative to the maps' depth (the game's convention)
     uint32_t missedCalibrations = 0;
     ComPtr<ID3D12RootSignature> fitRs, voteRs;
     ComPtr<ID3D12PipelineState> fitPso, votePso;
     ComPtr<ID3D12Resource> pairsUpload[3], pairDirs, sunBuf, sunUpload, sunReadback[3];
-    ComPtr<ID3D12Resource> regionUpload[3]; // table des zones de l'écran pour le GPU (par image)
-    // places fixes (g_livePersist) : table de toutes les places tenues, comptes de sommets gardés d'une image à
-    // l'autre (8 octets par place), paires (compteur de l'image, case de compte) des dessins de l'image
+    ComPtr<ID3D12Resource> regionUpload[3]; // table of the screen's regions for the GPU (per frame)
+    // fixed places (g_livePersist): table of all held places, vertex counts kept from one frame to
+    // the next (8 bytes per place), pairs (frame counter, count cell) of the frame's draws
     ComPtr<ID3D12Resource> placeUpload[3], srcUpload[3], fitUpload[3];
-    std::unordered_map<uint32_t, uint32_t> idMesh; // identité d'un exemplaire -> son maillage (budget par maillage)
+    std::unordered_map<uint32_t, uint32_t> idMesh; // identity of a copy -> its mesh (budget per mesh)
     ComPtr<ID3D12RootSignature> countsRs;
     ComPtr<ID3D12PipelineState> countsPso;
-    uint32_t blasConverted = 0; // sommets de la dernière construction complète (mise à jour : même nombre)
-    // places redistribuées à la fin de l'image précédente, ou beaucoup de nouvelles dans celle-ci : les triangles
-    // ne sont plus là où la structure les attend, une mise à jour la rendrait très lente (v58 : 4,5 i/s) ;
-    // reconstruction complète
+    uint32_t blasConverted = 0; // vertices of the last full build (update: same count)
+    // places redistributed at the end of the previous frame, or many new ones in this one: the triangles
+    // are no longer where the structure expects them, an update would make it very slow (v58: 4.5 fps);
+    // full rebuild
     bool placesMoved = false, placesResetPending = false;
-    // mise à jour ou reconstruction, au coût mesuré (chronomètres du GPU lus trois images plus tard) : une mise à
-    // jour coûte moins cher que la reconstruction, mais ralentit les rayons ; dès que leur ralentissement
-    // cumulé depuis la dernière reconstruction dépasse ce qu'elle épargne, la structure est reconstruite
+    // update or rebuild, on measured cost (GPU timers read three frames later): an update
+    // costs less than a rebuild, but slows rays down; as soon as their slowdown
+    // accumulated since the last rebuild exceeds what it saves, the structure is rebuilt
     uint32_t buildCycle = 0, slotCycle[3] = {};
     bool slotRefit[3] = {}, slotBuilt[3] = {};
     double rebuildMs = 2.0, refitMs = 0.5, traceBase = -1.0, refitExtra = 0.0;
     uint64_t statCycles = 0;
     uint64_t statPlaces = 0, statPlaceHeld = 0, statPlaceHigh = 0, statPlaceNew = 0, statPlaceFrames = 0, statPlaceResets = 0;
-    ComPtr<ID3D12Resource> atlasBuf; // copie de la carte d'ombres du jeu, pour recalculer son ombre
-    // application à l'image présentée (toutes les présentations, images générées comprises)
+    ComPtr<ID3D12Resource> atlasBuf; // copy of the game's shadow map, to recompute its shadow
+    // applied to the presented image (every present, generated frames included)
     ComPtr<ID3D12RootSignature> compositeRs;
     ComPtr<ID3D12PipelineState> compositePso;
     ComPtr<ID3D12Resource> imageIn, imageOut;
     uint64_t imageBytes = 0;
-    // bilan par 300 présentations : sans dessin du jeu, effets de ReShade, ombres appliquées
+    // summary per 300 presents: without game draws, ReShade effects, shadows applied
     uint32_t statPresents = 0, statNoDraw = 0, statEffects = 0, statComposited = 0;
-    uint32_t statNoDepth = 0, statMaskOld = 0, statGapMax = 0; // calculs sans profondeur, présentations au masque trop vieux, plus long écart entre deux calculs
-    uint32_t statSkipOverlay = 0, statSkipTechnique = 0; // présentations sans effet : menu de ReShade ouvert, effet coupé dans ReShade
-    // tampons retirés, détruits bien plus tard ; signal de la file des présentations, attente quand un tampon en anneau (frame % 3) est
-    // repris alors que le GPU ne l'a pas encore lu
+    uint32_t statNoDepth = 0, statMaskOld = 0, statGapMax = 0; // computations without depth, presents with a mask too old, longest gap between two computations
+    uint32_t statSkipOverlay = 0, statSkipTechnique = 0; // presents without effect: ReShade menu open, effect off in ReShade
+    // retired buffers, destroyed much later; present-queue fence, wait when a ring buffer (frame % 3) is
+    // reused while the GPU has not read it yet
     struct RetiredBuffer
     {
         uint64_t frame = 0;
@@ -530,88 +530,88 @@ struct LiveState
     HANDLE slotEvent = nullptr;
     uint64_t slotFenceValue = 0, slotDone[3] = {};
     uint32_t statSlotWaits = 0;
-    // décalage sous-pixel de la dernière image (cisaillement de l'espace caméra, caméra du jeu)
+    // sub-pixel jitter of the last frame (shear of camera space, game camera)
     float camShear[2] = {};
     ComPtr<ID3D12Resource> jitUpload[3];
-    // stabilité de la scène RT : image où chaque maillage en est sorti, tour de chaque maillage énorme
+    // RT scene stability: frame where each mesh left it, round of each huge mesh
     std::unordered_map<uint32_t, uint64_t> meshLeft;
     std::unordered_map<uint32_t, uint32_t> meshPhase;
-    // une image du jeu à la fois : copies de la profondeur faites dans les listes du jeu (mémoire vidéo, état commun : passent d'une
-    // file à l'autre sans barrière), dernière vue, calcul de cette présentation
+    // one game frame at a time: depth copies made inside the game's lists (video memory, common state: they move from one
+    // queue to the other without a barrier), last view, computation of this present
     static constexpr uint32_t kDepthSnaps = 12;
     bool frameSync = false, syncNow = false, presentComputed = false;
     ComPtr<ID3D12Resource> depthSnap[kDepthSnaps];
     uint64_t depthSnapBytes = 0, snapSerialSeen = 0, snapSerialUsed = 0, snapSeenFrame = 0;
     uint32_t depthSnapPitch = 0, depthSnapWidth = 0, depthSnapHeight = 0;
     int32_t snapIndexNow = -1;
-    // copies de l'image de matériau (même principe), celle de ce calcul
+    // copies of the material image (same principle), the one of this computation
     static constexpr uint32_t kMaterialSnaps = 4;
     ComPtr<ID3D12Resource> materialSnap[kMaterialSnaps];
-    // normales du G-buffer (gnormal_slot=, gnormal=) : anneau des copies comme le matériau (avec frame_sync), sinon une copie ; comparaison (journal)
+    // G-buffer normals (gnormal_slot=, gnormal=): ring of copies like the material (with frame_sync), otherwise one copy; comparison (log)
     ComPtr<ID3D12Resource> gnSnap[kMaterialSnaps], gnBuf, gnStats, gnStatsRb;
     uint64_t gnBytes = 0, gnFrame = ~0ull;
     uint32_t gnPitch = 0, gnWidth = 0, gnHeight = 0, gnFormat = 0;
     int gnSlot = -1;
     uint32_t gnMode = 0, gnSigns = 0;
     bool gnUse = false, gnCompare = true, gnReflect = true;
-    ID3D12Resource* gnNowFrame = nullptr; // copie des normales de l'image en cours (lue par les ombres puis les reflets)
+    ID3D12Resource* gnNowFrame = nullptr; // copy of the current frame's normals (read by the shadows, then the reflections)
     ComPtr<ID3D12RootSignature> rotfitRs;
     ComPtr<ID3D12PipelineState> rotfitPso;
     uint32_t rotLogFrames = 0;
     double rotSum[4] = {};
     int32_t materialIndexNow = -1;
     uint32_t statMaterialWait = 0, statMaterialLate = 0, statFramesSkipped = 0;
-    // axe vertical du monde (d'après la caméra), et ce même axe dans l'espace caméra de cette image : la normale de l'eau
+    // world vertical axis (from the camera), and the same axis in this frame's camera space: the water's normal
     double camUpScore[3] = {};
     float worldUp[3] = {};
     bool worldUpKnown = false, reflectUp = true;
     uint32_t statSnapUsed = 0, statSnapFallback = 0;
-    // urti.ini frame_trace=1 : une ligne par présentation, et une rangée de profondeur et de masque par calcul
+    // urti.ini frame_trace=1: one line per present, and a row of depth and mask per computation
     bool frameTrace = false;
     ComPtr<ID3D12Resource> traceRb[3];
     uint64_t traceFrame[3] = { ~0ull, ~0ull, ~0ull };
     uint32_t traceWidth[3] = {};
-    // rechargement à chaud : réglages (urti.ini) et shaders (urti_shaders\*.cso), sans relancer le jeu
+    // hot reload: settings (urti.ini) and shaders (urti_shaders\*.cso), without restarting the game
     FILETIME iniTime = {}, shaderTime[7] = {};
     std::vector<ComPtr<ID3D12PipelineState>> retiredPso[3];
     uint64_t atlasBytes = 0;
     uint32_t atlasPitch = 0;
-    bool atlasD24 = false, atlas16 = false; // carte d'ombres du jeu en D24, en 16 bits (RDR2 : R16, deux octets par texel)
+    bool atlasD24 = false, atlas16 = false; // the game's shadow map in D24, in 16 bits (RDR2: R16, two bytes per texel)
     uint64_t framesSinceSun = 0, sunFrames = 0, sunAccepted = 0, pairSum = 0;
     uint32_t rotationValid = 0;
     double rotationSum = 0;
 } live;
 std::mutex g_liveRetireMutex;
 constexpr uint32_t kLiveMaxPairs = 256;
-// soleil, bilan, cascades (48 + 64 k), soleil en attente (560), rotation de la caméra (576), cascades de
-// l'image précédente (640)
-constexpr uint32_t kLiveMaxMotionPairs = 32768; // paires de sommets pour le mouvement de la caméra (live_camfit)
-constexpr uint32_t kLiveSunBytes = 2176; // + suivi du décalage sous-pixel du jeu (1168 à 1199), étirement de la projection (1200 à 1223),
-                                                             // part du soleil dans l'image (1232 : paires, 1248 : histogrammes, 1888 à 2047 : contrôle, live_sunlight)
+// sun, summary, cascades (48 + 64 k), pending sun (560), camera rotation (576), cascades of
+// the previous frame (640)
+constexpr uint32_t kLiveMaxMotionPairs = 32768; // vertex pairs for the camera motion (live_camfit)
+constexpr uint32_t kLiveSunBytes = 2176; // + tracking of the game's sub-pixel jitter (1168 to 1199), stretch of the projection (1200 to 1223),
+                                                             // sun share in the image (1232: pairs, 1248: histograms, 1888 to 2047: check, live_sunlight)
 
 // ------------------------------------------------------------------------------------------------
-// étalonnage stocké : loi de profondeur, convention de la carte d'ombres, description de cette carte
+// stored calibration: depth law, shadow-map convention, description of that map
 // ------------------------------------------------------------------------------------------------
 
 void LiveSaveCalibration()
 {
-    // loi de profondeur invalide : rien n'est écrit (relue au lancement, une loi NaN rendait chaque point de l'écran
-    // invalide : plus d'occultation ni de reflet dans Horizon Forbidden West, jusqu'à la mesure de l'image)
+    // invalid depth law: nothing is written (read back at launch, a NaN law made every screen point
+    // invalid: no more occlusion or reflection in a game we tested, until the frame's measurement)
     if (!std::isfinite(live.A) || !std::isfinite(live.B) || live.B == 0)
         return;
     if (FILE* f = std::fopen((g_dir + "\\urti_calib.ini").c_str(), "w"))
     {
-        std::fprintf(f, "; étalonnage URTI de ce jeu (relu au lancement ; F6 le refait)\n");
+        std::fprintf(f, "; URTI calibration for this game (read back at launch; F6 redoes it)\n");
         std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\nmotion_target=%u\nmotion_source=%s\n", live.A, live.B,
                      live.sunSign > 0 ? 1 : -1, live.sunMapWidth, live.sunMapHeight, live.sunMapFormat, live.mvSynthetic ? 255u : live.mvConvention,
                      live.mvCandidate, live.mvSynthetic ? "camera" : "jeu");
         if (live.fovMeasured && live.p11 > 0 && !live.camLive)
-            std::fprintf(f, "fov_v=%.2f\n", 2.0f * std::atan(1.0f / live.p11) * 57.2957795f); // champ de vision vertical mesuré (degrés)
+            std::fprintf(f, "fov_v=%.2f\n", 2.0f * std::atan(1.0f / live.p11) * 57.2957795f); // measured vertical field of view (degrees)
         std::fclose(f);
     }
 }
 
-// projection supposée (champ de vision arbitraire, comme Calibrate) pour le rapport largeur / hauteur
+// assumed projection (arbitrary field of view, like Calibrate) for the width / height ratio
 void LiveSetProjection(const D3D12_RESOURCE_DESC& depthDesc)
 {
     const bool stored = live.fovStored >= 15.0f && live.fovStored <= 80.0f;
@@ -622,7 +622,7 @@ void LiveSetProjection(const D3D12_RESOURCE_DESC& depthDesc)
         live.fovMeasured = true;
 }
 
-// à la première présentation : étalonnage relu ; la carte d'ombres sera reconnue à sa description
+// on the first present: calibration read back; the shadow map will be recognised by its description
 void LiveLoadCalibration()
 {
     if (live.storeLoaded)
@@ -650,21 +650,21 @@ void LiveLoadCalibration()
     std::fclose(f);
     if (b == 0 || !std::isfinite(a) || !std::isfinite(b) || !sign || !w)
         return;
-    live.p00 = 0; // fixée à la première profondeur (rapport largeur / hauteur)
+    live.p00 = 0; // set at the first depth (width / height ratio)
     live.A = float(a), live.B = float(b), g.depthReversed = b > 0, live.sunSign = float(sign);
     live.sunMapWidth = w, live.sunMapHeight = h, live.sunMapFormat = fmt;
     live.depthReady = live.calibrated = live.fromStore = true;
-    live.framesSinceSun = 1000; // pas d'ombres avant la première mesure du soleil (quelques images)
+    live.framesSinceSun = 1000; // no shadows before the first sun measurement (a few frames)
     g_liveSunMapDesc[0] = w, g_liveSunMapDesc[1] = h, g_liveSunMapDesc[2] = fmt;
-    Log("URTI direct : étalonnage stocké relu (profondeur = %.6f + %.6f / w, carte d'ombres %ux%u format %u) : ombres dès la première image",
+    Log("URTI live: stored calibration read back (depth = %.6f + %.6f / w, shadow map %ux%u format %u): effects from the first frame",
         a, b, w, h, fmt);
 }
 
 // ------------------------------------------------------------------------------------------------
-// étalonnage : direction du soleil (cartes d'ombres) et loi de profondeur, sur le processeur
+// calibration: sun direction (shadow maps) and depth law, on the CPU
 // ------------------------------------------------------------------------------------------------
 
-// moindres carrés S ≈ X M (X : n × 4, S : n × 3) par les équations normales ; faux si mal conditionné
+// least squares S ≈ X M (X: n × 4, S: n × 3) through the normal equations; false if ill-conditioned
 bool SolveAffine(const std::vector<double>& X, const std::vector<double>& S, size_t n, double M[4][3])
 {
     double N[4][4] = {}, R[4][3] = {};
@@ -676,7 +676,7 @@ bool SolveAffine(const std::vector<double>& X, const std::vector<double>& S, siz
             for (int c = 0; c < 3; c++)
                 R[a][c] += X[i * 4 + a] * S[i * 3 + c];
         }
-    for (int col = 0; col < 4; col++) // Gauss avec pivot partiel
+    for (int col = 0; col < 4; col++) // Gauss with partial pivoting
     {
         int p = col;
         for (int r = col + 1; r < 4; r++)
@@ -705,21 +705,21 @@ bool SolveAffine(const std::vector<double>& X, const std::vector<double>& S, siz
     return true;
 }
 
-// À partir d'une capture lue (sommets de tous les flux, bornes des dessins) : soleil et profondeur.
+// From a captured file (vertices of every stream, bounds of the draws): sun and depth.
 void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* marks)
 {
     const int mainSlot = g.captureSlot;
     if (mainSlot < 0)
     {
-        live.missedCalibrations++; // (pas d'écran : la prochaine recherche plus tard)
+        live.missedCalibrations++; // (no screen: the next search later)
         return;
     }
-    const float fov = 50.0f * 3.14159265f / 180.0f; // valeur arbitraire : les ombres n'en dépendent pas
+    const float fov = 50.0f * 3.14159265f / 180.0f; // arbitrary value: shadows do not depend on it
     const float aspect = g.depthDesc.Height ? float(g.depthDesc.Width) / float(g.depthDesc.Height) : 16.0f / 9.0f;
     const float p11 = 1.0f / std::tan(fov * 0.5f), p00 = p11 / aspect;
     auto vertex = [&](int slot, uint64_t byteOffset) { return reinterpret_cast<const float*>(so + slot * kSlotBytes + byteOffset); };
 
-    // loi de profondeur : z de découpage = A w + B, ajustée sur les sommets de l'écran
+    // depth law: clip z = A w + B, fitted on the screen's vertices
     double sw = 0, sz = 0, sww = 0, swz = 0, n = 0;
     const uint64_t mainBytes = std::min<uint64_t>(counters[mainSlot * 2], kSlotBytes);
     const uint64_t sampleStep = 16 * std::max<uint64_t>(1, mainBytes / 16 / 20000);
@@ -731,24 +731,24 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     }
     if (n < 30)
     {
-        Log("URTI direct : étalonnage impossible (%u sommets sur la profondeur de l'écran)", unsigned(n));
+        Log("URTI live: calibration impossible (%u vertices on the screen depth)", unsigned(n));
         return;
     }
     const double A = (n * swz - sw * sz) / (n * sww - sw * sw), B = (sz - A * sw) / n;
     if (!std::isfinite(A) || !std::isfinite(B) || B == 0)
     {
-        Log("URTI direct : étalonnage impossible (loi de profondeur dégénérée)");
+        Log("URTI live: calibration impossible (degenerate depth law)");
         return;
     }
     if (!live.depthReady)
-        Log("URTI direct : loi de profondeur = %.6f + %.6f / w (reflets possibles même sans soleil)", A, B);
+        Log("URTI live: depth law = %.6f + %.6f / w (reflections possible even without a sun)", A, B);
     live.A = float(A), live.B = float(B);
-    if (!live.fovMeasured || live.p11 <= 0) // (champ de vision mesuré : gardé ; celui de l'étalonnage est arbitraire, 50°)
+    if (!live.fovMeasured || live.p11 <= 0) // (measured field of view: kept; the calibration's is arbitrary, 50°)
         live.p00 = p00, live.p11 = p11;
     g.depthReversed = B > 0;
     live.depthReady = true;
 
-    // soleil : pour chaque carte d'ombres, une direction par paire de dessins, puis vote
+    // sun: for each shadow map, one direction per pair of draws, then a vote
     struct Dir { double d[3]; double w; };
     double bestSun[3] = { 0, 1, 0 }, bestScore = 0;
     uint32_t bestSlot = 0;
@@ -768,7 +768,7 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
             if (g.draws[d].slot == s && marks[d * 2 + 1] > marks[d * 2])
                 theirs[key(g.draws[d], marks[d * 2 + 1] - marks[d * 2])].push_back(d);
         std::vector<double> X, S;
-        std::unordered_map<uint64_t, uint32_t> rank; // rang du dessin parmi ceux de même signature
+        std::unordered_map<uint64_t, uint32_t> rank; // rank of the draw among those with the same signature
         for (uint32_t d = 0; d < g.captureDrawCount && dirs.size() < 4000; d++)
         {
             if (g.draws[d].slot != uint32_t(mainSlot) || marks[d * 2 + 1] <= marks[d * 2])
@@ -797,7 +797,7 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
                 double M[4][3];
                 if (k < 24 || !SolveAffine(X, S, k, M))
                     continue;
-                // ajustement fidèle ? (sinon autre objet, ou animé)
+                // faithful fit? (otherwise another object, or animated)
                 std::vector<double> res(k);
                 double lo[3] = { 1e30, 1e30, 1e30 }, hi[3] = { -1e30, -1e30, -1e30 };
                 for (size_t i = 0; i < k; i++)
@@ -817,22 +817,22 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
                 const double scale = std::max({ hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2] }) + 1e-12;
                 if (res[k / 2] > 1e-3 * scale)
                     continue;
-                // d tel que A d = (0, 0, 1), A = M[0..2]ᵀ : la direction de la profondeur de la carte
+                // d such that A d = (0, 0, 1), A = M[0..2]ᵀ: the direction of the map's depth
                 const double a[3][3] = { { M[0][0], M[1][0], M[2][0] }, { M[0][1], M[1][1], M[2][1] }, { M[0][2], M[1][2], M[2][2] } };
                 const double det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
                                    a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
                 if (std::fabs(det) < 1e-18)
                     continue;
-                // troisième colonne de l'inverse : cofacteurs de la troisième ligne
+                // third column of the inverse: cofactors of the third row
                 const double dx = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) / det;
                 const double dy = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) / det;
                 const double dz = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) / det;
                 const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
-                // même rang dans les deux passes : très probablement le même objet (maillages répétés)
+                // same rank in both passes: very probably the same object (repeated meshes)
                 dirs.push_back({ { -dx / len, -dy / len, -dz / len }, double(k) * (m == myRank ? 8.0 : 1.0) });
             }
         }
-        // direction (au signe près) sur laquelle s'accordent le plus de sommets, à 2°
+        // direction (up to sign) on which the most vertices agree, within 2°
         const double cosTol = std::cos(2.0 * 3.14159265 / 180.0);
         double slotBest = 0;
         size_t bestIndex = 0;
@@ -856,9 +856,9 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
                     sum[q] += (c > 0 ? 1 : -1) * o.d[q] * o.w;
         }
         const double len = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
-        // vue verticale (pluie, occlusion) : pas le soleil ; vue dans l'axe de la caméra (profondeur réduite de l'écran pour l'élimination des objets
-        // cachés, 1024 × 1024 dans Red Dead) : pas le soleil non plus. Un étalonnage de Red Dead l'avait prise (soleil (0,002 0,059 0,998)) et l'avait
-        // enregistrée : plus aucun soleil suivi depuis
+        // vertical view (rain, occlusion): not the sun; view along the camera's axis (reduced screen depth for culling hidden
+        // objects, 1024 × 1024 in Red Dead): not the sun either. A Red Dead calibration had taken it (sun (0.002 0.059 0.998)) and had
+        // stored it: no sun tracked since
         if (len <= 0 || std::fabs(sum[1] / len) > 0.995 || std::fabs(sum[2] / len) > 0.97)
             continue;
         bestScore = slotBest;
@@ -868,22 +868,22 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     }
     if (bestScore <= 0)
     {
-        // ciel couvert, nuit, intérieur : pas de soleil, pas d'ombres (après trois essais de suite)
+        // overcast, night, indoors: no sun, no shadows (after three attempts in a row)
         if (++live.missedCalibrations >= 3 && live.calibrated)
         {
             live.calibrated = false;
-            Log("URTI direct : plus de carte d'ombres du soleil, ombres RT suspendues");
+            Log("URTI live: no sun shadow map any more, RT shadows suspended");
         }
         else
-            Log("URTI direct : étalonnage sans carte d'ombres du soleil");
+            Log("URTI live: calibration without a sun shadow map");
         return;
     }
     live.missedCalibrations = 0;
     g_liveSunDepth = g.slotDepth[bestSlot];
     live.sunDirty = true;
     live.framesSinceSun = 0;
-    // les directions par paire ont un sens défini (profondeur décroissante de la carte) ; le soleil est
-    // au-dessus de l'horizon : ce choix fixe la convention du jeu pour le suivi image par image
+        // per-pair directions have a defined orientation (decreasing depth of the map); the sun is
+        // above the horizon: this choice sets the game's convention for frame-by-frame tracking
     live.sunSign = bestSun[1] < 0 ? -1.0f : 1.0f;
     if (bestSun[1] < 0)
         for (double& v : bestSun)
@@ -891,14 +891,14 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
     for (int q = 0; q < 3; q++)
         live.sun[q] = float(bestSun[q]);
     if (!std::isfinite(A) || !std::isfinite(B) || B == 0)
-        return; // loi dégénérée : rien n'est adopté
+        return; // degenerate law: nothing is adopted
     live.A = float(A), live.B = float(B);
-    if (!live.fovMeasured || live.p11 <= 0) // (champ de vision mesuré : gardé ; celui de l'étalonnage est arbitraire, 50°)
+    if (!live.fovMeasured || live.p11 <= 0) // (measured field of view: kept; the calibration's is arbitrary, 50°)
         live.p00 = p00, live.p11 = p11;
-    g.depthReversed = B > 0; // profondeur inversée : d = B / w, le ciel (w infini) à 0
+    g.depthReversed = B > 0; // reversed depth: d = B / w, the sky (infinite w) at 0
     live.calibrated = true;
     live.verified = true;
-    Log("URTI direct : soleil (%.3f, %.3f, %.3f), profondeur = %.6f + %.6f / w", bestSun[0], bestSun[1], bestSun[2], A, B);
+    Log("URTI live: sun (%.3f, %.3f, %.3f), depth = %.6f + %.6f / w", bestSun[0], bestSun[1], bestSun[2], A, B);
     if (ID3D12Resource* map = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth))
     {
         const D3D12_RESOURCE_DESC d = map->GetDesc();
@@ -908,12 +908,12 @@ void Calibrate(const uint8_t* so, const uint32_t* counters, const uint64_t* mark
         live.sunMapWidth = uint32_t(d.Width), live.sunMapHeight = d.Height, live.sunMapFormat = uint32_t(d.Format);
         LiveSaveCalibration();
         if (changed)
-            Log("URTI direct : l'étalonnage stocké ne correspondait plus, il est remplacé");
+            Log("URTI live: the stored calibration no longer matched, it is replaced");
     }
 }
 
 // ------------------------------------------------------------------------------------------------
-// GPU : structure d'accélération et ombres, avant les effets de ReShade
+// GPU: acceleration structure and shadows, before ReShade's effects
 // ------------------------------------------------------------------------------------------------
 
 bool LiveCreatePipelines(ID3D12Device* device)
@@ -993,8 +993,8 @@ ComPtr<ID3D12Resource> UavBuffer(ID3D12Device* device, uint64_t size, D3D12_RESO
 
 void Retire(ComPtr<ID3D12Resource>& r)
 {
-    // gardée 120 présentations, pas trois : avec la génération d'images, trois présentations font une image et demie, et pendant un
-    // chargement le GPU a plus de retard que ça. Détruire un tampon encore utilisé fait perdre le GPU
+    // kept 120 presents, not three: with frame generation, three presents make a frame and a half, and during a
+    // load the GPU lags further behind than that. Destroying a buffer still in use loses the GPU
     if (r)
     {
         std::lock_guard<std::mutex> lock(g_liveRetireMutex);
@@ -1003,11 +1003,11 @@ void Retire(ComPtr<ID3D12Resource>& r)
     r.Reset();
 }
 
-// cache de géométrie : tailles par image et de la structure de tête
+// geometry cache: sizes per frame and of the top-level structure
 constexpr uint32_t kLiveGeoMaxInstances = 16384, kLiveGeoMaxBuilds = 1024, kLiveGeoFrameVerts = 2000000, kLiveGeoMeshVerts = 150000, kLiveSentinels = 96;
 constexpr uint64_t kLiveGeoScratchBytes = 192ull * 1048576;
 
-// structure d'accélération assez grande pour `vertices` sommets
+// acceleration structure large enough for `vertices` vertices
 bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
 {
     if (vertices <= live.capacity && live.blas)
@@ -1028,7 +1028,7 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&in, &info);
     info.ScratchDataSizeInBytes = std::max(info.ScratchDataSizeInBytes, info.UpdateScratchDataSizeInBytes);
-    live.blasAge = ~0u; // nouvelle structure : construction complète
+    live.blasAge = ~0u; // new structure: full build
     Retire(live.view), Retire(live.blas), Retire(live.blasScratch);
     live.view = UavBuffer(device, cap * 12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Retire(live.viewPrev);
@@ -1046,20 +1046,20 @@ bool LiveEnsureCapacity(ID3D12Device5* device, uint64_t vertices)
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tin = {};
         tin.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
         tin.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        tin.NumDescs = 2 + kLiveGeoMaxInstances; // scène opaque (masque 1), surfaces transparentes planes (masque 2), cache de géométrie (masque 1)
+        tin.NumDescs = 2 + kLiveGeoMaxInstances; // opaque scene (mask 1), flat transparent surfaces (mask 2), geometry cache (mask 1)
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO ti = {};
         device->GetRaytracingAccelerationStructurePrebuildInfo(&tin, &ti);
         live.tlas = UavBuffer(device, ti.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
         live.tlasScratch = UavBuffer(device, ti.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
-    Log("URTI direct : structure d'accélération pour %llu sommets (%.1f Mo)", (unsigned long long)cap, info.ResultDataMaxSizeInBytes / 1048576.0);
+    Log("URTI live: acceleration structure for %llu vertices (%.1f MB)", (unsigned long long)cap, info.ResultDataMaxSizeInBytes / 1048576.0);
     return live.view && live.blas && live.blasScratch && live.tlas && live.instances;
 }
 
-// images (profondeur, ombres) à la taille de la profondeur du jeu
-// zone rendue : celle où le jeu dessine (zones de dessin de ses dessins à l'écran), sinon toute la profondeur.
-// Avec le DLSS ou une résolution dynamique, des moteurs (Decima) dessinent dans un coin de cibles pleine taille :
-// lues en entier, ombres et reflets tombaient décalés et étirés (×1,5 dans Horizon Forbidden West)
+// images (depth, shadows) at the size of the game's depth
+// rendered area: where the game draws (viewports of its screen draws), otherwise the whole depth.
+// With DLSS or dynamic resolution, some engines draw into a corner of full-size targets:
+// read whole, shadows and reflections fell shifted and stretched (×1.5 in a game we tested)
 void LiveRenderArea(const D3D12_RESOURCE_DESC& depthDesc, uint32_t& w, uint32_t& h)
 {
     w = uint32_t(depthDesc.Width), h = depthDesc.Height;
@@ -1075,15 +1075,15 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     if (live.mask && live.allocWidth == depthDesc.Width && live.allocHeight == depthDesc.Height && live.depthFormat == depthDesc.Format)
     {
         if (renderW != live.width || renderH != live.height)
-            Log("URTI direct : zone rendue %ux%u dans la profondeur %llux%u", renderW, renderH, (unsigned long long)depthDesc.Width, depthDesc.Height);
-        live.width = renderW, live.height = renderH; // les images (pleine taille) servent telles quelles
+            Log("URTI live: rendered area %ux%u inside the depth %llux%u", renderW, renderH, (unsigned long long)depthDesc.Width, depthDesc.Height);
+        live.width = renderW, live.height = renderH; // the (full-size) images are used as they are
         return true;
     }
     Retire(live.depthBuf), Retire(live.shadowBuf), Retire(live.mask), Retire(live.prevShadowBuf);
     if (live.maskSrv.handle)
         runtime->get_device()->destroy_resource_view(live.maskSrv), live.maskSrv = {};
     live.allocWidth = uint32_t(depthDesc.Width), live.allocHeight = depthDesc.Height, live.depthFormat = depthDesc.Format;
-    // images allouées à la taille pleine (une résolution dynamique change la zone rendue sans tout réallouer)
+    // images allocated at full size (dynamic resolution changes the rendered area without reallocating everything)
     live.width = live.allocWidth, live.height = live.allocHeight;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
     UINT64 total = 0;
@@ -1095,7 +1095,7 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
     live.prevShadowBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_COPY_DEST);
     Retire(live.shadowRawBuf);
     live.shadowRawBuf = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    for (auto& b : live.denoiseLen) // longueur d'historique du débruiteur (à zéro : rien d'accumulé)
+    for (auto& b : live.denoiseLen) // denoiser history length (zero: nothing accumulated)
         Retire(b), b = UavBuffer(device, uint64_t(live.shadowPitch) * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Retire(live.giRaw), Retire(live.giBuf), Retire(live.giPrev);
     live.giRaw = UavBuffer(device, 3ull * live.shadowPitch * live.height, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1123,11 +1123,11 @@ bool LiveEnsureImages(effect_runtime* runtime, ID3D12Device* device, const D3D12
             r = MakeBuffer(device, kSlots * 8ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     live.width = renderW, live.height = renderH;
     if (renderW != live.allocWidth || renderH != live.allocHeight)
-        Log("URTI direct : zone rendue %ux%u dans la profondeur %ux%u", renderW, renderH, live.allocWidth, live.allocHeight);
+        Log("URTI live: rendered area %ux%u inside the depth %ux%u", renderW, renderH, live.allocWidth, live.allocHeight);
     return live.depthBuf && live.shadowBuf;
 }
 
-// tampons du suivi du soleil (créés une fois)
+// sun-tracking buffers (created once)
 bool LiveEnsureSun(ID3D12Device* device)
 {
     if (live.sunBuf)
@@ -1152,10 +1152,10 @@ FILETIME FileTime(const std::string& path)
 
 bool Newer(const FILETIME& a, const FILETIME& b) { return CompareFileTime(&a, &b) > 0; }
 
-#include "urti_nrd.inl" // débruiteurs de NVIDIA (si l'add-on est compilé avec NRD)
+#include "urti_nrd.inl" // NVIDIA denoisers (if the add-on is built with NRD)
 
-// toutes les 30 images : urti.ini modifié -> réglages relus ; shader recompilé dans urti_shaders -> pipeline
-// recréé (l'ancien est libéré trois images plus tard)
+// every 30 frames: urti.ini modified -> settings read again; shader recompiled in urti_shaders -> pipeline
+// recreated (the old one is released three frames later)
 void LiveHotReload(ID3D12Device* device)
 {
     if (live.frame % 30 != 0)
@@ -1167,11 +1167,11 @@ void LiveHotReload(ID3D12Device* device)
         live.iniTime = t;
         if (FILE* f = std::fopen(ini.c_str(), "r"))
         {
-            // valeurs par défaut à chaque relecture : une ligne retirée du fichier rend son réglage d'origine
+            // default values at every reread: a line removed from the file gives its setting back its original value
             float combine = -1.0f, mask = 0.0f, debug = 0.0f, gameBias = 0.0015f, rayBias = 0.003f, sunRadius = 0.5f;
             float refl = 1.0f, channel = 1, invert = 0, smoothMin = 0.5f, f0 = 0.04f, debugReflect = 0, slot = 2, everywhere = 0, rays = 2, debugView = -1;
             float reflAlphaMin = 0.1f, reflAlphaMax = 0.5f, reflGamma = 1.0f, reflDepthTol = 0.1f, anchorAlpha = 0.0f, anchorGamma = 2.5f, alphaScreen = 1, blasRefit = 0, persist = 1, jitter = 2, fovAuto = 1, sunMeasure = 1, gameDilate = 1, gameMin = 1, ao = 1.0f, aoRadius = 1.5f, sunShadows = 0, aoQuarter = 1, buildMs = 2.5f, surfCache = 1, aoMs = 2.5f, gi = 1.0f, personMask = 1, motionSource = 0, renderArea = 1, water = 0, aoRoughIni = 0, nrdOn = 0, nrdDisocclusion = 0.01f, nrdFrames = 5;
-            float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget : 6 M sur les 8 M d'un emplacement
+            float vertexBudget = 6000000, probeBudget = 250000, slotLimit = 0, uiPhoto = 1, geoIni = 1, geoMb = 1000, motionLogIni = 0, cameraIni = 1, queueSyncIni = 1, traceDraw = 0, reflectDiag = 0, depthLawFixedIni = -1; // budget: 6 M out of a slot's 8 M
             float zone[4] = {};
             bool traceIni = false;
             float frameSyncIni = 1, reflectUpIni = 1, hudlessIni = 1, fgShiftIni = 0.5f, geoNewIni = 300000, geoRefreshIni = 100000, aoBoostIni = 0, slowRaysIni = 0, reflMsIni = 3.5f, reflectAllIni = 0, reflStatsIni = 0, waterBaseIni = 0, waterGainIni = 1.5f, radIni = 1, radVoxelIni = 0.005f, lagIni = 1, lagBiasIni = 0, reflFullIni = 1, denoiseLenIni = 1, reflSoftIni = 1.0f, reflSpatialIni = 0.5f, reflCoherentIni = 1, geoProbeIni = 2000000, sunEighthIni = 0, denoiseFarIni = 1, gnSlotIni = -1, gnModeIni = 0, gnSignsIni = 0, gnUseIni = 0, gnCompareIni = 1, gnReflectIni = 1, tessIni = 0, aoMotionIni = 1, dualIni = 1, ignIni = 1, sunRayIni = 1, fovForceIni = 0, skyIni = 0.7f, skyRangeIni = 16.0f, glossMinIni = 0.0f, glossIni = 1.0f;
@@ -1191,10 +1191,10 @@ void LiveHotReload(ID3D12Device* device)
                 value("shadow_rays=", rays), value("debug_view=", debugView);
                 value("refl_alpha_min=", reflAlphaMin), value("refl_alpha_max=", reflAlphaMax);
                 value("refl_gamma=", reflGamma), value("refl_depth_tol=", reflDepthTol);
-                value("anchor_alpha=", anchorAlpha), value("anchor_gamma=", anchorGamma); // anchor_alpha=0 : ancrage coupé
-                value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0 : toujours reconstruire
-                value("persist=", persist); // persist=0 : zones attribuées à la suite à chaque image (ancienne règle)
-                // budget de géométrie (sommets ; 0 : sans budget), re-mesures par image, emplacement réduit (essai)
+                value("anchor_alpha=", anchorAlpha), value("anchor_gamma=", anchorGamma); // anchor_alpha=0: anchoring off
+                value("alpha_screen=", alphaScreen), value("blas_refit=", blasRefit); // blas_refit=0: always rebuild
+                value("persist=", persist); // persist=0: regions assigned one after the other every frame (old rule)
+                // geometry budget (vertices; 0: no budget), re-measurements per frame, smaller slot (test)
                 value("vertex_budget=", vertexBudget), value("probe_budget=", probeBudget), value("slot_limit=", slotLimit), value("ui_photo=", uiPhoto),
                 value("camera=", cameraIni), value("geo=", geoIni), value("geo_mb=", geoMb), value("motion_log=", motionLogIni), value("queue_sync=", queueSyncIni), value("trace_draw=", traceDraw), value("reflect_diag=", reflectDiag), value("depth_law_fixed=", depthLawFixedIni);
                 value("nrd=", nrdOn), value("nrd_disocclusion=", nrdDisocclusion), value("nrd_frames=", nrdFrames), value("jitter=", jitter), value("fov_auto=", fovAuto);
@@ -1208,9 +1208,9 @@ void LiveHotReload(ID3D12Device* device)
                 float ft = 0;
                 value("frame_trace=", ft);
                 value("frame_sync=", frameSyncIni);
-                value("reflect_up=", reflectUpIni); // 0 : normale de l'eau tirée de la profondeur (ancienne règle, pour comparer)
-                value("hudless=", hudlessIni);      // 0 : sans l'image du jeu d'avant son interface (contrôle)
-                value("fg_shift=", fgShiftIni);     // images générées : part du mouvement (0 : ombre et reflet figés, ancienne règle)
+                value("reflect_up=", reflectUpIni); // 0: water normal from depth (old rule, to compare)
+                value("hudless=", hudlessIni);      // 0: without the game's image before its UI (control)
+                value("fg_shift=", fgShiftIni);     // generated frames: share of the motion (0: shadow and reflection frozen, old rule)
                 value("geo_new=", geoNewIni), value("geo_refresh=", geoRefreshIni), value("ao_boost=", aoBoostIni), value("rayons_lents=", slowRaysIni), value("refl_ms=", reflMsIni), value("reflect_all=", reflectAllIni), value("reflect_stats=", reflStatsIni), value("water_base=", waterBaseIni), value("water_gain=", waterGainIni), value("radcache=", radIni), value("rad_voxel=", radVoxelIni), value("lag=", lagIni), value("lag_bias=", lagBiasIni), value("refl_full=", reflFullIni), value("denoise_len=", denoiseLenIni), value("refl_soft=", reflSoftIni), value("refl_spatial=", reflSpatialIni), value("refl_coherent=", reflCoherentIni), value("geo_probe=", geoProbeIni), value("sun_eighth=", sunEighthIni), value("denoise_far=", denoiseFarIni), value("gnormal_slot=", gnSlotIni), value("gnormal=", gnModeIni), value("gnormal_signs=", gnSignsIni), value("gnormal_use=", gnUseIni), value("gnormal_compare=", gnCompareIni), value("gnormal_reflect=", gnReflectIni), value("ao_sky=", skyIni), value("ao_sky_range=", skyRangeIni), value("gloss_min=", glossMinIni), value("gloss=", glossIni), value("tess=", tessIni), value("ao_motion=", aoMotionIni), value("denoise_dual=", dualIni), value("ao_ign=", ignIni), value("ao_sunray=", sunRayIni), value("fov_force=", fovForceIni);
                 if (l.rfind("frame_trace=", 0) == 0)
                     traceIni = ft != 0;
@@ -1246,14 +1246,14 @@ void LiveHotReload(ID3D12Device* device)
                 const float aspect = live.p11 / live.p00;
                 live.p11 = 1.0f / std::tan(live.fovForce * 0.5f / 57.2957795f), live.p00 = live.p11 / aspect;
                 live.fovMeasured = true, live.fovReset = true;
-                Log("URTI direct : champ de vision imposé : %.1f°", live.fovForce);
+                Log("URTI live: field of view imposed: %.1f°", live.fovForce);
             }
             live.glossMin = std::clamp(glossMinIni, 0.0f, 0.95f), live.glossAmount = std::clamp(glossIni, 0.0f, 1.0f);
             g_liveTraceOn = traceIni;
-            // (avec la caméra du jeu seulement : sinon, rien ne change)
+            // (with the game's camera only: otherwise nothing changes)
             live.frameSync = frameSyncIni != 0 && g_camCbvSize != 0;
             g_liveFrameSync = live.frameSync;
-            live.iniCombine = int(combine); // -1 : le mode vient du menu de ReShade (UrtiMode)
+            live.iniCombine = int(combine); // -1: the mode comes from the ReShade menu (UrtiMode)
             g_liveShowMask = mask != 0, g_liveDebugGame = uint32_t(debug);
             g_liveGameBias = gameBias, g_liveRayBias = rayBias, g_liveSunRadius = sunRadius;
             live.reflStrength = refl, live.reflChannel = uint32_t(channel) & 3, live.reflInvert = invert != 0, live.smoothMin = smoothMin;
@@ -1271,7 +1271,7 @@ void LiveHotReload(ID3D12Device* device)
                 g_livePlaces.clear(), g_liveFreeSpace.clear(), g_liveFreeCounts.clear(), g_livePlaceHigh = 0, g_liveNextCount = 0;
             }
             live.budgetMax = uint64_t(std::max(0.0f, vertexBudget)), live.probeBudget = uint64_t(std::max(0.0f, probeBudget));
-            // cache de géométrie : la scène de l'image n'a plus à tout porter (objets proches et mobiles)
+            // geometry cache: the frame's scene no longer has to carry everything (near and moving objects)
             live.geoOn = geoIni != 0;
             live.motionLog = motionLogIni != 0;
             live.cameraOn = cameraIni != 0;
@@ -1317,9 +1317,9 @@ void LiveHotReload(ID3D12Device* device)
                 live.aoRays = 4;
         }
         if (!first)
-            Log("URTI direct : réglages relus (combine %d, masque %d, contrôle %u, game_bias %.4f, ray_bias %.4f, soleil %.2f° ; reflets %.2f, "
-                "canal %u%s, lissé min %.2f, f0 %.3f, contrôle %u, cible %u)", live.iniCombine, g_liveShowMask, g_liveDebugGame, g_liveGameBias,
-                g_liveRayBias, g_liveSunRadius, live.reflStrength, live.reflChannel, live.reflInvert ? " inversé" : "", live.smoothMin, live.f0,
+            Log("URTI live: settings read again (combine %d, mask %d, check %u, game_bias %.4f, ray_bias %.4f, sun %.2f°; reflections %.2f, "
+                "channel %u%s, smoothness min %.2f, f0 %.3f, check %u, target %u)", live.iniCombine, g_liveShowMask, g_liveDebugGame, g_liveGameBias,
+                g_liveRayBias, g_liveSunRadius, live.reflStrength, live.reflChannel, live.reflInvert ? " inverted" : "", live.smoothMin, live.f0,
                 live.debugReflect, live.materialSlot);
     }
     struct Hot { const char* name; ID3D12RootSignature* rs; ComPtr<ID3D12PipelineState>* pso; };
@@ -1352,17 +1352,17 @@ void LiveHotReload(ID3D12Device* device)
         ComPtr<ID3D12PipelineState> pso;
         if (code.empty() || FAILED(device->CreateComputePipelineState(&cd, IID_PPV_ARGS(&pso))))
         {
-            Log("URTI direct : shader %s refusé (signature ou code invalide), l'ancien reste", hot[i].name);
+            Log("URTI live: shader %s refused (invalid signature or code), the old one stays", hot[i].name);
             continue;
         }
         live.retiredPso[live.frame % 3].push_back(*hot[i].pso);
         *hot[i].pso = pso;
-        Log("URTI direct : shader %s rechargé à chaud", hot[i].name);
+        Log("URTI live: shader %s hot-reloaded", hot[i].name);
     }
 }
 
-// copie d'une cible du G-buffer (texels de 32 bits) dans un tampon, à la fin de son écriture (passage cible de
-// rendu -> lecture), dans la liste de commandes du jeu
+// copy of a G-buffer target (32-bit texels) into a buffer, at the end of its writing (render target
+// -> read transition), inside the game's command list
 void LiveCopyGbuffer(command_list* cmd, uint64_t target, uint32_t count, const resource* resources, const resource_usage* oldStates,
                      const resource_usage* newStates, ComPtr<ID3D12Resource>& buf, uint64_t& bytes, uint32_t& pitch, uint32_t& width,
                      uint32_t& height, uint32_t& format, uint64_t& frame, const char* what, bool* computeSeen = nullptr, int32_t* copied = nullptr)
@@ -1372,9 +1372,9 @@ void LiveCopyGbuffer(command_list* cmd, uint64_t target, uint32_t count, const r
         if (resources[i].handle != target)
             continue;
         const uint32_t before = PassD3D12State(static_cast<uint32_t>(oldStates[i])), after = PassD3D12State(static_cast<uint32_t>(newStates[i]));
-        // (computeSeen : aussi à la fin d'une écriture en calcul, et alors seulement elle : Horizon Forbidden West finit sa
-        // cible de matériau ainsi, et c'est là seulement que l'eau y vaut 0 ; la copie de la fin du G-buffer de l'image
-        // suivante l'écrasait avant le calcul des reflets, l'eau n'était vue qu'une image sur dix)
+        // (computeSeen: also at the end of a compute write, and then only there: some games finish their
+        // material target that way, and only there is water 0 in it; the copy at the end of the next frame's
+        // G-buffer overwrote it before the reflection computation, and water was seen only one frame in ten)
         const uint32_t written = D3D12_RESOURCE_STATE_RENDER_TARGET | (computeSeen ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : 0);
         if (!(before & written) || (after & written))
             continue;
@@ -1396,10 +1396,10 @@ void LiveCopyGbuffer(command_list* cmd, uint64_t target, uint32_t count, const r
         if (!buf || (copied ? buf->GetDesc().Width : bytes) < total)
         {
             Retire(buf);
-            // (état commun pour un tampon de l'anneau : passe d'une file à l'autre sans barrière)
+            // (common state for a ring buffer: it moves from one queue to the other without a barrier)
             buf = UavBuffer(g.device, total, copied ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST);
             bytes = total;
-            Log("URTI direct : %s du G-buffer %llux%u format %d copié à chaque image", what, (unsigned long long)d.Width, d.Height, int(d.Format));
+            Log("URTI live: G-buffer %s %llux%u format %d copied every frame", what, (unsigned long long)d.Width, d.Height, int(d.Format));
         }
         if (!buf)
             return;
@@ -1424,7 +1424,7 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
 {
     if (!g_liveCapture || !live.enabled || !OurDevice(cmd->get_device()))
         return;
-    // fin d'écriture de la profondeur principale : copiée ici, dans la liste du jeu, et repère pour fermer la fenêtre à l'exécution
+    // end of writing of the main depth: copied here, inside the game's list, with a marker to close the window at execution
     if (live.frameSync)
     {
         uint64_t mainDepth = 0;
@@ -1453,10 +1453,10 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
                 for (auto& b : live.depthSnap)
                     Retire(b), b = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COMMON);
                 live.depthSnapBytes = total;
-                Log("URTI direct : profondeur principale %llux%u format %d copiée dans les listes du jeu (%u tampons de %.1f Mo)", (unsigned long long)d.Width, d.Height, int(d.Format),
+                Log("URTI live: main depth %llux%u format %d copied inside the game's lists (%u buffers of %.1f MB)", (unsigned long long)d.Width, d.Height, int(d.Format),
                     LiveState::kDepthSnaps, double(total) / 1048576.0);
             }
-            // rien de dessiné depuis la dernière copie : le même tampon vaut
+            // nothing drawn since the last copy: the same buffer will do
             const bool again = g_liveMainAtCopy != g_liveMainRecorded;
             const uint32_t k = again ? g_liveSnapNext++ % LiveState::kDepthSnaps : (g_liveSnapNext + LiveState::kDepthSnaps - 1) % LiveState::kDepthSnaps;
             if (!live.depthSnap[k])
@@ -1465,8 +1465,8 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
             {
                 g_liveMainAtCopy = g_liveMainRecorded;
                 g_liveSnapCopies++;
-                // (le plan de la profondeur seulement : celui du gabarit peut être dans un autre état. Déjà lisible par une copie, comme
-                // quand le jeu copie lui-même sa profondeur : pas de barrière, une transition d'un état vers lui-même fait perdre le GPU)
+                // (the depth plane only: the stencil's may be in another state. Already readable by a copy, as
+                // when the game copies its depth itself: no barrier, a transition from a state to itself loses the GPU)
                 const bool readable = (after & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
                 D3D12_RESOURCE_BARRIER b = {};
                 b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1497,8 +1497,8 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
             break;
         }
     }
-    // image du jeu sans son interface : les images de la taille de l'écran en RGBA 16 bits flottants à la fin de leur écriture (repère
-    // pour la reconnaître à l'exécution) ; celle adoptée est copiée ici, dans un anneau
+    // the game's image without its UI: screen-sized RGBA 16-bit float images at the end of their writing (marker
+    // to recognise it at execution); the adopted one is copied here, into a ring
     if (live.hudlessOn && live.frameSync)
     {
         uint32_t bw = 0, bh = 0;
@@ -1536,13 +1536,13 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
                     for (auto& b : live.hudSnap)
                         Retire(b), b = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COMMON);
                     live.hudBytes = total;
-                    Log("URTI direct : image du jeu sans son interface %llux%u copiée dans ses listes (%u tampons de %.1f Mo)", (unsigned long long)d.Width, d.Height,
+                    Log("URTI live: the game's UI-free image %llux%u copied inside its lists (%u buffers of %.1f MB)", (unsigned long long)d.Width, d.Height,
                         LiveState::kHudSnaps, double(total) / 1048576.0);
                 }
                 const uint32_t k = g_liveHudNext++ % LiveState::kHudSnaps;
                 if (live.hudSnap[k])
                 {
-                    // (déjà lisible par une copie : pas de barrière, une transition d'un état vers lui-même fait perdre le GPU)
+                    // (already readable by a copy: no barrier, a transition from a state to itself loses the GPU)
                     const bool readable = (after & D3D12_RESOURCE_STATE_COPY_SOURCE) != 0;
                     if (!readable)
                         Transition(l, res, D3D12_RESOURCE_STATES(after), D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1574,10 +1574,10 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
             gnTarget = g_liveGbuffer[live.gnSlot];
         if (live.materialSlot < g_liveGbufferCount && live.reflStrength > 0)
             target = g_liveGbuffer[live.materialSlot];
-        // couleur propre des surfaces (première cible du G-buffer) : rebond de lumière
+        // the surfaces' own colour (first G-buffer target): light bounce
         if (g_liveGbufferCount >= 3 && live.giStrength > 0 && live.aoAmount > 0)
             albedoTarget = g_liveGbuffer[0], normalTarget = live.personMask ? g_liveGbuffer[1] : 0;
-        // vecteurs de mouvement : une cible du G-buffer en deux flottants 16 bits (la n-ième s'il y en a plusieurs)
+        // motion vectors: a G-buffer target with two 16-bit floats (the n-th if there are several)
         uint64_t candidates[8] = {};
         uint32_t found = 0;
         for (uint32_t k = 0; k < g_liveGbufferCount && k < 8; k++)
@@ -1608,7 +1608,7 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
             Retire(live.mvBuf);
             live.mvBuf = UavBuffer(g.device, total, D3D12_RESOURCE_STATE_COPY_DEST);
             live.mvBytes = total;
-            Log("URTI direct : vecteurs de mouvement du jeu %llux%u copiés à chaque image (accumulation dans le temps)", (unsigned long long)d.Width, d.Height);
+            Log("URTI live: the game's motion vectors %llux%u copied every frame (accumulation over time)", (unsigned long long)d.Width, d.Height);
         }
         if (!live.mvBuf)
             break;
@@ -1627,7 +1627,7 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
     }
     if (target && live.frameSync)
     {
-        // dans un anneau, avec un repère : le calcul prend celui de son image, et ne lit jamais un tampon en cours d'écriture
+        // into a ring, with a marker: the computation takes the one of its frame, and never reads a buffer being written
         uint32_t k = 0;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -1635,7 +1635,7 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
         }
         int32_t copied = 0;
         LiveCopyGbuffer(cmd, target, count, resources, oldStates, newStates, live.materialSnap[k], live.materialBytes, live.materialPitch,
-                        live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "matériau (cible 2)", &live.materialAfterCompute, &copied);
+                        live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "material (target 2)", &live.materialAfterCompute, &copied);
         if (copied)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -1648,8 +1648,8 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
     }
     else if (target)
         LiveCopyGbuffer(cmd, target, count, resources, oldStates, newStates, live.materialBuf, live.materialBytes, live.materialPitch,
-                        live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "matériau (cible 2)", &live.materialAfterCompute);
-    // normales du G-buffer : à la fin de leur écriture ; avec frame_sync, dans la case de l'anneau que prendra le matériau de la même image
+                        live.materialWidth, live.materialHeight, live.materialFormat, live.materialFrame, "material (target 2)", &live.materialAfterCompute);
+    // G-buffer normals: at the end of their writing; with frame_sync, in the ring slot the same frame's material will take
     if (gnTarget && live.frameSync)
     {
         uint32_t k = 0;
@@ -1659,44 +1659,44 @@ void LiveGbufferBarrier(command_list* cmd, uint32_t count, const resource* resou
         }
         int32_t gnCopied = 0;
         LiveCopyGbuffer(cmd, gnTarget, count, resources, oldStates, newStates, live.gnSnap[k], live.gnBytes, live.gnPitch,
-                        live.gnWidth, live.gnHeight, live.gnFormat, live.gnFrame, "normales (réglage gnormal_slot)", nullptr, &gnCopied);
+                        live.gnWidth, live.gnHeight, live.gnFormat, live.gnFrame, "normals (gnormal_slot setting)", nullptr, &gnCopied);
     }
     else if (gnTarget)
         LiveCopyGbuffer(cmd, gnTarget, count, resources, oldStates, newStates, live.gnBuf, live.gnBytes, live.gnPitch,
-                        live.gnWidth, live.gnHeight, live.gnFormat, live.gnFrame, "normales (réglage gnormal_slot)");
+                        live.gnWidth, live.gnHeight, live.gnFormat, live.gnFrame, "normals (gnormal_slot setting)");
     if (albedoTarget)
         LiveCopyGbuffer(cmd, albedoTarget, count, resources, oldStates, newStates, live.albedoBuf, live.albedoBytes, live.albedoPitch,
-                        live.albedoWidth, live.albedoHeight, live.albedoFormat, live.albedoFrame, "couleur propre (albedo, cible 0)");
+                        live.albedoWidth, live.albedoHeight, live.albedoFormat, live.albedoFrame, "own colour (albedo, target 0)");
     if (normalTarget)
         LiveCopyGbuffer(cmd, normalTarget, count, resources, oldStates, newStates, live.normalBuf, live.normalBytes, live.normalPitch,
                         live.normalWidth, live.normalHeight, live.normalFormat, live.normalFrame, "normale (cible 1)");
 }
 
-// minutage détaillé : repère k du calcul (0 à 11, anneau de l'image) ou de la composition (12 à 17, anneau des présentations)
+// detailed timing: marker k of the computation (0 to 11, frame ring) or of the composition (12 to 17, present ring)
 void LiveTimeD(ID3D12GraphicsCommandList* list, uint32_t k)
 {
     if (live.timeDHeap)
         list->EndQuery(live.timeDHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, uint32_t(k < 12 ? live.frame % 3 : live.compCounter % 3) * LiveState::kTimeD + k);
 }
 
-// horodatage k (0 à 7) de l'image en cours
+// timestamp k (0 to 7) of the current frame
 void LiveTime(ID3D12GraphicsCommandList* list, uint32_t k)
 {
     if (live.timeHeap)
         list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * 8 + k);
 }
 
-// cache de géométrie vidé (coupure de la caméra, autre écran principal) : son repère ne vaut plus rien
-// Caméra du jeu de cette image -> pose du repère du cache vers la caméra et mouvement depuis l'image précédente, à écrire dans
-// motion (mêmes places que live_camfit ; octets 176 à 183 : décalage sous-pixel). Espace caméra d'URTI : x = droite . d,
-// y = haut . d, z = w = -arrière . d, d = point - position. Faux : pas de caméra du jeu, l'ancienne mesure continue.
+// geometry cache cleared (camera cut, another main screen): its frame is worthless
+// The game's camera for this frame -> pose from the cache's frame to the camera and motion since the previous frame, to write into
+// motion (same places as live_camfit; bytes 176 to 183: sub-pixel jitter). URTI's camera space: x = right . d,
+// y = up . d, z = w = -back . d, d = point - position. False: no game camera, the old measurement goes on.
 void LiveGeoFlush(const char* why);
 
 bool LiveCameraFrame(float* out)
 {
     live.camLive = live.cameraOn && live.camSerialNow != 0;
-    // caméra perdue (le jeu ne l'écrit plus là, urti_camscan.inl en cherche une autre) : l'ancienne mesure prend le relais. Sinon la dernière caméra reste, figée
-    // alors que le joueur bouge : mouvement nul, historique relu au mauvais endroit, objets gardés mal placés (bouillie de pixels en courant)
+    // camera lost (the game no longer writes it there, urti_camscan.inl looks for another one): the old measurement takes over. Otherwise the last camera stays, frozen
+    // while the player moves: zero motion, history read at the wrong place, kept objects misplaced (pixel soup while running)
     {
         const uint32_t latest = g_camSerial.load(std::memory_order_acquire);
         if (latest != live.camSeenSerial)
@@ -1705,8 +1705,8 @@ bool LiveCameraFrame(float* out)
         if (lost != live.camLost)
         {
             live.camLost = lost;
-            Log("URTI direct : caméra du jeu %s", lost ? "perdue : mesure sur les témoins à la place" : "de nouveau lue");
-            LiveGeoFlush(lost ? "caméra du jeu perdue" : "caméra du jeu retrouvée");
+            Log("URTI live: game camera %s", lost ? "lost: measuring on the witnesses instead" : "read again");
+            LiveGeoFlush(lost ? "game camera lost" : "game camera found again");
         }
         if (lost)
             live.camLive = false;
@@ -1731,7 +1731,7 @@ bool LiveCameraFrame(float* out)
         for (int i = 0; i < 3; i++)
             m[0][i] = k.right[i], m[1][i] = k.up[i], m[2][i] = -double(k.back[i]);
     };
-    // A = Rcur Ra^T, t = Rcur (posa - poscur) : point de l'espace caméra de a -> espace caméra de cette image
+    // A = Rcur Ra^T, t = Rcur (posa - poscur): point of a's camera space -> this frame's camera space
     const auto relative = [&](const GameCamera& a, float* rOut, float* tOut, double* rotDeg, double* move) {
         double rc[3][3], ra[3][3];
         rows(c, rc), rows(a, ra);
@@ -1759,17 +1759,17 @@ bool LiveCameraFrame(float* out)
     out[12] = 1.0f; // valide
     out[13] = out[14] = out[15] = 0.0f;
     relative(live.camRef, out + 32, out + 41, nullptr, &live.geoPoseDistance);
-    // décalage sous-pixel : x de l'espace capté = x vrai - (jx / p00) w
+    // sub-pixel jitter: x of the captured space = true x - (jx / p00) w
     out[44] = -c.jx / c.p00, out[45] = -c.jy / c.p11;
-    // axe vertical du monde : celui où le haut de la caméra pèse le plus et sa droite le moins (la caméra ne penche pas) ; l'eau est plate et
-    // horizontale, sa normale exacte vaut mieux que celle tirée de la profondeur (décalée à chaque image : le reflet tremblait)
+    // world vertical axis: the one where the camera's up weighs most and its right least (the camera does not tilt); water is flat and
+    // horizontal, its exact normal is better than the one from depth (shifted every frame: the reflection shook)
     for (int k = 0; k < 3; k++)
         live.camUpScore[k] += std::fabs(c.up[k]) - std::fabs(c.right[k]);
     {
         const int axis = live.camUpScore[0] > live.camUpScore[1] ? (live.camUpScore[0] > live.camUpScore[2] ? 0 : 2) : (live.camUpScore[1] > live.camUpScore[2] ? 1 : 2);
         const float sign = c.up[axis] >= 0 ? 1.0f : -1.0f;
         float n[3] = { c.right[axis] * sign, c.up[axis] * sign, -c.back[axis] * sign };
-        // (dans l'espace décalé par le sous-pixel, comme la géométrie)
+        // (in the space shifted by the sub-pixel jitter, like the geometry)
         n[2] -= out[44] * n[0] + out[45] * n[1];
         const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
         live.worldUp[0] = n[0] / len, live.worldUp[1] = n[1] / len, live.worldUp[2] = n[2] / len;
@@ -1782,7 +1782,7 @@ bool LiveCameraFrame(float* out)
         live.statCamJumps++;
     if (live.statCamFrames >= 300)
     {
-        Log("URTI direct : caméra du jeu : %u images, %u nouvelles, %.2f cm et %.3f° par image en moyenne, %.1f cm au plus, %u sauts de plus de 5 m ; champ %.2f°, décalage (%.5f, %.5f), loi %.4g + %.5f / w ; %llu lues, %llu refusées",
+        Log("URTI live: game camera: %u frames, %u new, %.2f cm and %.3f° per frame on average, %.1f cm at most, %u jumps over 5 m; field %.2f°, jitter (%.5f, %.5f), law %.4g + %.5f / w; %llu read, %llu refused",
             live.statCamFrames, live.statCamNew, live.statCamTrans / live.statCamFrames * 100.0, live.statCamRot / live.statCamFrames, live.statCamTransMax * 100.0, live.statCamJumps,
             2.0 * std::atan(1.0 / c.p11) * 57.29578, c.jx, c.jy, live.A, live.B, (unsigned long long)g_camProbes.load(), (unsigned long long)g_camRefused.load());
         live.statCamFrames = live.statCamNew = live.statCamJumps = 0, live.statCamTrans = live.statCamRot = live.statCamTransMax = 0;
@@ -1793,17 +1793,17 @@ bool LiveCameraFrame(float* out)
 void LiveGeoFlush(const char* why)
 {
     if (!live.geo.empty())
-        Log("URTI direct : cache de géométrie vidé (%s) : %zu objets", why, live.geo.size());
+        Log("URTI live: geometry cache cleared (%s): %zu objects", why, live.geo.size());
     live.geo.clear(), live.geoByOffset.clear(), live.meshProbed.clear();
     live.geoHead = 0, live.geoResetPose = true, live.geoLastFlush = live.frame;
     live.sentinels.clear(), live.sentinelRef.clear(), live.sentinelFree.clear();
     live.statGeoFlushes++;
 }
 
-// écran principal : la profondeur de la taille de l'écran la plus dessinée, sur les dernières images (une fenêtre de
-// capture peut ne contenir qu'une partie d'une image du jeu : sans cette moyenne, une fenêtre sans dessin de la vraie
-// profondeur en choisissait une autre le temps d'une image, et le calcul partait de la mauvaise : plus aucun effet sur
-// cette image)
+// main screen: the screen-sized depth drawn the most, over the last frames (a capture window
+// may hold only part of a game frame: without this average, a window without draws of the real
+// depth chose another one for a frame, and the computation started from the wrong one: no effect at all on
+// that frame)
 int LiveMainSlot()
 {
     int best = -1;
@@ -1832,11 +1832,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             bool on = false;
             runtime->get_uniform_value_bool(split, &on, 1);
             runtime->set_uniform_value_bool(split, !on);
-            Log("URTI : écran partagé %s", on ? "coupé" : "actif");
+            Log("URTI: split screen %s", on ? "off" : "on");
         }
     if (!live.enabled)
     {
-        // ombres coupées : l'effet ne doit plus appliquer l'ancienne image d'ombres
+        // shadows off: the effect must no longer apply the old shadow image
         if (const effect_uniform_variable off = runtime->find_uniform_variable("urti.fx", "UrtiActive"); off.handle)
             runtime->set_uniform_value_bool(off, false);
         live.bound = false;
@@ -1858,8 +1858,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.retiredLong.erase(std::remove_if(live.retiredLong.begin(), live.retiredLong.end(), [](const LiveState::RetiredBuffer& b) { return live.frame > b.frame + 120; }), live.retiredLong.end());
     }
     live.retiredPso[live.frame % 3].clear();
-    // tout ce que les présentations précédentes ont envoyé à cette file est fini quand ce signal passe : garde les tampons en anneau
-    // (voir plus bas), réécrits trois présentations plus tard
+    // everything previous presents sent to this queue is finished when this fence passes: protects the ring buffers
+    // (see below), rewritten three presents later
     ID3D12CommandQueue* slotQueue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
     if (!live.slotFence && SUCCEEDED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&live.slotFence))))
         live.slotEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1867,7 +1867,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.slotDone[(live.frame + 2) % 3] = live.slotFenceValue;
     if (!live.convertPso && !LiveCreatePipelines(g.device))
     {
-        Log("URTI direct : shaders refusés, mode direct coupé");
+        Log("URTI live: shaders refused, live mode off");
         live.enabled = false;
         return;
     }
@@ -1875,9 +1875,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (live.iniCombine >= 0)
         g_liveCombine = live.iniCombine != 0;
     else
-        g_liveCombine = true; // seulement les ombres que le jeu n'a pas (le menu n'a plus que « URTI activé »)
+        g_liveCombine = true; // only the shadows the game lacks (the menu only has "URTI" left)
 
-    // ce que le flux a reçu il y a trois images (lecture sans attente)
+    // what the stream received three frames ago (read without waiting)
     if (const uint64_t* c = nullptr; live.counterReadback[live.frame % 3] && SUCCEEDED(live.counterReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
     {
         const int slot = LiveMainSlot();
@@ -1889,16 +1889,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const uint32_t drawsThisFrame = slot >= 0 ? uint32_t(g.slotDraws[slot]) : 0;
     std::vector<LiveMark> marksNow;
     std::vector<LiveRegion> regionsNow, probesNow, placesNow;
-    // début dans le flux (octets) de la zone écrite par chaque dessin de cette image, dans l'ordre de regionsNow ;
-    // de chaque place, dans l'ordre de placesNow (place gardée sans être dessinée : pas lue)
+    // start in the stream (bytes) of the region written by each draw of this frame, in regionsNow's order;
+    // of each place, in placesNow's order (a place kept without being drawn: not read)
     std::vector<uint32_t> srcNow, placeSrc;
-    std::vector<LiveRegion> transpNow; // surfaces transparentes exécutées (couche 2) et leur début dans le flux
+    std::vector<LiveRegion> transpNow; // transparent surfaces executed (layer 2) and their start in the stream
     std::vector<uint32_t> transpSrcNow;
     uint32_t transpCursorNow = 0;
     uint32_t cursorNow = 0, zeroArea = ~0u;
     bool persistNow = false;
-    // une image du jeu à la fois : calcul seulement quand une image de plus est complète ; plus de repère depuis 16 présentations (écran
-    // sans la profondeur principale, menu) : l'ancienne règle
+    // one game frame at a time: computation only when one more frame is complete; no marker for 16 presents (screen
+    // without the main depth, menu): the old rule
     bool snapNew = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1907,17 +1907,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.syncNow = live.frameSync && g_liveSnapSerial != 0 && live.frame <= live.snapSeenFrame + 16;
         snapNew = g_liveSnapSerial != live.snapSerialUsed;
     }
-    // son matériau pas encore exécuté : à la présentation suivante (deux présentations au plus)
+    // its material not executed yet: on the next present (two presents at most)
     if (live.syncNow && snapNew && live.reflStrength > 0 && live.frame <= live.snapSeenFrame + 2)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        // (image suivante déjà en attente : pas d'attente, le retard ne doit pas s'accumuler)
+        // (next frame already waiting: no wait, the lag must not build up)
         if (g_liveWindowMaterial < 0 && g_liveMaterialDone >= 0 && g_liveDeferred.empty())
             snapNew = false, live.statMaterialWait++;
     }
     live.presentComputed = false;
     {
-        // à-coup du jeu : une présentation qui arrive plus de 2,2 fois plus tard que d'habitude ; les trois calculs suivants sont des rattrapages
+        // game hitch: a present arriving more than 2.2 times later than usual; the next three computations are catch-ups
         LARGE_INTEGER now, freq;
         QueryPerformanceCounter(&now), QueryPerformanceFrequency(&freq);
         const double dt = live.lastPresentTime.QuadPart ? double(now.QuadPart - live.lastPresentTime.QuadPart) * 1000.0 / double(freq.QuadPart) : 0.0;
@@ -1931,20 +1931,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     if ((live.syncNow ? !snapNew : live.lastPresentDraws == 0) && live.bound)
     {
-        // aucun dessin du jeu exécuté depuis la présentation précédente (image générée par DLSS-G ou FSR3, ou jeu
-        // qui présente deux fois) : rien de neuf à calculer, le dernier résultat est reposé ; la fenêtre de capture
-        // n'avance pas (les dessins exécutés ensuite appartiennent à l'image suivante du jeu)
+        // no game draw executed since the previous present (frame generated by DLSS-G or FSR3, or a game
+        // that presents twice): nothing new to compute, the last result is laid again; the capture window
+        // does not advance (draws executed afterwards belong to the game's next frame)
         live.statNoDraw++;
         if (live.frameTrace)
-            Log("TRAME %llu t %.2f sans calcul gen %d", (unsigned long long)live.frame, LiveTraceMs(), int(live.imageGenerated));
+            Log("FRAME %llu t %.2f no compute gen %d", (unsigned long long)live.frame, LiveTraceMs(), int(live.imageGenerated));
         live.frame++;
         return;
     }
     live.presentComputed = true;
     {
-        // calcul de rattrapage (juste après un à-coup du jeu : plusieurs images complètes en attente) : son calque n'est pas montré (file d'attente des calques)
-        // calcul dont l'image n'a presque aucun dessin du jeu exécuté avant cette présentation (moins d'un dixième de d'habitude : les listes du jeu sont
-        // passées dans la fenêtre d'avant) : son calque différait des autres (reflet en partie absent) et s'affichait le temps d'une présentation
+        // catch-up computation (right after a game hitch: several complete frames waiting): its layer is not shown (layer queue)
+        // computation whose frame has almost no game draw executed before this present (less than a tenth of usual: the game's lists
+        // went into the previous window): its layer differed from the others (reflection partly missing) and showed for one present
         const double pd = double(live.lastPresentDraws);
         const bool starved = live.presentDrawsAvg > 200.0 && pd < 0.1 * live.presentDrawsAvg;
         if (!starved)
@@ -1954,17 +1954,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.suspectLeft--;
         live.statSuspect += live.layerSuspect ? 1u : 0u;
     }
-    // tampons d'envoi et de relecture en anneau, par frame % 3 : si le GPU a plus de trois présentations de retard, la place de cet
-    // anneau est encore en lecture : la réécrire donnerait au GPU des tables de zones fausses (lectures hors des tampons, GPU perdu)
+    // upload and readback buffers in a ring, by frame % 3: if the GPU is more than three presents behind, this ring's
+    // slot is still being read: rewriting it would give the GPU wrong region tables (reads outside the buffers, GPU lost)
     if (const uint64_t need = live.slotDone[live.frame % 3]; need && live.slotEvent && live.slotFence->GetCompletedValue() < need)
     {
         live.statSlotWaits++;
         if (SUCCEEDED(live.slotFence->SetEventOnCompletion(need, live.slotEvent)))
             WaitForSingleObject(live.slotEvent, 200);
     }
-    // tous les dessins du jeu exécutés jusqu'ici finis avant ce calcul : le jeu exécute ses listes sur une autre file que
-    // celle des présentations, et rien ne les ordonne ; ce qui venait d'être exécuté (l'eau, tard dans l'image) n'avait pas
-    // encore écrit ses sommets ni son compteur : objet vide, reflet qui clignote. Attente sur le GPU, pas sur le processeur
+    // every game draw executed so far finished before this computation: the game executes its lists on a different queue from
+    // the present queue, and nothing orders them; what had just been executed (water, late in the frame) had not
+    // written its vertices or its counter yet: empty object, blinking reflection. Wait on the GPU, not on the CPU
     if (live.queueSyncOn)
     {
         ID3D12CommandQueue* presentQueue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
@@ -1987,9 +1987,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         std::lock_guard<std::mutex> lock(g_mutex);
         marksNow.swap(g_liveMarks);
         {
-            // la plus grande des zones assez fréquentes (un cinquième des dessins de la plus fréquente) : des passes à
-            // mi-résolution (852×480 dans Horizon) dessinent aussi dans cette profondeur, quelques repères en 3D
-            // gardent la zone pleine
+            // the largest of the frequent enough viewports (a fifth of the draws of the most frequent): passes at
+            // half resolution (852×480 in one game) also draw into this depth, a few 3D markers
+            // keep the full area
             uint32_t most = 0;
             for (const auto& [extent, n] : g_liveViewCounts)
                 most = std::max(most, n);
@@ -1998,8 +1998,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             for (const auto& [extent, n] : g_liveViewCounts)
                 if (n * 5 >= most && uint64_t(extent >> 16) * (extent & 0xFFFF) > bestArea)
                     best = extent, bestArea = uint64_t(extent >> 16) * (extent & 0xFFFF);
-            // une image de temps en temps (sonde d'environnement ?) est dominée par une autre zone : la zone rendue ne
-            // change qu'après dix images de suite avec la même nouvelle zone (une résolution dynamique change lentement)
+            // an occasional frame (environment probe?) is dominated by another area: the rendered area only
+            // changes after ten frames in a row with the same new area (dynamic resolution changes slowly)
             if (most >= 16)
             {
                 if (best == live.viewCandidate)
@@ -2020,7 +2020,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     std::snprintf(item, sizeof(item), " %ux%u : %u", v[i].first >> 16, v[i].first & 0xFFFF, v[i].second);
                     std::strncat(text, item, sizeof(text) - std::strlen(text) - 1);
                 }
-                Log("URTI direct : zones de dessin dans la profondeur de l'écran (dessins) :%s", text);
+                Log("URTI live: viewports in the screen depth (draws):%s", text);
             }
             g_liveViewCounts.clear();
         }
@@ -2028,8 +2028,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             regionsNow.swap(g_liveRegions[slot]), srcNow.swap(g_liveRegionSrc[slot]), cursorNow = g_liveCursor[slot];
         transpNow.swap(g_liveTranspRegions), transpSrcNow.swap(g_liveTranspSrc), transpCursorNow = g_liveTranspCursor;
         g_liveTranspRegions.clear(), g_liveTranspSrc.clear(), g_liveTranspCursor = 0, g_liveTranspVerts = 0;
-        // places fixes : un objet absent depuis plus de kLiveKeepFrames images rend sa place ; les autres restent
-        // dans la scène RT avec leur dernière géométrie ; partie occupée trop morcelée : tout est redistribué
+        // fixed places: an object absent for more than kLiveKeepFrames frames gives its place back; the others stay
+        // in the RT scene with their last geometry; used part too fragmented: everything is redistributed
         if (g_livePersist && slot >= 0 && g.slotDepth[slot] == g_liveMainDepth)
         {
             constexpr uint64_t kLiveKeepFrames = 3;
@@ -2042,8 +2042,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     it = g_livePlaces.erase(it);
                     continue;
                 }
-                // dessinée dans cette image : convertie depuis sa zone du flux, jusqu'à son compteur ; sinon gardée
-                // telle quelle dans la scène RT (compteur ~0 : la conversion n'y touche pas)
+                // drawn in this frame: converted from its region of the stream, up to its counter; otherwise kept
+                // as it is in the RT scene (counter ~0: the conversion does not touch it)
                 const bool drawn = it->second.lastFrame == g_livePlaceFrame;
                 placesNow.push_back({ it->second.offset, it->second.capacity, drawn ? it->second.frameCounter : ~0u, it->first });
                 held += it->second.capacity;
@@ -2069,7 +2069,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             {
                 const auto f = srcOf.find(placesNow[i].id);
                 placeSrc[i] = f != srcOf.end() ? f->second : 0;
-                // dessinée à la même place à l'image précédente : ses anciens sommets servent au mouvement de la caméra
+                // drawn at the same place in the previous frame: its old vertices serve the camera motion
                 if (f != srcOf.end())
                     if (const auto pl = g_livePlaces.find(placesNow[i].id);
                         pl != g_livePlaces.end() && pl->second.prevFrame + 1 == g_livePlaceFrame && pl->second.stableOrder && pl->second.uniquePrev &&
@@ -2081,9 +2081,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.statPlaceNew += g_livePlaceNew, live.statPlaceFrames++;
             live.placesMoved = live.placesResetPending || g_livePlaceNew > placesNow.size() / 16 + 8;
             live.placesResetPending = false;
-            // une place refusée (emplacement plein), ou plus d'un cinquième de la partie occupée perdu en trous :
-            // toutes les places sont rendues, l'image suivante les redistribue à la suite (la structure étant
-            // reconstruite à chaque image, seuls les objets gardés sans être dessinés manquent une image)
+            // a refused place (slot full), or more than a fifth of the used part lost to holes:
+            // every place is given back, the next frame redistributes them one after the other (the structure being
+            // rebuilt every frame, only objects kept without being drawn miss one frame)
             if (g_livePlaceFailed || held < uint64_t(g_livePlaceHigh) * 8 / 10)
             {
                 live.statPlaceResets++, live.placesResetPending = true;
@@ -2096,7 +2096,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         g_livePlaceFrame++;
         for (uint32_t s = 0; s < kSlots; s++)
             g_liveRegions[s].clear(), g_liveRegionSrc[s].clear(), g_liveCursor[s] = 0;
-        // maillages dessinés une seule fois dans cette image (pour les paires de l'image suivante)
+        // meshes drawn only once in this frame (for the next frame's pairs)
         for (auto& [id, place] : g_livePlaces)
             if (place.lastFrame == g_livePlaceFrame - 1)
             {
@@ -2109,18 +2109,18 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             probesNow.swap(g_liveProbes[slot]);
         for (uint32_t s = 0; s < kSlots; s++)
             g_liveProbes[s].clear();
-        // fenêtre suivante : sa partie du flux (servie il y a trois fenêtres) repart du début ; ses compteurs sont
-        // remis à zéro à la fin de cette image, avant toute liste écrite dans la nouvelle fenêtre
+        // next window: its part of the stream (used three windows ago) starts again from the beginning; its counters are
+        // reset at the end of this frame, before any list is written in the new window
         g_liveWindow++;
         const uint32_t nextArea = uint32_t(g_liveWindow % kLiveAreas);
         for (uint32_t s = 0; s < kSlots; s++)
             g_liveAreaCursor[s][nextArea] = g_liveAreaProbe[s][nextArea] = 0;
         g_liveAreaCounters[nextArea] = 0;
-        // profondeur de cette fenêtre ; les listes déjà exécutées de l'image suivante entrent dans la nouvelle fenêtre (qui peut déjà se
-        // fermer : un calcul de plus à la présentation suivante)
+        // depth of this window; lists of the next frame already executed go into the new window (which may already
+        // close: one more computation on the next present)
         live.snapIndexNow = g_liveSnapDone, live.snapSerialUsed = g_liveSnapSerial;
-        // copie de l'image sans interface de cette image du jeu : une par image, dans l'ordre ; la dernière paire connue donne le numéro (la copie
-        // elle-même peut ne pas être encore exécutée). Le calque est recalé sur l'image affichée d'après ce numéro (live_hudgain)
+        // copy of the UI-free image of this game frame: one per frame, in order; the last known pair gives the number (the copy
+        // itself may not be executed yet). The layer is realigned on the displayed image from that number (live_hudgain)
         live.layerHudSerial = g_livePairHud + (g_liveSnapSerial - g_livePairSnap);
         live.statMaterialLate += live.syncNow && g_liveWindowMaterial < 0 ? 1 : 0;
         live.materialIndexNow = g_liveWindowMaterial >= 0 ? g_liveWindowMaterial : g_liveMaterialDone;
@@ -2129,9 +2129,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             std::vector<LiveDeferred> later;
             later.swap(g_liveDeferred);
-            // plusieurs images complètes en attente (gros à-coup : le jeu a continué pendant que les présentations étaient bloquées) : seule la
-            // dernière est gardée. Un calcul par image ne rattrape jamais son retard : les zones du flux attendues étaient reprises avant d'être
-            // lues, la scène de l'image restait vide pour toujours, sans que rien ne le dise
+            // several complete frames waiting (big hitch: the game went on while presents were blocked): only the
+            // last one is kept. One computation per frame never catches up its lag: the expected stream regions were reused before being
+            // read, and the frame's scene stayed empty forever, with nothing saying so
             {
                 struct Close
                 {
@@ -2170,13 +2170,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 else
                     LiveCommit(d.pending, d.listMain, d.counted);
         }
-        // compteurs remis à zéro une fenêtre à l'avance : cette remise à zéro s'exécute à la fin de ce calcul, sur la file
-        // des présentations, et rien ne l'ordonne avec la file du jeu. Pour la fenêtre qui commence, elle arrivait pendant
-        // que le jeu dessinait déjà : tous les compteurs écrits avant elle étaient effacés (objets vides au hasard, l'eau
-        // captée une image sur huit, des places qui clignotent). Celle d'après ne commence qu'après le prochain calcul ; ses
-        // dernières lectures (kLiveAreaMaxAge) sont faites plus haut dans cette image
+        // counters reset one window ahead: this reset runs at the end of this computation, on the present
+        // queue, and nothing orders it with the game's queue. For the window that starts, it arrived while
+        // the game was already drawing: every counter written before it was erased (random empty objects, water
+        // captured one frame in eight, blinking places). The one after starts only after the next computation; its
+        // last reads (kLiveAreaMaxAge) are done further up in this frame
         zeroArea = uint32_t((g_liveWindow + 1) % kLiveAreas);
-        for (auto it = g_livePending.begin(); it != g_livePending.end();) // listes écrites mais jamais exécutées
+        for (auto it = g_livePending.begin(); it != g_livePending.end();) // lists written but never executed
             it = !it->second.empty() && g_liveWindow - it->second.front().window > 8 ? g_livePending.erase(it) : std::next(it);
         for (const auto& [id, mesh] : g_liveIdMesh)
             live.idMesh[id] = mesh;
@@ -2188,8 +2188,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         if (live.idMesh.size() > 200000)
             live.idMesh.clear();
         live.seenNow.swap(g_liveSeen);
-        // (hausse limitée : une fenêtre qui contient deux images du jeu ne double pas le coût des maillages : le budget tombait
-        // de 105 à 27 objets le temps d'une image, et ils revenaient à la suivante)
+        // (increase limited: a window holding two game frames does not double the meshes' cost: the budget dropped
+        // from 105 to 27 objects for one frame, and they came back on the next)
         for (const auto& [mesh, vertices] : live.seenNow)
         {
             auto& seen = live.seenRecent[mesh];
@@ -2214,11 +2214,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             g_livePrevSunKeys.swap(g_liveSunKeys);
         g_liveSunKeys.clear();
         g_liveSunMarked = 0;
-        // (occultation et rebond décochés dans le menu : le soleil ne sert plus à rien, sa carte n'est rejouée que par huitièmes)
+        // (occlusion and bounce unticked in the menu: the sun is no longer useful, its map is only replayed by eighths)
         g_liveSunEighth = !live.sunShadows && (live.sunEighth || !(live.menuAo || live.menuGi));
     }
-    // compteurs remis à zéro dans la liste de cette image (avant toute liste écrite dans la fenêtre suivante) : ceux
-    // des emplacements (étalonnage) et ceux de la partie du flux de la fenêtre suivante, après leur dernière lecture
+    // counters reset inside this frame's list (before any list written in the next window): those
+    // of the slots (calibration) and those of the next window's part of the stream, after their last read
     auto zeroCounters = [&](D3D12_RESOURCE_STATES from) {
         Transition(list.Get(), g.counters.Get(), from, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyBufferRegion(g.counters.Get(), 0, g.zeros.Get(), 0, kSlots * 8ull);
@@ -2226,9 +2226,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->CopyBufferRegion(g.counters.Get(), (kSlots + uint64_t(zeroArea) * kLiveAreaCounters) * 8ull, g.zeros.Get(), 0, uint64_t(kLiveAreaCounters) * 8ull);
         Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
     };
-    // budget de géométrie : mesures arrivées (trois images plus tard), puis choix des objets de la scène RT
-    // pour les images suivantes : par taille apparente décroissante jusqu'au budget (bonus aux objets déjà
-    // dedans : pas de va-et-vient au bord du budget) ; les objets inconnus entrent d'office (mesurés ensuite)
+    // geometry budget: measurements arrived (three frames later), then choice of the RT scene's objects
+    // for the next frames: by decreasing apparent size up to the budget (bonus to objects already
+    // inside: no back and forth at the edge of the budget); unknown objects get in automatically (measured afterwards)
     {
         std::vector<uint32_t>& ids = live.statsIds[live.frame % 3];
         if (!ids.empty() && live.statsReadback[live.frame % 3])
@@ -2241,13 +2241,13 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     const float minZ = v[i * 4], size = v[i * 4 + 1];
                     const float importance = (minZ < 1e8f && size > 0) ? size / std::max(minZ, 0.3f) : 0.0f;
                     live.objects[ids[i]] = { importance, live.frame, uint32_t(v[i * 4 + 2]), minZ };
-                    // ExecuteIndirect : une zone remplie jusqu'au bout a été tronquée : réserve maximale à l'image suivante
+                    // ExecuteIndirect: a region filled to the end was truncated: maximum reserve on the next frame
                     if (live.idSig.count(ids[i]))
                     {
                         const std::vector<uint32_t>& caps = live.statsCaps[live.frame % 3];
                         const float written = v[i * 4 + 2], cap = i < caps.size() ? float(caps[i]) : 0.0f;
                         if (cap > 0 && written >= cap)
-                            live.objects[ids[i]].vertices = 65536; // la mesure suivante dira la vraie taille
+                            live.objects[ids[i]].vertices = 65536; // the next measurement will tell the true size
                     }
                 }
                 live.statsReadback[live.frame % 3]->Unmap(0, nullptr);
@@ -2257,9 +2257,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         if (live.objects.size() > 200000)
             live.objects.clear();
-        // budget par maillage (tous ses exemplaires ensemble) : l'identité d'un exemplaire n'est connue qu'à
-        // l'exécution, le choix de capter se fait à l'écriture. Mesures des exemplaires réunies : importance du plus
-        // important, sommets écrits du plus gros, mesure la plus ancienne
+        // budget per mesh (all its copies together): a copy's identity is only known at
+        // execution, the choice to capture is made at writing. The copies' measurements combined: importance of the most
+        // important, vertices written by the biggest, the oldest measurement
         struct MeshInfo
         {
             float importance = 0;
@@ -2289,17 +2289,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 const auto it = meshes.find(mesh);
                 if (it == meshes.end())
                 {
-                    used += vertices; // inconnu : entre d'office
+                    used += vertices; // unknown: gets in automatically
                     continue;
                 }
                 known.insert(mesh);
                 ranked.push_back({ it->second.importance * (live.admitted.count(mesh) ? 2.0f : 1.0f), mesh });
             }
-            // témoins du mouvement de la caméra : dessinés une seule fois (sinon leur ordre d'une image à l'autre n'est pas
-            // sûr), dessin direct, petits, à plus de 4 m (pas le personnage que la caméra suit) ; répartis en distance : les
-            // lointains disent la rotation, les proches le déplacement ; gardés tant qu'ils restent à l'écran
+            // camera-motion witnesses: drawn only once (otherwise their order from one frame to the next is not
+            // reliable), direct draw, small, further than 4 m (not the character the camera follows); spread in distance: the
+            // distant ones tell the rotation, the near ones the displacement; kept as long as they stay on screen
             if (live.geoOn && live.cameraOn && live.camSerialNow && !live.motionLog && !live.camLost)
-                live.sentinels.clear(); // la pose vient de la caméra du jeu
+                live.sentinels.clear(); // the pose comes from the game's camera
             else if (live.geoOn)
             {
                 auto single = [&](uint32_t mesh, const MeshInfo& mi) { return live.seenNow[mesh] <= mi.vertices + mi.vertices / 20 + 3; };
@@ -2332,17 +2332,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             }
             std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<uint64_t, uint32_t>> stale;
-            // un maillage trop gros pour la place restante est sauté, les suivants peuvent entrer ; sommets comptés :
-            // ceux réservés par tous ses exemplaires dans cette image.
-            // Scène stable : le nombre de dessins du jeu varie d'une image à l'autre (selon le décalage sous-pixel, même en
-            // pause), et au bord du budget des maillages entraient et sortaient sans arrêt (6 à 7 par image, caméra immobile).
-            // Un maillage déjà dedans garde sa place tant qu'il tient dans le budget + 20 % ; un nouveau n'entre que dans le
-            // budget, deux au plus par image, et pas dans les deux secondes après en être sorti
+            // a mesh too big for the remaining room is skipped, the next ones may get in; vertices counted:
+            // those reserved by all its copies in this frame.
+            // Stable scene: the number of game draws varies from one frame to the next (with the sub-pixel jitter, even when
+            // paused), and at the edge of the budget meshes kept entering and leaving (6 to 7 per frame, still camera).
+            // A mesh already inside keeps its place as long as it fits in the budget + 20 %; a new one only gets in within the
+            // budget, two at most per frame, and not within two seconds of leaving
             uint32_t entries = 0;
             for (const auto& [score, mesh] : ranked)
             {
                 if (admit.count(mesh))
-                    continue; // témoin
+                    continue; // witness
                 const uint32_t vertices = live.seenNow[mesh];
                 const bool inside = live.admitted.count(mesh) != 0;
                 bool fits = used + vertices <= (inside ? live.vertexBudget + live.vertexBudget / 5 : live.vertexBudget);
@@ -2357,8 +2357,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 else
                     stale.push_back({ live.geoOn ? live.meshProbed[mesh] : meshes[mesh].frame, mesh });
             }
-            // re-mesures (et cache de géométrie) : à tour de rôle, les plus anciennes d'abord ; maillage énorme (herbe,
-            // feuillage, des milliers de dessins) : une part de ses dessins à chaque tour
+            // re-measurements (and geometry cache): in turn, the oldest first; huge mesh (grass,
+            // foliage, thousands of draws): a share of its draws on each round
             std::sort(stale.begin(), stale.end());
             uint64_t probed = 0;
             std::unordered_map<uint32_t, uint32_t> strides, phases;
@@ -2369,7 +2369,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (probed + vertices / stride > live.probeBudget)
                     continue;
                 probed += vertices / stride, probe.insert(mesh);
-                // (un maillage énorme est capté par parts : chacune son tour, et chacune garde ses objets dans le cache)
+                // (a huge mesh is captured in parts: each in turn, and each keeps its objects in the cache)
                 if (stride > 1)
                     strides[mesh] = stride, phases[mesh] = live.meshPhase[mesh]++ % stride;
                 if (live.geoOn)
@@ -2393,9 +2393,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             uint64_t unknownVerts = 0, knownVerts = 0;
             for (const auto& [mesh, vertices] : live.seenNow)
                 (known.count(mesh) ? knownVerts : unknownVerts) += vertices;
-            Log("URTI direct : budget : %zu maillages à l'écran (%llu sommets mesurés, %llu pas encore mesurés), %zu dans la scène RT, %zu exemplaires mesurés",
+            Log("URTI live: budget: %zu meshes on screen (%llu vertices measured, %llu not measured yet), %zu in the RT scene, %zu copies measured",
                 live.seenNow.size(), (unsigned long long)knownVerts, (unsigned long long)unknownVerts, admit.size(), live.objects.size());
-            // les plus gros objets : sommets réservés (nombre d'indices × instances) et réellement écrits
+            // the biggest objects: reserved vertices (index count × instances) and really written
             std::vector<std::pair<uint32_t, uint32_t>> big;
             for (const auto& [id, vertices] : live.seenNow)
                 big.push_back({ vertices, id });
@@ -2411,7 +2411,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 std::snprintf(item, sizeof(item), " %u/%u", big[i].first, it != meshes.end() ? it->second.vertices : 0u);
                 std::strncat(top, item, sizeof(top) - std::strlen(top) - 1);
             }
-            Log("URTI direct : budget : sommets réservés des maillages admis %llu ; plus gros maillages (réservés, tous exemplaires / plus gros exemplaire écrit) :%s",
+            Log("URTI live: budget: reserved vertices of admitted meshes %llu; biggest meshes (reserved, all copies / biggest copy written):%s",
                 (unsigned long long)admittedReserved, top);
         }
         live.churnIn = live.churnOut = 0;
@@ -2421,7 +2421,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             if (!admit.count(id))
             {
                 live.churnOut++;
-                // sorti de la scène de l'image : capté pour le cache dès l'image suivante (ses places le gardent d'ici là)
+                // left the frame's scene: captured for the cache from the next frame (its places keep it until then)
                 live.meshLeft[id] = live.frame;
                 if (live.geoOn)
                     live.meshProbed[id] = 0;
@@ -2431,18 +2431,18 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         std::lock_guard<std::mutex> lock(g_mutex);
         g_liveKnown.swap(known), g_liveAdmit.swap(admit), g_liveProbeWant.swap(probe);
         g_liveBudget = live.vertexBudget > 0;
-        // (cache de géométrie : la limite par image a été respectée au choix ; ici, seulement une limite dure, les dessins
-        // d'un maillage énorme n'ont pas tous la même taille)
+        // (geometry cache: the per-frame limit was respected when choosing; here, only a hard limit, the draws
+        // of a huge mesh do not all have the same size)
         g_liveBudgetVertices = live.vertexBudget, g_liveProbeBudget = live.geoOn ? std::max<uint64_t>(live.probeBudget, live.geoProbe) : live.probeBudget;
         g_liveSlotLimit = live.slotLimit;
         g_liveMainDepth = slot >= 0 ? g.slotDepth[slot] : 0;
         g_liveMainSlotIndex = slot;
-        // tailles apprises des ExecuteIndirect : par signature de commande (à chaque image), et par identité
+        // learned ExecuteIndirect sizes: per command signature (every frame), and per identity
         if (live.frame % 10 == 0)
         {
             g_liveLearned.clear();
             for (const auto& [id, o] : live.objects)
-                if (live.frame - o.frame < 120) // 0 compris : un ExecuteIndirect qui ne dessine rien ne réserve presque rien
+                if (live.frame - o.frame < 120) // 0 included: an ExecuteIndirect that draws nothing reserves almost nothing
                     if (const auto m = live.idMesh.find(id); m != live.idMesh.end())
                     {
                         const auto [jt, added] = g_liveLearned.emplace(m->second, o.vertices);
@@ -2451,57 +2451,57 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     }
         }
     }
-    // mouvement de la caméra mesuré sur notre géométrie, lu trois images plus tard
+    // camera motion measured on our geometry, read three frames later
     if (const float* m = nullptr; live.motionReadback[live.frame % 3] && SUCCEEDED(live.motionReadback[live.frame % 3]->Map(0, nullptr, (void**)&m)) && m)
     {
         live.motFrames++;
         live.motPairs += uint64_t(m[14]);
         if (live.motionLog)
-            Log("MOUVEMENT %llu valide %.0f paires %.0f gardees %.0f ecart %.4f t %.4f %.4f %.4f trace %.6f pose %.3f", (unsigned long long)live.frame, m[12], m[14], m[13], m[15], m[9], m[10], m[11],
+            Log("MOTION %llu valid %.0f pairs %.0f kept %.0f deviation %.4f t %.4f %.4f %.4f trace %.6f pose %.3f", (unsigned long long)live.frame, m[12], m[14], m[13], m[15], m[9], m[10], m[11],
                 m[0] + m[4] + m[8], std::sqrt(m[41] * m[41] + m[42] * m[42] + m[43] * m[43]));
         if (m[12] > 0.5f)
         {
             const double tr = std::clamp((double(m[0]) + m[4] + m[8] - 1.0) * 0.5, -1.0, 1.0);
             const double rot = std::acos(tr) * 180.0 / 3.14159265, move = std::sqrt(double(m[9]) * m[9] + double(m[10]) * m[10] + double(m[11]) * m[11]);
             live.motValid++, live.motRot += rot, live.motTrans += move;
-            if (move > 0.01) // (plus d'un centimètre par image : la caméra avance ; la mesure du champ de vision en est faussée)
+            if (move > 0.01) // (more than a centimetre per frame: the camera moves forward; the field-of-view measurement is skewed by it)
                 live.motLastMoveFrame = live.frame;
             live.motKept += m[14] > 0 ? m[13] / m[14] : 0.0, live.motRms += m[15];
             if (!live.camLive)
                 live.geoPoseDistance = std::sqrt(double(m[41]) * m[41] + double(m[42]) * m[42] + double(m[43]) * m[43]);
-            // la caméra bouge (notre mesure) et les vecteurs du jeu ne se laissent toujours pas lire : ils ne
-            // contiennent sans doute pas le mouvement de la caméra (seulement celui des personnages) ; trois secondes
-            // ainsi et les nôtres les remplacent
+            // the camera moves (our measurement) and the game's vectors still cannot be read: they probably do not
+            // contain the camera's motion (only the characters'); three seconds
+            // like that and ours replace them
             if (live.motionSource == 0 && !live.mvSynthetic && live.mvConvention == 255 && (rot > 0.05 || move > 0.005) && ++live.motMovingNoGame >= 180)
             {
                 live.mvSynthetic = true, live.mvConvention = 0;
-                Log("URTI direct : la caméra bouge et les vecteurs de mouvement du jeu restent illisibles : mouvement de la caméra mesuré sur notre "
-                    "géométrie à la place");
+                Log("URTI live: the camera moves and the game's motion vectors stay unreadable: camera motion measured on our "
+                    "geometry instead");
                 if (live.verified || live.fromStore)
                     LiveSaveCalibration();
             }
         }
-        // assez de paires, et presque aucune n'accepte le moindre mouvement : coupure de la caméra (cinématique, voyage
-        // rapide). Une coupure non vue n'est pas grave (le tour suivant remplace tout, et les rayons écartent ce que la
-        // caméra voit à travers) ; un vidage de trop fait disparaître la moitié de l'effet pendant une seconde
+        // enough pairs, and almost none accepts the slightest motion: camera cut (cutscene, fast
+        // travel). A missed cut is not serious (the next round replaces everything, and rays discard what the
+        // camera sees through); one clearing too many makes half the effect disappear for a second
         const bool badFit = !live.camLive && m[12] <= 0.5f && m[14] >= 256.0f && m[13] < 32.0f;
         live.motionReadback[live.frame % 3]->Unmap(0, nullptr);
         if (badFit)
         {
             live.statGeoBadFit++;
             if (live.frame > live.geoLastFlush + 120)
-                LiveGeoFlush("mouvement de la caméra impossible à mesurer");
+                LiveGeoFlush("camera motion impossible to measure");
         }
         if (live.motFrames >= 300)
         {
             const double v = std::max(1u, live.motValid);
-            Log("URTI direct : mouvement de la caméra mesuré sur notre géométrie : %u images sur %u, rotation %.3f° et translation %.1f cm par image en "
-                "moyenne, %.0f paires reçues par image, %.0f %% gardées, écart %.1f mm, %zu témoins%s", live.motValid, live.motFrames, live.motRot / v, live.motTrans / v * 100.0,
-                double(live.motPairs) / live.motFrames, live.motKept / v * 100.0, live.motRms / v * 1000.0, live.sentinels.size(), live.mvSynthetic ? " (vecteurs de mouvement fabriqués avec lui)" : "");
+            Log("URTI live: camera motion measured on our geometry: %u frames out of %u, rotation %.3f° and translation %.1f cm per frame on "
+                "average, %.0f pairs received per frame, %.0f %% kept, deviation %.1f mm, %zu witnesses%s", live.motValid, live.motFrames, live.motRot / v, live.motTrans / v * 100.0,
+                double(live.motPairs) / live.motFrames, live.motKept / v * 100.0, live.motRms / v * 1000.0, live.sentinels.size(), live.mvSynthetic ? " (motion vectors built from it)" : "");
             live.motFrames = live.motValid = 0, live.motRot = live.motTrans = live.motKept = live.motRms = 0, live.motPairs = 0;
         }
     }
-    // bilan du suivi du soleil, lu trois images plus tard
+    // sun-tracking summary, read three frames later
     if (const float* r = nullptr; live.sunReadback[live.frame % 3] && SUCCEEDED(live.sunReadback[live.frame % 3]->Map(0, nullptr, (void**)&r)) && r)
     {
         if ((live.gnMode & 3) == 2)
@@ -2513,7 +2513,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             if (++live.rotLogFrames >= 300)
             {
                 const double k = std::max(live.rotSum[3], 1.0);
-                Log("URTI direct : orientation de la caméra par les normales du G-buffer : %.0f images sur 300 avec des pixels, accord moyen %.3f sur %.0f pixels, valide %.0f %% ; "
+                Log("URTI live: camera orientation from the G-buffer normals: %.0f frames out of 300 with pixels, mean agreement %.3f over %.0f pixels, valid %.0f %%; "
                     "lignes (%.3f %.3f %.3f) (%.3f %.3f %.3f) (%.3f %.3f %.3f)",
                     live.rotSum[3], live.rotSum[0] / k, live.rotSum[1] / k, live.rotSum[2] / k * 100.0, o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8]);
                 live.rotLogFrames = 0;
@@ -2522,17 +2522,17 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             }
         }
         if (live.frame % 600 == 0)
-            Log("URTI direct : loi de profondeur de l'image : %g + %g / w (valide %.0f) ; stockée : %g + %g / w", r[9], r[10], r[11], live.A, live.B);
+            Log("URTI live: depth law of the frame: %g + %g / w (valid %.0f); stored: %g + %g / w", r[9], r[10], r[11], live.A, live.B);
         if (live.motionLog)
             Log("LOI %llu %g %g valide %.0f", (unsigned long long)live.frame, r[9], r[10], r[11]);
         if (live.calibrated)
         {
             live.sunFrames++, live.pairSum += uint64_t(r[4]);
-            if (live.jitterLog) // urti.ini jitter_log=1 : décalage sous-pixel mesuré à chaque image (celle d'il y a trois)
-                Log("JITTER %llu valide %.0f ecart %.6f %.6f absolu %.6f %.6f s2 %.3f t2 %.3f", (unsigned long long)live.frame, r[156], r[157], r[158], r[296], r[297], r[304], r[305]);
-            if (r[156] > 0) // rotation de la caméra mesurée (octet 624)
+            if (live.jitterLog) // urti.ini jitter_log=1: sub-pixel jitter measured every frame (the one from three frames ago)
+                Log("JITTER %llu valid %.0f delta %.6f %.6f absolute %.6f %.6f s2 %.3f t2 %.3f", (unsigned long long)live.frame, r[156], r[157], r[158], r[296], r[297], r[304], r[305]);
+            if (r[156] > 0) // camera rotation measured (byte 624)
             {
-                const double tr = r[144] + r[149] + r[154]; // trace de la matrice (lignes à 576, 592, 608)
+                const double tr = r[144] + r[149] + r[154]; // trace of the matrix (rows at 576, 592, 608)
                 live.rotationSum += std::acos(std::clamp((tr - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / 3.14159265;
                 live.rotationValid++;
             }
@@ -2549,24 +2549,24 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (!live.verified)
                 {
                     live.verified = true;
-                    // vérification discrète de l'étalonnage stocké. Pas avec la caméra du jeu, qui donne projection et loi de profondeur à
-                    // chaque image : cette capture complète, au chargement, écrase le flux pendant que le jeu charge (GPU perdu, Horizon)
+                    // quiet check of the stored calibration. Not with the game's camera, which gives projection and depth law
+                    // every frame: this full capture, at load, overwrites the stream while the game loads (GPU lost in one game)
                     live.forceCalibration = g_camCbvSize == 0;
                 }
             }
             else
                 live.framesSinceSun++;
             if (r[305] > 0)
-                live.fovStretch = r[305]; // t² : (tan du demi-champ supposé / tan du vrai)²
-            // part du soleil dans l'image du jeu : médiane de chaque histogramme (live_sunlight), lissée en log
-            // (une demi-seconde environ) ; trop peu de paires (pas d'ombre du jeu à l'écran) : valeur gardée
+                live.fovStretch = r[305]; // t²: (tan of the assumed half-field / tan of the true one)²
+            // sun share in the game's image: median of each histogram (live_sunlight), smoothed in log space
+            // (about half a second); too few pairs (no game shadow on screen): value kept
             const uint32_t* check = reinterpret_cast<const uint32_t*>(r) + 472; // octet 1888
             for (int k = 0; k < 6; k++)
                 live.mapCheck[k] += check[k];
             for (int k = 0; k < 16; k++)
                 live.depthHist[k] += check[8 + k], live.gapHist[k] += check[24 + k];
-            // mesure acceptée seulement si la carte lue concorde avec l'image : les points qu'elle éclaire sont
-            // nettement plus clairs que ceux qu'elle ombre (sinon elle est mal lue : la valeur d'avant reste)
+            // measurement accepted only if the map read agrees with the image: the points it lights are
+            // clearly brighter than those it shadows (otherwise it is read wrongly: the previous value stays)
             const bool mapAgrees = check[0] >= 32 && check[1] >= 32 && check[5] > 0 &&
                                    (double(check[4]) / check[0]) > 1.3 * (double(check[5]) / check[1]);
             if (const uint32_t* u = reinterpret_cast<const uint32_t*>(r); live.sunMeasure && mapAgrees && u[308] >= 32)
@@ -2591,18 +2591,18 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 }
                 live.sunSkyFrames++, live.sunSkyPairs += u[308];
             }
-            // champ de vision du jeu : la projection d'URTI est corrigée quand la mesure est fiable (assez de
-            // rotation de la caméra) et s'écarte de plus de 1,5 % ; les reflets ont alors des angles exacts (dans
-            // un espace caméra étiré, la normale du sol est fausse et le reflet décalé : il « flotte »)
+            // the game's field of view: URTI's projection is corrected when the measurement is reliable (enough
+            // camera rotation) and differs by more than 1.5 %; reflections then have exact angles (in
+            // a stretched camera space, the floor's normal is wrong and the reflection shifted: it "floats")
             if (live.fovHold)
                 live.fovHold--;
-            // (seuil de rotation 4e-4 -> 1e-4 : avec des mouvements de caméra ordinaires il n'était jamais atteint ; garde : les étirements horizontal et
-            // vertical concordent à 15 % près, une mesure cohérente)
+            // (rotation threshold 4e-4 -> 1e-4: with ordinary camera moves it was never reached; guard: the horizontal and
+            // vertical stretches agree within 15 %, a consistent measurement)
             else if (live.fovAuto && live.fovForce <= 0 && !live.camLive && r[304] > 0 && r[305] > 0 && r[300] + r[302] > 1e-4f && std::fabs(r[304] / r[305] - 1.0f) < 0.15f)
             {
                 const float k2 = (r[300] * r[304] + r[302] * r[305]) / (r[300] + r[302]);
-                // stable dans le temps : la même valeur (à 5 % près) qu'au moins 30 images plus tôt ; sinon elle devient la référence. En marchant, pendant
-                // une rafale, la mesure partait parfois seule (37,9° -> 60,8° -> 91,2°)
+                // stable over time: the same value (within 5 %) as at least 30 frames earlier; otherwise it becomes the reference. While walking, during
+                // a burst, the measurement sometimes drifted on its own (37.9° -> 60.8° -> 91.2°)
                 bool stable = false;
                 if (live.fovK2Ref > 0 && live.frame >= live.fovK2RefFrame + 30)
                 {
@@ -2611,49 +2611,49 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 }
                 else if (live.fovK2Ref <= 0)
                     live.fovK2Ref = k2, live.fovK2RefFrame = live.frame;
-                // (et la caméra n'a pas avancé depuis 220 images : les sommes de la mesure, qui s'effacent en ~200 images, ne contiennent plus de marche)
+                // (and the camera has not moved forward for 220 frames: the measurement's sums, which fade in ~200 frames, no longer contain any walking)
                 if (stable && live.frame > live.motLastMoveFrame + 220 && std::fabs(k2 - 1.0f) > 0.03f)
                 {
                     const float before = 2.0f * std::atan(1.0f / live.p11) * 57.2957795f;
                     const float aspect = live.p11 / live.p00;
-                    // (pas plus de ~25 % d'un coup, champ vertical entre 25° et 75°)
-                    live.p11 = std::clamp(live.p11 * std::pow(std::clamp(k2, 0.6f, 1.7f), 0.4f), // 80 % de l'écart : pas d'oscillation
+                    // (no more than ~25 % at once, vertical field between 25° and 75°)
+                    live.p11 = std::clamp(live.p11 * std::pow(std::clamp(k2, 0.6f, 1.7f), 0.4f), // 80 % of the difference: no oscillation
                                             1.0f / std::tan(37.5f / 57.2957795f), 1.0f / std::tan(12.5f / 57.2957795f));
                     live.p00 = live.p11 / aspect;
                     live.fovReset = true, live.fovHold = 6, live.fovMeasured = true;
                     LiveSaveCalibration();
-                    Log("URTI direct : champ de vision corrigé : %.1f° -> %.1f°", before, 2.0f * std::atan(1.0f / live.p11) * 57.2957795f);
+                    Log("URTI live: field of view corrected: %.1f° -> %.1f°", before, 2.0f * std::atan(1.0f / live.p11) * 57.2957795f);
                 }
             }
             if (live.sunFrames == 300)
             {
                 if (live.fovStretch > 0 && live.p11 > 0 && !live.camLive)
-                    Log("URTI direct : champ de vision vertical du jeu mesuré : %.1f° (URTI suppose %.1f°)",
+                    Log("URTI live: the game's vertical field of view measured: %.1f° (URTI assumes %.1f°)",
                         2.0 * std::atan(1.0 / (live.p11 * std::sqrt(double(live.fovStretch)))) * 180.0 / 3.14159265,
                         2.0 * std::atan(1.0 / double(live.p11)) * 180.0 / 3.14159265);
-                Log("URTI direct : soleil suivi (%.3f, %.3f, %.3f), mesuré sur %.0f %% des images, %.0f paires par image, %u cascades", r[0], r[1], r[2],
+                Log("URTI live: sun tracked (%.3f, %.3f, %.3f), measured on %.0f %% of frames, %.0f pairs per frame, %u cascades", r[0], r[1], r[2],
                     100.0 * live.sunAccepted / live.sunFrames, double(live.pairSum) / live.sunFrames, reinterpret_cast<const uint32_t*>(r)[8]);
                 if (live.sunJitterCount)
-                    Log("URTI direct : soleil d'une image à l'autre : %.3f° en moyenne, %.2f° au plus (caméra comprise)", live.sunJitterSum / live.sunJitterCount,
+                    Log("URTI live: sun from one frame to the next: %.3f° on average, %.2f° at most (camera included)", live.sunJitterSum / live.sunJitterCount,
                         live.sunJitterMax);
                 live.sunJitterSum = live.sunJitterMax = 0, live.sunJitterCount = 0;
                 if (live.rotationValid)
-                    Log("URTI direct : rotation de la caméra mesurée sur %u images sur 300 (cascades), %.3f° par image en moyenne", live.rotationValid,
+                    Log("URTI live: camera rotation measured on %u frames out of 300 (cascades), %.3f° per frame on average", live.rotationValid,
                         live.rotationSum / live.rotationValid);
                 live.rotationValid = 0, live.rotationSum = 0;
                 live.sunFrames = live.sunAccepted = live.pairSum = 0;
                 if (live.sunSkyFrames > live.sunSkyLogged)
-                    Log("URTI direct : lumière du jeu mesurée : soleil / ciel %.2f (rouge %.2f, vert %.2f, bleu %.2f) ; ombre RT face au soleil : "
-                        "%.0f %% de la lumière retirée ; %u images mesurées sur 300, %.0f paires par image", live.sunSky[3], live.sunSky[0], live.sunSky[1],
+                    Log("URTI live: the game's light measured: sun / sky %.2f (red %.2f, green %.2f, blue %.2f); RT shadow facing the sun: "
+                        "%.0f %% of the light removed; %u frames measured out of 300, %.0f pairs per frame", live.sunSky[3], live.sunSky[0], live.sunSky[1],
                         live.sunSky[2], 100.0f * live.sunSky[3] / (1.0f + live.sunSky[3]), live.sunSkyFrames - live.sunSkyLogged,
                         double(live.sunSkyPairs) / std::max(1u, live.sunSkyFrames - live.sunSkyLogged));
                 else if (live.sunMeasure)
-                    Log("URTI direct : lumière du jeu non mesurée (pas d'ombre du jeu à l'écran) : soleil / ciel gardé à %.2f", live.sunSky[3]);
+                    Log("URTI live: the game's light not measured (no game shadow on screen): sun / sky kept at %.2f", live.sunSky[3]);
                 live.sunSkyLogged = live.sunSkyFrames, live.sunSkyPairs = 0;
                 if (const uint64_t n = live.mapCheck[0] + live.mapCheck[1] + live.mapCheck[2] + live.mapCheck[3])
                 {
-                    Log("URTI direct : carte d'ombres du jeu au point vu (face au soleil) : %.0f %% éclairés, %.0f %% à l'ombre, %.0f %% au bord, "
-                        "%.0f %% hors des cascades ; luminance moyenne éclairés %.3f, à l'ombre %.3f (rapport %.2f : bien plus que 1 si la carte lue est la bonne)",
+                    Log("URTI live: the game's shadow map at the point seen (facing the sun): %.0f %% lit, %.0f %% shadowed, %.0f %% on the edge, "
+                        "%.0f %% outside the cascades; mean luminance lit %.3f, shadowed %.3f (ratio %.2f: much more than 1 if the map read is the right one)",
                         100.0 * live.mapCheck[0] / n, 100.0 * live.mapCheck[1] / n, 100.0 * live.mapCheck[2] / n, 100.0 * live.mapCheck[3] / n,
                         live.mapCheck[0] ? live.mapCheck[4] / 1024.0 / live.mapCheck[0] : 0.0, live.mapCheck[1] ? live.mapCheck[5] / 1024.0 / live.mapCheck[1] : 0.0,
                         live.mapCheck[0] && live.mapCheck[1] && live.mapCheck[5] ? (double(live.mapCheck[4]) / live.mapCheck[0]) / (double(live.mapCheck[5]) / live.mapCheck[1]) : 0.0);
@@ -2663,7 +2663,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                         a += std::snprintf(depthText + a, sizeof(depthText) - a, "%s%llu", k ? " " : "", (unsigned long long)live.depthHist[k]);
                         b += std::snprintf(gapText + b, sizeof(gapText) - b, "%s%llu", k ? " " : "", (unsigned long long)live.gapHist[k]);
                     }
-                    Log("URTI direct : profondeur des points dans la cascade (-0,5 à 1,5 par 0,125) : %s ; carte - point (-0,02 à 0,02 par 0,0025) : %s",
+                    Log("URTI live: depth of the points in the cascade (-0.5 to 1.5 by 0.125): %s; map - point (-0.02 to 0.02 by 0.0025): %s",
                         depthText, gapText);
                 }
                 for (uint64_t& v : live.mapCheck)
@@ -2678,7 +2678,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         if (const uint32_t* e = nullptr; SUCCEEDED(live.mvErrorsReadback[live.frame % 3]->Map(0, nullptr, (void**)&e)) && e)
         {
             const double meanMotion = e[33] ? e[32] / 1e6 / e[33] : 0;
-            if (meanMotion > 0.0008) // la caméra bouge : les candidates se départagent
+            if (meanMotion > 0.0008) // the camera moves: the candidates can be told apart
             {
                 for (int k = 0; k < 16; k++)
                     live.mvErr[k] += e[k * 2] / 10000.0, live.mvCount[k] += e[k * 2 + 1];
@@ -2699,30 +2699,30 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     if (best >= 0 && bestErr < 0.7 * secondErr)
                     {
                         live.mvConvention = uint32_t(best);
-                        Log("URTI direct : convention des vecteurs de mouvement trouvée (%d : erreur %.4f, suivante %.4f) : accumulation des ombres active", best,
+                        Log("URTI live: motion-vector convention found (%d: error %.4f, next %.4f): shadow accumulation on", best,
                             bestErr, secondErr);
                         if (live.verified || live.fromStore)
                             LiveSaveCalibration();
                     }
                     else if (++live.mvUndecided >= 3 && live.motionSource == 0 && ++live.mvGiveUps >= 2)
                     {
-                        // deux cibles essayées sans vainqueur : les vecteurs du jeu sont illisibles (Horizon Forbidden
-                        // West), ceux fabriqués avec le mouvement de la caméra mesuré sur notre géométrie les remplacent
+                        // two targets tried without a winner: the game's vectors are unreadable (seen in one
+                        // game), those built from the camera motion measured on our geometry replace them
                         live.mvUndecided = 0, live.mvSynthetic = true, live.mvConvention = 0;
-                        Log("URTI direct : vecteurs de mouvement du jeu illisibles : mouvement de la caméra mesuré sur notre géométrie à la place");
+                        Log("URTI live: the game's motion vectors are unreadable: camera motion measured on our geometry instead");
                         if (live.verified || live.fromStore)
                             LiveSaveCalibration();
                     }
                     else if (live.mvUndecided >= 3)
                     {
-                        // trois mesures en mouvement sans vainqueur : ce ne sont pas des vecteurs de mouvement, la cible
-                        // suivante du même format est essayée
+                        // three measurements in motion without a winner: these are not motion vectors, the next target
+                        // of the same format is tried
                         live.mvUndecided = 0, live.mvCandidate++;
-                        Log("URTI direct : vecteurs de mouvement jamais départagés (meilleure %.4f, suivante %.4f) : essai de la cible n° %u de ce format",
+                        Log("URTI live: motion vectors never told apart (best %.4f, next %.4f): trying target no. %u of this format",
                             bestErr, secondErr, live.mvCandidate);
                     }
                     else
-                        Log("URTI direct : vecteurs de mouvement pas encore départagés (meilleure %.4f, suivante %.4f), on continue", bestErr, secondErr);
+                        Log("URTI live: motion vectors not told apart yet (best %.4f, next %.4f), going on", bestErr, secondErr);
                     std::fill(std::begin(live.mvErr), std::end(live.mvErr), 0.0), std::fill(std::begin(live.mvCount), std::end(live.mvCount), 0.0);
                     live.mvMovingFrames = 0;
                 }
@@ -2731,9 +2731,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
     if (live.frameTrace)
     {
-        Log("TRAME %llu t %.2f calcul gen %d dessins %u principal %u zones %zu places %zu mesures %zu cam %u", (unsigned long long)live.frame, LiveTraceMs(), int(live.imageGenerated),
+        Log("FRAME %llu t %.2f compute gen %d draws %u main %u regions %zu places %zu probes %zu cam %u", (unsigned long long)live.frame, LiveTraceMs(), int(live.imageGenerated),
             live.lastPresentDraws, drawsThisFrame, regionsNow.size(), placesNow.size(), probesNow.size(), live.camSerialNow);
-        // rangée de profondeur et de masque de ce calcul, lue trois calculs plus tard : le calcul a-t-il vu toute l'image ?
+        // row of depth and mask of this computation, read three computations later: did the computation see the whole frame?
         const uint32_t s = uint32_t(live.frame % 3);
         if (live.traceFrame[s] != ~0ull && live.traceRb[s])
             if (const uint32_t* v = nullptr; SUCCEEDED(live.traceRb[s]->Map(0, nullptr, (void**)&v)) && v)
@@ -2748,7 +2748,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     sky += d == 0.0f || d == 1.0f ? 1 : 0;
                     sumD += d, sumLit += reinterpret_cast<const float*>(v)[n + i];
                 }
-                Log("RANGEE %llu ciel %.1f profondeur %.6f masque %.4f", (unsigned long long)live.traceFrame[s], n ? 100.0 * sky / n : 0.0, n ? sumD / n : 0.0, n ? sumLit / n : 0.0);
+                Log("ROW %llu sky %.1f depth %.6f mask %.4f", (unsigned long long)live.traceFrame[s], n ? 100.0 * sky / n : 0.0, n ? sumD / n : 0.0, n ? sumLit / n : 0.0);
                 live.traceRb[s]->Unmap(0, nullptr);
                 live.traceFrame[s] = ~0ull;
             }
@@ -2761,7 +2761,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const effect_uniform_variable active = runtime->find_uniform_variable("urti.fx", "UrtiActive");
     if (depthCopy && !live.depthReady)
     {
-        // la loi de profondeur est mesurée à chaque image sur le GPU : seule la projection est supposée
+        // the depth law is measured every frame on the GPU: only the projection is assumed
         LiveSetProjection(depthCopy->GetDesc());
         live.depthReady = true;
     }
@@ -2799,7 +2799,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         for (auto& r : live.timeCRb)
             r = MakeBuffer(g.device, LiveState::kTimeD * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     }
-    // minutage détaillé du calcul, lu trois images plus tard
+    // detailed timing of the computation, read three frames later
     if (const uint64_t* t = nullptr; live.timeDRb[live.frame % 3] && SUCCEEDED(live.timeDRb[live.frame % 3]->Map(0, nullptr, (void**)&t)) && t)
     {
         UINT64 freq = 0;
@@ -2816,8 +2816,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (++live.timeDFrames == 300)
                 {
                     const double n = live.timeDFrames;
-                    Log("URTI direct : GPU détail (ms par calcul) : sommets %.2f, mouvement %.2f, transparents %.2f, cache de géométrie %.2f, mesure %.2f, "
-                        "soleil et loi %.2f, structure de l'image %.2f, structure de la scène %.2f, profondeur %.2f, ombres et occultation %.2f, débruitage %.2f",
+                    Log("URTI live: GPU detail (ms per computation): vertices %.2f, motion %.2f, transparents %.2f, geometry cache %.2f, measurement %.2f, "
+                        "sun and law %.2f, frame structure %.2f, scene structure %.2f, depth %.2f, shadows and occlusion %.2f, denoising %.2f",
                         live.timeDSum[0] / n, live.timeDSum[1] / n, live.timeDSum[2] / n, live.timeDSum[3] / n, live.timeDSum[4] / n, live.timeDSum[5] / n,
                         live.timeDSum[6] / n, live.timeDSum[7] / n, live.timeDSum[8] / n, live.timeDSum[9] / n, live.timeDSum[10] / n);
                     for (int k = 0; k < 11; k++)
@@ -2828,7 +2828,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         live.timeDRb[live.frame % 3]->Unmap(0, nullptr);
     }
-    // minutage lu trois images plus tard : structure, soleil, ombres, reflets, composition (ms)
+    // timing read three frames later: structure, sun, shadows, reflections, composition (ms)
     if (const uint64_t* t = nullptr; live.timeReadback[live.frame % 3] && SUCCEEDED(live.timeReadback[live.frame % 3]->Map(0, nullptr, (void**)&t)) && t)
     {
         UINT64 freq = 0;
@@ -2837,16 +2837,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         {
             for (int k = 0; k < 5; k++)
                 live.timeSum[k] += double(t[k + 1] - t[k]) * 1000.0 / double(freq);
-            // budget de temps : la passe des ombres (occultation et débruitage, repères 3 à 4 : c'était 2 à 3, la copie de la carte du jeu, 0,02 ms : le régulateur croyait
-            // toujours avoir de la marge) et celle des reflets, à chaque image. Un dépassement monte le niveau tout de suite, le retour se fait lentement
+            // time budget: the shadow pass (occlusion and denoising, markers 3 to 4: it used to be 2 to 3, the copy of the game's map, 0.02 ms: the regulator always believed
+            // it had room) and the reflection pass, every frame. An overrun raises the level at once, the return is slow
             {
                 const double aoNow = std::min(200.0, double(t[4] - t[3]) * 1000.0 / double(freq)), reflNow = std::min(200.0, double(t[5] - t[4]) * 1000.0 / double(freq));
                 live.shadowMs = aoNow;
                 live.statAoMax = std::max(live.statAoMax, aoNow), live.statReflMax = std::max(live.statReflMax, reflNow);
                 live.statAoSpikes += aoNow > 12.0 ? 1u : 0u, live.statReflSpikes += reflNow > 8.0 ? 1u : 0u;
-                // décision sur la médiane des 9 dernières images : un pic isolé (souvent le jeu lui-même, qui prend la file au même moment : 25 à 50 ms
-                // d'« occultation » relevés dans la partie du joueur) faisait monter de deux paliers, et la qualité ne revenait qu'un palier toutes les 40
-                // images : en permanence au plus bas, l'image la plus bruitée
+                // decision on the median of the last 9 frames: an isolated peak (often the game itself, taking the queue at the same moment: 25 to 50 ms
+                // of "occlusion" recorded in the player's session) raised it by two levels, and quality came back only one level every 40
+                // frames: permanently at the lowest, the noisiest image
                 auto regulate = [](int& level, double now, double& ema, float target, uint32_t& cool, double* hist, uint32_t& n) {
                     ema += (now - ema) * 0.25;
                     hist[n++ % 9] = now;
@@ -2863,7 +2863,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     std::nth_element(s, s + m / 2, s + m);
                     const double med = s[m / 2];
                     if (cool == 0 && med > target * 1.25)
-                        level = std::min(4, level + 1), cool = 6; // (le résultat se lit trois images plus tard)
+                        level = std::min(4, level + 1), cool = 6; // (the result is read three frames later)
                     else if (cool == 0 && level > 0 && med < target * 0.65)
                         level--, cool = 30;
                 };
@@ -2871,8 +2871,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 regulate(live.reflLevel, reflNow, live.reflEma, live.reflTarget, live.reflCool, live.reflHist9, live.reflHistN);
                 // (the reach of reflections never shrinks: without the far trees the water turned bright green; and occlusion is never limited to the very near)
                 static const uint32_t kAoRays[5] = { 4, 3, 2, 2, 2 }, kAoHops[5] = { 2, 2, 1, 1, 0 }, kRStride[5] = { 2, 2, 2, 2, 4 }, kRHops[5] = { 3, 3, 2, 1, 0 };
-                // (reflets : un pixel sur deux à tout niveau, l'autre garde son historique ; avec le cache du monde, un rayon plus court finit sur la carte du
-                // ciel et du lointain, plus sur l'eau verte du jeu : la portée peut baisser. Occultation : jamais un seul rayon (bruit), la portée baisse)
+                // (reflections: one pixel in two at any level, the other keeps its history; with the world cache, a shorter ray ends on the sky
+                // and distance map, no longer on the game's water: the range may drop. Occlusion: never a single ray (noise), the range drops)
                 static const float kAoDist[5] = { 50.0f, 40.0f, 28.0f, 18.0f, 12.0f }, kRMaxRad[5] = { 500.0f, 300.0f, 200.0f, 140.0f, 90.0f };
                 static const float kRMax[5] = { 500.0f, 500.0f, 500.0f, 500.0f, 500.0f };
                 live.aoRays = kAoRays[live.aoLevel], live.aoHopsNow = kAoHops[live.aoLevel], live.aoDistNow = kAoDist[live.aoLevel];
@@ -2887,7 +2887,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (!live.slotRefit[s])
                 {
                     live.rebuildMs += (build - live.rebuildMs) * 0.2;
-                    // budget de géométrie : toutes les 30 images, -15 % au-dessus de la cible (+10 %), +8 % bien en dessous
+                    // geometry budget: every 30 frames, -15 % above the target (+10 %), +8 % well below
                     if (live.buildTarget > 0 && live.budgetMax > 0 && live.frame % 30 == 0)
                     {
                         const uint64_t kBudgetMin = live.geoOn ? 500000 : 1500000;
@@ -2896,8 +2896,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                         else if (live.rebuildMs < live.buildTarget * 0.75)
                             live.vertexBudget = std::min<uint64_t>(live.budgetMax, live.vertexBudget * 108 / 100);
                     }
-                    // le coût de la mise à jour revient lentement vers une valeur plausible : une seule mesure
-                    // aberrante (image chargée, autre programme) ne bloque pas les mises à jour pour toujours
+                    // the update cost slowly returns to a plausible value: a single aberrant
+                    // measurement (busy frame, another program) does not block updates forever
                     live.refitMs += (0.3 * live.rebuildMs - live.refitMs) * 0.05;
                     if (live.slotCycle[s] == live.buildCycle)
                         live.traceBase = trace;
@@ -2915,21 +2915,21 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             if (++live.timeFrames == 300)
             {
                 const double n = live.timeFrames;
-                Log("URTI direct : budget de temps : occultation niveau moyen %.1f (pire image %.1f ms, %u images au-dessus de 12 ms, cible %.1f), reflets niveau moyen %.1f (pire image %.1f ms, %u images au-dessus de 8 ms, cible %.1f)",
+                Log("URTI live: time budget: occlusion mean level %.1f (worst frame %.1f ms, %u frames above 12 ms, target %.1f), reflections mean level %.1f (worst frame %.1f ms, %u frames above 8 ms, target %.1f)",
                     live.statAoLevelSum / n, live.statAoMax, live.statAoSpikes, live.aoTarget, live.statReflLevelSum / n, live.statReflMax, live.statReflSpikes, live.reflTarget);
                 live.statAoMax = live.statReflMax = 0, live.statAoSpikes = live.statReflSpikes = live.statAoLevelSum = live.statReflLevelSum = 0;
-                Log("URTI direct : GPU par image : structure %.2f ms, soleil et profondeur %.2f, copie carte du jeu %.2f, ombres (%u rayons) %.2f, "
+                Log("URTI live: GPU per frame: structure %.2f ms, sun and depth %.2f, game map copy %.2f, shadows (%u rays) %.2f, "
                     "reflets %.2f, composition %.2f", live.timeSum[0] / n, live.timeSum[1] / n, live.timeSum[2] / n, live.shadowRays, live.timeSum[3] / n,
                     live.timeSum[4] / n, live.timeSum[5] / n);
                 const uint32_t builds = live.statRebuilds + live.statUpdates;
                 if (builds)
-                    Log("URTI direct : structure d'accélération : %.0f sommets en moyenne (capacité %llu), %u reconstructions et %u mises à jour "
-                        "(reconstruction %.2f ms, mise à jour %.2f ms)", double(live.statVertices) / builds, (unsigned long long)live.capacity,
+                    Log("URTI live: acceleration structure: %.0f vertices on average (capacity %llu), %u rebuilds and %u updates "
+                        "(rebuild %.2f ms, update %.2f ms)", double(live.statVertices) / builds, (unsigned long long)live.capacity,
                         live.statRebuilds, live.statUpdates, live.rebuildMs, live.refitMs);
                 if (live.statPlaceFrames)
                 {
                     const double f = double(live.statPlaceFrames);
-                    Log("URTI direct : places fixes : %.0f tenues (%.0f Mo), partie occupée %.0f Mo sur %.0f, %.1f nouvelles par image, %llu redistributions",
+                    Log("URTI live: fixed places: %.0f held (%.0f MB), used part %.0f MB out of %.0f, %.1f new per frame, %llu redistributions",
                         live.statPlaces / f, live.statPlaceHeld / f / 1048576.0, live.statPlaceHigh / f / 1048576.0, kSlotBytes / 1048576.0,
                         live.statPlaceNew / f, (unsigned long long)live.statPlaceResets);
                 }
@@ -2938,8 +2938,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (live.statBudgetFrames)
                 {
                     const double f = double(live.statBudgetFrames);
-                    Log("URTI direct : budget de géométrie %llu sommets : %.0f dessins dans la scène RT (%.0f sommets réservés), %.0f hors budget, "
-                        "%.0f re-mesurés, %.1f refusés (emplacement plein), %.1f entrés ou sortis de la scène RT par image", (unsigned long long)live.vertexBudget,
+                    Log("URTI live: geometry budget %llu vertices: %.0f draws in the RT scene (%.0f vertices reserved), %.0f out of budget, "
+                        "%.0f re-measured, %.1f refused (slot full), %.1f entered or left the RT scene per frame", (unsigned long long)live.vertexBudget,
                         live.statDraws / f, live.statReserved / f, live.statOutOfBudget / f, live.statProbes / f, live.statOverflow / f, live.statChurn / f);
                 }
                 live.statChurn = 0;
@@ -2952,11 +2952,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     LiveTime(list.Get(), 0);
     LiveTimeD(list.Get(), 0);
-    // 1. sommets de l'écran vers l'espace caméra (NaN au-delà de ce qui a été rempli dans chaque zone) ;
-    // seulement la partie du flux attribuée à cette image : la structure ne couvre qu'elle
+    // 1. screen vertices to camera space (NaN beyond what was filled in each region);
+    // only the part of the stream assigned to this frame: the structure covers only that
     Transition(list.Get(), g.so.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_STREAM_OUT, srv);
-    const std::vector<LiveRegion>& tableNow = persistNow ? placesNow : regionsNow; // zones converties (scène RT)
+    const std::vector<LiveRegion>& tableNow = persistNow ? placesNow : regionsNow; // converted regions (RT scene)
     ID3D12Resource* placesBuf = nullptr;
     if (persistNow)
     {
@@ -3002,7 +3002,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         zeroCounters(srv), Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
         return;
     }
-    // par zone : identité, début de la zone du même objet dans l'image précédente (+ 1 ; 0 : inconnue)
+    // per region: identity, start of the same object's region in the previous frame (+ 1; 0: unknown)
     ID3D12Resource* linksBuf = nullptr;
     {
         live.pendingStart.clear();
@@ -3030,8 +3030,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             linksBuf = up.Get();
         }
     }
-    // début dans le flux de la zone de chaque entrée de la table convertie ; zones de cette image triées par leur
-    // début dans le flux, pour la loi de profondeur (live_depthfit y tire ses sommets)
+    // start in the stream of the region of each entry of the converted table; this frame's regions sorted by their
+    // start in the stream, for the depth law (live_depthfit draws its vertices there)
     const std::vector<uint32_t>& srcTable = persistNow ? placeSrc : srcNow;
     std::vector<LiveRegion> fitNow(regionsNow.size());
     uint32_t fitEnd = 0;
@@ -3058,8 +3058,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         zeroCounters(srv), Transition(list.Get(), g.so.Get(), srv, D3D12_RESOURCE_STATE_STREAM_OUT);
         return;
     }
-    // table des zones de la scène RT copiée en mémoire vidéo : chaque sommet (conversion), chaque reflet et le cache
-    // de surfaces y cherchent leur zone ; dans le tampon d'envoi, chaque lecture traversait le bus PCIe
+    // the RT scene's region table copied into video memory: each vertex (conversion), each reflection and the surface
+    // cache look up their region there; in the upload buffer, every read crossed the PCIe bus
     ID3D12Resource* sceneTable = persistNow ? placesBuf : regionsBuf;
     {
         const uint64_t bytes = std::max<size_t>(tableNow.size(), 1) * sizeof(LiveRegion);
@@ -3095,27 +3095,27 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     list->SetComputeRootUnorderedAccessView(5, live.pairsBuf ? live.pairsBuf->GetGPUVirtualAddress() : live.view->GetGPUVirtualAddress());
     const uint32_t converted = std::max(3u, uint32_t(std::min<uint64_t>(cursorNow / 16, live.capacity)) / 3 * 3);
-    // cache de géométrie : les paires viennent des points de référence des témoins (live_refpairs), pas d'une image à l'autre
+    // geometry cache: the pairs come from the witnesses' reference points (live_refpairs), not from one frame to the next
     const bool refPose = live.geoOn && live.refpairsPso;
-    // caméra du jeu : pose, mouvement, projection, loi de profondeur de cette image, exacts
+    // the game's camera: pose, motion, projection, depth law of this frame, exact
     float camData[48] = {};
     const bool trueCam = LiveCameraFrame(camData);
-    // motion_log=1 : la mesure sur les témoins continue, à part, pour vérifier la caméra lue
+    // motion_log=1: the witness measurement goes on, separately, to check the camera read
     const bool camVerify = trueCam && live.motionLog && refPose;
     const float shearPrev[2] = { live.camShear[0], live.camShear[1] };
     if (trueCam)
         live.camShear[0] = camData[44], live.camShear[1] = camData[45];
-    // places gardées sans être dessinées : leurs sommets suivent la caméra (sinon, en mouvement, elles restaient là où la caméra
-    // les voyait à leur dernier dessin : jusqu'à trois images de mouvement d'écart)
+    // places kept without being drawn: their vertices follow the camera (otherwise, in motion, they stayed where the camera
+    // saw them at their last draw: up to three frames of motion off)
     const struct { float p00, p11; uint32_t count, regionCount, maxPairs, heldStep, pad1, pad2; float step[12]; float shearA[2], shearB[2]; } cc = {
         live.p00, live.p11, converted, uint32_t(tableNow.size()), live.pairsBuf && !refPose && !trueCam ? kLiveMaxMotionPairs : 0u,
-        trueCam && camData[9] * camData[9] + camData[10] * camData[10] + camData[11] * camData[11] < 900.0f ? 1u : 0u, 0, 0, // (coupure de la caméra : pas déplacées)
+        trueCam && camData[9] * camData[9] + camData[10] * camData[10] + camData[11] * camData[11] < 900.0f ? 1u : 0u, 0, 0, // (camera cut: not moved)
         { camData[0], camData[1], camData[2], camData[9], camData[3], camData[4], camData[5], camData[10], camData[6], camData[7], camData[8], camData[11] },
         { shearPrev[0], shearPrev[1] }, { live.camShear[0], live.camShear[1] } };
     list->SetComputeRoot32BitConstants(6, 24, &cc, 0);
     list->Dispatch(UINT((converted + 255) / 256), 1, 1);
     LiveTimeD(list.Get(), 1);
-    // 1d. mouvement de la caméra depuis l'image précédente, mesuré sur les paires de sommets de la conversion
+    // 1d. camera motion since the previous frame, measured on the conversion's vertex pairs
     if (live.camfitPso && live.pairsBuf && live.motionBuf && live.motionReadback[live.frame % 3])
     {
         if (trueCam)
@@ -3134,7 +3134,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.sentRefs = UavBuffer(g.device, 208ull * (kLiveSentinels * 2), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 live.sentinelFree.clear();
             }
-            // places des points : celles des témoins partis redeviennent libres
+            // places of the points: those of departed witnesses become free again
             for (auto it = live.sentinelRef.begin(); it != live.sentinelRef.end();)
                 if (live.sentinels.count(it->first))
                     ++it;
@@ -3204,9 +3204,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         Transition(list.Get(), motionOut, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     LiveTimeD(list.Get(), 2);
-    // 1e. surfaces transparentes (eau, vitres) : leur couche convertie, puis seules les surfaces planes gardées
-    // (fenêtre sans aucune, image du jeu coupée entre deux présentations : la dernière couche reste, le reflet de l'eau
-    // ne s'éteint pas une image sur deux)
+    // 1e. transparent surfaces (water, glass): their layer converted, then only the flat surfaces kept
+    // (window without any, game frame split between two presents: the last layer stays, the water's reflection
+    // does not go out every other frame)
     if (!live.waterOn || (transpNow.empty() && ++live.transpMiss > 8))
         live.transpBuilt = false;
     if (live.waterOn && !transpNow.empty() && live.planesPso)
@@ -3235,7 +3235,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.blasT = UavBuffer(g.device, pi.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
             live.blasTScratch = UavBuffer(g.device, pi.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             live.viewTRead = false;
-            Log("URTI direct : couche des surfaces transparentes pour %u sommets (%.1f Mo)", kLiveTranspVertices, pi.ResultDataMaxSizeInBytes / 1048576.0);
+            Log("URTI live: transparent-surface layer for %u vertices (%.1f MB)", kLiveTranspVertices, pi.ResultDataMaxSizeInBytes / 1048576.0);
         }
         auto uploadT = [&](ComPtr<ID3D12Resource>& up, const void* data, uint64_t bytes) -> ID3D12Resource* {
             if (!up || up->GetDesc().Width < bytes)
@@ -3253,7 +3253,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         if (live.motionLog)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            Log("COUCHEP %llu dessins %zu sommets %u refuses %u", (unsigned long long)live.frame, transpNow.size(), tCount, g_liveTranspRefused);
+            Log("TLAYER %llu draws %zu vertices %u refused %u", (unsigned long long)live.frame, transpNow.size(), tCount, g_liveTranspRefused);
             g_liveTranspRefused = 0;
         }
         if (live.viewT && live.blasT && live.blasTScratch && tTable && tSrc && live.planeStats && live.planeReadback[live.frame % 3])
@@ -3262,7 +3262,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 Transition(list.Get(), live.viewT.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), live.viewTRead = false;
             list->SetComputeRootSignature(live.convertRs.Get());
             list->SetPipelineState(live.convertPso.Get());
-            list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress()); // débuts dans tout le flux
+            list->SetComputeRootShaderResourceView(0, g.so->GetGPUVirtualAddress()); // starts across the whole stream
             list->SetComputeRootShaderResourceView(1, g.counters->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(2, tTable->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(3, tSrc->GetGPUVirtualAddress());
@@ -3276,7 +3276,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             vb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             vb.UAV.pResource = live.viewT.Get();
             list->ResourceBarrier(1, &vb);
-            // tri : surfaces planes gardées, le reste invisible aux rayons ; bilan lu trois images plus tard
+            // sorting: flat surfaces kept, the rest invisible to rays; summary read three frames later
             Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyBufferRegion(live.planeStats.Get(), 0, g.zeros.Get(), 0, 16);
             Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3293,7 +3293,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->CopyBufferRegion(live.planeReadback[live.frame % 3].Get(), 0, live.planeStats.Get(), 0, 16 + 256 * 24);
             Transition(list.Get(), live.planeStats.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             Transition(list.Get(), live.viewT.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv), live.viewTRead = true;
-            // sa structure, reconstruite à chaque image (quelques surfaces)
+            // its structure, rebuilt every frame (a few surfaces)
             D3D12_RAYTRACING_GEOMETRY_DESC tg = {};
             tg.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
             tg.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
@@ -3314,14 +3314,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.transpBuilt = true;
         }
     }
-    // bilan des surfaces transparentes, lu trois images plus tard
+    // transparent-surface summary, read three frames later
     if (const uint32_t* c = nullptr; live.planeReadback[live.frame % 3] && SUCCEEDED(live.planeReadback[live.frame % 3]->Map(0, nullptr, (void**)&c)) && c)
     {
         live.planeFrames++, live.planeKept += c[0], live.planeTris += c[1], live.planeSeen += c[2];
         if (live.motionLog)
         {
             char text[2400] = "";
-            // les surfaces à peu près horizontales et assez étendues, celles qui peuvent être de l'eau
+            // roughly horizontal and large enough surfaces, those that may be water
             for (uint32_t k = 0; k < c[2] && k < 256; k++)
                 if (const uint32_t v = c[4 + k * 6]; (v & 0x1FFFFFFF) >= 30 && (c[5 + k * 6] >> 16) >= 300 && std::fabs(reinterpret_cast<const float*>(c)[7 + k * 6]) > 0.6f)
                 {
@@ -3331,20 +3331,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     std::snprintf(item, sizeof(item), " %u%s/%u/%u/n%.2f,%.2f,%.2f/d%.2f", v & 0x1FFFFFFF, (v >> 31) ? "P" : (v >> 29) & 1 ? "F" : (v >> 30) & 1 ? "c" : "x", c[5 + k * 6] & 0xFFFF, c[5 + k * 6] >> 16, nd[0], nd[1], nd[2], nd[3]);
                     std::strncat(text, item, sizeof(text) - std::strlen(text) - 1);
                 }
-            Log("COUCHE %llu recus %u plans %u :%s", (unsigned long long)live.frame, c[2], c[0], text);
+            Log("LAYER %llu received %u planes %u :%s", (unsigned long long)live.frame, c[2], c[0], text);
         }
         live.planeReadback[live.frame % 3]->Unmap(0, nullptr);
         if (live.planeFrames >= 300)
         {
-            Log("URTI direct : surfaces transparentes : %.1f dessins par image, dont %.1f planes gardées (eau, vitres : %.0f triangles)",
+            Log("URTI live: transparent surfaces: %.1f draws per frame, of which %.1f flat ones kept (water, glass: %.0f triangles)",
                 double(live.planeSeen) / live.planeFrames, double(live.planeKept) / live.planeFrames, double(live.planeTris) / live.planeFrames);
             live.planeFrames = live.planeKept = live.planeTris = live.planeSeen = 0;
         }
     }
     LiveTimeD(list.Get(), 3);
-    // 1f. cache de géométrie : les objets captés à leur tour (zone de mesure) sont convertis dans le repère du cache,
-    // chacun a sa structure, gardée jusqu'au tour suivant (toute la forêt d'Horizon : 14 millions de sommets, qu'aucune
-    // reconstruction par image ne peut suivre). Bâti en premier des objets de la scène de l'image, retirés du cache
+    // 1f. geometry cache: objects captured in turn (measurement area) are converted into the cache's frame,
+    // each one gets its structure, kept until the next round (a whole forest: 14 million vertices, which no
+    // per-frame rebuild can follow). Built first from the objects of the frame's scene, removed from the cache
     if (live.geoOn && !live.geoPool && live.geoconvPso && live.geoinstPso && live.motionBuf)
     {
         live.geoPoolBytes = live.geoWantBytes;
@@ -3354,9 +3354,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         live.geoInstances = UavBuffer(g.device, (uint64_t(kLiveGeoMaxInstances) + 2) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         live.geoColors = UavBuffer(g.device, uint64_t(kLiveGeoMaxInstances) * LiveState::kGeoColorBins * 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (!live.geoPool || !live.geoView || !live.geoScratch || !live.geoInstances)
-            live.geoOn = false, Log("URTI direct : cache de géométrie : mémoire refusée (%llu Mo), coupé", (unsigned long long)(live.geoPoolBytes / 1048576));
+            live.geoOn = false, Log("URTI live: geometry cache: memory refused (%llu MB), off", (unsigned long long)(live.geoPoolBytes / 1048576));
         else
-            Log("URTI direct : cache de géométrie : réserve de %llu Mo", (unsigned long long)(live.geoPoolBytes / 1048576));
+            Log("URTI live: geometry cache: reserve of %llu MB", (unsigned long long)(live.geoPoolBytes / 1048576));
     }
     const bool geoActive = live.geoOn && live.geoPool && live.geoView && live.geoScratch && live.geoInstances;
     if (geoActive)
@@ -3380,7 +3380,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         uint64_t scratchUsed = 0;
         if (live.geoSlotOwner.empty())
             live.geoSlotOwner.assign(kLiveGeoMaxInstances, 0u), live.geoSlotGen.assign(kLiveGeoMaxInstances, 0);
-        // place de la table des couleurs : celle de l'objet s'il l'avait déjà (il est recapté à chaque tour), sinon la suivante libre
+        // place in the colour table: the object's own if it already had one (it is recaptured every round), otherwise the next free one
         auto slotFor = [&](uint32_t id, uint32_t keep, uint32_t& gen) -> uint32_t {
             if (keep != ~0u && live.geoSlotOwner[keep] == id)
             {
@@ -3410,8 +3410,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const bool isNew = !live.geo.count(r.id);
             if (live.geo.size() >= kLiveGeoMaxInstances && isNew)
                 continue;
-            // objet à moins de 6 m de la caméra (le personnage qu'elle suit, son équipement, ce qu'il porte) : jamais dans le cache, où il
-            // restait figé à son ancienne place (reflet ou ombre d'une partie d'Aloy à côté d'elle)
+            // object closer than 6 m to the camera (the character it follows, its gear, what it carries): never in the cache, where it
+            // stayed frozen at its old place (reflection or shadow of a part of the character next to them)
             if (const auto o = live.objects.find(r.id); o != live.objects.end() && o->second.minZ < 6.0f)
             {
                 if (!isNew)
@@ -3419,7 +3419,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 live.statGeoNear++;
                 continue;
             }
-            // part de cette image : objets nouveaux, puis remises à jour (les autres attendent leur prochain tour)
+            // this frame's share: new objects, then refreshes (the others wait for their next round)
             if (isNew ? newVerts + n > live.geoNewVerts : refreshVerts + n > live.geoRefreshVerts)
                 continue;
             (isNew ? newVerts : refreshVerts) += n;
@@ -3444,14 +3444,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 geoms.pop_back();
                 continue;
             }
-            // place dans la réserve : tampon circulaire, les plus anciens objets sur le chemin laissent la place
+            // place in the reserve: ring buffer, the oldest objects in the way make room
             uint32_t keepSlot = ~0u;
             if (const auto e = live.geo.find(r.id); e != live.geo.end())
                 keepSlot = e->second.slot;
             geoErase(r.id);
-            // la tête du tampon circulaire saute les objets captés récemment (encore à l'écran ou tout près) : en mouvement, elle faisait le tour de la
-            // réserve en quelques secondes et chassait au passage des objets visibles, qui manquaient aux reflets jusqu'à leur prochaine capture.
-            // Seuls les objets pas recaptés depuis longtemps laissent la place ; un tour complet sans place : l'ancienne règle
+            // the ring buffer's head skips recently captured objects (still on screen or close): in motion, it went round the
+            // reserve in a few seconds and evicted visible objects on the way, which were missing from reflections until their next capture.
+            // Only objects not recaptured for a long time make room; a full round without room: the old rule
             {
                 bool wrapped = false;
                 for (uint32_t guard = 0; guard < 256; guard++)
@@ -3535,11 +3535,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->ResourceBarrier(1, &gb);
         }
         else if (!geoRegions.empty())
-            LiveGeoFlush("mémoire d'envoi refusée");
+            LiveGeoFlush("upload memory refused");
         live.statGeoFrames++, live.statGeoBuilds += builds.size(), live.statGeoVerts += frameVerts;
     }
     LiveTimeD(list.Get(), 4);
-    // 1a. mesure de chaque objet capté, de la scène RT et de la zone de mesure (budget de géométrie)
+    // 1a. measurement of each captured object, of the RT scene and of the measurement area (geometry budget)
     if (live.statsPso && !(regionsNow.empty() && probesNow.empty()))
     {
         const size_t n = regionsNow.size() + probesNow.size();
@@ -3591,7 +3591,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         live.statDraws += regionsNow.size(), live.statProbes += probesNow.size(), live.statBudgetFrames++;
     }
-    // 1g. diagnostic (motion_log=1) : planéité des petits objets captés, tous les huit calculs ; bilan lu trois images plus tard
+    // 1g. diagnostic (motion_log=1): flatness of small captured objects, every eight computations; summary read three frames later
     if (live.objplanesPso && live.motionLog)
     {
         std::vector<uint32_t>& flatIds = live.objPlanesIds[live.frame % 3];
@@ -3605,7 +3605,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 if (m == live.idMesh.end())
                     continue;
                 if (live.motionLog && tris >= 2 && size >= 8.0f && std::fabs(ny) > 0.8f && coh > 0.8f && err < 0.03f * size + 0.1f && live.flatLogged.insert(m->second).second && live.flatLogged.size() < 400)
-                    Log("OBJETPLAT maillage %08x triangles %u coherence %.3f ecart %.2f taille %.1f normale %.2f %.2f %.2f distance %.2f", m->second, tris, coh, err, size, f[k * 8 + 4], ny, f[k * 8 + 6], f[k * 8 + 7]);
+                    Log("FLATOBJ mesh %08x triangles %u coherence %.3f deviation %.2f size %.1f normal %.2f %.2f %.2f distance %.2f", m->second, tris, coh, err, size, f[k * 8 + 4], ny, f[k * 8 + 6], f[k * 8 + 7]);
             }
             live.objPlanesRead[live.frame % 3]->Unmap(0, nullptr);
         }
@@ -3654,10 +3654,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 
     LiveTime(list.Get(), 1);
     LiveTimeD(list.Get(), 5);
-    // 1b. soleil de cette image : paires écran / carte d'ombres de même signature, ajustées puis votées
+    // 1b. sun of this frame: pairs screen / shadow map with the same signature, fitted then voted
     if (live.fovReset)
     {
-        // projection changée : la mesure de l'étirement repart de zéro
+        // projection changed: the stretch measurement starts from zero
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyBufferRegion(live.sunBuf.Get(), 1200, g.zeros.Get(), 0, 24);
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3679,7 +3679,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     struct Pair
     {
-        uint32_t camBase, mapBase, camCounter, mapCounter; // débuts dans le flux (octets), compteurs
+        uint32_t camBase, mapBase, camCounter, mapCounter; // starts in the stream (bytes), counters
         float viewport[4];
         float weight;
         uint32_t camCapacity, mapCapacity, pad;
@@ -3700,7 +3700,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 continue;
             const uint32_t r = rank[marksNow[i].key]++;
             const std::vector<uint32_t>& c = it->second;
-            // même rang dans les deux passes : très probablement le même objet (poids 8)
+            // same rank in both passes: very probably the same object (weight 8)
             auto add = [&](uint32_t m, float w) {
                 const LiveMark &a = marksNow[i], &b = marksNow[m];
                 pairs.push_back({ uint32_t(a.slot * kSlotBytes + a.offset), uint32_t(b.slot * kSlotBytes + b.offset), a.counter, b.counter,
@@ -3743,20 +3743,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         else
         {
-            // aucune paire : bilan « non mesuré », le soleil précédent reste, plus de cascade connue
+            // no pair: "not measured" summary, the previous sun stays, no known cascade any more
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 20); // pas la loi de profondeur (36 à 47)
-            list->CopyBufferRegion(live.sunBuf.Get(), 624, g.zeros.Get(), 0, 32); // rotation non mesurée, plus de cascades gardées
+            list->CopyBufferRegion(live.sunBuf.Get(), 16, g.zeros.Get(), 0, 20); // not the depth law (36 to 47)
+            list->CopyBufferRegion(live.sunBuf.Get(), 624, g.zeros.Get(), 0, 32); // rotation not measured, no cascades kept any more
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
     }
-    // décalage sous-pixel : celui de la caméra du jeu, à chaque image. La mesure sur les cascades n'existe que sur une image sur
-    // cinq dans Horizon : le reste du temps, l'écart d'une image à l'autre valait 0 et l'absolu restait figé, le masque et les
-    // reflets posés à côté de l'image d'un demi-pixel variable, l'historique relu au mauvais endroit (feuillage qui scintille)
+    // sub-pixel jitter: the game camera's, every frame. The measurement on the cascades exists on only one frame in
+    // five in some games: the rest of the time, the frame-to-frame difference was 0 and the absolute value stayed frozen, mask and
+    // reflections laid next to the image by a varying half pixel, history read at the wrong place (flickering foliage)
     if (trueCam && live.jitterMode >= 1)
     {
-        // (avec la rotation de la caméra, de cette image vers la précédente, même place que live_sunvote : la stabilisation des reflets s'en sert
-        // pour savoir où était le reflet ; mesurée sur les cascades, elle manquait neuf images sur dix, et l'historique était relu à côté)
+        // (with the camera rotation, from this frame to the previous one, same place as live_sunvote: reflection stabilisation uses it
+        // to know where the reflection was; measured on the cascades, it was missing nine frames out of ten, and the history was read off-target)
         const float jit[17] = { camData[0], camData[3], camData[6], 0.0f, camData[1], camData[4], camData[7], 0.0f, camData[2], camData[5], camData[8], 0.0f, 1.0f,
                                 shearPrev[0] - camData[44], shearPrev[1] - camData[45], camData[44], camData[45] };
         if (ID3D12Resource* up = upload(live.jitUpload[live.frame % 3], jit, sizeof(jit)))
@@ -3768,11 +3768,11 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
     }
-    // 1c. loi de profondeur de cette image, mesurée sur les sommets de l'écran
-    // Une loi déjà sûre (stockée, vérifiée) prime : la mesure fait une moyenne sur les sommets captés, et ils n'ont pas tous la
-    // même loi (Horizon : 0,19 / w pour le décor, autre chose pour le personnage). La scène de l'image ne gardant plus que le
-    // proche, elle tombait entre 0,08 et 0,13 d'une image à l'autre : toutes les distances fausses, le reflet qui décroche
-    // sur tout le lac pendant des séries d'images. urti.ini depth_law_fixed= : 1 toujours la loi connue, 0 toujours la mesure
+    // 1c. depth law of this frame, measured on the screen's vertices
+    // A law already trusted (stored, checked) takes precedence: the measurement averages the captured vertices, and they do not all
+    // follow the same law (in one game: 0.19 / w for the scenery, something else for the character). The frame's scene keeping only what is
+    // near, it fell between 0.08 and 0.13 from one frame to the next: every distance wrong, the reflection dropping
+    // across the whole lake for series of frames. urti.ini depth_law_fixed=: 1 always the known law, 0 always the measurement
     const bool lawKnown = live.depthLawFixed == 1 || (live.depthLawFixed < 0 && (live.fromStore || live.verified));
     ID3D12Resource* lawUp = nullptr;
     if (lawKnown)
@@ -3805,15 +3805,15 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
 
     LiveTimeD(list.Get(), 6);
-    // 2. structures d'accélération
+    // 2. acceleration structures
     D3D12_RAYTRACING_GEOMETRY_DESC geom = {};
     geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
     geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
     geom.Triangles.VertexBuffer = { live.view->GetGPUVirtualAddress(), 12 };
     geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
     geom.Triangles.VertexCount = converted;
-    // même liste de dessins (zones, tailles, identités) qu'à la dernière construction : les triangles sont
-    // les mêmes, seules leurs positions ont changé (caméra, vent, objets mobiles) : mise à jour
+    // same list of draws (regions, sizes, identities) as at the last build: the triangles are
+    // the same, only their positions changed (camera, wind, moving objects): update
     uint64_t layout = 1469598103934665603ull ^ converted;
     for (const LiveRegion& r : regionsNow)
         layout = (layout ^ (uint64_t(r.offset) << 32 ^ r.capacity ^ uint64_t(r.id) << 17)) * 1099511628211ull;
@@ -3845,8 +3845,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     uint32_t tlasCount = 2;
     D3D12_GPU_VIRTUAL_ADDRESS tlasInstances = live.instances->GetGPUVirtualAddress();
     {
-        // exemplaire 0 : la scène opaque (masque 1 : occultation, reflets, cache) ; exemplaire 1 : les surfaces
-        // transparentes planes (masque 2 : seul le rayon de la caméra des reflets les cherche ; masque 0 sans elles)
+        // copy 0: the opaque scene (mask 1: occlusion, reflections, cache); copy 1: the surfaces
+        // flat transparent surfaces (mask 2: only the reflections' camera ray looks for them; mask 0 without them)
         D3D12_RAYTRACING_INSTANCE_DESC inst[2] = {};
         for (auto& i : inst)
             i.Transform[0][0] = i.Transform[1][1] = i.Transform[2][2] = 1.0f;
@@ -3861,8 +3861,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             std::memcpy(p, inst, sizeof(inst));
             live.instances->Unmap(0, nullptr);
         }
-        // exemplaires du cache de géométrie : même masque que la scène de l'image, identité 2 (ni zones ni sommets
-        // d'image précédente), posés par la pose de la caméra de cette image (live_geoinst)
+        // geometry cache copies: same mask as the frame's scene, identity 2 (neither regions nor vertices
+        // of a previous frame), placed with this frame's camera pose (live_geoinst)
         if (geoActive)
         {
             std::vector<D3D12_RAYTRACING_INSTANCE_DESC> all(2 + live.geo.size());
@@ -3872,8 +3872,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             for (const auto& [id, e] : live.geo)
             {
                 D3D12_RAYTRACING_INSTANCE_DESC& d = all[k++];
-                // identité : bit 23, génération de la place, place (live_surfcache, live_reflect) ; triangles de l'objet dans le champ du groupe de touche
-                // (inutilisé par les rayons en ligne)
+                // identity: bit 23, generation of the place, place (live_surfcache, live_reflect); the object's triangles in the hit-group field
+                // (unused by inline rays)
                 d.InstanceID = e.slot != ~0u ? (1u << 23) | ((e.gen & 255u) << 14) | e.slot : 2u;
                 d.InstanceContributionToHitGroupIndex = std::min<uint32_t>(e.triangles, 0xFFFFFF);
                 d.InstanceMask = 0x01;
@@ -3910,20 +3910,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     uav.UAV.pResource = live.tlas.Get();
     list->ResourceBarrier(1, &uav);
 
-    // 3a. profondeur de l'image précédente gardée (accumulation dans le temps)
+    // 3a. previous frame's depth kept (accumulation over time)
     if (live.depthPrevBuf)
     {
         Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->CopyResource(live.depthPrevBuf.Get(), live.depthBuf.Get());
         Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     }
-    // 3. profondeur du jeu (copie de ReShade) vers un tampon lisible par le shader
+    // 3. the game's depth (ReShade's copy) into a buffer the shader can read
     const D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const bool snapUse = live.syncNow && live.snapIndexNow >= 0 && live.depthSnap[live.snapIndexNow] && live.depthSnapPitch == live.depthPitch &&
                          live.depthSnapWidth == depthDesc.Width && live.depthSnapHeight == depthDesc.Height;
     if (snapUse)
     {
-        // la profondeur de cette image, copiée dans la liste du jeu (exécutée : attente de sa file ci-dessus)
+        // this frame's depth, copied inside the game's list (executed: wait on its queue above)
         live.statSnapUsed++;
         list->CopyBufferRegion(live.depthBuf.Get(), 0, live.depthSnap[live.snapIndexNow].Get(), 0, std::min<uint64_t>(live.depthSnapBytes, live.depthBuf->GetDesc().Width));
     }
@@ -3944,7 +3944,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         Transition(list.Get(), depthCopy, D3D12_RESOURCE_STATE_COPY_SOURCE, depthState);
     }
     Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
-    // 3c. vecteurs de mouvement fabriqués avec le mouvement de la caméra mesuré (ceux du jeu sont illisibles)
+    // 3c. motion vectors built from the measured camera motion (the game's are unreadable)
     if (live.mvSynthetic && live.mvsynthPso && live.motionBuf)
     {
         const uint32_t pitch = (live.width * 4 + 255) & ~255u;
@@ -3954,7 +3954,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             Retire(live.mvBuf);
             live.mvBuf = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
             live.mvBytes = live.mvBuf ? bytes : 0;
-            Log("URTI direct : vecteurs de mouvement fabriqués %ux%u (mouvement de la caméra mesuré sur notre géométrie)", live.width, live.height);
+            Log("URTI live: built motion vectors %ux%u (camera motion measured on our geometry)", live.width, live.height);
         }
         if (live.mvBuf)
         {
@@ -3978,10 +3978,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
 
     LiveTime(list.Get(), 2);
-    // 3b. carte d'ombres du jeu (son ombre est recalculée pixel par pixel : nos ombres ne s'ajoutent
-    // que là où le jeu n'en met pas)
+    // 3b. the game's shadow map (its shadow is recomputed pixel by pixel: our shadows are only added
+    // where the game puts none)
     bool atlasValid = false;
-    // (lue aussi pour reconnaître les trous du feuillage découpé : la carte est la vue du soleil)
+    // (also read to recognise holes in cut-out foliage: the map is the sun's view)
     if (ID3D12Resource* atlas = reinterpret_cast<ID3D12Resource*>(g_liveSunDepth); atlas && (g_liveCombine || live.alphaScreen) && live.calibrated)
     {
         uint32_t state = 0;
@@ -4001,7 +4001,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             Retire(live.atlasBuf);
             live.atlasBuf = UavBuffer(g.device, atotal, D3D12_RESOURCE_STATE_COPY_DEST);
             live.atlasBytes = atotal;
-            Log("URTI direct : carte d'ombres du jeu %llux%u format %d recopiée à chaque image (%.0f Mo)", (unsigned long long)ad.Width, ad.Height,
+            Log("URTI live: the game's shadow map %llux%u format %d copied every frame (%.0f MB)", (unsigned long long)ad.Width, ad.Height,
                 int(ad.Format), atotal / 1048576.0);
         }
         if (known && live.atlasBuf)
@@ -4026,16 +4026,16 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 
     LiveTime(list.Get(), 3);
     LiveTimeD(list.Get(), 9);
-    // masque de l'image précédente gardé (images générées, mode mélange)
+    // previous frame's mask kept (generated frames, blend mode)
     if (live.prevShadowBuf)
     {
         Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->CopyBufferRegion(live.prevShadowBuf.Get(), 0, live.shadowBuf.Get(), 0, uint64_t(live.shadowPitch) * live.height);
         Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
-    // rebond de lumière : rayons d'occultation au quart, cache de surfaces rempli et couvrant toute la scène, table
-    // des zones en mémoire vidéo
-    // menu : occultation et rebond chacun coupé ou dosé ; le rebond a besoin des rayons d'occultation (lancés même si elle est coupée, presque sans effet)
+    // light bounce: quarter-rate occlusion rays, surface cache filled and covering the whole scene, region table
+    // in video memory
+    // menu: occlusion and bounce each off or scaled; the bounce needs the occlusion rays (cast even when it is off, almost without effect)
     const float aoEff = live.aoAmount * (live.menuAo ? live.menuAoForce : 0.0f), giEff = live.giStrength * (live.menuGi ? live.menuGiForce : 0.0f);
     const float aoRadiusNow = live.menuAoRadius > 0 ? live.menuAoRadius : live.aoRadius;
     const bool giNow = giEff > 0 && live.aoAmount > 0 && live.aoQuarter && !live.sunShadows && live.shadowRawBuf && live.denoisePso &&
@@ -4049,7 +4049,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     if (giNow)
         Transition(list.Get(), live.surfCache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-    // 4. un rayon par pixel vers le soleil
+    // 4. rays from each pixel (sun, occlusion)
     list->SetComputeRootSignature(live.shadowRs.Get());
     list->SetPipelineState(live.shadowPso.Get());
     list->SetComputeRootShaderResourceView(0, live.tlas->GetGPUVirtualAddress());
@@ -4070,10 +4070,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(6, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(7, giNow ? live.surfCache->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(8, giNow ? sceneTable->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    // (racine : 11 lectures t0-t10, puis u0 masque brut, u1 pénombre, u2 rebond, u3 comparaison des normales, puis les constantes)
+    // (root: 11 reads t0-t10, then u0 raw mask, u1 penumbra, u2 bounce, u3 normal comparison, then the constants)
     list->SetComputeRootUnorderedAccessView(11, live.shadowRawBuf ? live.shadowRawBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(13, giNow ? live.giRaw->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    // normales du G-buffer de cette image (anneau : la case du matériau de l'image ; sinon la dernière copie)
+    // this frame's G-buffer normals (ring: the slot of the frame's material; otherwise the last copy)
     ID3D12Resource* gnNow = nullptr;
     if (live.gnMode && live.gnFrame != ~0ull && live.frame <= live.gnFrame + 8 && live.gnWidth >= live.width && live.gnHeight >= live.height)
         gnNow = live.frameSync ? (live.materialIndexNow >= 0 ? live.gnSnap[live.materialIndexNow].Get() : nullptr) : live.gnBuf.Get();
@@ -4093,7 +4093,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         Transition(list.Get(), live.gnStats.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     list->SetComputeRootShaderResourceView(9, gnNow ? gnNow->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-    // cible de matériau de Red Dead (normales du monde : même disposition du G-buffer) : son type écarte feuillage et peau de l'occultation
+    // Red Dead's material target (world normals: same G-buffer layout): its type keeps foliage and skin out of occlusion
     ID3D12Resource* matShadow = nullptr;
     if ((live.gnMode & 3) == 2 && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 8 && live.materialPitch < 65536 &&
         live.materialWidth >= live.width && live.materialHeight >= live.height)
@@ -4103,7 +4103,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->SetComputeRootShaderResourceView(10, matShadow ? matShadow->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(14, (gnStatsNow || gnRotNow) && live.gnStats ? live.gnStats->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     const bool d24 = depthDesc.Format == DXGI_FORMAT_R24G8_TYPELESS || depthDesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT;
-    // SIGMA (NVIDIA) : un rayon par pixel, pénombre et poids des corrections ; débruitage ensuite
+    // SIGMA (NVIDIA): one ray per pixel, penumbra and weight of the corrections; denoising afterwards
 #if URTI_NRD
     const bool nrdActive = live.nrdShadows && motionOk && live.mvConvention < 16 && live.shadowRawBuf && NrdEnsure(runtime);
     list->SetComputeRootUnorderedAccessView(12, nrdActive ? g_nrd.penumbraBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
@@ -4111,15 +4111,15 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     const bool nrdActive = false;
     list->SetComputeRootUnorderedAccessView(12, live.shadowBuf->GetGPUVirtualAddress());
 #endif
-    // soleil mesuré dans les 30 dernières images (3 de retard de lecture) : sinon pas d'ombres RT
-    // ciel couvert, crépuscule : la part du soleil mesurée dans l'image est si faible qu'une ombre RT ne se
-    // verrait pas (moins de 13 % de la lumière retirée) : pas de rayons d'ombre (plusieurs ms gagnées)
+    // sun measured within the last 30 frames (3 of readback lag): otherwise no RT shadows
+    // overcast, dusk: the sun share measured in the image is so small that an RT shadow would not
+    // show (less than 13 % of the light removed): no shadow rays (several ms saved)
     const bool sunWeak = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] < 0.15f;
     if (sunWeak != live.sunWeakLogged)
-        Log("URTI direct : ombres RT %s (soleil / ciel mesuré %.2f)", sunWeak ? "suspendues : lumière directe trop faible pour se voir" : "reprises", live.sunSky[3]);
+        Log("URTI live: RT shadows %s (measured sun / sky %.2f)", sunWeak ? "suspended: direct light too weak to show" : "resumed", live.sunSky[3]);
     live.sunWeakLogged = sunWeak;
     const bool sunNow = live.calibrated && live.framesSinceSun < 30 && !sunWeak;
-    // (sans soleil, la passe garde l'occultation ambiante : flags 16 ne coupe que les rayons du soleil)
+    // (without a sun, the pass keeps ambient occlusion: flag 16 only cuts the sun rays)
     const uint32_t flags = (atlasValid ? 1u : 0u) | (live.atlasD24 ? 2u : 0u) | (live.atlas16 ? 32u : 0u) | (g_liveCombine ? 4u : 0u) | (g_liveDebugGame ? 8u : 0u) |
                            (sunNow ? 0u : 16u) | (live.sunShadows ? 0u : 64u) | (live.shadowRays << 8) | (live.alphaScreen ? 2048u : 0u) |
                            (nrdActive ? 4096u : 0u) |
@@ -4145,10 +4145,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     } sc = { live.sunSign, g_liveGameBias, g_liveSunRadius * 3.14159265f / 180.0f, g_liveRayBias, live.width, live.height, live.depthPitch, live.shadowPitch,
              live.A, live.B, live.p00, live.p11, g.depthReversed ? 0.0f : 1.0f, d24 ? 1u : 0u, live.atlasPitch, flags,
              live.mvPitch, live.shadowRawBuf ? 255u : (motionOk && live.prevShadowBuf ? live.mvConvention : 255u), live.temporalAlpha,
-             // (soleil / ciel : la mesure dans l'image du jeu s'appuie sur sa carte d'ombres, qui ne concorde pas dans Red Dead : 0,04 en plein soleil.
-             // En dessous de 0,3, peu crédible : 2,2, la valeur supposée d'URTI)
+             // (sun / sky: the measurement in the game's image relies on its shadow map, which does not match in Red Dead: 0.04 in full sun.
+             // Below 0.3, implausible: 2.2, URTI's assumed value)
              0u, uint32_t(live.frame), live.sunMeasure && live.sunSky[3] >= 0.3f ? live.sunSky[3] : 2.2f, live.gameDilate, live.gameMin ? 1u : 0u,
-             aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoMotionFull && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u, // (vecteurs de mouvement : pixels en mouvement calculés à chaque image)
+             aoEff > 0 || giNow ? std::max(aoEff, 1e-4f) : 0.0f, aoRadiusNow, live.aoMotionFull && motionOk && live.mvConvention < 16 ? live.mvConvention : 255u, // (motion vectors: moving pixels computed every frame)
              giNow ? uint32_t(live.surfTriangles) : 0u, giNow ? uint32_t(tableNow.size()) : 0u, live.aoDistNow,
              gnNow ? (live.gnMode & 3) | (live.gnSigns << 8) | (live.gnUse ? 0x1000u : 0u) | (gnStatsNow && live.gnStats ? 0x2000u : 0u) | (gnRotNow && live.gnStats ? 0x4000u : 0u) : 0u, (gnNow ? live.gnPitch : 0u) | (matShadow ? live.materialPitch << 16 : 0u),
              aoEff > 0 ? live.skyAmount * live.menuSky : 0.0f, live.skyRange };
@@ -4156,8 +4156,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
     if (matShadow && !live.frameSync)
         Transition(list.Get(), matShadow, srv, D3D12_RESOURCE_STATE_COPY_DEST);
-    live.gnNowFrame = gnNow; // (sans anneau : gardée lisible jusqu'après les reflets)
-    // comparaison des normales : relue toutes les 300 images (copiée, remise à zéro ; lue trois images plus tard)
+    live.gnNowFrame = gnNow; // (without a ring: kept readable until after the reflections)
+    // normal comparison: read again every 300 frames (copied, reset; read three frames later)
     if (gnStatsNow && live.gnStats && live.gnStatsRb)
     {
         if (live.frame % 300 == 3)
@@ -4165,7 +4165,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             if (const int32_t* v = nullptr; SUCCEEDED(live.gnStatsRb->Map(0, nullptr, (void**)&v)) && v)
             {
                 char line[512];
-                int len = std::snprintf(line, sizeof(line), "URTI direct : normales du G-buffer contre celles de la profondeur (surfaces planes), accord moyen par signes inversés :");
+                int len = std::snprintf(line, sizeof(line), "URTI live: G-buffer normals against depth normals (flat surfaces), mean agreement per sign flip:");
                 for (int s = 0; s < 8 && len < int(sizeof(line)) - 40; s++)
                     len += std::snprintf(line + len, sizeof(line) - len, " %s%s%s %.3f (%d)", (s & 1) ? "-x" : "x", (s & 2) ? "-y" : "y", (s & 4) ? "-z" : "z",
                                          v[s * 2 + 1] ? v[s * 2] / 1000.0 / v[s * 2 + 1] : 0.0, v[s * 2 + 1]);
@@ -4189,15 +4189,15 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     LiveTimeD(list.Get(), 10);
     if (giNow)
         Transition(list.Get(), live.surfCache.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // débruitage : SIGMA de NVIDIA ; sinon celui d'URTI (flou guidé par la profondeur, historique reprojeté,
-    // bornage statistique, mélange adaptatif)
+    // denoising: NVIDIA's SIGMA; otherwise URTI's (depth-guided blur, reprojected history,
+    // statistical clamp, adaptive blend)
     bool nrdDone = false;
 #if URTI_NRD
     if (nrdActive)
     {
         D3D12_RESOURCE_BARRIER ub = {};
         ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        ub.UAV.pResource = nullptr; // les deux sorties du tracé d'ombres
+        ub.UAV.pResource = nullptr; // both outputs of the shadow trace
         list->ResourceBarrier(1, &ub);
         nrdDone = NrdShadows(runtime, list.Get(), d24, motionOk);
         live.statNrd += nrdDone ? 1 : 0;
@@ -4214,7 +4214,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->SetComputeRootShaderResourceView(3, motionOk ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(4, motionOk ? live.mvBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(5, live.sunBuf->GetGPUVirtualAddress());
-        // longueur d'historique : celle de l'image précédente lue, celle de cette image écrite dans l'autre tampon
+        // history length: the previous frame's is read, this frame's written into the other buffer
         const bool lenNow = live.denoiseLenOn && live.denoiseLen[0] && live.denoiseLen[1];
         const uint32_t lenOut = live.denoiseLenNext & 1;
         if (lenNow)
@@ -4233,10 +4233,10 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             float p00, p11, farSkip;
         } dn = { live.width, live.height, live.depthPitch, live.shadowPitch, live.mvPitch,
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
-                 // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
-                 // accumulées et un bornage plus large (moins de grain qui tremble)
-                 // (en mouvement : la moitié de neuf, les pixels qui bougent étant calculés à chaque image ; v104 avait ce commentaire en milieu de ligne,
-                 // qui retirait le bornage et le rayon du flou : réglages décalés d'une place)
+                 // ambient occlusion alone (sun shadows off): it varies slowly, more frames
+                 // accumulated and a wider clamp (less shaking grain)
+                 // (in motion: half new, moving pixels being computed every frame; v104 had this comment in the middle of a line,
+                 // which removed the clamp and the blur radius: settings shifted by one place)
                  live.sunShadows ? 0.1f : 0.06f, live.sunShadows || live.aoMotionFull ? 0.5f : 0.3f, live.sunShadows ? 1.5f : 2.0f,
                  (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u) | (lenNow && live.denoiseDual && !live.sunShadows ? 4096u : 0u),
                  live.p00, live.p11, live.sunShadows || !live.denoiseFarSkip ? 0.0f : live.aoDistNow * 1.02f + 0.5f };
@@ -4254,7 +4254,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             auto gn = dn;
             gn.motionConvention = motionOk && live.giValid ? live.mvConvention : 255u;
             gn.debugMode = 0;
-            gn.blurRadius = 2u | 256u | 512u | (lenNow ? 2048u | 1024u : 0u) | (lenNow && live.denoiseDual && !live.sunShadows ? 4096u : 0u); // (4096 : longueurs rangées avec l'historique rapide) // 5×5, jamais calculé -> 0, trois plans ; longueur lue (la même que l'occultation), pas écrite
+            gn.blurRadius = 2u | 256u | 512u | (lenNow ? 2048u | 1024u : 0u) | (lenNow && live.denoiseDual && !live.sunShadows ? 4096u : 0u); // (4096: lengths stored with the fast history) // 5×5, never computed -> 0, three planes; length read (the same as occlusion), not written
             list->SetComputeRoot32BitConstants(9, 15, &gn, 0);
             list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);
             Transition(list.Get(), live.giRaw.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -4276,7 +4276,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     live.giValid = giNow && !nrdActive && !nrdDone && live.shadowRawBuf && live.denoisePso;
     live.giStamp = live.frame;
-    // recherche de la convention des vecteurs de mouvement (tant qu'elle n'est pas trouvée)
+    // search for the motion-vector convention (as long as it is not found)
     if (motionOk && live.mvConvention == 255 && live.mvcalPso)
     {
         if (!live.mvErrors)
@@ -4299,7 +4299,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRootUnorderedAccessView(4, live.mvErrors->GetGPUVirtualAddress());
             const uint32_t mc[8] = { live.width, live.height, live.depthPitch, live.mvPitch, d24 ? 1u : 0u, 0, 0, 0 };
             list->SetComputeRoot32BitConstants(5, 8, mc, 0);
-            list->Dispatch(16, 1, 1); // 4096 échantillons
+            list->Dispatch(16, 1, 1); // 4096 samples
             Transition(list.Get(), live.mvErrors.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->CopyBufferRegion(live.mvErrorsReadback[live.frame % 3].Get(), 0, live.mvErrors.Get(), 0, 256);
             Transition(list.Get(), live.mvErrors.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -4317,7 +4317,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(live.sunReadback[live.frame % 3].Get(), 0, live.sunBuf.Get(), 0, kLiveSunBytes);
     Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // orientation de la caméra (normales du monde du G-buffer) : résolue ici, lue par les reflets de cette image
+    // camera orientation (world normals of the G-buffer): solved here, read by this frame's reflections
     if (gnRotNow && live.gnStats)
     {
         D3D12_RESOURCE_BARRIER rb[2] = {};
@@ -4328,7 +4328,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->SetPipelineState(live.rotfitPso.Get());
         list->SetComputeRootUnorderedAccessView(0, live.gnStats->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, live.sunBuf->GetGPUVirtualAddress());
-        const float minAgree = 0.35f; // (relief des textures dans les normales du jeu : 0,5 à 0,65 pour la bonne rotation, près de 0 pour une fausse)
+        const float minAgree = 0.35f; // (texture relief in the game's normals: 0.5 to 0.65 for the right rotation, close to 0 for a wrong one)
         uint32_t rc[4] = { 300u, 0, 0, 0 };
         std::memcpy(&rc[1], &minAgree, 4);
         list->SetComputeRoot32BitConstants(2, 4, rc, 0);
@@ -4338,7 +4338,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
 
     LiveTime(list.Get(), 4);
     LiveTimeD(list.Get(), 11);
-    // reflets : plus de réglage dans le menu (force 1, pas de sol mouillé) ; urti.ini garde la main pour les essais
+    // reflections: no more settings in the menu (strength 1, no wet floor); urti.ini still rules for tests
     {
         int32_t view = live.iniDebugView;
         if (view < 0)
@@ -4348,7 +4348,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 runtime->get_uniform_value_int(v, &view, 1);
         }
         if (uint32_t(view) != live.debugView)
-            Log("URTI direct : vue de diagnostic %d", view);
+            Log("URTI live: diagnostic view %d", view);
         live.debugView = uint32_t(std::clamp(view, 0, 11));
     }
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiGenerated"); v.handle)
@@ -4359,7 +4359,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     live.reflEffective = live.menuRefl ? live.reflStrength : 0.0f;
     const float smoothMinEffective = live.smoothMin;
-    // 4b. reflets : un rayon réfléchi par pixel lisse (matériau du G-buffer copié dans cette image)
+    // 4b. reflections: one reflected ray per smooth pixel (G-buffer material copied in this frame)
     if (live.reflEffective > 0 || live.debugReflect)
     {
         const uint64_t bytes = uint64_t(live.width) * live.height * 16;
@@ -4369,7 +4369,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             live.reflectBuf = UavBuffer(g.device, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             live.reflectBytes = bytes;
         }
-        // matériau de cette image (anneau, passe d'une file à l'autre sans barrière), ou l'unique copie sans frame_sync
+        // this frame's material (ring, moves from one queue to the other without a barrier), or the single copy without frame_sync
         ID3D12Resource* materialNow = live.frameSync ? (live.materialIndexNow >= 0 ? live.materialSnap[live.materialIndexNow].Get() : nullptr) : live.materialBuf.Get();
         const bool materialRing = live.frameSync;
         const bool material = materialNow && live.materialFrame != ~0ull && live.frame <= live.materialFrame + 8 &&
@@ -4383,14 +4383,14 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         }
         if (live.reflectBuf && live.reflectPso && live.anchor[0] && live.anchor[1])
         {
-            // ancrage de cette image : l'autre tampon garde celui de la précédente
+            // this frame's anchoring: the other buffer keeps the previous one's
             live.anchorOut = live.anchorOut < 0 ? 0 : 1 - live.anchorOut;
             live.anchorPrevOk = live.anchorFrame != ~0ull && live.anchorFrame + 1 == live.frame;
             live.anchorFrame = live.frame;
             if (materialNow && !materialRing)
                 Transition(list.Get(), materialNow, D3D12_RESOURCE_STATE_COPY_DEST, srv);
             Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-            // cache de surfaces : lu seulement s'il couvre toute la scène et a déjà été rempli
+            // surface cache: read only if it covers the whole scene and has already been filled
             const bool surfRead = live.surfCacheOn && live.surfCache && live.surfFilled > 0 && live.surfTriangles >= live.capacity / 3;
             if (surfRead)
                 Transition(list.Get(), live.surfCache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
@@ -4409,20 +4409,20 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             const bool geoColorsRead = live.geoColors && live.geoOn;
             if (geoColorsRead)
                 Transition(list.Get(), live.geoColors.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-            // cache de radiance du monde : seulement avec la caméra du jeu (repère du monde exact)
+            // world radiance cache: only with the game's camera (exact world frame)
             bool radNow = live.radOn && live.radPso && trueCam && live.worldUpKnown && live.camHaveCur;
             if (radNow)
             {
                 const uint64_t hashBytes = (16ull << live.radBits), envBytes = uint64_t(live.radEnvSize) * live.radEnvSize * 16;
                 if (!live.radHash)
                 {
-                    live.radHash = UavBuffer(g.device, hashBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // à zéro : vide
+                    live.radHash = UavBuffer(g.device, hashBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // zeroed: empty
                     live.radEnv = UavBuffer(g.device, envBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     live.radStats = UavBuffer(g.device, 64, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     for (auto& r : live.radStatsRb)
                         r = MakeBuffer(g.device, 64, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
                     QueryPerformanceCounter(&live.radClock0);
-                    Log("URTI direct : cache de radiance du monde : %u cases (%.0f Mo), carte du ciel %u × %u", 1u << live.radBits, hashBytes / 1048576.0, live.radEnvSize, live.radEnvSize);
+                    Log("URTI live: world radiance cache: %u cells (%.0f MB), sky map %u × %u", 1u << live.radBits, hashBytes / 1048576.0, live.radEnvSize, live.radEnvSize);
                 }
                 if (!live.reflMix || live.reflMixBytes < bytes)
                 {
@@ -4460,7 +4460,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 Transition(list.Get(), live.radEnv.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
             }
             live.reflMixValid = radNow, live.radParamsNow = radParams, live.radStamp = radNow ? live.frame : ~0ull;
-            // comptes (reflect_stats=1) : remis à zéro, relus trois images plus tard
+            // counters (reflect_stats=1): reset, read three frames later
             const bool reflStatsNow = live.reflStatsOn;
             if (reflStatsNow && !live.reflStats)
             {
@@ -4478,8 +4478,8 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     if (++live.statRsFrames == 300)
                     {
                         const double f = 300.0, screen = double(live.width) * live.height;
-                        Log("URTI direct : reflets par image : %.1f %% de l'écran à reflet, dont %.1f %% d'eau ; %.0f rayons, %.0f pixels sautés, %.0f rayons arrêtés au plafond de sauts ; niveau %d ; "
-                            "cache du monde : %.0f couleurs relues, %.0f restes de rayon pris à la carte du ciel, %.0f pixels sans couleur",
+                        Log("URTI live: reflections per frame: %.1f %% of the screen reflecting, %.1f %% of it water; %.0f rays, %.0f pixels skipped, %.0f rays stopped at the hop cap; level %d; "
+                            "world cache: %.0f colours read, %.0f ray remainders taken from the sky map, %.0f pixels without colour",
                             live.statRs[0] / f / screen * 100.0, live.statRs[1] / f / screen * 100.0, live.statRs[2] / f, live.statRs[3] / f, live.statRs[4] / f, live.reflLevel,
                             live.statRs[5] / f, live.statRs[6] / f, live.statRs[7] / f);
                         for (auto& v2 : live.statRs)
@@ -4495,7 +4495,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->SetComputeRootShaderResourceView(11, radNow ? live.radHash->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(12, radNow ? live.radEnv->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootShaderResourceView(13, radNow ? radParams->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
-            const bool gnRefl = live.gnNowFrame != nullptr; // (bit 5 de gnInfo : la normale des reflets les prend, gnormal_reflect=1)
+            const bool gnRefl = live.gnNowFrame != nullptr; // (bit 5 of gnInfo: the reflections' normal takes them, gnormal_reflect=1)
             list->SetComputeRootShaderResourceView(14, gnRefl ? live.gnNowFrame->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(15, live.reflectBuf->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(16, live.anchor[live.anchorOut]->GetGPUVirtualAddress());
@@ -4547,7 +4547,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                 mb.UAV.pResource = live.reflMix.Get();
                 list->ResourceBarrier(1, &mb);
             }
-            // scène de cette image : le cache sera rempli à la composition, sur l'image présentée
+            // this frame's scene: the cache will be filled at composition, on the presented image
             live.sceneTable = sceneTable, live.sceneCount = uint32_t(tableNow.size()), live.sceneStamp = live.frame;
             Transition(list.Get(), live.sunBuf.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (materialNow && !materialRing)
@@ -4558,7 +4558,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
             list->ResourceBarrier(1, &uavb);
         }
     }
-    // normales du G-buffer (sans anneau) : rendues à la copie de la prochaine image
+    // G-buffer normals (without a ring): given back at the next frame's copy
     if (live.gnNowFrame && !live.frameSync)
         Transition(list.Get(), live.gnNowFrame, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     live.gnNowFrame = nullptr;
@@ -4568,7 +4568,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
         list->ResolveQueryData(live.timeDHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * LiveState::kTimeD, 12, live.timeDRb[live.frame % 3].Get(), 0);
     if (live.timeHeap && live.timeReadback[live.frame % 3])
         list->ResolveQueryData(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (live.frame % 3) * 8, 6, live.timeReadback[live.frame % 3].Get(), 0);
-    // 5. image d'ombres pour l'effet
+    // 5. effect layers for the composition
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(list.Get(), live.mask.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     {
@@ -4582,7 +4582,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     Transition(list.Get(), live.mask.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // sommets de cette image gardés pour la suivante (mémoire géométrique)
+    // this frame's vertices kept for the next (geometric memory)
     if (live.viewPrev && live.anchorAlpha > 0)
     {
         Transition(list.Get(), live.view.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -4616,7 +4616,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     }
     Transition(list.Get(), live.depthBuf.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    // 6. compteurs : lus plus tard, puis remis à zéro pour l'image suivante
+    // 6. counters: read later, then reset for the next frame
     Transition(list.Get(), g.counters.Get(), srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(live.counterReadback[live.frame % 3].Get(), 0, g.counters.Get(), 0, kSlots * 8ull);
     Transition(list.Get(), g.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -4630,9 +4630,9 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (slot != live.lastMainSlot)
     {
         const D3D12_RESOURCE_DESC md = slot >= 0 && g.slotDepth[slot] ? reinterpret_cast<ID3D12Resource*>(g.slotDepth[slot])->GetDesc() : D3D12_RESOURCE_DESC{};
-        Log("URTI direct : écran principal : flux %d, profondeur %llux%u (%u dessins dans cette image)", slot, (unsigned long long)md.Width, md.Height, drawsThisFrame);
+        Log("URTI live: main screen: stream %d, depth %llux%u (%u draws in this frame)", slot, (unsigned long long)md.Width, md.Height, drawsThisFrame);
         live.lastMainSlot = slot;
-        LiveGeoFlush("autre écran principal");
+        LiveGeoFlush("another main screen");
     }
     live.lastDrawsThisFrame = drawsThisFrame;
 
@@ -4642,35 +4642,35 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
     if (active.handle)
         runtime->set_uniform_value_bool(active, true);
     const effect_uniform_variable showMask = runtime->find_uniform_variable("urti.fx", "UrtiShowMask");
-    // urti.ini show_mask=1 coche « masque seul » dans l'effet ; retiré, il la décoche (sinon la vue reste)
+    // urti.ini show_mask=1 ticks "mask only" in the effect; removed, it unticks it (otherwise the view stays)
     if (showMask.handle && g_liveShowMask != live.iniMaskSet)
         runtime->set_uniform_value_bool(showMask, g_liveShowMask), live.iniMaskSet = g_liveShowMask;
     if (!live.bound && active.handle)
     {
         live.bound = true;
         live.boundFrame = live.frame;
-        Log("URTI direct : première image : flux %d, %u dessins, %llu sommets remplis (structure %llu), profondeur %ux%u format %d, uniforme %s",
+        Log("URTI live: first frame: stream %d, %u draws, %llu vertices filled (structure %llu), depth %ux%u format %d, uniform %s",
             slot, drawsThisFrame, (unsigned long long)live.lastFilled, (unsigned long long)live.capacity, live.width, live.height,
-            (int)depthDesc.Format, active.handle ? "trouvé" : "ABSENT");
+            (int)depthDesc.Format, active.handle ? "found" : "MISSING");
     }
     live.frame++;
 }
 
-// ombres RT posées sur l'image présentée, sur la liste immédiate de ReShade (exécutée avant la
-// présentation). Toutes les présentations passent ici, y compris les images générées par la génération
-// d'images (DLSS-G / FSR), qui sont fabriquées à partir de l'image du jeu avant ReShade : sans cela,
-// une image sur deux n'aurait pas les ombres RT.
+// RT effects laid on the presented image, on ReShade's immediate list (executed before the
+// present). Every present comes through here, including frames generated by frame
+// generation (DLSS-G / FSR), which are built from the game's image before ReShade: without this,
+// every other frame would lack the RT effects.
 void LiveComposite(effect_runtime* runtime)
 {
     live.composedNow = false;
     if (live.showGameOnly)
-        return; // F4 : avant (le calcul RT continue : le retour à « après » est immédiat)
+        return; // F4: before (the RT computation goes on: going back to "after" is immediate)
     if (!live.enabled || !live.depthReady || !live.bound || !live.shadowBuf || !live.compositePso)
         return;
-    // masque d'une image trop ancienne (calcul sauté : étalonnage, profondeur absente…) : rien plutôt que des ombres
-    // figées qui ne suivent plus la caméra. Compté large : avec la génération d'images, plusieurs présentations de
-    // suite sans dessin du jeu arrivent en régime normal (« 00001 ») ; l'effet coupé sur l'une d'elles se voyait
-    // comme un clignotement
+    // mask of a frame too old (computation skipped: calibration, missing depth…): nothing rather than frozen
+    // shadows that no longer follow the camera. Counted generously: with frame generation, several presents in
+    // a row without a game draw arrive in normal operation ("00001"); the effect cut on one of them showed
+    // as a blink
     if (live.maskFrame == ~0ull || live.frame > live.maskFrame + 8)
     {
         live.statMaskOld++;
@@ -4679,14 +4679,14 @@ void LiveComposite(effect_runtime* runtime)
     if (live.overlayOpen)
     {
         live.statSkipOverlay++;
-        return; // menu de ReShade ouvert : il doit rester lisible (la passe le recouvrirait)
+        return; // ReShade menu open: it must stay readable (the pass would cover it)
     }
     if (live.fgMode == 1 && live.imageGenerated)
-        return; // image générée laissée telle quelle (réglage du menu)
+        return; // generated frame left as it is (menu setting)
     const effect_technique technique = runtime->find_technique("urti.fx", "URTI");
     const bool techniqueOn = runtime->get_effects_state() && (!technique.handle || runtime->get_technique_state(technique));
     if (techniqueOn != live.lastTechnique)
-        Log("URTI direct : %s dans ReShade", techniqueOn ? "effet URTI actif" : "effet URTI coupé (ou effets coupés) : pas d'ombres RT");
+        Log("URTI live: %s in ReShade", techniqueOn ? "URTI effect on" : "URTI effect off (or effects off): no RT effects");
     live.lastTechnique = techniqueOn;
     if (!techniqueOn)
     {
@@ -4722,9 +4722,9 @@ void LiveComposite(effect_runtime* runtime)
     ComPtr<ID3D12GraphicsCommandList> list;
     if (FAILED(reinterpret_cast<IUnknown*>(runtime->get_command_queue()->get_immediate_command_list()->get_native())->QueryInterface(IID_PPV_ARGS(&list))))
         return;
-    // photos de l'écran avant l'interface : tampons (même disposition que imageIn), images d'écran connues,
-    // choix d'après les comparaisons lues trois présentations plus tard
-    // (et nouvelle disposition dès que l'image d'écran change de format ou de taille : passage en HDR, Alt+Tab)
+    // screen snapshots before the UI: buffers (same layout as imageIn), known screen images,
+    // choice from the comparisons read three presents later
+    // (and a new layout as soon as the screen image changes format or size: switch to HDR, Alt+Tab)
     const bool snapLayoutChanged = g_liveSnapFp.Footprint.Format != fp.Footprint.Format || g_liveSnapFp.Footprint.Width != fp.Footprint.Width ||
                                    g_liveSnapFp.Footprint.Height != fp.Footprint.Height || g_liveSnapFp.Footprint.RowPitch != fp.Footprint.RowPitch;
     if (live.snapBytes < total || snapLayoutChanged)
@@ -4743,14 +4743,14 @@ void LiveComposite(effect_runtime* runtime)
             live.snapBytes = total;
         }
         if (snapLayoutChanged && g_liveSnapFp.Footprint.Width)
-            Log("URTI direct : image d'écran changée (format %d, %ux%u) : photos d'avant l'interface remises à zéro", int(fp.Footprint.Format),
+            Log("URTI live: screen image changed (format %d, %ux%u): snapshots before the UI reset", int(fp.Footprint.Format),
                 fp.Footprint.Width, fp.Footprint.Height);
         g_liveSnapFp = fp;
         live.uiChoice = -1;
     }
     {
-        // images d'écran de cette présentation seulement : après une recréation, les anciennes sont détruites et
-        // leur adresse peut servir à une autre image du jeu
+        // screen images of this present only: after a recreation, the old ones are destroyed and
+        // their address may serve another game image
         std::lock_guard<std::mutex> lock(g_mutex);
         g_liveBackBuffers.clear();
         for (uint32_t i = 0; i < runtime->get_back_buffer_count(); i++)
@@ -4765,7 +4765,7 @@ void LiveComposite(effect_runtime* runtime)
     const uint32_t uiSlot = uint32_t(live.uiFrame % 3);
     if (const uint32_t* c = nullptr; live.uiFrame >= 3 && live.uiCountAt[uiSlot] && SUCCEEDED(live.uiReadback[uiSlot]->Map(0, nullptr, (void**)&c)) && c)
     {
-        // choix fait par live_uiselect sur le GPU, dans la même image (octets 64 et 68 selon la parité)
+        // choice made by live_uiselect on the GPU, in the same frame (bytes 64 and 68 depending on parity)
         const int choice = int(c[16 + live.uiParity[uiSlot]]) - 1;
         const float best = choice >= 0 && choice < 4 && c[8] ? float(c[choice]) / float(c[8]) : 0.0f;
         if (choice != live.uiChoice)
@@ -4773,8 +4773,8 @@ void LiveComposite(effect_runtime* runtime)
             char detail[160] = "";
             for (uint32_t k = 0, n = 0; k < live.uiCountAt[uiSlot] && k < 4 && c[8]; k++)
                 n += std::snprintf(detail + n, sizeof(detail) - n, " ; photo %u : %.1f %% / %.1f %%", k, 100.0 * c[k] / c[8], 100.0 * c[4 + k] / c[8]);
-            Log(choice >= 0 ? "URTI direct : image avant l'interface du jeu : photo %d (%.1f %% des pixels identiques à l'image finale)%s"
-                            : "URTI direct : pas de photo avant l'interface du jeu (%d, %.1f)%s (identiques à l'image finale / à la précédente)",
+            Log(choice >= 0 ? "URTI live: image before the game's UI: snapshot %d (%.1f %% of pixels identical to the final image)%s"
+                            : "URTI live: no snapshot before the game's UI (%d, %.1f)%s (identical to the final image / to the previous one)",
                 choice, best * 100.0f, detail);
         }
         live.uiChoice = choice;
@@ -4785,8 +4785,8 @@ void LiveComposite(effect_runtime* runtime)
         std::lock_guard<std::mutex> lock(g_mutex);
         snapCount = std::min(g_liveSnapCount, kLiveSnaps);
     }
-    // réglages de l'effet : écran partagé (F5), masque seul (contrôle) ; plus de force dans le menu : la
-    // lumière du soleil est retirée entièrement, comme dans les ombres du jeu
+    // effect settings: split screen (F5), mask only (check); no more strength in the menu: the
+    // sunlight is removed entirely, as in the game's shadows
     const float strength = 1.0f;
     bool split = false, showMask = false;
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiSplit"); v.handle)
@@ -4795,7 +4795,7 @@ void LiveComposite(effect_runtime* runtime)
         runtime->get_uniform_value_bool(v, &showMask, 1);
     showMask = showMask || g_liveShowMask || (live.debugView >= 1 && live.debugView <= 3);
     if (strength != live.lastStrength || split != live.lastSplit || showMask != live.lastShowMask)
-        Log("URTI direct : réglages du menu : force %.2f, écran partagé %d, masque seul %d", strength, split, showMask);
+        Log("URTI live: menu settings: strength %.2f, split screen %d, mask only %d", strength, split, showMask);
     live.lastStrength = strength, live.lastSplit = split, live.lastShowMask = showMask;
 
     const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -4804,11 +4804,11 @@ void LiveComposite(effect_runtime* runtime)
     tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     buf.PlacedFootprint = fp;
-    const uint32_t slotTime = uint32_t((live.frame + 2) % 3); // image dont les effets viennent d'être enregistrés
+    const uint32_t slotTime = uint32_t((live.frame + 2) % 3); // frame whose effects were just recorded
     if (live.timeHeap)
         list->EndQuery(live.timeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slotTime * 8 + 6);
     live.compCounter++;
-    // composition détaillée de la présentation d'il y a trois : interface, reflets (stabilisation, cache de surfaces), lumière, composition, copie
+    // detailed composition of the present from three ago: UI, reflections (stabilisation, surface cache), light, composition, copy
     if (const uint64_t* t = nullptr; live.timeCRb[live.compCounter % 3] && SUCCEEDED(live.timeCRb[live.compCounter % 3]->Map(0, nullptr, (void**)&t)) && t)
     {
         UINT64 freq = 0;
@@ -4820,7 +4820,7 @@ void LiveComposite(effect_runtime* runtime)
             if (++live.timeCFrames == 300)
             {
                 const double n = live.timeCFrames;
-                Log("URTI direct : GPU détail (ms par présentation) : image sans interface %.2f, reflets stabilisés et cache de surfaces %.2f, lumière %.2f, "
+                Log("URTI live: GPU detail (ms per present): UI-free image %.2f, stabilised reflections and surface cache %.2f, light %.2f, "
                     "composition %.2f, copie %.2f", live.timeDSum[12] / n, live.timeDSum[13] / n, live.timeDSum[14] / n, live.timeDSum[15] / n, live.timeDSum[16] / n);
                 for (int k = 12; k < 17; k++)
                     live.timeDSum[k] = 0;
@@ -4836,13 +4836,13 @@ void LiveComposite(effect_runtime* runtime)
     Transition(list.Get(), live.imageIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     for (uint32_t k = 0; k < snapCount; k++)
         Transition(list.Get(), live.snaps[k].Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
-    // image d'avant l'interface : photos de cette image comparées à l'image finale et à l'image affichée
-    // précédente, choix et copie sur le GPU (live_uicompare puis live_uiselect), dans la même image
+    // image before the UI: this frame's snapshots compared with the final image and the previous displayed
+    // image, choice and copy on the GPU (live_uicompare then live_uiselect), in the same frame
     live.uiCountAt[uiSlot] = 0;
     ID3D12Resource* preUi = nullptr;
-    bool hudLead = false; // live_hudgain a écrit l'avance du calque sur l'image de cette présentation
-    // image du jeu sans son interface, copiée dans ses listes : adoptée d'après les votes de l'exécution, puis prise telle quelle (pas
-    // de photo ni de comparaison) tant qu'une copie récente existe
+    bool hudLead = false; // live_hudgain wrote the layer's lead on this present's image
+    // the game's image without its UI, copied inside its lists: adopted from the execution votes, then taken as it is (no
+    // snapshot or comparison) as long as a recent copy exists
     int32_t hudSlot = -1, hudPrevSlot = -1, hudPrev2Slot = -1;
     uint32_t hudPitch = 0;
     uint64_t hudSerialNow = 0;
@@ -4857,11 +4857,11 @@ void LiveComposite(effect_runtime* runtime)
                 if (n > votes)
                     best = h, votes = n;
             if (votes * 10 >= g_liveHudVoteCount * 8 && best != g_liveHudHandle)
-                Log("URTI direct : image du jeu sans son interface reconnue (%u fois sur %u, %zu candidates, image d'écran format %d) : couleurs des reflets "
-                    "prises avant le HUD, interface laissée intacte", votes, g_liveHudVoteCount, g_liveHudVotes.size(), int(bd.Format)),
+                Log("URTI live: the game's UI-free image recognised (%u times out of %u, %zu candidates, screen image format %d): reflection colours "
+                    "taken before the HUD, UI left intact", votes, g_liveHudVoteCount, g_liveHudVotes.size(), int(bd.Format)),
                     g_liveHudHandle = best, g_liveHudDone = -1;
             else if (g_liveHudHandle && g_liveHudVotes[g_liveHudHandle] * 2 < g_liveHudVoteCount)
-                Log("URTI direct : image sans interface plus reconnue (%u fois sur %u)", g_liveHudVotes[g_liveHudHandle], g_liveHudVoteCount),
+                Log("URTI live: UI-free image no longer recognised (%u times out of %u)", g_liveHudVotes[g_liveHudHandle], g_liveHudVoteCount),
                     g_liveHudHandle = 0, g_liveHudDone = -1;
             g_liveHudVotes.clear(), g_liveHudVoteCount = 0;
         }
@@ -4870,7 +4870,7 @@ void LiveComposite(effect_runtime* runtime)
             live.hudWidth == uint32_t(bd.Width) && live.hudHeight == bd.Height && live.hudPitch * uint64_t(bd.Height) <= live.hudBytes)
         {
             hudSlot = g_liveHudDone, hudPitch = live.hudPitch, hudSerialNow = g_liveHudSerial;
-            // copie d'avant (l'anneau est rempli dans l'ordre) : pixels immobiles
+            // previous copy (the ring is filled in order): still pixels
             const int32_t prev = int32_t((uint32_t(hudSlot) + LiveState::kHudSnaps - 1) % LiveState::kHudSnaps);
             if (g_liveHudNext >= 2 && live.hudSnap[prev])
                 hudPrevSlot = prev;
@@ -4897,13 +4897,13 @@ void LiveComposite(effect_runtime* runtime)
     }
     if (hudSlot < 0)
         live.hudConverted = ~0ull;
-    // à chaque présentation : conversion si la copie est nouvelle ; puis un pixel sur 64 comparé à l'image finale (cette présentation montre-t-elle
-    // l'image de la copie ? avec DLSS-G, une sur deux est fabriquée entre deux images du jeu) ; si oui, masque d'interface de tous les pixels
+    // on every present: conversion if the copy is new; then one pixel in 64 compared with the final image (does this present show
+    // the copy's image? with DLSS-G, one in two is made between two game frames); if so, UI mask of every pixel
     if (hudSlot >= 0 && live.hudPso && live.hudGainPso && live.preUiBuf && live.uiCounts && live.uiMaskBuf && live.hudGain)
     {
-        // les trois dernières copies : l'image finale d'une présentation est celle d'une copie plus ancienne (le jeu a de l'avance)
+        // the last three copies: a present's final image is that of an older copy (the game is ahead)
         const uint32_t copies = hudPrev2Slot >= 0 ? 3u : hudPrevSlot >= 0 ? 2u : 1u;
-        // copie convertie : celle de l'image du jeu du dernier calcul (ses couleurs vont avec sa profondeur), si elle est encore dans les trois dernières
+        // converted copy: the one of the last computation's game frame (its colours go with its depth), if it is still among the last three
         const uint64_t convSerial = live.layerHudSerial <= hudSerialNow && hudSerialNow - live.layerHudSerial < copies ? live.layerHudSerial : hudSerialNow;
         const uint32_t convBack = uint32_t(hudSerialNow - convSerial);
         live.statHudConvBack[std::min<uint64_t>(live.layerHudSerial > hudSerialNow ? 3 : hudSerialNow - live.layerHudSerial, 3)]++;
@@ -4912,7 +4912,7 @@ void LiveComposite(effect_runtime* runtime)
         if (fresh)
         {
             live.hudConverted = convSerial, live.statHudConverted++;
-            // pas de choix de photo (octets 64 et 68 à zéro) : live_composite prend le masque d'interface écrit ici et les couleurs de l'image finale
+            // no snapshot choice (bytes 64 and 68 zeroed): live_composite takes the UI mask written here and the final image's colours
             Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyBufferRegion(live.uiCounts.Get(), 0, g.zeros.Get(), 0, 72);
             Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -4948,7 +4948,7 @@ void LiveComposite(effect_runtime* runtime)
         hc.mode = 2u | ((copies - 1) << 8);
         list->SetComputeRoot32BitConstants(7, 8, &hc, 0);
         list->Dispatch(((hc.width + 7) / 8 + 7) / 8, ((hc.height + 7) / 8 + 7) / 8, 1);
-        // rapport : moyenne glissante des médianes (au moins 1000 pixels), et part des pixels qui concordent ; lus pour le journal
+        // ratio: running average of the medians (at least 1000 pixels), and share of matching pixels; read for the log
         ub.UAV.pResource = live.hudGain.Get();
         list->ResourceBarrier(1, &ub);
         const float blendNow = 0.1f;
@@ -4973,7 +4973,7 @@ void LiveComposite(effect_runtime* runtime)
         list->ResourceBarrier(1, &ub);
         if (const uint32_t rs = uint32_t(live.uiFrame % 3); live.hudGainReadback[rs])
         {
-            // (lu trois présentations plus tard : présentations qui concordent comptées pour le journal)
+            // (read three presents later: matching presents counted for the log)
             if (const float* gv = nullptr; SUCCEEDED(live.hudGainReadback[rs]->Map(0, nullptr, (void**)&gv)) && gv)
             {
                 const uint32_t lag = std::min(((const uint32_t*)gv)[4], 2u);
@@ -5019,7 +5019,7 @@ void LiveComposite(effect_runtime* runtime)
         list->SetComputeRoot32BitConstants(7, 8, uc, 0);
         list->Dispatch((uint32_t(bd.Width) / 4 + 7) / 8, (bd.Height / 4 + 7) / 8, 1);
         Transition(list.Get(), live.imageOut.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(1, &ub); // comptes écrits, lus (et choix gardé) par live_uiselect
+        list->ResourceBarrier(1, &ub); // counters written, read (and choice kept) by live_uiselect
         list->SetComputeRootSignature(live.uiSelRs.Get());
         list->SetPipelineState(live.uiSelPso.Get());
         list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
@@ -5038,23 +5038,23 @@ void LiveComposite(effect_runtime* runtime)
     }
     live.uiFrame++;
     LiveTimeD(list.Get(), 13);
-    // pas de photo sûre d'avant l'interface (lu trois images plus tard) : les couleurs des reflets viendraient de
-    // l'image finale, menus compris ; les reflets RT s'effacent en douceur (le jeu garde les siens) et reviennent
-    // avec la photo
-    // (une photo périmée de temps en temps est rattrapée par live_composite : dernière photo sûre ; seulement
-    // au-delà de dix de suite, les couleurs gardées deviennent trop vieilles)
+    // no safe snapshot before the UI (read three frames later): the reflections' colours would come from
+    // the final image, menus included; RT reflections fade out smoothly (the game keeps its own) and come back
+    // with the snapshot
+    // (an occasional stale snapshot is caught by live_composite: last safe snapshot; only
+    // beyond ten in a row do the kept colours get too old)
     live.uiBadReadbacks = live.uiChoice < 0 && hudSlot < 0 ? live.uiBadReadbacks + 1 : 0;
     const bool uiUnsafe = preUi && live.uiBadReadbacks > 10;
     live.uiReflGate = uiUnsafe ? std::max(0.0f, live.uiReflGate - 0.15f) : std::min(1.0f, live.uiReflGate + 0.1f);
     Transition(list.Get(), live.shadowBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-    // vues 4 à 8 : lissé, poids, couleur reflétée, distance de touche (dans le canal du lissé), confiance
+    // views 4 to 8: smoothness, weight, reflected colour, hit distance (in the smoothness channel), confidence
     const uint32_t reflectView = live.debugView == 4 ? 1u : live.debugView == 5 ? 2u : live.debugView == 6 ? 3u : live.debugView == 7 ? 1u :
                                  live.debugView == 8 ? 3u : live.debugView == 9 ? 4u : live.debugView == 10 ? 5u : live.debugView == 11 ? 6u : live.debugReflect;
     const bool reflections = live.reflectBuf && (live.reflEffective > 0 || reflectView);
     if (reflections)
         Transition(list.Get(), live.reflectBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
-    // reflets stabilisés dans le temps (image réelle : mise à jour de l'historique ; image générée : le
-    // dernier résultat est repris tel quel)
+    // reflections stabilised over time (real frame: history update; generated frame: the
+    // last result is reused as it is)
     const bool isGenerated = live.syncNow ? !live.presentComputed : live.lastPresentDraws == 0;
     int reflHistOut = -1;
     if (reflections && live.resolvePso)
@@ -5099,8 +5099,8 @@ void LiveComposite(effect_runtime* runtime)
                 list->SetComputeRootShaderResourceView(4, live.depthBuf->GetGPUVirtualAddress());
                 list->SetComputeRootShaderResourceView(5, live.depthPrevBuf ? live.depthPrevBuf->GetGPUVirtualAddress() : live.depthBuf->GetGPUVirtualAddress());
                 list->SetComputeRootShaderResourceView(6, live.sunBuf->GetGPUVirtualAddress());
-                // ancrage (point reflété retrouvé à l'image précédente, identités) : celui de cette image et le précédent
-                const bool anchored = live.anchorOut >= 0 && live.anchor[0] && live.anchor[1] && live.anchorFrame + 1 == live.frame; // écrit par les effets de cette image
+                // anchoring (reflected point found in the previous frame, identities): this frame's and the previous one
+                const bool anchored = live.anchorOut >= 0 && live.anchor[0] && live.anchor[1] && live.anchorFrame + 1 == live.frame; // written by this frame's effects
                 if (anchored)
                     for (auto& a : live.anchor)
                         Transition(list.Get(), a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
@@ -5138,7 +5138,7 @@ void LiveComposite(effect_runtime* runtime)
                     list->ResourceBarrier(1, &mb);
                     live.reflMotionFrame = motionOk ? live.frame : ~0ull;
                 }
-                // cache de surfaces : un pixel de rendu par bloc 4×4 (live_surfcache), sur la scène RT de cette image
+                // surface cache: one render pixel per 4×4 block (live_surfcache), on this frame's RT scene
                 if (live.surfCacheOn && live.surfPso && live.tlas && live.sceneTable && live.sceneCount && live.sceneStamp + 1 == live.frame &&
                     live.capacity)
                 {
@@ -5146,9 +5146,9 @@ void LiveComposite(effect_runtime* runtime)
                     if (!live.surfCache || live.surfTriangles < triangles)
                     {
                         Retire(live.surfCache);
-                        live.surfCache = UavBuffer(g.device, triangles * 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // à zéro : vide
+                        live.surfCache = UavBuffer(g.device, triangles * 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // zeroed: empty
                         live.surfTriangles = live.surfCache ? triangles : 0, live.surfFilled = 0;
-                        Log("URTI direct : cache de surfaces pour %llu triangles (%.1f Mo)", (unsigned long long)triangles, triangles * 8 / 1048576.0);
+                        Log("URTI live: surface cache for %llu triangles (%.1f MB)", (unsigned long long)triangles, triangles * 8 / 1048576.0);
                     }
                     if (live.surfCache)
                     {
@@ -5185,7 +5185,7 @@ void LiveComposite(effect_runtime* runtime)
                         live.surfFilled++;
                     }
                 }
-                // cache de radiance du monde : ce que l'image montre, déposé là où c'est dans le monde (live_radcache) ; puis la carte du ciel s'étend
+                // world radiance cache: what the image shows, deposited where it is in the world (live_radcache); then the sky map grows
                 if (mixed && live.radPso && live.radParamsNow && live.radHash && live.radEnv && live.radStats && (live.frame & 1) == 0)
                 {
                     const bool sceneOk = live.tlas && live.sceneStamp + 1 == live.frame;
@@ -5199,7 +5199,7 @@ void LiveComposite(effect_runtime* runtime)
                             live.radStatsRb[live.frame % 3]->Unmap(0, nullptr);
                             if (++live.radStatFrames == 300)
                             {
-                                Log("URTI direct : cache de radiance du monde, par image : %.0f couleurs déposées, %.0f refusées (table pleine), %.0f trous et %.0f pleins appris, %.0f pixels de ciel ; %.0f cases créées, %.0f reprises",
+                                Log("URTI live: world radiance cache, per frame: %.0f colours deposited, %.0f refused (table full), %.0f holes and %.0f solids learned, %.0f sky pixels; %.0f cells created, %.0f reclaimed",
                                     live.statRad[0] / 300.0, live.statRad[1] / 300.0, live.statRad[2] / 300.0, live.statRad[3] / 300.0, live.statRad[4] / 300.0, live.statRad[5] / 300.0, live.statRad[6] / 300.0);
                                 for (auto& v2 : live.statRad)
                                     v2 = 0;
@@ -5307,12 +5307,12 @@ void LiveComposite(effect_runtime* runtime)
         }
     }
     LiveTimeD(list.Get(), 14);
-    // part du soleil dans l'image du jeu (live_sunlight) : points d'une même surface que le jeu éclaire et ombre
-    if (live.sunMeasure && !isGenerated && live.sunlightPso && live.atlasBuf && live.atlasFrame + 1 == live.frame && live.depthBuf && // copiée par les effets de cette image
+    // sun share in the game's image (live_sunlight): points of the same surface that the game lights and shadows
+    if (live.sunMeasure && !isGenerated && live.sunlightPso && live.atlasBuf && live.atlasFrame + 1 == live.frame && live.depthBuf && // copied by this frame's effects
         live.calibrated && live.framesSinceSun < 30)
     {
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, 2048 - 1232); // (pas l'orientation de la caméra, 2048 et après)
+        list->CopyBufferRegion(live.sunBuf.Get(), 1232, g.zeros.Get(), 0, 2048 - 1232); // (not the camera orientation, 2048 and after)
         Transition(list.Get(), live.sunBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
         Transition(list.Get(), live.atlasBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
@@ -5339,7 +5339,7 @@ void LiveComposite(effect_runtime* runtime)
         ub.UAV.pResource = live.sunBuf.Get();
         list->ResourceBarrier(1, &ub);
     }
-    // file d'attente des calques : celui de cette image calculée rangé avec son numéro ; la composition prend celui de l'image que l'écran montre
+    // layer queue: this computed frame's layer stored with its number; the composition takes the one of the frame the screen shows
     bool ringUse = false;
     if (hudLead && live.delayPso && live.hudGain && live.shadowBuf && live.syncNow)
     {
@@ -5347,7 +5347,7 @@ void LiveComposite(effect_runtime* runtime)
         if (!live.delayRing || live.delayW != live.width || live.delayH != live.height)
         {
             Retire(live.delayRing);
-            live.delayRing = UavBuffer(g.device, 64 + 3 * sliceBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // à zéro : aucune tranche garnie
+            live.delayRing = UavBuffer(g.device, 64 + 3 * sliceBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); // zeroed: no slice filled
             live.delayW = live.width, live.delayH = live.height;
         }
         if (live.delayRing && live.presentComputed && !live.layerSuspect)
@@ -5383,9 +5383,9 @@ void LiveComposite(effect_runtime* runtime)
     list->SetComputeRootShaderResourceView(0, live.imageIn->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(1, live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, reflections ? live.reflectBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    // image générée : fabriquée entre la vraie image précédente et celle dont le calcul est le dernier fait (le
-    // calcul a lieu dès que les dessins du jeu sont exécutés : avec DLSS-G, juste avant l'image générée) ; mode
-    // mélange : moitié de chaque
+    // generated frame: built between the previous real frame and the one whose computation is the last done (the
+    // computation happens as soon as the game's draws are executed: with DLSS-G, just before the generated frame); blend
+    // mode: half of each
     const bool generated = live.imageGenerated;
     const bool blend = generated && live.fgMode == 2 && live.prevShadowBuf;
     if (blend)
@@ -5398,10 +5398,10 @@ void LiveComposite(effect_runtime* runtime)
     if (live.uiCounts)
         Transition(list.Get(), live.uiCounts.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv);
     list->SetComputeRootShaderResourceView(7, live.uiCounts ? live.uiCounts->GetGPUVirtualAddress() : live.sunBuf->GetGPUVirtualAddress());
-    // rebond de lumière de cette image et couleur propre des surfaces (copiée pendant l'image du jeu)
-    // rebond de lumière : celui de ce calcul, ou le dernier calculé quand rien de neuf n'a été calculé (image générée)
-    // (compté large, comme le masque : avec la génération d'images, plusieurs présentations de suite sans calcul ou sans
-    // G-buffer copié arrivent en régime normal ; le rebond coupé sur l'une d'elles clignotait)
+    // this frame's light bounce and the surfaces' own colour (copied during the game frame)
+    // light bounce: this computation's, or the last one computed when nothing new was computed (generated frame)
+    // (counted generously, like the mask: with frame generation, several presents in a row without a computation or without
+    // a copied G-buffer arrive in normal operation; the bounce cut on one of them blinked)
     const bool giFresh = live.giStamp != ~0ull && live.frame <= live.giStamp + 8;
     const float giEffC = live.giStrength * (live.menuGi ? live.menuGiForce : 0.0f);
     const bool giUse = giEffC > 0 && live.giValid && giFresh && live.albedoBuf && live.albedoFrame != ~0ull &&
@@ -5417,14 +5417,14 @@ void LiveComposite(effect_runtime* runtime)
         Transition(list.Get(), live.normalBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     list->SetComputeRootShaderResourceView(8, giUse ? live.giBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(9, giUse ? live.albedoBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
-    // vue 11 (alignement) : la profondeur du calcul à la place de la normale
+    // view 11 (alignment): the computation's depth instead of the normal
     const bool alignView = live.debugView == 11 && live.depthBuf;
     if (alignView)
         Transition(list.Get(), live.depthBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, srv);
     list->SetComputeRootShaderResourceView(10, alignView ? live.depthBuf->GetGPUVirtualAddress() : normalUse ? live.normalBuf->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     if (const uint64_t maskBytes = uint64_t(bd.Width) * bd.Height * 4; !live.uiMaskBuf || live.uiMaskBytes < maskBytes)
         Retire(live.uiMaskBuf), live.uiMaskBuf = UavBuffer(g.device, maskBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), live.uiMaskBytes = maskBytes;
-    // image générée : l'ombre et le reflet du dernier calcul glissent avec le mouvement (mesuré par le dernier calcul, une ou deux présentations avant)
+    // generated frame: the last computation's shadow and reflection slide with the motion (measured by the last computation, one or two presents before)
     const bool shiftNow = live.fgShift > 0 && live.syncNow && !live.presentComputed && live.reflMotion && live.reflMotionFrame != ~0ull &&
                           live.frame <= live.reflMotionFrame + 2;
     if (live.reflMotion)
@@ -5443,7 +5443,7 @@ void LiveComposite(effect_runtime* runtime)
     list->SetComputeRootShaderResourceView(14, ringUse ? live.delayRing->GetGPUVirtualAddress() : live.shadowBuf->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(15, live.imageOut->GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(16, live.uiMaskBuf ? live.uiMaskBuf->GetGPUVirtualAddress() : live.imageOut->GetGPUVirtualAddress());
-    const bool tinted = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] > 0.01f; // teinte des ombres mesurée
+    const bool tinted = live.sunMeasure && live.sunSkyFrames && live.sunSky[3] > 0.01f; // measured shadow tint
     const struct
     {
         uint32_t width, height, pitch, format, maskWidth, maskHeight, maskPitch;
@@ -5462,7 +5462,7 @@ void LiveComposite(effect_runtime* runtime)
         float waterBaseOn, waterGain;
     } cc = { uint32_t(bd.Width), bd.Height, fp.Footprint.RowPitch, format, live.width, live.height, live.shadowPitch, strength,
              split ? 1u : 0u, showMask ? 1u : 0u,
-             // (image générée aussi : le dernier reflet stabilisé. Coupé sur elles, il s'éteignait une présentation sur deux)
+             // (generated frame too: the last stabilised reflection. Cut on them, it went out every other present)
              reflections ? (reflectView ? 1.0f : live.reflEffective * live.uiReflGate) : 0.0f,
              (reflections ? reflectView : 0u) | (blend ? 0x100u : 0u) | (reflHistOut >= 0 ? 0x200u : 0u) | (preUi ? 0x400u : 0u) |
              (live.sunShadows ? 0u : 0x800u) | (leadUse && !ringUse ? 0x1000u : 0u) | (ringUse ? 0x2000u : 0u), live.p00, live.p11,
@@ -5530,18 +5530,18 @@ void LiveComposite(effect_runtime* runtime)
 bool OnOpenOverlay(effect_runtime*, bool open, input_source)
 {
     live.overlayOpen = open;
-    Log("URTI direct : menu de ReShade %s", open ? "ouvert" : "fermé");
+    Log("URTI live: ReShade menu %s", open ? "open" : "closed");
     return false;
 }
 
-// photo de l'écran après les effets (fichier déclencheur urti_photo, ou présentations listées dans urti.ini
-// photo_frames= : urti_photo_<présentation>.ppm, pour comparer deux lancements image par image)
+// screen snapshot after the effects (trigger file urti_photo, or presents listed in urti.ini
+// photo_frames=: urti_photo_<present>.ppm, to compare two launches frame by frame)
 void OnReshadePresent(effect_runtime* runtime)
 {
     if (!OurDevice(runtime->get_device()))
         return;
-    // case « URTI activé » du menu : décochée, plus aucun calcul RT (capture, structure, ombres, reflets, pose) ;
-    // F7 fait la même chose et la case suit
+    // "URTI" menu checkbox: unticked, no RT computation at all (capture, structure, shadows, reflections, composition);
+    // F7 does the same and the box follows
     if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", "UrtiOn"); v.handle && g_liveAtStart)
     {
         bool on = true;
@@ -5549,13 +5549,13 @@ void OnReshadePresent(effect_runtime* runtime)
         if (int(on) != live.menuOn)
         {
             if (live.menuOn >= 0 && live.enabled != on)
-                Log("URTI : %s (menu)", on ? "activé, le calcul ray tracing reprend" : "coupé, plus aucun calcul ray tracing");
+                Log("URTI: %s (menu)", on ? "on, ray-tracing computation resumes" : "off, no ray-tracing computation at all");
             live.menuOn = int(on), live.enabled = on;
         }
         else if (live.enabled != on)
             runtime->set_uniform_value_bool(v, live.enabled), live.menuOn = int(live.enabled); // F7
     }
-    // cases du menu : reflets, occultation ambiante (force, portée), rebond de lumière (force)
+    // menu checkboxes: reflections, ambient occlusion (strength, range), light bounce (strength)
     {
         auto readBool = [&](const char* name, bool& out) {
             if (const effect_uniform_variable v = runtime->find_uniform_variable("urti.fx", name); v.handle)
@@ -5563,7 +5563,7 @@ void OnReshadePresent(effect_runtime* runtime)
                 bool b = out;
                 runtime->get_uniform_value_bool(v, &b, 1);
                 if (b != out)
-                    Log("URTI : menu, %s %s", name, b ? "coché" : "décoché");
+                    Log("URTI: menu, %s %s", name, b ? "ticked" : "unticked");
                 out = b;
             }
         };
@@ -5579,14 +5579,14 @@ void OnReshadePresent(effect_runtime* runtime)
         readBool("UrtiReflets", live.menuRefl), readBool("UrtiOcclusion", live.menuAo), readBool("UrtiRebond", live.menuGi), readBool("UrtiBrillant", live.menuGloss);
         readFloat("UrtiOcclusionForce", live.menuAoForce, 0.0f, 2.0f), readFloat("UrtiOcclusionPortee", live.menuAoRadius, 0.5f, 5.0f);
         readFloat("UrtiRebondForce", live.menuGiForce, 0.0f, 3.0f), readFloat("UrtiCiel", live.menuSky, 0.0f, 1.6f);
-        // occultation et rebond décochés : le soleil ne sert plus, sa carte n'est rejouée que par huitièmes (2 millions de sommets par présentation dans Red Dead)
+        // occlusion and bounce unticked: the sun is no longer used, its map is only replayed by eighths (2 million vertices per present in Red Dead)
         g_liveSunEighth = !live.sunShadows && (live.sunEighth || !(live.menuAo || live.menuGi));
-        // (jeu sans caméra lue, champ de vision mesuré automatiquement : le suivi du soleil reste, ses cascades mesurent le champ de vision, dont les
-        // reflets ont besoin pour des angles justes)
+        // (game without a read camera, field of view measured automatically: sun tracking stays, its cascades measure the field of view, which
+        // reflections need for correct angles)
         g_liveSunUnused = !live.sunShadows && !live.menuAo && !live.menuGi && (live.camLive || !live.fovAuto);
     }
     LiveComposite(runtime);
-    // film : cette présentation (calculée ou générée), avant et après URTI, rangée dans l'anneau en mémoire vidéo
+    // film: this present (computed or generated), before and after URTI, stored in the video-memory ring
     if (live.film > 0 && live.composedNow && live.imageIn && live.imageOut && live.filmPso)
         if (const resource back = runtime->get_current_back_buffer(); back.handle)
         {
@@ -5601,7 +5601,7 @@ void OnReshadePresent(effect_runtime* runtime)
             const uint32_t hw = uint32_t(bd.Width) / 2, hh = bd.Height / 2;
             const uint64_t frameBytes = uint64_t(hw) * hh * 4;
             if (fmt == 9)
-                Log("URTI direct : film impossible (image d'écran format %d)", int(bd.Format)), live.film = 0;
+                Log("URTI live: film impossible (screen image format %d)", int(bd.Format)), live.film = 0;
             else
             {
                 if (!live.filmRing || live.filmFrameBytes != frameBytes)
@@ -5629,13 +5629,13 @@ void OnReshadePresent(effect_runtime* runtime)
                     }
                     Transition(fl.Get(), live.imageOut.Get(), srv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     Transition(fl.Get(), live.imageIn.Get(), srv, D3D12_RESOURCE_STATE_COPY_DEST);
-                    Log("FILM %u %u image %llu genere %d calcul %d sync %d dessins %u", live.filmCount, live.filmIndex, (unsigned long long)live.frame,
+                    Log("FILM %u %u frame %llu generated %d computed %d sync %d draws %u", live.filmCount, live.filmIndex, (unsigned long long)live.frame,
                         int(live.imageGenerated), int(live.presentComputed), int(live.syncNow), live.lastPresentDraws);
                     live.filmIndex++;
                 }
                 if (live.filmIndex >= LiveState::kFilmFrames && live.filmRing)
                 {
-                    // fin : tout l'anneau lu d'un coup, puis écrit (une seule attente, après le film)
+                    // end: the whole ring read at once, then written (a single wait, after the film)
                     runtime->get_command_queue()->flush_immediate_command_list();
                     ID3D12CommandQueue* queue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
                     const uint64_t all = frameBytes * 2 * LiveState::kFilmFrames;
@@ -5653,7 +5653,7 @@ void OnReshadePresent(effect_runtime* runtime)
                             const uint32_t dxgi = fmt == 2 ? uint32_t(DXGI_FORMAT_R10G10B10A2_UNORM) : fmt == 1 ? uint32_t(DXGI_FORMAT_B8G8R8A8_UNORM) : uint32_t(DXGI_FORMAT_R8G8B8A8_UNORM);
                             for (uint32_t k = 0; k < LiveState::kFilmFrames; k++)
                                 for (uint32_t which = 0; which < 2; which++)
-                                    if (FILE* f = std::fopen((live.filmFolder + (which ? "\\apres_" : "\\avant_") + std::to_string(k) + ".raw").c_str(), "wb"))
+                                    if (FILE* f = std::fopen((live.filmFolder + (which ? "\\after_" : "\\before_") + std::to_string(k) + ".raw").c_str(), "wb"))
                                     {
                                         std::fprintf(f, "URTIRAW %u %u %u 4\n", dxgi, hw, hh);
                                         std::fwrite(data + (uint64_t(k) * 2 + which) * frameBytes, 1, size_t(frameBytes), f);
@@ -5662,7 +5662,7 @@ void OnReshadePresent(effect_runtime* runtime)
                             rb->Unmap(0, nullptr);
                         }
                     }
-                    // profondeur et matériau (masque de l'eau) du dernier calcul, et de quoi refaire la hauteur de chaque pixel
+                    // depth and material (water mask) of the last computation, and what is needed to rebuild each pixel's height
                     {
                         const bool d24 = live.depthFormat == DXGI_FORMAT_R24G8_TYPELESS || live.depthFormat == DXGI_FORMAT_D24_UNORM_S8_UINT;
                         ID3D12Resource* mat = live.materialIndexNow >= 0 ? live.materialSnap[live.materialIndexNow].Get() : nullptr;
@@ -5684,54 +5684,54 @@ void OnReshadePresent(effect_runtime* runtime)
                             const uint8_t* data = nullptr;
                             if (SUCCEEDED(rd->Map(0, nullptr, (void**)&data)) && data)
                             {
-                                if (FILE* f = std::fopen((live.filmFolder + "\\profondeur.bin").c_str(), "wb"))
+                                if (FILE* f = std::fopen((live.filmFolder + "\\depth.bin").c_str(), "wb"))
                                     std::fwrite(data, 1, size_t(depthBytes), f), std::fclose(f);
                                 if (mat)
-                                    if (FILE* f = std::fopen((live.filmFolder + "\\materiau.bin").c_str(), "wb"))
+                                    if (FILE* f = std::fopen((live.filmFolder + "\\material.bin").c_str(), "wb"))
                                         std::fwrite(data + depthBytes, 1, size_t(matBytes), f), std::fclose(f);
                                 rd->Unmap(0, nullptr);
                             }
                         }
-                        Log("FILMCAM A %.9g B %.9g p00 %.6f p11 %.6f haut %.5f %.5f %.5f d24 %d pas %u rendu %ux%u alloue %ux%u materiau %u %ux%u format %u canal %u inverse %d",
+                        Log("FILMCAM A %.9g B %.9g p00 %.6f p11 %.6f up %.5f %.5f %.5f d24 %d pitch %u render %ux%u alloc %ux%u material %u %ux%u format %u channel %u inverted %d",
                             live.A, live.B, live.p00, live.p11, live.worldUp[0], live.worldUp[1], live.worldUp[2], int(d24), live.depthPitch, live.width, live.height,
                             live.allocWidth, live.allocHeight, mat ? live.materialPitch : 0u, live.materialWidth, live.materialHeight, live.materialFormat, live.reflChannel,
                             int(live.reflInvert));
                     }
-                    Log("URTI direct : film %u terminé (%u présentations)", live.filmCount, live.filmIndex);
+                    Log("URTI live: film %u finished (%u presents)", live.filmCount, live.filmIndex);
                     live.film = 0;
                     Retire(live.filmRing), live.filmFrameBytes = 0;
                 }
             }
         }
-    // rafale : l'image sans URTI (sa copie, imageIn) et avec, à chaque image réelle composée
+    // burst: the image without URTI (its copy, imageIn) and with it, on every composed real frame
     if (live.burst > 0 && live.composedNow && (live.syncNow ? live.presentComputed : live.lastPresentDraws > 0) && live.imageIn)
         if (const resource back = runtime->get_current_back_buffer(); back.handle)
         {
             runtime->get_command_queue()->flush_immediate_command_list();
             ID3D12CommandQueue* queue = reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native());
             const std::string base = live.burstFolder + "\\";
-            SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "apres_" + std::to_string(live.burstIndex) + ".ppm", 2);
-            SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "avant_" + std::to_string(live.burstIndex) + ".ppm", 2, live.imageIn.Get());
-            // photo d'avant l'interface : la première prise dans cette image (brute) et celle qu'URTI a gardée
+            SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "after_" + std::to_string(live.burstIndex) + ".ppm", 2);
+            SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "before_" + std::to_string(live.burstIndex) + ".ppm", 2, live.imageIn.Get());
+            // snapshot before the UI: the first one taken in this frame (raw) and the one URTI kept
             if (live.snaps[0])
                 SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "photo_" + std::to_string(live.burstIndex) + ".ppm", 2, live.snaps[0].Get());
             if (live.preUiBuf)
                 SaveBackBuffer(queue, reinterpret_cast<ID3D12Resource*>(back.handle), base + "gardee_" + std::to_string(live.burstIndex) + ".ppm", 2, live.preUiBuf.Get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Log("RAFALE %u %u image %llu objets RT %zu entrés %u sortis %u dessins %u scene %u reflet %.2f hist %d bits %x gate %.2f photos %u/%d mauvaises %u materiau %lld", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
+            Log("BURST %u %u frame %llu RT objects %zu in %u out %u draws %u scene %u reflection %.2f hist %d bits %x gate %.2f photos %u/%d bad %u material %lld", live.burstCount, live.burstIndex, (unsigned long long)live.frame, live.admitted.size(), live.churnIn,
                 live.churnOut, live.lastDrawsThisFrame, live.sceneCount, live.diagReflStrength, live.diagHistOut, live.diagDebugReflect, live.uiReflGate, live.diagSnaps, int(live.diagPreUi), live.uiBadReadbacks,
                 (long long)live.frame - (long long)live.materialFrame);
             live.burstIndex++;
             if (--live.burst == 0)
-                Log("URTI direct : rafale %u terminée (%u paires d'images)", live.burstCount, live.burstIndex);
+                Log("URTI live: burst %u finished (%u image pairs)", live.burstCount, live.burstIndex);
         }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_liveSnapCount = 0; // photos de la prochaine image
+        g_liveSnapCount = 0; // snapshots of the next frame
     }
     if (++live.statPresents == 300)
     {
-        Log("URTI direct : sur 300 présentations, %u sans dessin du jeu, %u passages dans les effets, %u avec ombres RT appliquées ; %u calculs sans profondeur, %u au masque trop vieux, %u présentations au plus entre deux calculs ; %u avec le menu de ReShade ouvert, %u effet coupé ; %u calculs avec la profondeur de l'image, %u avec celle du moment, %u repères refusés, %u copies ; %u attentes de l'anneau ; matériau : %u attentes, %u calculs sans celui de leur image ; %u images sautées (retard)",
+        Log("URTI live: over 300 presents, %u without a game draw, %u passes through the effects, %u with RT effects applied; %u computations without depth, %u with a mask too old, %u presents at most between two computations; %u with the ReShade menu open, %u effect off; %u computations with the frame's depth, %u with the current one, %u markers refused, %u copies; %u ring waits; material: %u waits, %u computations without their frame's; %u frames skipped (lag)",
             live.statNoDraw, live.statEffects, live.statComposited, live.statNoDepth, live.statMaskOld, live.statGapMax, live.statSkipOverlay, live.statSkipTechnique, live.statSnapUsed, live.statSnapFallback, g_liveMarksRefused, g_liveSnapCopies, live.statSlotWaits, live.statMaterialWait, live.statMaterialLate, live.statFramesSkipped);
         live.statNoDepth = live.statMaskOld = live.statGapMax = live.statSkipOverlay = live.statSkipTechnique = live.statSnapUsed = live.statSnapFallback = 0;
         g_liveMarksRefused = g_liveSnapCopies = 0;
@@ -5740,23 +5740,23 @@ void OnReshadePresent(effect_runtime* runtime)
         if (const float* gv = nullptr; live.hudGainReadback[(live.uiFrame + 1) % 3] && SUCCEEDED(live.hudGainReadback[(live.uiFrame + 1) % 3]->Map(0, nullptr, (void**)&gv)) && gv)
             hudGainNow = gv[0], hudUiNow = gv[1], live.hudGainReadback[(live.uiFrame + 1) % 3]->Unmap(0, nullptr);
         if (live.statHudless || g_liveHudHandle)
-            Log("URTI direct : image du jeu sans son interface prise %u fois sur 300 présentations (%u conversions) ; image d'écran = %.3f × image sans interface ; "
-                "pente %.3f ; interface %.1f %% de l'écran ; %u présentations montrent l'image d'une copie (masque refait : %u la dernière, %u celle d'avant, %u encore avant), concordance moyenne %.2f ; "
-                "avance moyenne du calque sur l'image %.2f images du jeu (%s) ; %u calques de rattrapage écartés ; copie du calcul : %u la dernière, %u celle d'avant, %u encore avant, %u pas encore là",
+            Log("URTI live: the game's UI-free image taken %u times over 300 presents (%u conversions); screen image = %.3f × UI-free image; "
+                "slope %.3f; UI %.1f %% of the screen; %u presents show a copy's image (mask redone: %u the last, %u the one before, %u earlier), mean match %.2f; "
+                "mean layer lead over the image %.2f game frames (%s); %u catch-up layers discarded; copy of the computation: %u the last, %u the one before, %u earlier, %u not there yet",
                 live.statHudless, live.statHudConverted, hudGainNow, live.hudSlopeNow, hudUiNow * 100.0f, live.statHudMatched, live.statHudLag[0], live.statHudLag[1], live.statHudLag[2],
-                live.statHudless ? live.statHudMatchSum / live.statHudless : 0.0, live.statHudless ? live.statLeadSum / live.statHudless : 0.0, live.lagOn ? "rattrapée" : "laissée", live.statSuspect,
+                live.statHudless ? live.statHudMatchSum / live.statHudless : 0.0, live.statHudless ? live.statLeadSum / live.statHudless : 0.0, live.lagOn ? "caught up" : "left", live.statSuspect,
                 live.statHudConvBack[0], live.statHudConvBack[1], live.statHudConvBack[2], live.statHudConvBack[3]);
         live.statHudConvBack[0] = live.statHudConvBack[1] = live.statHudConvBack[2] = live.statHudConvBack[3] = 0, live.statSuspect = 0;
         live.statHudConverted = 0, live.statHudMatched = 0, live.statHudMatchSum = 0, live.statLeadSum = 0;
         live.statHudLag[0] = live.statHudLag[1] = live.statHudLag[2] = 0;
         live.statHudless = 0;
-        Log("URTI direct : images générées : ombre et reflet glissés %u fois sur 300 présentations (part %.2f du mouvement)", live.statShifted, live.fgShift);
+        Log("URTI live: generated frames: shadow and reflection slid %u times over 300 presents (share %.2f of the motion)", live.statShifted, live.fgShift);
         live.statShifted = 0;
         if (g_liveCensusOn)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            static const char* const kDepthNames[4] = { "sansprof", "principale", "autrevue", "autre" };
-            static const char* const kClass[8] = { "ecrit", "transp", "sanstest", "tess", "autreetage", "reste", "?", "inconnu" };
+            static const char* const kDepthNames[4] = { "nodepth", "main", "otherview", "other" };
+            static const char* const kClass[8] = { "written", "transp", "notest", "tess", "otherlevel", "rest", "?", "unknown" };
             for (const auto& [key, ce] : g_liveCensus)
             {
                 std::vector<std::pair<uint32_t, uint32_t>> big(ce.sizes.begin(), ce.sizes.end());
@@ -5768,7 +5768,7 @@ void OnReshadePresent(effect_runtime* runtime)
                     std::snprintf(item, sizeof(item), " %ux%u", big[k].first, big[k].second);
                     std::strncat(top, item, sizeof(top) - std::strlen(top) - 1);
                 }
-                Log("RECENSEMENT %s %s %s%s : %llu dessins, %llu sommets ;%s", kDepthNames[key >> 8], kClass[(key >> 4) & 15], (key & 2) ? "melange" : "plein", (key & 1) ? " indirect" : "",
+                Log("CENSUS %s %s %s%s: %llu draws, %llu vertices;%s", kDepthNames[key >> 8], kClass[(key >> 4) & 15], (key & 2) ? "blended" : "opaque", (key & 1) ? " indirect" : "",
                     (unsigned long long)ce.draws, (unsigned long long)ce.vertices, top);
             }
             g_liveCensus.clear();
@@ -5779,18 +5779,18 @@ void OnReshadePresent(effect_runtime* runtime)
             for (const auto& [id, e] : live.geo)
                 triangles += e.triangles, usedBytes += e.size;
             const double frames = double(live.statGeoFrames);
-            Log("URTI direct : cache de géométrie : %zu objets, %.2f M triangles, %.0f Mo sur %.0f ; construits par image : %.1f objets, %.0f sommets ; %llu chassés de la réserve, %u vidages, %u mouvements impossibles à mesurer ; caméra à %.1f m du repère ; %llu attentes de la file du jeu",
+            Log("URTI live: geometry cache: %zu objects, %.2f M triangles, %.0f MB out of %.0f; built per frame: %.1f objects, %.0f vertices; %llu evicted from the reserve, %u clearings, %u motions impossible to measure; camera %.1f m from the frame; %llu game-queue waits",
                 live.geo.size(), triangles / 1e6, usedBytes / 1048576.0, live.geoPoolBytes / 1048576.0, live.statGeoBuilds / frames, live.statGeoVerts / frames,
                 (unsigned long long)live.statGeoEvicted, live.statGeoFlushes, live.statGeoBadFit, live.geoPoseDistance, (unsigned long long)live.statSyncWaits);
             live.statSyncWaits = 0;
-            Log("URTI direct : cache de géométrie : %llu objets proches de la caméra écartés (à moins de 6 m), part par image : %u sommets nouveaux, %u remis à jour",
+            Log("URTI live: geometry cache: %llu objects close to the camera discarded (closer than 6 m), share per frame: %u new vertices, %u refreshed",
                 (unsigned long long)live.statGeoNear, live.geoNewVerts, live.geoRefreshVerts);
             live.statGeoNear = 0;
             live.statGeoFrames = live.statGeoBuilds = live.statGeoVerts = live.statGeoEvicted = 0;
             live.statGeoFlushes = live.statGeoBadFit = 0;
         }
-        Log("URTI direct : dessins exécutés : %u écrits dans la même fenêtre de présentation (%u listes), %u écrits avant la présentation "
-            "précédente (%u listes)", g_execOnTime.exchange(0), g_execLists.exchange(0), g_execLate.exchange(0), g_execLateLists.exchange(0));
+        Log("URTI live: draws executed: %u written in the same present window (%u lists), %u written before the previous "
+            "present (%u lists)", g_execOnTime.exchange(0), g_execLists.exchange(0), g_execLate.exchange(0), g_execLateLists.exchange(0));
         live.statPresents = live.statNoDraw = live.statEffects = live.statComposited = 0;
     }
     if (std::binary_search(g_photoFrames.begin(), g_photoFrames.end(), g.frame))
@@ -5804,18 +5804,18 @@ void OnReshadePresent(effect_runtime* runtime)
         return;
     }
     const std::string trigger = g_dir + "\\urti_photo";
-    // pas avant que ReShade ait fini de charger ses effets (quelques dixièmes de seconde)
+    // not before ReShade has finished loading its effects (a few tenths of a second)
     if (g.frame < 300 || g.frame % 15 != 0 || GetFileAttributesA(trigger.c_str()) == INVALID_FILE_ATTRIBUTES)
         return;
     if (live.enabled && (!live.bound || live.frame < live.boundFrame + 60))
-        return; // ombres pas encore prêtes : la photo attend
+        return; // effects not ready yet: the snapshot waits
     DeleteFileA(trigger.c_str());
-    // lecture directe du tampon d'affichage (gère le HDR10 du jeu, que capture_screenshot rend brut)
+    // direct read of the display buffer (handles the game's HDR10, which capture_screenshot returns raw)
     const resource back = runtime->get_current_back_buffer();
     if (!back.handle)
         return;
     const std::string path = g_dir + "\\urti_photo" + std::to_string(live.photoIndex++) + ".ppm";
-    runtime->get_command_queue()->flush_immediate_command_list(); // les effets de cette image d'abord
+    runtime->get_command_queue()->flush_immediate_command_list(); // this frame's effects first
     SaveBackBuffer(reinterpret_cast<ID3D12CommandQueue*>(runtime->get_command_queue()->get_native()), reinterpret_cast<ID3D12Resource*>(back.handle), path, 1);
-    Log("URTI : photo %s (ombres RT %s)", path.c_str(), live.enabled ? "actives" : "coupées");
+    Log("URTI: snapshot %s (RT effects %s)", path.c_str(), live.enabled ? "on" : "off");
 }

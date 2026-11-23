@@ -1,14 +1,14 @@
-// URTI en direct : entrées des débruiteurs de NVIDIA (NRD) tirées de la profondeur du jeu : profondeur
-// linéaire (IN_VIEWZ) et normale + rugosité encodées comme NRD l'attend (IN_NORMAL_ROUGHNESS,
-// R10G10B10A2). L'espace « monde » donné à NRD est l'espace caméra de cette image (matrices identité).
-// Écrit dans des tampons aux lignes alignées, recopiés ensuite dans les textures de NRD.
+// Live URTI: inputs of NVIDIA's denoisers (NRD) taken from the game's depth: linear
+// depth (IN_VIEWZ) and normal + roughness encoded the way NRD expects (IN_NORMAL_ROUGHNESS,
+// R10G10B10A2). The "world" space given to NRD is this frame's camera space (identity matrices).
+// Written into buffers with aligned rows, then copied into NRD's textures.
 
 #include "NRD.hlsli"
 
-ByteAddressBuffer depth : register(t0);   // profondeur du jeu (32 bits par texel, lignes alignées)
-ByteAddressBuffer sunBuf : register(t1);  // octets 36 à 47 : loi de profondeur de cette image
-RWByteAddressBuffer viewZOut : register(u0);  // float par pixel
-RWByteAddressBuffer normalOut : register(u1); // R10G10B10A2 par pixel
+ByteAddressBuffer depth : register(t0);   // the game's depth (32 bits per texel, aligned rows)
+ByteAddressBuffer sunBuf : register(t1);  // bytes 36 to 47: this frame's depth law
+RWByteAddressBuffer viewZOut : register(u0);  // float per pixel
+RWByteAddressBuffer normalOut : register(u1); // R10G10B10A2 per pixel
 
 cbuffer Constants : register(b0)
 {
@@ -21,7 +21,7 @@ cbuffer Constants : register(b0)
     float p00;
     float p11;
     uint depth24;
-    float skyViewZ; // au-delà de la portée du débruitage : NRD ignore ces pixels
+    float skyViewZ; // beyond the denoising range: NRD ignores these pixels
     uint pad0;
     uint pad1;
 };
@@ -41,7 +41,7 @@ float3 PointAt(int2 t)
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
 }
 
-// normale tirée de la profondeur : côté le plus proche de chaque axe (bords d'objets)
+// depth-derived normal: the nearest side on each axis (object edges)
 float3 NormalAt(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));

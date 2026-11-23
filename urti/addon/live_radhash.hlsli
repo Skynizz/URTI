@@ -1,10 +1,10 @@
-// URTI en direct : cache de radiance du monde (table de hachage spatiale, d'après SHaRC de NVIDIA) et carte du ciel et du lointain.
-// La caméra du jeu donne le repère du monde : chaque point que l'écran montre y dépose sa couleur (live_radcache), dans une case dont
-// la taille grandit avec la distance (quelques pixels à l'écran) ; un reflet qui touche un point caché ou hors de l'écran y relit la
-// couleur vue là (live_reflect). Chaque case retient aussi sa part pleine : les feuillages sont des plaques découpées dont la géométrie
-// captée n'a que le rectangle, la caméra voit à travers leurs trous quand ils sont à l'écran, et ce qu'elle a vu vaut hors de l'écran.
-// À définir avant l'inclusion : RAD_BUF (table), RAD_ENV (carte), RAD_PARAMS (réglages de l'image).
-// Case (16 octets) : clé ; r, g (16 bits flottants) ; b, date (quarts de seconde) ; mesures de couleur, part pleine, mesures de part pleine (8 bits).
+// Live URTI: world radiance cache (spatial hash table, after NVIDIA's SHaRC) and sky and distance map.
+// The game's camera gives the world frame: each point the screen shows deposits its colour there (live_radcache), in a cell whose
+// size grows with distance (a few pixels on screen); a reflection hitting a hidden or off-screen point reads back the
+// colour seen there (live_reflect). Each cell also keeps its solid share: foliage is made of cut-out cards whose captured
+// geometry is just the rectangle, the camera sees through their holes when they are on screen, and what it saw holds off screen.
+// To define before inclusion: RAD_BUF (table), RAD_ENV (map), RAD_PARAMS (the frame's settings).
+// Cell (16 bytes): key; r, g (16-bit floats); b, date (quarter seconds); colour measurements, solid share, solid-share measurements (8 bits).
 
 static float3 gCamRight, gCamUp, gCamFwd, gCamPos;
 static float2 gShear;
@@ -22,7 +22,7 @@ void RadLoadParams()
     gRadTick = f.x, gRadFrame = f.y, gEnvFar = asfloat(f.z);
 }
 
-// espace caméra capté (décalé par le sous-pixel du jeu) -> monde
+// captured camera space (shifted by the game's sub-pixel jitter) -> world
 float3 RadWorld(float3 h)
 {
     const float2 t = h.xy - gShear * h.z;
@@ -42,7 +42,7 @@ uint RadPcg(uint x)
 }
 
 static const uint kRadLevels = 13;
-// niveau d'après la distance parcourue jusqu'au point (de l'œil, miroir compris) : cases de quelques pixels à toute distance
+// level from the distance travelled to the point (from the eye, mirror included): cells of a few pixels at any distance
 uint RadLevel(float dist) { return uint(clamp(floor(log2(max(dist, gD0) / gD0)), 0.0, float(kRadLevels - 1))); }
 
 void RadKey(float3 world, uint level, out uint bucket, out uint tag)
@@ -50,7 +50,7 @@ void RadKey(float3 world, uint level, out uint bucket, out uint tag)
     const float size = gVoxel0 * exp2(float(level));
     const int3 c = int3(floor(world / size));
     const uint h = RadPcg(uint(c.x) + RadPcg(uint(c.y) + RadPcg(uint(c.z) + level * 0x9E3779B9u)));
-    bucket = (h & gRadMask) & ~3u; // quatre cases de suite (64 octets)
+    bucket = (h & gRadMask) & ~3u; // four cells in a row (64 bytes)
     tag = RadPcg((uint(c.z) * 0x9E3779B1u) ^ RadPcg(uint(c.x) ^ RadPcg(uint(c.y) + level * 0x85EBCA6Bu + 0x1234567u)));
     tag = tag ? tag : 1u;
 }
@@ -80,11 +80,11 @@ bool RadRead(float3 world, uint level, out RadEntry e)
     return false;
 }
 
-// couleur et part pleine retenues en ce point : à ce niveau, puis plus grossier (le point a été vu de plus loin), puis un cran plus fin.
-// Une seule case lue, à une position tirée au hasard dans un voisinage de la taille d'une case (jitter, de 0 à 1 par axe, nouveau à chaque image) :
-// le lissage entre cases se fait par l'accumulation dans le temps des reflets (comme SHaRC de NVIDIA). Lire les huit cases voisines coûtait jusqu'à
-// quarante lectures en mémoire par point, à chaque traversée de feuillage (17 ms de reflets dans les scènes chargées)
-// 0 : jamais vu (alpha vaut quand même si la part pleine est connue) ; 1 : couleur et part pleine ; 2 : que des trous ici (pas de couleur)
+// colour and solid share kept at this point: at this level, then coarser (the point was seen from further away), then one step finer.
+// A single cell read, at a position drawn at random within a neighbourhood the size of a cell (jitter, 0 to 1 per axis, new every frame):
+// smoothing between cells comes from the reflections' accumulation over time (as in NVIDIA's SHaRC). Reading the eight neighbouring cells cost up to
+// forty memory reads per point, at every foliage crossing (17 ms of reflections in busy scenes)
+// 0: never seen (alpha still holds if the solid share is known); 1: colour and solid share; 2: only holes here (no colour)
 uint RadLookup(float3 world, uint level, float3 jitter, out float3 c, out float alpha)
 {
     static const int kTry[4] = { 0, 1, 2, -1 };
@@ -112,7 +112,7 @@ uint RadLookup(float3 world, uint level, float3 jitter, out float3 c, out float 
     return 0;
 }
 
-// carte du ciel et du lointain : octaèdre déplié, le haut du monde au centre
+// sky and distance map: unfolded octahedron, the world's up at the centre
 float2 RadOct(float3 n)
 {
     n /= abs(n.x) + abs(n.y) + abs(n.z);

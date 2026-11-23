@@ -1,40 +1,40 @@
-// URTI en direct : sommets captés (espace de découpage) vers l'espace caméra pour la structure
-// d'accélération. Chaque dessin a sa zone du flux et son compteur (pas de barrière entre dessins), écrite dans la
-// partie du flux de la fenêtre où sa liste a été écrite ; sa place dans la scène RT (même place d'une image à
-// l'autre) est donnée à l'exécution de sa liste. Un sommet n'est valide que s'il tombe dans la partie remplie
-// de sa zone ; sinon il est posé sur le premier sommet de la zone : triangle plat, jamais touché, mais actif
-// (une mise à jour de la structure ne peut pas changer l'état actif / inactif d'un triangle, et les places
-// fixes en changent le contenu d'une image à l'autre). À l'origine (la caméra), une mise à jour qui le rendait
-// réel étirait des boîtes de la caméra à l'objet, à travers toute la vue : rayons dix fois plus lents (v59).
-// Place gardée sans être dessinée dans cette image : laissée telle quelle ; hors de toute place : triangle plat
-// à l'origine (place rendue, ses anciens sommets ne doivent pas rester dans la scène).
+// Live URTI: captured vertices (clip space) to camera space for the acceleration
+// structure. Each draw has its region of the stream and its counter (no barrier between draws), written in the
+// part of the stream of the window its list was written in; its place in the RT scene (the same place from one frame to
+// the next) is given when its list executes. A vertex is valid only if it falls in the filled part
+// of its region; otherwise it is laid on the region's first vertex: a flat triangle, never hit, but active
+// (an update of the structure cannot change a triangle's active / inactive state, and fixed
+// places change their content from one frame to the next). At the origin (the camera), an update that made it
+// real stretched boxes from the camera to the object, across the whole view: rays ten times slower (v59).
+// Place kept without being drawn in this frame: left as it is; outside any place: a flat triangle
+// at the origin (place given back, its old vertices must not stay in the scene).
 
-StructuredBuffer<float4> clip : register(t0);   // flux de l'écran (début de son emplacement)
-ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
-StructuredBuffer<uint4> regions : register(t2); // par place, triée : début dans la scène (octets), taille, compteur (~0 : gardée), identité
-StructuredBuffer<uint> source : register(t3);   // par place : début de sa zone dans le flux (octets) ; bit 31 : dessinée à
-                                                // la même place à l'image précédente (ses anciens sommets sont encore là)
-RWByteAddressBuffer view : register(u0);        // float3 par sommet
-RWByteAddressBuffer pairs : register(u1);       // paires de sommets (image précédente, celle-ci) pour live_camfit
+StructuredBuffer<float4> clip : register(t0);   // the screen's stream (start of its slot)
+ByteAddressBuffer counters : register(t1);      // bytes written per draw
+StructuredBuffer<uint4> regions : register(t2); // per place, sorted: start in the scene (bytes), size, counter (~0: kept), identity
+StructuredBuffer<uint> source : register(t3);   // per place: start of its region in the stream (bytes); bit 31: drawn at
+                                                // the same place in the previous frame (its old vertices are still there)
+RWByteAddressBuffer view : register(u0);        // float3 per vertex
+RWByteAddressBuffer pairs : register(u1);       // vertex pairs (previous frame, this one) for live_camfit
 
 cbuffer Constants : register(b0)
 {
     float p00;
     float p11;
-    uint vertexCount; // sommets à convertir (zones de l'image)
+    uint vertexCount; // vertices to convert (the frame's regions)
     uint regionCount;
     uint maxPairs;
-    uint heldStep; // 1 : places gardées déplacées par le mouvement de la caméra ci-dessous
+    uint heldStep; // 1: kept places moved by the camera motion below
     uint pad1;
     uint pad2;
-    float4 step0;  // mouvement de la caméra depuis l'image précédente (espace vrai) : lignes de R, t
+    float4 step0;  // camera motion since the previous frame (true space): rows of R, t
     float4 step1;
     float4 step2;
-    float2 shearPrev; // décalage sous-pixel (cisaillement) de l'image précédente et de celle-ci
+    float2 shearPrev; // sub-pixel jitter (shear) of the previous frame and of this one
     float2 shearCur;
 };
 
-// zone qui contient l'octet (zones triées par début)
+// region holding the byte (regions sorted by start)
 uint4 RegionOf(uint byte)
 {
     uint lo = 0, hi = regionCount;
@@ -71,7 +71,7 @@ void main(uint id : SV_DispatchThreadID)
         const bool inside = byte >= r.x && byte - r.x < r.y;
         if (inside && r.z == 0xFFFFFFFF)
         {
-            // gardée : sa géométrie de la dernière image où elle a été dessinée, qui suit la caméra
+            // kept: its geometry from the last frame where it was drawn, which follows the camera
             if (heldStep != 0)
             {
                 const float3 o = asfloat(view.Load3(id * 12));
@@ -79,7 +79,7 @@ void main(uint id : SV_DispatchThreadID)
                 {
                     const float3 t = float3(o.x - shearPrev.x * o.z, o.y - shearPrev.y * o.z, o.z);
                     const float3 n = float3(dot(step0.xyz, t) + step0.w, dot(step1.xyz, t) + step1.w, dot(step2.xyz, t) + step2.w);
-                    // (jamais à plus de 20 km : un seul sommet étire la boîte de toute la scène)
+                    // (never further than 20 km: a single vertex stretches the whole scene's box)
                     if (all(abs(n) < 20000.0))
                         view.Store3(id * 12, asuint(float3(n.x + shearCur.x * n.z, n.y + shearCur.y * n.z, n.z)));
                 }
@@ -96,17 +96,17 @@ void main(uint id : SV_DispatchThreadID)
         const bool written = byte - r.x < filled;
         const float4 c = written ? clip[(src + byte - r.x) / 16] : clip[src / 16];
         const float3 cv = float3(c.x / p00, c.y / p11, c.w);
-        // sommet aberrant (non fini, ou à plus de 20 km) : replié sur le premier sommet de sa zone, sinon à
-        // l'origine. Un seul suffit à étirer la boîte de toute la scène : les boîtes intérieures, rangées avec
-        // une précision relative à elle, ne valent plus rien et plus aucun rayon ne touche (v66-v67, places
-        // fixes et reconstruction à chaque image)
+        // aberrant vertex (non-finite, or further than 20 km): folded onto its region's first vertex, otherwise onto
+        // the origin. A single one is enough to stretch the whole scene's box: the inner boxes, stored with
+        // a precision relative to it, become worthless and no ray hits anything any more (v66-v67, fixed
+        // places and rebuild every frame)
         const float4 c0 = clip[src / 16];
         const float3 v0 = float3(c0.x / p00, c0.y / p11, c0.w);
         if (all(isfinite(cv)) && all(abs(cv) < 20000.0))
         {
             v = cv;
-            // mouvement de la caméra : une quinzaine de sommets par objet resté à sa place (même poids pour chaque
-            // objet : un personnage qui suit la caméra ne l'emporte pas sur le décor), avec leur position précédente
+            // camera motion: about fifteen vertices per object that stayed in place (same weight for each
+            // object: a character following the camera does not outweigh the scenery), with their previous position
             const uint rel = (byte - r.x) / 16, stride = max(1u, filled / 16 / 16);
             if (maxPairs > 0 && (source[lo] & 0x80000000) && written && rel % stride == 0 && rel / stride < 16)
             {

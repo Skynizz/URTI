@@ -1,20 +1,20 @@
-// URTI en direct : part de la lumière directe du soleil dans l'image du jeu, mesurée à chaque image.
-// Une ombre ne retire que la lumière du soleil : ce qui reste (ciel, rebonds) dépend de la scène (midi,
-// soir, temps couvert) et de sa couleur. On la lit dans l'image elle-même : deux points d'une même surface,
-// l'un que le jeu éclaire, l'autre qu'il ombre (sa carte d'ombres), ont pour rapport de couleur
-// ciel / (ciel + soleil × N·L). D'où x = soleil / ciel = (éclairé / ombré - 1) / N·L, par canal et en
-// luminance, accumulé dans un histogramme (log2 de x, quarts d'octave de 2^-5 à 2^5) : la médiane, lue sur
-// le processeur, donne la part du soleil que les ombres RT retirent (live_shadow) et leur teinte
-// (live_composite). Un fil par bloc de 4×4 pixels de rendu, un point du bloc tiré au hasard.
+// Live URTI: share of the sun's direct light in the game's image, measured every frame.
+// A shadow removes only sunlight: what remains (sky, bounces) depends on the scene (noon,
+// evening, overcast) and on its colour. It is read in the image itself: two points of the same surface,
+// one the game lights, the other it shadows (its shadow map), have a colour ratio of
+// sky / (sky + sun × N·L). Hence x = sun / sky = (lit / shadowed - 1) / N·L, per channel and in
+// luminance, accumulated in a histogram (log2 of x, quarter octaves from 2^-5 to 2^5): the median, read on
+// the CPU, gives the share of the sun that RT shadows remove (live_shadow) and their tint
+// (live_composite). One thread per 4×4 block of render pixels, one point of the block drawn at random.
 
-ByteAddressBuffer depth : register(t0);   // copie de la profondeur (32 bits par texel, lignes alignées)
-ByteAddressBuffer atlas : register(t1);   // copie de la carte d'ombres du jeu
-ByteAddressBuffer image : register(t2);   // image présentée (photo d'avant l'interface si elle existe)
-RWByteAddressBuffer sunBuf : register(u0); // soleil, cascades, décalage sous-pixel ; histogramme à 1232
+ByteAddressBuffer depth : register(t0);   // copy of the depth (32 bits per texel, aligned rows)
+ByteAddressBuffer atlas : register(t1);   // copy of the game's shadow map
+ByteAddressBuffer image : register(t2);   // presented image (snapshot before the UI if it exists)
+RWByteAddressBuffer sunBuf : register(u0); // sun, cascades, sub-pixel jitter; histogram at 1232
 
 cbuffer Constants : register(b0)
 {
-    uint width;        // résolution de rendu (profondeur)
+    uint width;        // render resolution (depth)
     uint height;
     uint depthPitch;
     uint depth24;
@@ -22,11 +22,11 @@ cbuffer Constants : register(b0)
     float B;
     float p00;
     float p11;
-    float sunSign;     // +1 : la profondeur de la carte croît en s'éloignant du soleil
+    float sunSign;     // +1: the map's depth grows away from the sun
     float gameBias;
     uint atlasPitch;
-    uint atlasFormat;  // 0 flottants 32 bits, 1 D24, 2 16 bits normalisés (RDR2)
-    uint imageWidth;   // image présentée
+    uint atlasFormat;  // 0 32-bit floats, 1 D24, 2 16-bit normalised (RDR2)
+    uint imageWidth;   // presented image
     uint imageHeight;
     uint imagePitch;
     uint format;       // 0 RGBA8, 1 BGRA8, 2 RGB10A2 en HDR10 (PQ), 3 RGBA16F (scRGB)
@@ -36,12 +36,12 @@ cbuffer Constants : register(b0)
     uint pad2;
 };
 
-static const uint kCount = 1232;  // nombre de paires mesurées
+static const uint kCount = 1232;  // number of pairs measured
 static const uint kHist = 1248;   // 4 × 40 cases : rouge, vert, bleu, luminance
 static const uint kBins = 40;
-static const uint kStats = 1888; // contrôle : points éclairés, à l'ombre, au bord, hors des cascades ; luminance × 1024 des deux premiers
-static const uint kDepthHist = 1920; // profondeur du point dans la première cascade qui le couvre en x, y : 16 cases de -0,5 à 1,5
-static const uint kGapHist = 1984;   // carte - point (profondeur), points couverts : 16 cases de -0,02 à 0,02
+static const uint kStats = 1888; // check: points lit, shadowed, on the edge, outside the cascades; luminance × 1024 of the first two
+static const uint kDepthHist = 1920; // depth of the point in the first cascade covering it in x, y: 16 bins from -0.5 to 1.5
+static const uint kGapHist = 1984;   // map - point (depth), covered points: 16 bins from -0.02 to 0.02
 
 static float gA, gB, gClear;
 
@@ -54,7 +54,7 @@ float3 PqToNits(float3 e)
     return 10000.0 * pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
 }
 
-// lumière linéaire de l'image présentée (même décodage que live_composite)
+// linear light of the presented image (same decoding as live_composite)
 float3 LoadLinear(int2 px)
 {
     px = clamp(px, int2(0, 0), int2(imageWidth - 1, imageHeight - 1));
@@ -71,7 +71,7 @@ float3 LoadLinear(int2 px)
     return SrgbToLinear(format == 1 ? c.bgr : c);
 }
 
-// point de l'espace caméra du pixel (z = w ; w <= 0 si ciel ou hors image)
+// camera-space point of the pixel (z = w; w <= 0 if sky or outside the image)
 float3 PointAt(int2 t)
 {
     if (t.x < 0 || t.y < 0 || t.x >= int(width) || t.y >= int(height))
@@ -85,7 +85,7 @@ float3 PointAt(int2 t)
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
 }
 
-// normale tirée de la profondeur (comme live_shadow)
+// depth-derived normal (like live_shadow)
 float3 NormalAt(int2 t, float3 p)
 {
     const float3 l = PointAt(t - int2(1, 0)), r = PointAt(t + int2(1, 0)), u = PointAt(t - int2(0, 1)), b = PointAt(t + int2(0, 1));
@@ -107,8 +107,8 @@ float AtlasDepth(uint2 t)
     return atlasFormat == 1 ? float(raw & 0xFFFFFF) / 16777215.0 : asfloat(raw);
 }
 
-// état du point dans la carte d'ombres du jeu : 1 éclairé, 0 à l'ombre (tout le voisinage 5×5 dans le même
-// état : loin des bords flous et de la pénombre), -1 bord ou hors des cascades
+// state of the point in the game's shadow map: 1 lit, 0 shadowed (the whole 5×5 neighbourhood in the same
+// state: far from blurred edges and penumbra), -1 edge or outside the cascades
 int GameState(float3 p)
 {
     const uint count = min(sunBuf.Load(32), 8u);
@@ -124,8 +124,8 @@ int GameState(float3 p)
             s[c] = M[9 + c] + p.x * M[c] + p.y * M[3 + c] + p.z * M[6 + c];
         if (abs(s.x) > 0.95 || abs(s.y) > 0.95)
             continue;
-        // contrôle : où tombe la profondeur du point dans la cascade, et l'écart à la carte (pour un point
-        // éclairé, la carte note le point lui-même : écart nul au décalage du jeu près)
+        // check: where the point's depth falls in the cascade, and the difference to the map (for a lit
+        // point, the map records the point itself: zero difference up to the game's bias)
         if (record)
             sunBuf.InterlockedAdd(kDepthHist + uint(clamp(floor((s.z + 0.5) * 8.0), 0.0, 15.0)) * 4, 1), record = false;
         if (s.z <= 0 || s.z >= 1)
@@ -142,7 +142,7 @@ int GameState(float3 p)
             }
         return lit == 25 ? 1 : lit == 0 ? 0 : -1;
     }
-    return -2; // hors des cascades
+    return -2; // outside the cascades
 }
 
 uint Hash(uint x)
@@ -151,7 +151,7 @@ uint Hash(uint x)
     return x;
 }
 
-// couleur de l'image présentée au point vu par le pixel de rendu t (moyenne 2×2 : moins de bruit de texture)
+// colour of the presented image at the point seen by render pixel t (2×2 average: less texture noise)
 float3 ColorAt(int2 t, float2 jitter)
 {
     const float2 q = (float2(t) + 0.5 - jitter) / float2(width, height) * float2(imageWidth, imageHeight) - 0.5;
@@ -162,7 +162,7 @@ float3 ColorAt(int2 t, float2 jitter)
 void Record(uint channel, float shadowed, float lit, float ndl)
 {
     if (lit < 0.01)
-        return; // trop sombre pour un rapport fiable
+        return; // too dark for a reliable ratio
     const float x = (lit / max(shadowed, 1e-4) - 1.0) / ndl;
     const uint bin = x <= 0.03125 ? 0u : uint(clamp(floor((log2(x) + 5.0) * 4.0), 0.0, float(kBins - 1)));
     sunBuf.InterlockedAdd(kHist + (channel * kBins + bin) * 4, 1);
@@ -180,16 +180,16 @@ void main(uint2 id : SV_DispatchThreadID)
     const uint h = Hash(id.x * 7919 + id.y * 104729 + frameIndex * 2654435761u);
     const int2 t = int2(id * 4) + int2(h & 3, (h >> 2) & 3);
     const float3 p = PointAt(t);
-    // au loin, la brume du jeu se mêle à la couleur : pas de mesure
+    // in the distance, the game's haze mixes into the colour: no measurement
     if (p.z <= 0 || p.z > 100)
         return;
     const float3 n = NormalAt(t, p);
     const float ndl = dot(n, sun);
     if (ndl < 0.2)
-        return; // surface rasante ou dos au soleil : le rapport y dit peu de chose
+        return; // grazing surface or facing away from the sun: the ratio says little there
     const int state = GameState(p);
-    // contrôle de la carte lue : si elle est bien celle du soleil, les points qu'elle éclaire sont nettement
-    // plus clairs dans l'image que ceux qu'elle ombre
+    // check of the map read: if it really is the sun's, the points it lights are clearly
+    // brighter in the image than those it shadows
     sunBuf.InterlockedAdd(kStats + (state == 1 ? 0 : state == 0 ? 4 : state == -1 ? 8 : 12), 1);
     if (state >= 0)
     {
@@ -199,7 +199,7 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     if (state < 0)
         return;
-    // partenaire : à 10 pixels, sur le même plan (même normale, à la même distance du plan), dans l'autre état
+    // partner: 10 pixels away, on the same plane (same normal, at the same distance from the plane), in the other state
     static const int2 kDirs[4] = { int2(1, 0), int2(0, 1), int2(-1, 0), int2(0, -1) };
     for (uint k = 0; k < 4; k++)
     {

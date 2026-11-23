@@ -1,25 +1,25 @@
-// URTI : la caméra du jeu, lue dans sa mémoire d'envoi (tampons visibles du processeur), au lieu d'être déduite de la géométrie.
+// URTI: the game's camera, read from its upload memory (CPU-visible buffers), instead of being deduced from the geometry.
 //
-// Lecteur (urti.ini camera_cb=512, relu au chargement de l'add-on) : Horizon Forbidden West écrit à chaque image, plusieurs
-// fois, un tampon de constantes de 512 octets qui décrit sa caméra, avant de créer la vue dessus :
-//   +240 projection, par colonnes : (p00 0 0 0) (0 p11 0 0) (jx jy a -1) (0 0 b 0), jx, jy : décalage sous-pixel du DLSS ;
-//   +304 caméra -> monde, par colonnes : droite, haut, arrière, position.
-// Chaque création de vue de cette taille est relue ; une valeur nouvelle prend un numéro de série. Le dessin capté retient le
-// numéro en cours, et le calcul prend le plus récent des dessins de sa fenêtre : la caméra exacte de l'image captée.
+// Reader (urti.ini camera_cb=512, read when the add-on loads): the game tested writes, several times every frame,
+// a 512-byte constant buffer describing its camera, before creating the view on it:
+//   +240 projection, by columns: (p00 0 0 0) (0 p11 0 0) (jx jy a -1) (0 0 b 0), jx, jy: DLSS sub-pixel jitter;
+//   +304 camera -> world, by columns: right, up, back, position.
+// Every view creation of that size is read again; a new value gets a serial number. A captured draw records the
+// current number, and the computation takes the most recent of its window's draws: the exact camera of the captured frame.
 //
-// Cette vue peut disparaître : Horizon ne l'écrit plus si le joueur coupe ses reflets dans les options. Plus aucune caméra valable depuis 90
-// présentations : les vues créées (une sur deux, 2 Mo par présentation au plus) et les tampons liés directement à la racine sont fouillés. Deux formes :
-// une projection comme ci-dessus suivie d'une matrice caméra -> monde ou monde -> caméra, ou une matrice vue-projection accompagnée de sa matrice de vue
-// (les dessins principaux, liés à la racine ; la projection, le décalage et la loi de profondeur s'en déduisent). Décalage sous-pixel non nul et changeant, vue à
-// au moins 60 % des présentations pendant au moins trente : elle devient la nouvelle source.
+// That view can disappear: the game stops writing it if the player turns its reflections off in the options. No valid camera for 90
+// presents: created views (one in two, 2 MB per present at most) and buffers bound directly to the root are searched. Two shapes:
+// a projection as above followed by a camera -> world or world -> camera matrix, or a view-projection matrix with its view matrix
+// (the main draws, bound to the root; projection, jitter and depth law follow from it). Non-zero and changing sub-pixel jitter, seen on
+// at least 60 % of presents for at least thirty: it becomes the new source.
 //
-// Sans ces reflets, aucune source sûre n'a été trouvée dans Horizon : il ne reste que les tampons des dessins (monde-vue-projection, monde-vue), où la vraie caméra n'est
-// que la valeur la plus fréquente, et pas à chaque image (elle alterne avec le repère de gros objets : essai du 2026-11-07). Une caméra parfois fausse étant pire que la mesure sur
-// les témoins, c'est celle-ci qui prend le relais (urti_live.inl). Une caméra ne se téléporte pas : une source qui saute est écartée, à l'adoption et ensuite.
+// Without those reflections, no safe source was found: only the draws' buffers remain (world-view-projection, world-view), where the true camera is
+// just the most frequent value, and not every frame (it alternates with the frame of big objects: test of 2026-11-07). A camera that is sometimes wrong being worse than the
+// witness measurement, the latter takes over (urti_live.inl). A camera does not teleport: a source that jumps is discarded, at adoption and afterwards.
 //
-// Recherche (fichier urti_camscan à côté de l'add-on) : à intervalles réguliers, un fil à part parcourt ces tampons à la
-// recherche de matrices en forme de caméra, et relie chaque trouvaille à sa vue : c'est ainsi que le tampon ci-dessus a été
-// trouvé, et ce qui servira pour les autres jeux.
+// Search (urti_camscan file next to the add-on): at regular intervals, a separate thread walks these buffers looking
+// for camera-shaped matrices, and links each find to its view: that is how the buffer above was
+// found, and what will serve for other games.
 
 struct GameCamera
 {
@@ -35,7 +35,7 @@ struct CamBuffer
 };
 struct CamBinding
 {
-    uint32_t param, kind; // kind 0 : racine, graphique ; 1 : racine, calcul ; 2 : vue créée
+    uint32_t param, kind; // kind 0: root, graphics; 1: root, compute; 2: created view
     uint64_t layout;
 };
 
@@ -49,10 +49,10 @@ GameCamera g_camRing[32];
 alignas(16) float g_camLastRaw[32] = {};
 std::atomic<uint32_t> g_camSerial{ 0 };
 std::atomic<uint64_t> g_camRefused{ 0 }, g_camProbes{ 0 };
-// source en cours : vue créée (taille) ou tampon lié à la racine (numéro du paramètre) ; forme : projection + matrice, ou vue-projection + vue
+// current source: created view (size) or buffer bound to the root (parameter number); shape: projection + matrix, or view-projection + view
 std::atomic<uint32_t> g_camSizeNow{ 0 }, g_camRootParam{ ~0u }, g_camOffA{ 240 }, g_camOffB{ 304 };
 std::atomic<bool> g_camPairForm{ false }, g_camMatIsView{ false };
-// recherche d'une autre source, quand il n'y a plus de caméra valable
+// search for another source, when there is no valid camera any more
 std::atomic<uint32_t> g_camPresentIndex{ 0 }, g_camLastAccept{ 0 }, g_camViewCounter{ 0 };
 std::atomic<bool> g_camSearching{ false };
 std::atomic<int64_t> g_camSearchBudget{ 0 };
@@ -62,13 +62,13 @@ struct CamCandidate
     float lastJx = 0, lastJy = 0, lastPos[3] = {};
 };
 std::mutex g_camSearchMutex;
-// racine ?, taille ou paramètre, place A, place B, forme (0 projection + caméra -> monde, 1 projection + monde -> caméra, 2 vue-projection + vue)
+// root?, size or parameter, place A, place B, shape (0 projection + camera -> world, 1 projection + world -> camera, 2 view-projection + view)
 std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, CamCandidate> g_camCandidates;
-std::map<std::pair<uint32_t, uint32_t>, uint32_t> g_camProjOnly;                         // projection sans matrice : taille, place
-std::set<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>> g_camRejected;        // sources adoptées puis écartées (valeurs trop nombreuses)
+std::map<std::pair<uint32_t, uint32_t>, uint32_t> g_camProjOnly;                         // projection without a matrix: size, place
+std::set<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>> g_camRejected;        // sources adopted then discarded (too many values)
 std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t> g_camAdopted;
 uint32_t g_camCheckSerial = 0, g_camCheckPresent = 0;
-std::atomic<uint32_t> g_camCheckJumps{ 0 }; // sauts de plus de 10 m de la source adoptée par la recherche
+std::atomic<uint32_t> g_camCheckJumps{ 0 }; // jumps of more than 10 m of the source adopted by the search
 std::atomic<uint64_t> g_camSearchViews{ 0 };
 
 // recherche
@@ -79,7 +79,7 @@ std::atomic<bool> g_camOn{ false }, g_camBusy{ false };
 std::atomic<uint32_t> g_camPresents{ 0 }, g_camScanIndex{ 0 };
 std::atomic<uint64_t> g_camRootBinds{ 0 }, g_camTableBinds{ 0 }, g_camViews{ 0 };
 
-// lecture de mémoire combinée en écriture, protégée : le tampon a pu disparaître
+// read of write-combined memory, protected: the buffer may have disappeared
 bool CamRead(const uint8_t* src, uint8_t* dst, size_t n)
 {
     __try
@@ -96,7 +96,7 @@ bool CamRead(const uint8_t* src, uint8_t* dst, size_t n)
 
 inline float CamDot(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
-// valeur de la caméra (projection par colonnes, puis caméra -> monde par colonnes) : gardée si elle en a bien la forme et si elle est nouvelle
+// camera value (projection by columns, then camera -> world by columns): kept if it really has that shape and if it is new
 void CamAccept(const float* f)
 {
     constexpr float kZero = 1e-4f;
@@ -131,8 +131,8 @@ void CamAccept(const float* f)
     g_camLastAccept.store(g_camPresentIndex.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
-// vue-projection et vue, en mémoire par colonnes -> projection et caméra -> monde. Clip = P V : x = p00 droite + jx arrière, y = p11 haut + jy arrière, z = a arrière + (0, 0, 0, b),
-// w = -arrière. Faux si la première n'est pas le produit d'une projection du jeu par la seconde (les matrices des objets ont la même allure, mais pas leur vue à côté)
+// view-projection and view, in memory by columns -> projection and camera -> world. Clip = P V: x = p00 right + jx back, y = p11 up + jy back, z = a back + (0, 0, 0, b),
+// w = -back. False if the first is not the product of a game projection by the second (objects' matrices look the same, but not their view next to them)
 bool CamFromPair(const float* vp, const float* v, float* f)
 {
     const float right[3] = { v[0], v[4], v[8] }, up[3] = { v[1], v[5], v[9] }, back[3] = { v[2], v[6], v[10] };
@@ -142,13 +142,13 @@ bool CamFromPair(const float* vp, const float* v, float* f)
     if (std::fabs(CamDot(right, right) - 1.0f) > 0.002f || std::fabs(CamDot(up, up) - 1.0f) > 0.002f || std::fabs(CamDot(back, back) - 1.0f) > 0.002f ||
         std::fabs(CamDot(right, up)) > 0.002f || std::fabs(CamDot(right, back)) > 0.002f || std::fabs(CamDot(up, back)) > 0.002f)
         return false;
-    // quatrième rangée : -arrière, translation comprise
+    // fourth row: -back, translation included
     if (std::fabs(r3[0] + back[0]) > 2e-3f || std::fabs(r3[1] + back[1]) > 2e-3f || std::fabs(r3[2] + back[2]) > 2e-3f || std::fabs(vp[15] + v[14]) > 0.01f + 1e-3f * std::fabs(v[14]))
         return false;
     const float p00 = CamDot(r0, right), p11 = CamDot(r1, up), jx = CamDot(r0, back), jy = CamDot(r1, back), a = CamDot(r2, back);
     if (!(p00 > 0.3f && p00 < 8.0f && p11 > 0.3f && p11 < 8.0f && p11 / p00 > 1.2f && p11 / p00 < 3.8f) || std::fabs(jx) > 0.02f || std::fabs(jy) > 0.02f)
         return false;
-    // (les deux autres composantes de chaque rangée sont nulles : pas de rotation en plus)
+    // (the other two components of each row are zero: no extra rotation)
     if (std::fabs(CamDot(r0, up)) > 1e-3f || std::fabs(CamDot(r1, right)) > 1e-3f)
         return false;
     std::memset(f, 0, sizeof(float) * 32);
@@ -161,7 +161,7 @@ bool CamFromPair(const float* vp, const float* v, float* f)
     return true;
 }
 
-// mémoire visible du processeur à cette adresse GPU, n octets lisibles
+// CPU-visible memory at this GPU address, n readable bytes
 const uint8_t* CamCpuOfVa(uint64_t va, uint64_t n)
 {
     std::shared_lock<std::shared_mutex> lock(g_camVaMutex);
@@ -174,7 +174,7 @@ const uint8_t* CamCpuOfVa(uint64_t va, uint64_t n)
     return it->second.ptr + (va - it->first);
 }
 
-// lecture de la source en cours
+// read of the current source
 void CamProbeCpu(const uint8_t* cpu)
 {
     alignas(16) float r[32];
@@ -190,7 +190,7 @@ void CamProbeCpu(const uint8_t* cpu)
             g_camRefused.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    // matrice monde -> caméra : retournée (rotation transposée, position)
+    // world -> camera matrix: inverted (transposed rotation, position)
     if (g_camMatIsView.load(std::memory_order_relaxed))
     {
         const float m[16] = { r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23], r[24], r[25], r[26], r[27], r[28], r[29], r[30], r[31] };
@@ -210,7 +210,7 @@ void CamReaderProbe(uint64_t va)
         CamProbeCpu(cpu);
 }
 
-// caméra de ce numéro (ou la plus récente, s'il est trop ancien)
+// camera of this number (or the most recent, if it is too old)
 GameCamera CamGet(uint32_t serial)
 {
     std::lock_guard<std::mutex> lock(g_camRingMutex);
@@ -218,9 +218,9 @@ GameCamera CamGet(uint32_t serial)
     return g_camRing[(last - serial >= 24 ? last : serial) % 32];
 }
 
-// une présence de plus pour une forme trouvée ; assez souvent, longtemps, décalage changeant : elle devient la source (appelé sous g_camSearchMutex)
-// Les tampons des objets ont la même allure quand l'objet est seulement tourné ; mais une caméra ne se téléporte pas : de sa valeur à la suivante, quelques centimètres,
-// et très peu de valeurs par image, même liée des dizaines de fois
+// one more presence for a found shape; often enough, for long enough, with a changing jitter: it becomes the source (called under g_camSearchMutex)
+// Objects' buffers look the same when the object is only rotated; but a camera does not teleport: from one value to the next, a few centimetres,
+// and very few values per frame, even when bound dozens of times
 bool CamCandidateSeen(bool root, uint32_t key, uint32_t a, uint32_t b, uint32_t form, float jx, float jy, const float* pos)
 {
     if (g_camRejected.count({ root, key, a, b, form }))
@@ -252,13 +252,13 @@ bool CamCandidateSeen(bool root, uint32_t key, uint32_t a, uint32_t b, uint32_t 
     g_camSizeNow.store(root ? 0 : key, std::memory_order_relaxed), g_camRootParam.store(root ? key : ~0u, std::memory_order_relaxed);
     g_camLastAccept.store(now, std::memory_order_relaxed);
     g_camSearching.store(false, std::memory_order_relaxed);
-    static const char* const kForm[3] = { "projection + caméra -> monde", "projection + monde -> caméra", "vue-projection + vue" };
-    Log("URTI : caméra du jeu retrouvée : %s %u, %s, +%u et +%u (vue %u fois, %u présentations)", root ? "tampon lié à la racine, paramètre" : "vues de taille", key, kForm[form], a, b, c.count, c.presents);
+    static const char* const kForm[3] = { "projection + camera -> world", "projection + world -> camera", "view-projection + view" };
+    Log("URTI: game camera found again: %s %u, %s, +%u and +%u (seen %u times, %u presents)", root ? "root-bound buffer, parameter" : "views of size", key, kForm[form], a, b, c.count, c.presents);
     g_camCandidates.clear();
     return true;
 }
 
-// un tampon quelconque, quand la caméra est perdue
+// any buffer, when the camera is lost
 void CamSearchMemory(const uint8_t* cpu, uint32_t size, bool root, uint32_t key)
 {
     size = std::min<uint32_t>(size, 16384) & ~15u;
@@ -274,7 +274,7 @@ void CamSearchMemory(const uint8_t* cpu, uint32_t size, bool root, uint32_t key)
     for (uint32_t i = 0; i + 16 <= count; i += 4)
     {
         const float* g = f + i;
-        // vue-projection et sa vue, tout près (avant ou après)
+        // view-projection and its view, close by (before or after)
         if (g[3] != 0.0f || g[7] != 0.0f || g[11] != 0.0f)
         {
             for (int d = -64; d <= 64; d += 128)
@@ -297,8 +297,8 @@ void CamSearchMemory(const uint8_t* cpu, uint32_t size, bool root, uint32_t key)
             continue;
         const float jx = g[8], jy = g[9];
         if ((jx == 0.0f && jy == 0.0f) || std::fabs(jx) > 0.02f || std::fabs(jy) > 0.02f)
-            continue; // pas la vue du jeu décalée par l'anticrénelage
-        // matrice : d'abord après la projection, sinon avant
+            continue; // not the game's view shifted by anti-aliasing
+        // matrix: first after the projection, otherwise before
         int mat = -1;
         bool isView = false;
         auto test = [&](uint32_t j) {
@@ -310,8 +310,8 @@ void CamSearchMemory(const uint8_t* cpu, uint32_t size, bool root, uint32_t key)
                 std::fabs(CamDot(a, b)) > 0.002f || std::fabs(CamDot(a, c)) > 0.002f || std::fabs(CamDot(b, c)) > 0.002f)
                 return false;
             if (std::fabs(m[0]) > 0.9999f && std::fabs(m[5]) > 0.9999f)
-                return false; // identité
-            // la droite de la caméra est horizontale : une de ses composantes est nulle (colonnes : caméra -> monde ; lignes : monde -> caméra)
+                return false; // identity
+            // the camera's right is horizontal: one of its components is zero (columns: camera -> world; rows: world -> camera)
             const float byCol = std::min({ std::fabs(m[0]), std::fabs(m[1]), std::fabs(m[2]) }), byRow = std::min({ std::fabs(m[0]), std::fabs(m[4]), std::fabs(m[8]) });
             isView = byRow < byCol;
             return true;
@@ -350,7 +350,7 @@ void STDMETHODCALLTYPE HookCreateCbv(ID3D12Device* device, const D3D12_CONSTANT_
         return;
     if (desc->SizeInBytes == g_camSizeNow.load(std::memory_order_relaxed))
         CamReaderProbe(desc->BufferLocation);
-    // caméra perdue : une vue sur deux fouillée, l'autre moitié à la présentation suivante
+    // camera lost: one view in two searched, the other half on the next present
     if (g_camSearching.load(std::memory_order_relaxed) && desc->SizeInBytes >= 128 && desc->SizeInBytes <= 65536 &&
         ((g_camViewCounter.fetch_add(1, std::memory_order_relaxed) ^ g_camPresentIndex.load(std::memory_order_relaxed)) & 1) == 0)
         if (const uint8_t* cpu = CamCpuOfVa(desc->BufferLocation, std::min<uint32_t>(desc->SizeInBytes, 16384)))
@@ -388,7 +388,7 @@ void CamScanNoteResource(const resource_desc& desc, resource res)
     }
 }
 
-// tampon de constantes lié directement à la racine (pas de vue créée) : la source en cours, ou la recherche
+// constant buffer bound directly to the root (no created view): the current source, or the search
 void OnCamRootBind(command_list*, shader_stage, pipeline_layout, uint32_t param, const descriptor_table_update& u)
 {
     if (u.type != descriptor_type::constant_buffer || !u.count)
@@ -457,13 +457,13 @@ void OnCamTables(command_list*, shader_stage, pipeline_layout, uint32_t, uint32_
     g_camTableBinds.fetch_add(count, std::memory_order_relaxed);
 }
 
-// 0 : rien ; 1 : vue-projection ; 2 : vue ; 3 : projection. r : les quatre rangées, chacune de quatre nombres
+// 0: nothing; 1: view-projection; 2: view; 3: projection. r: the four rows, each of four numbers
 int CamClassify(const float r[4][4], float& p00, float& p11)
 {
     const float n0 = CamDot(r[0], r[0]), n1 = CamDot(r[1], r[1]), n2 = CamDot(r[2], r[2]), n3 = CamDot(r[3], r[3]);
     if (!(n0 < 100.0f) || !(n1 < 100.0f) || !(n3 < 100.0f))
         return 0;
-    // vue-projection : quatrième rangée = axe de la caméra (norme 1), deux premières orthogonales, de rapport l'écran
+    // view-projection: fourth row = camera axis (norm 1), first two orthogonal, with the screen's aspect ratio
     if (std::fabs(n3 - 1.0f) < 0.02f && n0 > 0.09f && n1 > 0.09f)
     {
         const float l0 = std::sqrt(n0), l1 = std::sqrt(n1), ratio = l1 / l0;
@@ -474,7 +474,7 @@ int CamClassify(const float r[4][4], float& p00, float& p11)
             return 1;
         }
     }
-    // vue : rotation pure, axes non alignés, sans roulis (une composante de la première rangée nulle)
+    // view: pure rotation, axes not aligned, no roll (one component of the first row zero)
     if (std::fabs(n0 - 1.0f) < 0.004f && std::fabs(n1 - 1.0f) < 0.004f && std::fabs(n2 - 1.0f) < 0.004f && std::fabs(CamDot(r[0], r[1])) < 0.002f &&
         std::fabs(CamDot(r[0], r[2])) < 0.002f && std::fabs(CamDot(r[1], r[2])) < 0.002f)
     {
@@ -486,7 +486,7 @@ int CamClassify(const float r[4][4], float& p00, float& p11)
         if (big < 0.999f && small0 < 0.01f)
             return 2;
     }
-    // projection seule : diagonale, rapport de l'écran, 1 ou -1 dans la dernière rangée
+    // projection only: diagonal, the screen's aspect ratio, 1 or -1 in the last row
     if (r[0][0] > 0.3f && r[1][1] > 0.3f && r[1][1] / r[0][0] > 1.5f && r[1][1] / r[0][0] < 2.0f && std::fabs(r[0][1]) < 1e-5f && std::fabs(r[1][0]) < 1e-5f &&
         std::fabs(r[0][3]) < 1e-5f && std::fabs(r[1][3]) < 1e-5f && std::fabs(std::fabs(r[3][2]) - 1.0f) < 1e-4f && std::fabs(r[3][3]) < 1e-4f)
     {
@@ -563,7 +563,7 @@ void CamScanThread(uint32_t index, uint32_t present)
         bindings = g_camBindings.size();
         g_camBindings.clear();
     }
-    Log("CAMSCAN %u fini : %zu tampons, %.0f Mo, %.1f s ; VP %u, VUE %u, PROJ %u ; liaisons relevées %zu ; depuis le début : racine %llu, tables %llu, vues créées %llu", index, buffers.size(),
+    Log("CAMSCAN %u done: %zu buffers, %.0f MB, %.1f s; VP %u, VIEW %u, PROJ %u; bindings recorded %zu; since the start: root %llu, tables %llu, created views %llu", index, buffers.size(),
         total / 1048576.0, (GetTickCount() - t0) / 1000.0, found[1], found[2], found[3], bindings, (unsigned long long)g_camRootBinds.load(), (unsigned long long)g_camTableBinds.load(),
         (unsigned long long)g_camViews.load());
     g_camBusy.store(false);
@@ -577,12 +577,12 @@ void CamScanPresent()
         const bool lost = now - g_camLastAccept.load(std::memory_order_relaxed) > 90;
         if (lost != g_camSearching.load(std::memory_order_relaxed))
         {
-            Log("URTI : caméra du jeu %s", lost ? "perdue : recherche d'une autre vue" : "de nouveau lue");
+            Log("URTI: game camera %s", lost ? "lost: searching for another view" : "read again");
             g_camSearching.store(lost, std::memory_order_relaxed);
         }
-        // (peu : dans les menus aussi, la caméra est « perdue », et le menu tourne à 300 images par seconde)
+        // (few: in menus too, the camera is "lost", and the menu runs at 300 frames per second)
         g_camSearchBudget.store(512 * 1024, std::memory_order_relaxed);
-        // source adoptée par la recherche : plus de six caméras par présentation, ce n'est pas une caméra
+        // source adopted by the search: more than six cameras per present, that is not a camera
         {
             std::lock_guard<std::mutex> lock(g_camSearchMutex);
             if (std::get<1>(g_camAdopted) && now - g_camCheckPresent >= 60)
@@ -591,7 +591,7 @@ void CamScanPresent()
                 const uint32_t jumps = g_camCheckJumps.exchange(0, std::memory_order_relaxed);
                 if (serial - g_camCheckSerial > (now - g_camCheckPresent) * 6 || jumps > 3)
                 {
-                    Log("URTI : source de caméra écartée (%u valeurs, %u sauts en %u présentations) : tampon %u, +%u et +%u", serial - g_camCheckSerial, jumps, now - g_camCheckPresent, std::get<1>(g_camAdopted),
+                    Log("URTI: camera source discarded (%u values, %u jumps in %u presents): buffer %u, +%u and +%u", serial - g_camCheckSerial, jumps, now - g_camCheckPresent, std::get<1>(g_camAdopted),
                         std::get<2>(g_camAdopted), std::get<3>(g_camAdopted));
                     g_camRejected.insert(g_camAdopted);
                     g_camAdopted = {};
@@ -601,7 +601,7 @@ void CamScanPresent()
                 g_camCheckSerial = serial, g_camCheckPresent = now;
             }
         }
-        // bilan de la recherche, pour comprendre si elle ne trouve rien
+        // search summary, to understand whether it finds nothing
         if (lost && now % 600 == 0)
         {
             std::lock_guard<std::mutex> lock(g_camSearchMutex);
@@ -610,9 +610,9 @@ void CamScanPresent()
             for (const auto& [key, c] : g_camProjOnly)
                 if (n < sizeof(text) - 48)
                     n += std::snprintf(text + n, sizeof(text) - n, " %u+%u:%u", key.first, key.second, c);
-            Log("URTI : recherche de la caméra : %llu vues lues ; projections sans matrice (taille+place:fois)%s ; %zu candidates", (unsigned long long)g_camSearchViews.load(), text, g_camCandidates.size());
+            Log("URTI: camera search: %llu views read; projections without a matrix (size+place:times)%s; %zu candidates", (unsigned long long)g_camSearchViews.load(), text, g_camCandidates.size());
             g_camProjOnly.clear();
-            // les plus présentes
+            // the most frequent
             std::vector<std::pair<uint32_t, const decltype(g_camCandidates)::value_type*>> top;
             for (const auto& e : g_camCandidates)
                 top.push_back({ e.second.presents, &e });
@@ -625,7 +625,7 @@ void CamScanPresent()
                 if (quota >= 8)
                     continue;
                 quota++;
-                Log("URTI : candidate %s %u, +%u et +%u, forme %u : %u fois, %u présentations sur %u, %u valeurs, %u sauts", std::get<0>(key) ? "racine" : "vues", std::get<1>(key), std::get<2>(key), std::get<3>(key),
+                Log("URTI: candidate %s %u, +%u and +%u, shape %u: %u times, %u presents out of %u, %u values, %u jumps", std::get<0>(key) ? "root" : "views", std::get<1>(key), std::get<2>(key), std::get<3>(key),
                     std::get<4>(key), c.count, c.presents, now - c.firstPresent + 1, c.valueChanges, c.jumps);
             }
         }
@@ -640,7 +640,7 @@ void CamScanPresent()
 
 void CamScanRegister()
 {
-    // le lecteur : réglage lu ici, les tampons d'envoi du jeu sont créés dès son démarrage
+    // the reader: setting read here, the game's upload buffers are created from its start
     std::ifstream ini(g_dir + "\\urti.ini");
     for (std::string line; std::getline(ini, line);)
         if (line.rfind("camera_cb=", 0) == 0)
@@ -650,7 +650,7 @@ void CamScanRegister()
     {
         reshade::register_event<reshade::addon_event::destroy_resource>(OnCamDestroyResource);
         reshade::register_event<reshade::addon_event::push_descriptors>(OnCamRootBind);
-        Log("URTI : caméra du jeu lue dans ses tampons de %u octets", g_camCbvSize);
+        Log("URTI: the game's camera read from its %u-byte buffers", g_camCbvSize);
     }
     if (GetFileAttributesA((g_dir + "\\urti_camscan").c_str()) == INVALID_FILE_ATTRIBUTES)
         return;
@@ -658,5 +658,5 @@ void CamScanRegister()
     reshade::register_event<reshade::addon_event::push_descriptors>(OnCamPush);
     reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnCamUpdate);
     reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnCamTables);
-    Log("CAMSCAN : recherche de la caméra du jeu active");
+    Log("CAMSCAN: search for the game's camera active");
 }

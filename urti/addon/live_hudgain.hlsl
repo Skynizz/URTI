@@ -1,33 +1,33 @@
-// URTI en direct : loi entre l'image finale et l'image du jeu sans son interface (live_hudless). Horizon Forbidden West retouche son image
-// après l'avoir remise à la génération d'images : en codes PQ, par canal, log2(final / sans interface) = L + b × (log2(sans interface) + 1,75)
-// (mesuré : rapport de 1,3 à 2,2 selon la scène, pente b d'environ 0,15). Apprise sur un pixel sur 64 (live_hudless) : médiane de
-// l'histogramme du rapport des pixels sombres, et des pixels clairs, chacune à son code moyen : deux points, une droite ; moyenne
-// glissante ; histogrammes remis à zéro. La médiane ignore les pixels d'interface et ceux qui ont bougé, tant qu'ils sont minoritaires.
-// Aussi : laquelle des trois dernières copies concorde avec l'image finale de cette présentation, et à quel point.
+// Live URTI: law between the final image and the game's UI-free image (live_hudless). Some games retouch their image
+// after handing it to frame generation: in PQ codes, per channel, log2(final / UI-free) = L + b × (log2(UI-free) + 1.75)
+// (measured: ratio of 1.3 to 2.2 depending on the scene, slope b of about 0.15). Learned on one pixel in 64 (live_hudless): median of
+// the ratio histogram of dark pixels, and of bright pixels, each at its mean code: two points, a line; running
+// average; histograms reset. The median ignores UI pixels and those that moved, as long as they are a minority.
+// Also: which of the last three copies matches this present's final image, and how well.
 
-RWByteAddressBuffer gain : register(u0); // 0 : rapport au pivot exp2(L) (float) ; 4 : part d'interface (journal) ; 8 : part des pixels qui concordent ;
-                                         // 12 : pente b ; 16 + 4 × case : histogrammes (128 cases sombres, 128 claires) ; puis les comptes
+RWByteAddressBuffer gain : register(u0); // 0: ratio at the pivot exp2(L) (float); 4: UI share (log); 8: share of matching pixels;
+                                         // 12: slope b; 16 + 4 × bin: histograms (128 dark bins, 128 bright); then the counts
 
 static const uint kCounts = 16 + 256 * 4;
 static const uint kLag = kCounts + 32;
-static const uint kShown = kCounts + 36;   // numéro de la copie que montrait la dernière présentation qui concordait, et numéro de cette présentation
-static const uint kLead = kCounts + 44;    // avance du dernier calcul sur l'image de cette présentation, en images du jeu (float ; live_composite)
+static const uint kShown = kCounts + 36;   // number of the copy the last matching present showed, and the number of that present
+static const uint kLead = kCounts + 44;    // lead of the last computation over this present's image, in game frames (float; live_composite)
 
 cbuffer Constants : register(b0)
 {
-    uint minCount; // pixels au moins pour une mesure
-    float blend;   // part de la nouvelle mesure
-    uint serialNew;   // numéro de la dernière copie
-    uint presentIdx;  // numéro de cette présentation
-    uint layerSerial; // numéro de la dernière copie au moment du dernier calcul (le calque est de cette image du jeu)
-    float leadBias;   // correction (images du jeu)
+    uint minCount; // minimum pixels for a measurement
+    float blend;   // share of the new measurement
+    uint serialNew;   // number of the last copy
+    uint presentIdx;  // number of this present
+    uint layerSerial; // number of the last copy at the time of the last computation (the layer belongs to that game frame)
+    float leadBias;   // correction (game frames)
     uint pad0;
     uint pad1;
 };
 
 groupshared uint counts[256];
 
-// médiane (log2 du rapport) des cases first à first + 127, interpolée dans sa case
+// median (log2 of the ratio) of bins first to first + 127, interpolated within its bin
 float Median(uint first, uint n)
 {
     uint below = 0;
@@ -41,8 +41,8 @@ float Median(uint first, uint n)
     return 0;
 }
 
-// 256 fils : chacun lit et remet à zéro sa case ; le premier fait les médianes dans la mémoire partagée (un seul fil en mémoire vidéo
-// attendait chaque lecture l'une après l'autre)
+// 256 threads: each reads and resets its bin; the first computes the medians in shared memory (a single thread in video memory
+// waited for each read one after the other)
 [numthreads(256, 1, 1)]
 void main(uint k : SV_GroupIndex)
 {
@@ -54,32 +54,32 @@ void main(uint k : SV_GroupIndex)
     const uint4 c0 = gain.Load4(kCounts), c1 = gain.Load4(kCounts + 16);
     gain.Store4(kCounts, uint4(0, 0, 0, 0));
     gain.Store4(kCounts + 16, uint4(0, 0, 0, 0));
-    // part des pixels pris pour de l'interface (journal)
+    // share of pixels taken for UI (log)
     gain.Store(4, asuint(c0.x ? float(c0.y) / float(c0.x) : 0.0));
-    // copie qui concorde le mieux avec l'image finale de cette présentation
+    // copy that best matches this present's final image
     const uint m0 = c0.w, m1 = c1.x, m2 = c1.y;
     const uint best = max(m0, max(m1, m2));
     const float share = c0.z >= 1000 ? float(best) / float(c0.z) : 0.0;
     gain.Store(8, asuint(share));
-    // scène immobile : toutes les copies concordent ; la copie d'avant reste (le retard ne se mesure qu'en mouvement)
+    // still scene: every copy matches; the previous copy stays (the lag can only be measured in motion)
     const uint lagWas = min(gain.Load(kLag), 2u);
     const uint mWas = lagWas == 0 ? m0 : lagWas == 1 ? m1 : m2;
     const uint lag = mWas + c0.z / 200 >= best ? lagWas : best == m0 ? 0u : best == m1 ? 1u : 2u;
     gain.Store(kLag, lag);
     if (share >= 0.96)
         gain.Store2(kShown, uint2(serialNew - lag, presentIdx));
-    // avance du calque sur l'image montrée ; présentation qui ne concorde pas (image fabriquée entre deux) : une demi-image du jeu de plus
-    // que la précédente
+    // the layer's lead over the image shown; a present that does not match (image generated in between): half a game frame more
+    // than the previous one
     const uint2 shown = gain.Load2(kShown);
     const uint age = presentIdx - shown.y;
     gain.Store(kLead, asuint(age <= 6 ? float(int(layerSerial - shown.x)) - 0.5 * float(age) + leadBias : 0.0));
-    gain.Store(kLead + 4, layerSerial); // (live_composite : numéro de l'image du jeu du dernier calcul)
+    gain.Store(kLead + 4, layerSerial); // (live_composite: game frame number of the last computation)
     uint n0 = 0, n1 = 0;
     for (uint i = 0; i < 128; i++)
         n0 += counts[i], n1 += counts[128 + i];
     if (n0 + n1 < minCount)
         return;
-    // deux points (code moyen, rapport médian) en log2 ; un seul groupe garni : la pente d'avant
+    // two points (mean code, median ratio) in log2; a single group filled: the previous slope
     const float wasG = asfloat(gain.Load(0)), wasB = asfloat(gain.Load(12));
     const bool known = wasG > 0.25 && wasG < 8.0;
     const float bOld = known && abs(wasB) < 0.6 ? wasB : 0.0;

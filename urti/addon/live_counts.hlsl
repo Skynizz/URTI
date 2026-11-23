@@ -1,10 +1,10 @@
-// URTI en direct : places fixes des objets dans le flux (g_livePersist). Le compte de sommets écrits par un
-// dessin de cette image (son compteur, remis à zéro à chaque image) est recopié dans la case de sa place,
-// qui le garde tant que l'objet n'est plus dessiné : sa dernière géométrie reste dans la scène RT.
+// Live URTI: fixed places of objects in the stream (g_livePersist). The count of vertices written by a
+// draw of this frame (its counter, reset every frame) is copied into its place's cell,
+// which keeps it as long as the object is no longer drawn: its last geometry stays in the RT scene.
 
-StructuredBuffer<uint2> pairs : register(t0); // compteur de l'image, case de compte
-ByteAddressBuffer counters : register(t1);    // octets écrits par dessin (8 octets par compteur)
-RWByteAddressBuffer counts : register(u0);    // octets écrits par place (8 octets par case, comme counters)
+StructuredBuffer<uint2> pairs : register(t0); // frame counter, count cell
+ByteAddressBuffer counters : register(t1);    // bytes written per draw (8 bytes per counter)
+RWByteAddressBuffer counts : register(u0);    // bytes written per place (8 bytes per cell, like counters)
 
 cbuffer Constants : register(b0)
 {

@@ -1,10 +1,10 @@
-// URTI en direct : masque d'ombres à partir de la sortie de SIGMA (débruiteur d'ombres de NVIDIA) :
-// visibilité débruitée (SIGMA_BackEnd_UnpackShadow : carré de la valeur stockée), puis les corrections
-// d'URTI (ombre du jeu, N·L, brume au loin) sous forme de poids, écrites par live_shadow en mode SIGMA.
+// Live URTI: shadow mask from SIGMA's output (NVIDIA's shadow denoiser):
+// denoised visibility (SIGMA_BackEnd_UnpackShadow: square of the stored value), then URTI's
+// corrections (game shadow, N·L, distant haze) as weights, written by live_shadow in SIGMA mode.
 
-ByteAddressBuffer sigma : register(t0);   // OUT_SHADOW_TRANSLUCENCY recopiée (R8, lignes alignées)
-ByteAddressBuffer weight : register(t1);  // part de l'ombre gardée (float, pas : shadowPitch)
-RWByteAddressBuffer shadow : register(u0); // 1 éclairé, 0 à l'ombre (float, pas : shadowPitch)
+ByteAddressBuffer sigma : register(t0);   // OUT_SHADOW_TRANSLUCENCY copied (R8, aligned rows)
+ByteAddressBuffer weight : register(t1);  // share of the shadow kept (float, pitch: shadowPitch)
+RWByteAddressBuffer shadow : register(u0); // 1 lit, 0 in shadow (float, pitch: shadowPitch)
 
 cbuffer Constants : register(b0)
 {
@@ -12,7 +12,7 @@ cbuffer Constants : register(b0)
     uint height;
     uint sigmaPitch;
     uint shadowPitch;
-    uint debugMode; // 1 : visibilité de SIGMA seule, sans les corrections
+    uint debugMode; // 1: SIGMA's visibility alone, without the corrections
     uint pad0;
     uint pad1;
     uint pad2;

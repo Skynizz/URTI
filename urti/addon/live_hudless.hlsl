@@ -1,30 +1,30 @@
-// URTI en direct : image du jeu sans son interface. Horizon Forbidden West avec DLSS-G la donne à la génération d'images : une cible
-// de la taille de l'écran en RGBA 16 bits flottants, couleurs déjà codées comme l'image d'écran (PQ). Copiée dans les listes du jeu à
-// la fin de son écriture (urti_live.inl), elle est remise ici dans la disposition de l'image d'écran : les reflets, le cache de
-// radiance et la mesure de la lumière y prennent leurs couleurs (plus de HUD ni de menu dans l'eau).
-// Loi entre les deux (mesurée : le jeu retouche son image après l'avoir remise à la génération d'images) : par canal,
-// log2(final / sans interface) = L + b × (log2(sans interface) + 1,75), apprise en continu (live_hudgain).
-// Masque d'interface : ce qui, dans l'image finale, diffère de l'image sans interface. La comparaison ne vaut que si les deux sont de
-// la même image du jeu : l'image finale d'une présentation est celle d'une copie plus ancienne (le jeu a de l'avance), ou une image
-// fabriquée entre deux (DLSS-G), qui diffère de toutes partout où ça bouge. Trois passes (mode) :
-//   1 : conversion de la dernière copie (une fois par copie) ;
-//   2 : un pixel sur 64 comparé à l'image finale, pour les trois dernières copies : pixels qui concordent avec chacune, et
-//       histogrammes du rapport (pixels sombres et clairs à part : la pente de la loi) ;
-//   4 : si une copie concorde (live_hudgain : part à l'octet 8, laquelle à l'octet kLag), masque de tous les pixels d'après elle :
-//       part d'interface de 0 à 1 selon l'écart. Sinon le masque d'avant reste (le HUD ne bouge pas d'une présentation à l'autre).
-// (L'alpha de la cible couvre l'interface dans certains écrans seulement : il s'ajoute au masque.)
+// Live URTI: the game's image without its UI. Some games with DLSS-G hand it to frame generation: a screen-sized
+// RGBA 16-bit float target, colours already encoded like the screen image (PQ). Copied inside the game's lists at
+// the end of its writing (urti_live.inl), it is put back here into the screen image's layout: reflections, the radiance
+// cache and the light measurement take their colours from it (no more HUD or menu in the water).
+// Law between the two (measured: the game retouches its image after handing it to frame generation): per channel,
+// log2(final / UI-free) = L + b × (log2(UI-free) + 1.75), learned continuously (live_hudgain).
+// UI mask: what, in the final image, differs from the UI-free image. The comparison holds only if both come from
+// the same game frame: a present's final image is that of an older copy (the game is ahead), or an image
+// generated between two (DLSS-G), which differs from all of them wherever things move. Three passes (mode):
+//   1: conversion of the last copy (once per copy);
+//   2: one pixel in 64 compared with the final image, for the last three copies: pixels that match each one, and
+//       histograms of the ratio (dark and bright pixels apart: the law's slope);
+//   4: if a copy matches (live_hudgain: share at byte 8, which one at byte kLag), mask of every pixel from it:
+//       UI share from 0 to 1 depending on the difference. Otherwise the previous mask stays (the HUD does not move from one present to the next).
+// (The target's alpha covers the UI on some screens only: it is added to the mask.)
 
-ByteAddressBuffer hud : register(t0);      // RGBA 16 bits flottants, lignes de srcPitch octets : la dernière copie
-ByteAddressBuffer hud1 : register(t1);     // la copie d'avant
-ByteAddressBuffer finalImage : register(t2); // image finale de cette présentation (disposition de l'image d'écran)
-ByteAddressBuffer hud2 : register(t3);     // encore avant
-RWByteAddressBuffer preUi : register(u0);  // même disposition que l'image d'écran
-RWByteAddressBuffer uiMask : register(u1); // par pixel : bit 0 interface, bits 8 à 15 part d'interface (live_composite), bits 16 à 23 alpha de la cible
-RWByteAddressBuffer gain : register(u2);   // 0 : rapport au pivot (float, 0 : pas encore) ; 8 : part des pixels qui concordent ; 12 : pente b ;
-                                           // 16 + 4 × case : histogrammes du rapport (128 cases sombres, 128 claires) ; puis les comptes (kCounts)
+ByteAddressBuffer hud : register(t0);      // RGBA 16-bit floats, rows of srcPitch bytes: the last copy
+ByteAddressBuffer hud1 : register(t1);     // the copy before
+ByteAddressBuffer finalImage : register(t2); // final image of this present (screen image layout)
+ByteAddressBuffer hud2 : register(t3);     // the one before that
+RWByteAddressBuffer preUi : register(u0);  // same layout as the screen image
+RWByteAddressBuffer uiMask : register(u1); // per pixel: bit 0 UI, bits 8 to 15 UI share (live_composite), bits 16 to 23 the target's alpha
+RWByteAddressBuffer gain : register(u2);   // 0: ratio at the pivot (float, 0: not yet); 8: share of matching pixels; 12: slope b;
+                                           // 16 + 4 × bin: histograms of the ratio (128 dark bins, 128 bright); then the counts (kCounts)
 
-static const uint kCounts = 16 + 256 * 4; // pixels comptés, d'interface, comparés, concordants avec chaque copie (3), sommes de log2(code) sombres et claires
-static const uint kLag = kCounts + 32;    // copie qui concorde (0 la dernière, 1, 2)
+static const uint kCounts = 16 + 256 * 4; // pixels counted, UI, compared, matching each copy (3), sums of log2(code) dark and bright
+static const uint kLag = kCounts + 32;    // matching copy (0 the last, 1, 2)
 
 cbuffer Constants : register(b0)
 {
@@ -32,10 +32,10 @@ cbuffer Constants : register(b0)
     uint height;
     uint srcPitch;
     uint dstPitch;
-    uint format;   // image d'écran : 0 RGBA8, 1 BGRA8, 2 RGB10A2 (HDR10), 3 RGBA16F
-    float alphaUi; // au-delà : pixel d'interface
-    uint mode;     // bits 0 à 7 : passe ; bits 8 à 9 : copies disponibles - 1
-    float diffUi;  // écart à l'image finale toléré (valeurs codées, 0 à 1), en plus de 7 % de la valeur
+    uint format;   // screen image: 0 RGBA8, 1 BGRA8, 2 RGB10A2 (HDR10), 3 RGBA16F
+    float alphaUi; // beyond: UI pixel
+    uint mode;     // bits 0 to 7: pass; bits 8 to 9: copies available - 1
+    float diffUi;  // tolerated difference to the final image (encoded values, 0 to 1), on top of 7 % of the value
 };
 
 float4 Hud(ByteAddressBuffer b, uint2 id)
@@ -63,14 +63,14 @@ void LoadLaw()
     gSlope = gLawKnown && abs(b) < 0.6 ? b : 0.0;
 }
 
-// image finale attendue pour une couleur de l'image sans interface
+// final image expected for a colour of the UI-free image
 float3 Predict(float3 c)
 {
     c = max(c, 0.0);
     return saturate(c * exp2(gL + gSlope * (log2(max(c, 1e-3)) + 1.75)));
 }
 
-// écart au-delà du toléré, le pire des trois canaux (<= 0 : concorde)
+// difference beyond the tolerance, the worst of the three channels (<= 0: matches)
 float Excess(float3 shown, float3 pred)
 {
     const float3 d = abs(shown - pred) - (diffUi + 0.07 * max(shown, pred));
@@ -113,7 +113,7 @@ void main(uint2 id : SV_DispatchThreadID)
         gain.InterlockedAdd(kCounts, 1, unused);
         if (((uiMask.Load((px.y * width + px.x) * 4) >> 8) & 255) >= 128)
             gain.InterlockedAdd(kCounts + 4, 1, unused);
-        // rapport : sur la copie la plus proche de l'image finale en ce pixel, s'il n'en est pas trop loin (interface, mouvement)
+        // ratio: on the copy closest to the final image at this pixel, if it is not too far from it (UI, motion)
         const float hs = best.r + best.g + best.b, ss = shown.r + shown.g + shown.b;
         if (best.a <= alphaUi && hs > 0.15 && hs < 2.4 && all(shown < 0.95) && ss > 0.03 && (!gLawKnown || bestErr < 0.1 + 0.25 * ss))
         {
@@ -160,7 +160,7 @@ void main(uint2 id : SV_DispatchThreadID)
         const uint3 q = uint3(saturate(format == 1 ? c.bgr : c.rgb) * 255.0 + 0.5);
         preUi.Store(a, q.r | (q.g << 8) | (q.b << 16) | (255u << 24));
     }
-    // image d'écran en 16 bits flottants : pas de comparaison, l'alpha seul
+    // screen image in 16-bit floats: no comparison, the alpha alone
     if (format == 3)
         uiMask.Store((id.y * width + id.x) * 4, c.a > alphaUi ? (1u | (255u << 8)) : 0u);
 }

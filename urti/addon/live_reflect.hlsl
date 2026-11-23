@@ -1,33 +1,33 @@
-// URTI en direct : reflets en ray tracing. Un rayon par pixel lisse (selon le matériau du G-buffer du
-// jeu), réfléchi autour de la normale tirée de la profondeur, lancé dans la géométrie captée. Le point
-// touché est reprojeté à l'écran : s'il y est visible (même profondeur), sa couleur sera lue dans
-// l'image du jeu par la composition. Sortie par pixel : position à l'écran du point reflété (u, v),
-// poids (Fresnel × lissé), 0 si rien d'utilisable (le reflet du jeu reste alors).
+// Live URTI: ray-traced reflections. One ray per smooth pixel (according to the game's G-buffer
+// material), reflected around the depth-derived normal, cast into the captured geometry. The hit
+// point is reprojected on screen: if it is visible there (same depth), its colour will be read from
+// the game's image by the composition. Output per pixel: screen position of the reflected point (u, v),
+// weight (Fresnel × smoothness), 0 if nothing usable (the game's own reflection then stays).
 //
-// Ancrage (mémoire géométrique) : la surface-miroir et le point reflété sont retrouvés dans la géométrie
-// captée (même dessin, même triangle, mêmes coordonnées barycentriques) ; les sommets de l'image
-// précédente donnent leur position à ce moment-là, déformations comprises. Le point virtuel (le point
-// reflété symétrisé par le plan du miroir) de l'image précédente donne l'endroit exact où ce reflet se
-// trouvait : la stabilisation y lit son historique, si les identités (objet reflété, miroir) concordent.
+// Anchoring (geometric memory): the mirror surface and the reflected point are found again in the captured
+// geometry (same draw, same triangle, same barycentric coordinates); the previous frame's
+// vertices give their position at that time, deformations included. The virtual point (the reflected
+// point mirrored across the mirror's plane) of the previous frame gives the exact place where this reflection
+// was: stabilisation reads its history there, if the identities (reflected object, mirror) match.
 
 RaytracingAccelerationStructure scene : register(t0);
-ByteAddressBuffer depth : register(t1);    // profondeur du jeu (32 bits par texel, lignes alignées)
-ByteAddressBuffer material : register(t2); // copie de l'image de matériau du G-buffer (32 bits par texel)
-ByteAddressBuffer sunBuf : register(t3);   // octets 36 à 47 : loi de profondeur de cette image
-StructuredBuffer<uint4> regions : register(t4); // par dessin de l'écran : début (octets), taille, compteur, identité
-ByteAddressBuffer links : register(t5);    // par dessin : identité, début (sommets) du même objet dans l'image précédente + 1
-ByteAddressBuffer viewCur : register(t6);  // sommets de cette image (float3, espace caméra)
-ByteAddressBuffer viewPrev : register(t7); // sommets de l'image précédente (son espace caméra)
-ByteAddressBuffer surfCache : register(t8); // par triangle : couleur vue à l'écran (RGB9E5), identité et mesures (live_surfcache)
-ByteAddressBuffer viewT : register(t9);     // couche des surfaces transparentes planes (eau, vitres) : float3 par sommet
-ByteAddressBuffer geoColors : register(t10); // flags 16384 : couleurs apprises des objets du cache de géométrie (live_surfcache)
-RWByteAddressBuffer reflection : register(u0); // float4 par pixel : u, v, poids, lissé ; poids < 0 : surface
-                                               // réfléchissante dont le point reflété est caché ou hors de
-                                               // l'écran (couleur inconnue : la stabilisation garde l'historique) ;
-                                               // u < -0,5 : couleur tirée du cache de surfaces (-1 - r, g, poids, b)
-RWByteAddressBuffer rstats : register(u2);     // flags 131072 (reflect_stats=1) : pixels à reflet, dont l'eau, rayons lancés, pixels sautés, sauts au plafond
-RWByteAddressBuffer anchor : register(u1);     // uint4 par pixel : position précédente du reflet (u, v ; NaN si
-                                               // inconnue), identité de l'objet reflété, identité du miroir
+ByteAddressBuffer depth : register(t1);    // the game's depth (32 bits per texel, aligned rows)
+ByteAddressBuffer material : register(t2); // copy of the G-buffer's material image (32 bits per texel)
+ByteAddressBuffer sunBuf : register(t3);   // bytes 36 to 47: this frame's depth law
+StructuredBuffer<uint4> regions : register(t4); // per screen draw: start (bytes), size, counter, identity
+ByteAddressBuffer links : register(t5);    // per draw: identity, start (vertices) of the same object in the previous frame + 1
+ByteAddressBuffer viewCur : register(t6);  // this frame's vertices (float3, camera space)
+ByteAddressBuffer viewPrev : register(t7); // previous frame's vertices (its camera space)
+ByteAddressBuffer surfCache : register(t8); // per triangle: colour seen on screen (RGB9E5), identity and measurements (live_surfcache)
+ByteAddressBuffer viewT : register(t9);     // layer of flat transparent surfaces (water, glass): float3 per vertex
+ByteAddressBuffer geoColors : register(t10); // flags 16384: learned colours of geometry-cache objects (live_surfcache)
+RWByteAddressBuffer reflection : register(u0); // float4 per pixel: u, v, weight, smoothness; weight < 0: reflecting
+                                               // surface whose reflected point is hidden or off
+                                               // screen (colour unknown: stabilisation keeps the history);
+                                               // u < -0.5: colour taken from the surface cache (-1 - r, g, weight, b)
+RWByteAddressBuffer rstats : register(u2);     // flags 131072 (reflect_stats=1): reflecting pixels, water among them, rays cast, pixels skipped, hops at the cap
+RWByteAddressBuffer anchor : register(u1);     // uint4 per pixel: previous position of the reflection (u, v; NaN if
+                                               // unknown), identity of the reflected object, identity of the mirror
 
 cbuffer Constants : register(b0)
 {
@@ -41,32 +41,32 @@ cbuffer Constants : register(b0)
     float p11;
     float clearDepth;
     uint depth24;
-    uint channel;      // canal du matériau qui porte le lissé (0 à 3)
-    float smoothMin;   // en dessous : pas de reflet RT
+    uint channel;      // material channel that carries smoothness (0 to 3)
+    float smoothMin;   // below: no RT reflection
     float bias;
-    uint flags;        // 1 matériau lu, 2 inverser le canal (rugosité au lieu de lissé), 4 tout est lisse (contrôle),
-                       // 8 diagnostic : distance de touche normalisée ; 16 diagnostic : lissé ;
-                       // 32 : les trous des plaques découpées (vus à travers à l'écran) laissent passer le rayon ;
-                       // 64 : cache de surfaces lisible ; 256 : couche des surfaces transparentes planes (eau, vitres)
-                       // (sinon la 4e composante est la distance de touche, 1e4 pour le ciel)
-    float f0;          // réflectance à incidence normale (diélectrique ~0,04)
+    uint flags;        // 1 material read, 2 invert the channel (roughness instead of smoothness), 4 everything is smooth (check),
+                       // 8 diagnostic: normalised hit distance; 16 diagnostic: smoothness;
+                       // 32: holes of cut-out cards (seen through on screen) let the ray through;
+                       // 64: surface cache readable; 256: layer of flat transparent surfaces (water, glass)
+                       // (otherwise the 4th component is the hit distance, 1e4 for the sky)
+    float f0;          // reflectance at normal incidence (dielectric ~0.04)
     uint reflectPitch;
     uint regionCount;
-    uint anchors;      // 1 : sommets de l'image précédente disponibles
-    uint prevVertexCount; // sommets lisibles dans viewPrev (une lecture hors d'un tampon racine n'est pas bornée)
-    uint cacheTriangles;  // triangles tenus par le cache de surfaces
-    float3 worldUp;       // flags 8192 : le haut du monde dans l'espace caméra de cette image (normale exacte de l'eau)
-    uint budget;          // budget de temps (add-on) : bits 0 à 3 un pixel sur 1, 2 ou 4 reçoit un rayon, bits 4 à 7 sauts de trou en trou, bits 8 et plus numéro d'image
-    float tMaxNow;        // portée des rayons réfléchis (mètres)
-    uint gnInfo;          // normales du G-buffer : bits 0-1 codage (1 octaèdre RG16, 2 RGB8 du monde), 2-4 signes inversés, 5 à utiliser, 16-31 pas des lignes ;
-                          // reflets brillants : bits 6-12 lissé minimal (× 127), bits 13-15 force (× 7)
+    uint anchors;      // 1: previous frame's vertices available
+    uint prevVertexCount; // vertices readable in viewPrev (a read outside a root buffer is not bounded)
+    uint cacheTriangles;  // triangles held by the surface cache
+    float3 worldUp;       // flags 8192: the world's up in this frame's camera space (exact normal of water)
+    uint budget;          // time budget (add-on): bits 0 to 3 one pixel in 1, 2 or 4 gets a ray, bits 4 to 7 hops from hole to hole, bits 8 and up frame number
+    float tMaxNow;        // range of reflected rays (metres)
+    uint gnInfo;          // G-buffer normals: bits 0-1 encoding (1 octahedral RG16, 2 world RGB8), 2-4 flipped signs, 5 use them, 16-31 row pitch;
+                          // glossy reflections: bits 6-12 minimum smoothness (× 127), bits 13-15 strength (× 7)
 };
 
-// normales exactes du jeu (G-buffer) : celle de la profondeur ne fait que la deviner, avec le grain du décalage sous-pixel ;
-// Red Dead les range dans le repère du monde : tournées par l'orientation de la caméra résolue à cette image (sunBuf 2048-2095)
+// the game's exact normals (G-buffer): the depth's only guesses it, with the sub-pixel jitter's grain;
+// Red Dead stores them in world space: rotated by the camera orientation solved this frame (sunBuf 2048-2095)
 ByteAddressBuffer gnormal : register(t14);
 
-// normale du G-buffer telle que le jeu l'écrit (Red Dead : repère du monde, z vers le haut), signes appliqués ; 0 si absente
+// G-buffer normal as the game writes it (Red Dead: world space, z up), signs applied; 0 if absent
 float3 GNormalRaw(int2 t)
 {
     const uint enc = gnInfo & 3, pitch = gnInfo >> 16;
@@ -119,9 +119,9 @@ float3 GNormalAt(int2 t)
     return l > 1e-3 && all(isfinite(n)) ? n / l : 0;
 }
 
-// flags 262144 : cache de radiance du monde (caméra du jeu connue). Un point reflété caché ou hors de l'écran prend la couleur vue là
-// (table de hachage spatiale), un rayon qui ne touche rien celle du ciel dans sa direction (carte du ciel) ; le rayon traverse les
-// feuillages selon leur part pleine apprise. Sortie en plus (mixOut) : couleur déjà connue (rgb) et part à lire dans l'image en (u, v) (a)
+// flags 262144: world radiance cache (game camera known). A hidden or off-screen reflected point takes the colour seen there
+// (spatial hash table), a ray that hits nothing the sky's in its direction (sky map); the ray crosses
+// foliage according to its learned solid share. Extra output (mixOut): colour already known (rgb) and share to read from the image at (u, v) (a)
 ByteAddressBuffer radHash : register(t11);
 ByteAddressBuffer envMap : register(t12);
 ByteAddressBuffer radParams : register(t13);
@@ -131,7 +131,7 @@ RWByteAddressBuffer mixOut : register(u3);
 #define RAD_PARAMS radParams
 #include "live_radhash.hlsli"
 
-static const float kSkipped = -0.25; // u d'un pixel à reflet qui n'a pas reçu de rayon à cette image (live_reflresolve prend la couleur de ses voisins)
+static const float kSkipped = -0.25; // u of a reflecting pixel that got no ray this frame (live_reflresolve takes its neighbours' colour)
 
 void Count(uint at)
 {
@@ -139,7 +139,7 @@ void Count(uint at)
     rstats.InterlockedAdd(at, 1, unused);
 }
 
-// dessin qui contient ce triangle (zones triées par début)
+// draw that holds this triangle (regions sorted by start)
 uint RegionIndex(uint prim)
 {
     const uint byte = prim * 48;
@@ -157,10 +157,10 @@ uint RegionIndex(uint prim)
 
 float3 Vertex(ByteAddressBuffer b, uint v) { return asfloat(b.Load3(v * 12)); }
 
-// couleur retenue pour ce triangle par le cache de surfaces, si elle est à son objet actuel.
-// Une entrée pour huit triangles consécutifs (voisins dans le maillage) : dans RDR2, la plupart des triangles
-// sont plus petits qu'un pixel et une entrée par triangle n'était presque jamais remplie (un rayon d'occultation
-// sur quatre trouvait sa couleur). Entrée vide ou d'un autre objet : les entrées voisines du même objet
+// colour kept for this triangle by the surface cache, if it belongs to its current object.
+// One entry per eight consecutive triangles (neighbours in the mesh): in RDR2, most triangles
+// are smaller than a pixel and one entry per triangle was almost never filled (one occlusion ray
+// in four found its colour). Empty entry or one from another object: the neighbouring entries of the same object
 bool Cached(uint prim, out float3 c)
 {
     c = 0;
@@ -184,7 +184,7 @@ bool Cached(uint prim, out float3 c)
     return false;
 }
 
-// objet du cache de géométrie (identité : bit 23, génération, place) : la couleur apprise de son groupe de triangles, ou d'un groupe voisin
+// geometry-cache object (identity: bit 23, generation, place): the learned colour of its group of triangles, or of a neighbouring group
 bool CachedGeo(uint inst, uint prim, uint tris, out float3 c)
 {
     c = 0;
@@ -208,9 +208,9 @@ bool CachedGeo(uint inst, uint prim, uint tris, out float3 c)
     return false;
 }
 
-// couleur et part pleine d'un point touché que l'écran ne montre pas : ce que le cache de radiance du monde a vu là, sinon la couleur
-// apprise de son objet (plus grossière)
-// 0 : jamais vu ; 1 : couleur et part pleine ; 2 : que des trous à cet endroit (le rayon passe)
+// colour and solid share of a hit point the screen does not show: what the world radiance cache saw there, otherwise the learned
+// colour of its object (coarser)
+// 0: never seen; 1: colour and solid share; 2: only holes at that place (the ray goes through)
 static uint gRng = 1u;
 float Rand01()
 {
@@ -233,7 +233,7 @@ uint Remembered(float3 h, float path, uint inst, uint prim, uint contrib, out fl
     return 0;
 }
 
-// identité de l'objet du triangle ; position et normale du même point à l'image précédente si connues
+// identity of the triangle's object; position and normal of the same point in the previous frame if known
 bool Anchor(uint prim, float2 bary, out uint id, out float3 prevPos, out float3 prevNormal)
 {
     prevPos = prevNormal = 0;
@@ -258,8 +258,8 @@ bool Anchor(uint prim, float2 bary, out uint id, out float3 prevPos, out float3 
     return all(isfinite(prevPos)) && all(isfinite(prevNormal));
 }
 
-// même chose selon l'exemplaire touché : seule la scène de l'image (exemplaire 0) a des zones et des sommets de l'image
-// précédente ; un objet du cache de géométrie n'a que sa structure
+// same thing depending on the copy hit: only the frame's scene (copy 0) has regions and vertices of the previous
+// frame; a geometry-cache object only has its structure
 bool AnchorOf(uint instance, uint prim, float2 bary, out uint id, out float3 prevPos, out float3 prevNormal)
 {
     id = 0, prevPos = 0, prevNormal = 0;
@@ -283,9 +283,9 @@ float3 PointAt(int2 t)
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
 }
 
-// un point que la caméra voit à travers (elle voit plus loin que lui, ou le ciel) n'est pas solide : c'est
-// un trou d'une plaque découpée par alpha test (feuillage, herbe, grillage, franges), dont la géométrie
-// captée n'a que le rectangle. Hors de l'écran, on ne sait pas : on le suppose plein.
+// a point the camera sees through (it sees further than it, or the sky) is not solid: it is
+// a hole of an alpha-tested card (foliage, grass, fences, fringes), whose captured
+// geometry is just the rectangle. Off screen, we do not know: it is assumed solid.
 bool SeenThrough(float3 h)
 {
     if (h.z <= 1e-3)
@@ -300,9 +300,9 @@ bool SeenThrough(float3 h)
 
 float3 NormalAt(int2 t, float3 p)
 {
-    // différence centrée sur quatre pixels de part et d'autre quand les deux côtés sont sur la même surface
-    // (leur milieu retombe sur le point) : normale lissée, les vaguelettes de l'eau et le grain de la profondeur
-    // ne font plus trembler le reflet ; sinon (bord d'objet) le côté le plus proche, sur deux pixels
+    // centred difference four pixels away on each side when both sides are on the same surface
+    // (their middle falls back on the point): smoothed normal, the water's ripples and the depth's grain
+    // no longer make the reflection shake; otherwise (object edge) the nearest side, over two pixels
     float3 axis[2];
     for (uint k = 0; k < 2; k++)
     {
@@ -320,9 +320,9 @@ float3 NormalAt(int2 t, float3 p)
     return dot(n, p) > 0 ? -n : n;
 }
 
-// surface plane autour du pixel : les points à 4 pixels de part et d'autre, sur chaque axe, sont alignés
-// avec lui (vrai pour un sol, un toit, une flaque, quelle que soit la perspective ; faux pour un feuillage,
-// des branches, des câbles, où la profondeur saute). 1 : plane ; 0 : pas une surface continue.
+// flat surface around the pixel: the points 4 pixels away on each side, on each axis, are aligned
+// with it (true for a floor, a roof, a puddle, whatever the perspective; false for foliage,
+// branches, cables, where the depth jumps). 1: flat; 0: not a continuous surface.
 float Flatness(int2 t, float3 p, int k = 4)
 {
     const float3 l = PointAt(t - int2(k, 0)), r = PointAt(t + int2(k, 0)), u = PointAt(t - int2(0, k)), b = PointAt(t + int2(0, k));
@@ -331,12 +331,12 @@ float Flatness(int2 t, float3 p, int k = 4)
     const float3 h = r - l, v = b - u;
     const float eh = length(cross(h, p - l)) / max(length(h), 1e-6);
     const float ev = length(cross(v, p - u)) / max(length(v), 1e-6);
-    // relief dans les deux directions (feuillage, cheveux) ; sur une seule (bord d'une flaque contre un mur, objet
-    // au loin dans l'axe vertical), la surface reste plane
+    // relief in both directions (foliage, hair); in only one (edge of a puddle against a wall, distant object
+    // along the vertical axis), the surface stays flat
     return saturate(1.0 - (k == 4 ? max(eh, ev) : min(eh, ev)) / (0.004 * p.z + 0.002));
 }
 
-// type de matériau (Red Dead : canal rouge de la cible de matériau ; 0,2 feuillage, 0,31 peau, 0,5 commun) ; 0,5 sans matériau lu
+// material type (Red Dead: red channel of the material target; 0.2 foliage, 0.31 skin, 0.5 common); 0.5 without a material read
 float MaterialKind(int2 t)
 {
     return (flags & 1) ? float(material.Load(t.y * materialPitch + t.x * 4) & 255) / 255.0 : 0.5;
@@ -344,7 +344,7 @@ float MaterialKind(int2 t)
 
 float Smoothness(int2 t)
 {
-    if (flags & 4) // contrôle : toutes les surfaces lisses
+    if (flags & 4) // check: every surface smooth
         return 1.0;
     if ((flags & 1) == 0)
         return 0;
@@ -353,7 +353,7 @@ float Smoothness(int2 t)
     return (flags & 2) ? 1.0 - s : s;
 }
 
-// eau d'après le matériau : au moins trois de ses quatre voisins aussi, à peu près à la même distance (pas un point isolé sur un feuillage)
+// water according to the material: at least three of its four neighbours too, at about the same distance (not an isolated point on foliage)
 bool WaterAround(int2 t, float3 p)
 {
     uint count = 0;
@@ -372,15 +372,15 @@ void main(uint2 id : SV_DispatchThreadID)
 {
     if (id.x >= width || id.y >= height)
         return;
-    // loi de profondeur mesurée dans cette image (live_depthfit), sinon celle des constantes
+    // depth law measured in this frame (live_depthfit), otherwise the constants'
     const float3 law = asfloat(sunBuf.Load3(36));
     gA = law.z > 0 ? law.x : A, gB = law.z > 0 ? law.y : B;
-    gClear = gB > 0 ? 0.0 : 1.0; // profondeur inversée : le ciel à 0
+    gClear = gB > 0 ? 0.0 : 1.0; // reversed depth: the sky at 0
     float3 p = PointAt(int2(id));
-    float waterFade = 1.0; // eau : reflet effacé là où elle est trop mince (berges, fond qui affleure)
-    // eau, vitre : surface transparente plane devant le point que montre la profondeur (couche 2 de la scène RT, triée par
-    // live_planes, urti.ini water=1 ; pour un jeu qui ne l'écrit pas dans la profondeur) : le reflet part d'elle, avec la
-    // normale de son triangle, lisse comme un miroir
+    float waterFade = 1.0; // water: reflection faded where it is too thin (banks, bottom showing through)
+    // water, glass: flat transparent surface in front of the point the depth shows (layer 2 of the RT scene, sorted by
+    // live_planes, urti.ini water=1; for a game that does not write it into the depth): the reflection starts from it, with the
+    // normal of its triangle, smooth as a mirror
     bool water = false;
     float3 nWater = 0;
     if ((flags & 256) && p.z > 0)
@@ -402,23 +402,23 @@ void main(uint2 id : SV_DispatchThreadID)
             {
                 nw = normalize(nw);
                 water = true, nWater = dot(nw, ew.Direction) > 0 ? -nw : nw;
-                // épaisseur d'eau le long du regard (de la surface au fond que montre la profondeur) : la surface du jeu
-                // continue sous les berges, un reflet plein sur quelques millimètres d'eau y faisait des taches
+                // water thickness along the view (from the surface to the bottom the depth shows): the game's surface
+                // continues under the banks, a full reflection over a few millimetres of water made spots there
                 waterFade = saturate((length(p) - qw.CommittedRayT() - 0.05) / 0.3);
                 p = ew.Direction * qw.CommittedRayT();
             }
         }
     }
-    // sol mouillé (smoothMin < 0 : -smoothMin = quantité d'eau) : les surfaces tournées vers le haut
-    // deviennent lisses comme une rue après la pluie
+    // wet floor (smoothMin < 0: -smoothMin = amount of water): surfaces facing up
+    // become smooth like a street after the rain
     const float wet = smoothMin < 0 ? -smoothMin : 0.0;
     const float sMin = smoothMin < 0 ? 0.35 : smoothMin;
-    // reflets brillants (surfaces moins lisses que le seuil des miroirs : parquet, bois ciré, métal, pavés) : de glossMin à sMin, le reflet entre
-    // en douceur, flouté selon la rugosité (plus bas). Au-dessus de sMin, rien ne change
+    // glossy reflections (surfaces less smooth than the mirror threshold: parquet, waxed wood, metal, cobblestones): from glossMin to sMin, the reflection fades
+    // in, blurred according to roughness (below). Above sMin, nothing changes
     const float glossMin = float((gnInfo >> 6) & 127) / 127.0, glossAmt = float((gnInfo >> 13) & 7) / 7.0;
     const bool glossOn = smoothMin >= 0 && glossMin > 0 && glossMin < sMin && glossAmt > 0;
     const float sLow = glossOn ? glossMin : sMin;
-    // matériau d'abord : hors de l'eau et des surfaces lisses (la plus grande partie de l'écran), plus rien à calculer (ni normale ni planéité)
+    // material first: outside water and smooth surfaces (most of the screen), nothing more to compute (neither normal nor flatness)
     float material = Smoothness(int2(id));
     if (!water && wet <= 0 && (flags & 24) == 0 && (p.z <= 0 || material < sLow || ((flags & 65536) && material <= 0.98)))
     {
@@ -428,21 +428,21 @@ void main(uint2 id : SV_DispatchThreadID)
         return;
     }
     float3 n = water ? nWater : p.z > 0 ? NormalAt(int2(id), p) : float3(0, 1, 0);
-    // normale exacte du jeu, si elle regarde la caméra et s'accorde à peu près avec la forme de la profondeur (pas un détail de texture)
+    // the game's exact normal, if it faces the camera and roughly agrees with the depth's shape (not a texture detail)
     if (!water && p.z > 0)
     {
         const float3 g = GNormalAt(int2(id));
         if (dot(g, p) < 0 && dot(g, n) > 0.5)
             n = g;
     }
-    // reflets RT seulement sur une surface plane (sol, flaque, vitre, eau) : sur un feuillage, des cheveux, un
-    // visage, la normale tirée de la profondeur est du bruit, le reflet partait au hasard et clignotait (points
-    // gris) ; le jeu y garde ses propres reflets. Sol mouillé : en plus, tourné vers le haut
-    const float flat = water ? 1.0 : p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // voisins proches : au loin, 4 pixels tombent sur un autre objet
-    // miroir parfait d'après le matériau (eau : Horizon Forbidden West y écrit exactement 0 dans sa 5e cible) : la surface est
-    // lisse par définition, ses vagues n'y changent rien
-    // caméra du jeu connue : miroir parfait d'après le matériau seulement sur une surface horizontale et étendue (l'eau), et avec sa normale exacte :
-    // tirée de la profondeur, elle change à chaque image avec le décalage sous-pixel, le reflet tremblait et ne se nettoyait qu'en s'accumulant, jeu en pause
+    // RT reflections only on a flat surface (floor, puddle, glass, water): on foliage, hair, a
+    // face, the depth normal is noise, the reflection went anywhere and blinked (grey
+    // dots); the game keeps its own reflections there. Wet floor: also facing up
+    const float flat = water ? 1.0 : p.z > 0 ? Flatness(int2(id), p, 2) : 0.0; // close neighbours: in the distance, 4 pixels fall on another object
+    // perfect mirror according to the material (water: some games write exactly 0 into a material target): the surface is
+    // smooth by definition, its waves change nothing
+    // game camera known: perfect mirror according to the material only on a horizontal and extended surface (water), and with its exact normal:
+    // derived from depth, it changes every frame with the sub-pixel jitter, the reflection shook and only cleaned up by accumulating, with the game paused
     if ((flags & 8192) && !water && p.z > 0 && material > 0.98)
     {
         if (dot(n, worldUp) > 0.7 && WaterAround(int2(id), p))
@@ -451,8 +451,8 @@ void main(uint2 id : SV_DispatchThreadID)
             material = 0;
     }
     const float s = water ? 1.0 : max(material * ((flags & 4) || material > 0.98 ? 1.0 : flat), wet > 0 ? wet * saturate((n.y - 0.55) / 0.3) * flat : 0.0);
-    // (flags 524288) surface lisse étendue seulement : au moins 5 de ses 8 voisins à 2 pixels lisses aussi et sur la même surface. Un rail, un bord de pavé, une
-    // arête lisse isolée recevait un reflet dont la direction (tirée de la profondeur) changeait à chaque image : traits qui s'allumaient et s'éteignaient
+    // (flags 524288) extended smooth surface only: at least 5 of its 8 neighbours 2 pixels away smooth too and on the same surface. A rail, a cobblestone edge, an
+    // isolated smooth ridge received a reflection whose direction (from depth) changed every frame: lines that lit up and went out
     if ((flags & 524288) && !water && (flags & 4) == 0 && wet <= 0 && s >= sLow && p.z > 0)
     {
         uint ok = 0;
@@ -461,7 +461,7 @@ void main(uint2 id : SV_DispatchThreadID)
             static const int2 kRing[8] = { int2(2, 0), int2(-2, 0), int2(0, 2), int2(0, -2), int2(2, 2), int2(-2, 2), int2(2, -2), int2(-2, -2) };
             const int2 o = int2(id) + kRing[j];
             const float3 q = PointAt(o);
-            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= (s >= sMin ? sMin : sLow)) // (miroir : voisins miroirs aussi, règle de la v90 ; brillant : voisins brillants)
+            if (q.z > 0 && abs(q.z - p.z) < 0.05 * p.z + 0.05 && Smoothness(o) >= (s >= sMin ? sMin : sLow)) // (mirror: mirror neighbours too, v90's rule; glossy: glossy neighbours)
                 ok++;
         }
         waterFade *= saturate((float(ok) - 4.0) / 3.0);
@@ -471,12 +471,12 @@ void main(uint2 id : SV_DispatchThreadID)
     const bool useRad = (flags & 262144) != 0 && (flags & 24) == 0;
     const float nan = asfloat(0x7FC00000);
     uint4 anchorOut = uint4(asuint(nan), asuint(nan), 0, 0);
-    // pas de rayon là où le reflet serait presque invisible (surface vue de face : Fresnel ~4 %) : moins de 3 %
+    // no ray where the reflection would be almost invisible (surface seen face on: Fresnel ~4 %): below 3 %
     const float fresnelEarly = f0 + (1.0 - f0) * pow(1.0 - saturate(dot(-normalize(p), n)), 5.0);
-    // tri des surfaces brillantes (sous le seuil des miroirs) : seulement un sol (plan, étendu, tourné vers le haut : pierre polie, parquet), proche
-    // (effacé de 10 à 18 m : au-delà la brume du jeu noie tout et un reflet y paraissait plaqué), pas du feuillage ni de la peau (type de matériau de
-    // Red Dead, canal rouge de sa cible de matériau : 0,2 feuillage, 0,31 peau). Le haut du monde : orientation de la caméra (Red Dead), sinon celle
-    // du jeu ; inconnu : pas de reflet brillant. Un premier essai sans ce tri en mettait sur 20 % de l'écran, trop et trop loin (avis du joueur)
+    // sorting of glossy surfaces (below the mirror threshold): only a floor (flat, extended, facing up: polished stone, parquet), close
+    // (faded from 10 to 18 m: beyond, the game's haze drowns everything and a reflection looked pasted on), not foliage or skin (Red Dead's
+    // material type, red channel of its material target: 0.2 foliage, 0.31 skin). The world's up: camera orientation (Red Dead), otherwise the
+    // game's; unknown: no glossy reflection. A first try without this sorting put them on 20 % of the screen, too much and too far (player's opinion)
     float glossRamp = 0;
     if (glossOn && p.z > 0 && s >= glossMin && s < sMin)
     {
@@ -487,8 +487,8 @@ void main(uint2 id : SV_DispatchThreadID)
             upG = worldUp;
         const float kind = MaterialKind(int2(id));
         const bool skinOrLeaf = abs(kind - 0.2) < 0.04 || abs(kind - 0.31) < 0.04;
-        // sol : normale du monde du jeu tournée vers le haut (Red Dead, sans passer par l'orientation de la caméra, qui n'est résolue que si
-        // l'occultation tourne) ; sinon le haut du monde dans l'espace caméra
+        // floor: the game's world normal facing up (Red Dead, without going through the camera orientation, which is only solved when
+        // occlusion runs); otherwise the world's up in camera space
         const float3 gw = GNormalRaw(int2(id));
         const bool floorHere = any(gw != 0) ? gw.z > 0.85 : (dot(upG, upG) > 0.5 && dot(n, normalize(upG)) > 0.85);
         if (floorHere && !skinOrLeaf)
@@ -497,8 +497,8 @@ void main(uint2 id : SV_DispatchThreadID)
     const float ramp = max(saturate((s - sMin) / max(1e-3, 1.0 - sMin)), glossRamp);
     if (p.z > 0 && s >= sLow && fresnelEarly * ramp * waterFade >= 0.03)
     {
-        // surface-miroir dans la géométrie captée : le premier triangle sur le rayon de la caméra, s'il est à
-        // la profondeur que l'image montre
+        // mirror surface in the captured geometry: the first triangle on the camera ray, if it is at
+        // the depth the image shows
         bool mirrorKnown = false;
         float3 prevMirror = 0, prevMirrorN = 0;
         if (anchors != 0)
@@ -521,10 +521,10 @@ void main(uint2 id : SV_DispatchThreadID)
         const float3 v = normalize(p);
         const float3 r = reflect(v, n);
         const float cosTheta = saturate(dot(-v, n));
-        // Fresnel (Schlick) ; le lissé au-dessus du seuil module le poids
+        // Fresnel (Schlick); smoothness above the threshold modulates the weight
         const float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
         const float weight = fresnel * ramp * waterFade;
-        // par défaut : reflet attendu, couleur inconnue (remplacé ci-dessous si le point reflété est visible)
+        // by default: reflection expected, colour unknown (replaced below if the reflected point is visible)
         if (weight > 0)
             result.z = -weight;
         if (flags & 131072)
@@ -533,7 +533,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (material > 0.98 || water)
                 Count(4);
         }
-        // budget de temps dépassé : un pixel sur deux ou sur quatre reçoit un rayon à cette image (le motif tourne), les autres prennent la couleur de leurs voisins
+        // time budget exceeded: one pixel in two or in four gets a ray this frame (the pattern rotates), the others take their neighbours' colour
         {
             const uint stride = budget & 15, frameNo = budget >> 8;
             static const uint2 kFour[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
@@ -551,13 +551,13 @@ void main(uint2 id : SV_DispatchThreadID)
         RayDesc ray;
         ray.Origin = p + n * (bias * p.z);
         ray.Direction = r;
-        ray.TMin = 0.05; // pas les décalques du jeu posés juste au-dessus de la surface
-        ray.TMax = tMaxNow > 0 ? tMaxNow : 500.0; // au-delà, la brume du jeu efface tout reflet
+        ray.TMin = 0.05; // not the game's decals laid just above the surface
+        ray.TMax = tMaxNow > 0 ? tMaxNow : 500.0; // beyond, the game's haze erases every reflection
         if (useRad)
         {
-            // le rayon avance de triangle en triangle (au plus quelques-uns : budget). À l'écran, la profondeur de l'image tranche : point visible
-            // (sa couleur est dans l'image), trou d'une plaque découpée (la caméra voit plus loin : le rayon continue), ou caché. Caché ou hors de
-            // l'écran : la couleur et la part pleine que le cache du monde a retenues là ; le reste du rayon continue derrière. Rien touché : le ciel
+            // the ray moves from triangle to triangle (a few at most: budget). On screen, the image's depth decides: visible point
+            // (its colour is in the image), hole of a cut-out card (the camera sees further: the ray goes on), or hidden. Hidden or off
+            // screen: the colour and solid share the world cache kept there; the rest of the ray goes on behind. Nothing hit: the sky
             RadLoadParams();
             gRng = (id.x * 1973u + id.y * 9277u) ^ ((budget >> 8) * 26699u) ^ 0x9E3779B9u;
             const float eyeDist = length(p);
@@ -580,7 +580,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 const uint inst = qf.CommittedInstanceID(), prim = qf.CommittedPrimitiveIndex(), contrib = qf.CommittedInstanceContributionToHitGroupIndex();
                 const float3 h = ray.Origin + r * th;
                 const bool last = hop == maxHops;
-                uint state = 0; // 0 hors de l'écran, 1 visible, 2 trou (vu à travers), 3 caché
+                uint state = 0; // 0 off screen, 1 visible, 2 hole (seen through), 3 hidden
                 float2 uv = 0;
                 float seenZ = 0;
                 if (h.z > 1e-3)
@@ -595,7 +595,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 }
                 if (state == 1)
                 {
-                    // vers les bords de l'écran, la couleur de l'image laisse la place à celle du cache (pas de coupure au bord)
+                    // toward the screen's edges, the image's colour gives way to the cache's (no cut at the edge)
                     const float2 e2 = saturate(min(uv, 1.0 - uv) * 12.0);
                     float edge = e2.x * e2.y;
                     float3 c = 0;
@@ -608,7 +608,7 @@ void main(uint2 id : SV_DispatchThreadID)
                         tOut = th;
                     if (hop == 0)
                     {
-                        // ancrage : point reflété à l'image précédente, symétrisé par le plan du miroir d'alors
+                        // anchoring: reflected point in the previous frame, mirrored across the mirror's plane at that time
                         uint hitId;
                         float3 prevHit, prevHitN;
                         const bool hitKnown = AnchorOf(inst, prim, qf.CommittedTriangleBarycentrics(), hitId, prevHit, prevHitN);
@@ -635,15 +635,15 @@ void main(uint2 id : SV_DispatchThreadID)
                 const uint found = Remembered(h, eyeDist + th, inst, prim, contrib, c, alpha);
                 if (found == 2)
                 {
-                    // que des trous ici : le rayon passe (au dernier saut : le ciel derrière)
+                    // only holes here: the ray goes through (at the last hop: the sky behind)
                     stepRay.TMin = th + max(1e-3, 1e-4 * th);
                     continue;
                 }
                 if (found == 0)
                 {
                     if (state == 2)
-                        break; // trou jamais vu de près : le ciel derrière
-                    // jamais vu, loin derrière d'autres objets lointains : même matière, même brume, la couleur de l'écran vaut pour lui
+                        break; // hole never seen up close: the sky behind
+                    // never seen, far behind other distant objects: same material, same haze, the screen's colour holds for it
                     if (state == 3 && h.z > 8.0 && seenZ > 0.35 * h.z)
                     {
                         share = T, uvOut = uv, T = 0;
@@ -671,8 +671,8 @@ void main(uint2 id : SV_DispatchThreadID)
             }
             if (!unknown && T > 0)
             {
-                // ce qui reste du rayon part au loin : le ciel, ou le lointain, tel que l'écran le montre dans cette direction (plus net) quand il
-                // y est, sinon tel que la carte du ciel l'a retenu
+                // what is left of the ray goes into the distance: the sky, or the distance, as the screen shows it in that direction (sharper) when it
+                // is there, otherwise as the sky map kept it
                 float3 env;
                 const bool envKnown = RadEnv(RadWorldDir(r), env);
                 bool onScreen = false;
@@ -705,7 +705,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 if (tOut < 0)
                     tOut = 1e4;
             }
-            // une petite part inconnue : le reste du rayon vaut pour elle ; presque tout inconnu : reflet attendu, couleur inconnue (comme avant)
+            // a small unknown share: the rest of the ray stands for it; almost all unknown: reflection expected, colour unknown (as before)
             if (!(unknown && T > 0.5))
             {
                 const float k = 1.0 / max(1.0 - T, 1e-3);
@@ -717,15 +717,15 @@ void main(uint2 id : SV_DispatchThreadID)
         }
         else
         {
-        // d'abord un rayon opaque (le matériel trouve seul le plus proche) ; seulement si ce point est un trou que la caméra voit à travers
-        // (plaque découpée du feuillage), la recherche lente où chaque triangle rencontré est examiné. Même résultat : avant, chaque rayon
-        // examinait chaque triangle (sol, rochers, troncs compris)
+        // first an opaque ray (the hardware alone finds the closest); only if that point is a hole the camera sees through
+        // (cut-out foliage card), the slow search where every triangle met is examined. Same result: before, every ray
+        // examined every triangle (ground, rocks, trunks included)
         bool hitNow = false;
         float hitT = 0;
         uint hitInst = 0, hitPrim = 0, hitContrib = 0;
         float2 hitBary = 0;
-        // trou d'une feuille : rayon opaque suivant, juste après lui, au plus quelques fois (budget) ; le dernier point touché est gardé (feuillage, qu'on le voie
-        // à travers ou non). Le coût d'un rayon est borné : six sauts suivis d'une recherche sans limite faisaient 20 ms de reflets dans la végétation dense
+        // hole of a leaf: next opaque ray, right after it, at most a few times (budget); the last point hit is kept (foliage, whether seen
+        // through or not). A ray's cost is bounded: six hops followed by an unbounded search made 20 ms of reflections in dense vegetation
         bool holeLeft = false;
         RayDesc stepRay = ray;
         const uint maxHops = (budget >> 4) & 15;
@@ -748,7 +748,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 Count(16);
             stepRay.TMin = hitT + max(1e-3, 1e-4 * hitT);
         }
-        // (flags 32768 : ancienne règle, chaque triangle examiné, pour comparer)
+        // (flags 32768: old rule, every triangle examined, to compare)
         if ((flags & 32) && (flags & 32768))
         {
             RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
@@ -761,15 +761,15 @@ void main(uint2 id : SV_DispatchThreadID)
                 hitT = q.CommittedRayT(), hitInst = q.CommittedInstanceID(), hitPrim = q.CommittedPrimitiveIndex(),
                 hitContrib = q.CommittedInstanceContributionToHitGroupIndex(), hitBary = q.CommittedTriangleBarycentrics();
         }
-        // diagnostic (flags 8, vue 7) : pourquoi pas de reflet. 0,1 rien touché et vers l'arrière ; 0,2 rien touché, pas de
-        // ciel à cet endroit de l'écran ; 0,4 touché hors de l'écran ; 0,6 touché, l'écran y montre plus près (caché) ; 0,8
-        // touché, l'écran y montre plus loin
+        // diagnostic (flags 8, view 7): why no reflection. 0.1 nothing hit and backward; 0.2 nothing hit, no
+        // sky at that place on screen; 0.4 hit off screen; 0.6 hit, the screen shows something closer there (hidden); 0.8
+        // hit, the screen shows something further there
         float why = hitNow ? 0.4 : (r.z > 1e-3 ? 0.2 : 0.1);
         if (!hitNow && r.z > 1e-3)
         {
-            // rien touché : le rayon part au loin. Ce qui est à l'infini se reflète tel qu'il est vu dans cette direction : le
-            // ciel, ou le lointain que l'écran y montre (forêt noyée de brume au-delà de la scène RT : presque tout le reflet
-            // d'un lac vu en rasant)
+            // nothing hit: the ray goes into the distance. What is at infinity is reflected as it is seen in that direction: the
+            // sky, or the distance the screen shows there (forest drowned in haze beyond the RT scene: almost the whole reflection
+            // of a lake seen at a grazing angle)
             const float2 ndc = float2(r.x * p00 / r.z, r.y * p11 / r.z);
             const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
             const float seenFar = PointAt(int2(clamp(uv, 0.0, 0.999) * float2(width, height))).z;
@@ -789,16 +789,16 @@ void main(uint2 id : SV_DispatchThreadID)
                 const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
                 if (all(uv > 0.001) && all(uv < 0.999))
                 {
-                    // le point touché doit être celui que l'image montre à cet endroit (sinon il est caché)
+                    // the hit point must be the one the image shows at that place (otherwise it is hidden)
                     const float3 seen = PointAt(int2(uv * float2(width, height)));
                     why = seen.z > 0 && seen.z < h.z ? 0.6 : 0.8;
-                    // point lointain derrière d'autres objets lointains : le rayon réfléchi touche le feuillage en profondeur,
-                    // la caméra y voit celui de devant : même matière, même brume, la couleur de l'écran vaut pour lui. Sauf
-                    // derrière un objet nettement plus proche (personnage, herbes du premier plan)
+                    // distant point behind other distant objects: the reflected ray hits foliage in depth,
+                    // the camera sees the one in front: same material, same haze, the screen's colour holds for it. Except
+                    // behind a clearly closer object (character, foreground grass)
                     const bool behindFar = h.z > 8.0 && seen.z > 0.35 * h.z && seen.z < h.z;
                     if (seen.z > 0 && (abs(seen.z - h.z) < 0.03 * h.z + 0.05 || behindFar))
                     {
-                        // ancrage : point reflété à l'image précédente, symétrisé par le plan du miroir d'alors
+                        // anchoring: reflected point in the previous frame, mirrored across the mirror's plane at that time
                         uint hitId;
                         float3 prevHit, prevHitN;
                         const bool hitKnown = AnchorOf(hitInst, hitPrim, hitBary, hitId, prevHit, prevHitN);
@@ -812,18 +812,18 @@ void main(uint2 id : SV_DispatchThreadID)
                                 anchorOut.xy = asuint(float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5));
                             }
                         }
-                        // fondu vers les bords de l'écran (couleur inconnue au-delà)
+                        // fade toward the screen's edges (colour unknown beyond)
                         const float2 edge = saturate(min(uv, 1.0 - uv) * 12.0);
                         result = float4(uv, weight * edge.x * edge.y, (flags & 8) ? saturate(hitT / 50.0) : (flags & 16) ? s : hitT);
                         onScreen = true;
                     }
                 }
             }
-            // caché ou hors de l'écran : la couleur que le cache de surfaces a retenue pour ce triangle (pas dans
-            // les vues de diagnostic, qui lisent la 4e composante)
+            // hidden or off screen: the colour the surface cache kept for this triangle (not in
+            // the diagnostic views, which read the 4th component)
             float3 cached;
             if (!onScreen && (flags & 24) == 0 && hitInst != 0 && CachedGeo(hitInst, hitPrim, hitContrib, cached))
-                result = float4(-1.0 - cached.r, cached.g, weight, cached.b); // objet du cache : sa couleur apprise
+                result = float4(-1.0 - cached.r, cached.g, weight, cached.b); // cached object: its learned colour
             else if (!onScreen && (flags & 24) == 0 && hitInst == 0 && Cached(hitPrim, cached))
             {
                 uint hitId;
@@ -845,7 +845,7 @@ void main(uint2 id : SV_DispatchThreadID)
         if ((flags & 8) && result.z <= 0)
             result.w = why;
         }
-        // diagnostic (reflect_diag=) : direction du rayon réfléchi, composante 1 : y, 2 : z, 3 : normale y, 4 : normale z
+        // diagnostic (reflect_diag=): reflected ray direction, component 1: y, 2: z, 3: normal y, 4: normal z
         if (flags & 512)
             result.w = 0.5 + 0.5 * r.y;
         if (flags & 1024)
@@ -855,11 +855,11 @@ void main(uint2 id : SV_DispatchThreadID)
         if (flags & 4096)
             result.w = 0.5 + 0.5 * n.z;
     }
-    // reflet brillant : rayon du flou (pixels de rendu) rangé avec la distance du point reflété, w = distance + 20 000 × rayon (live_reflresolve le
-    // relit). Lobe d'un matériau rugueux : demi-angle ~ alpha = rugosité², empreinte au point reflété vue de la caméra = distance × alpha / (distance
-    // de l'œil + distance), comme l'image virtuelle d'un miroir. Approximation nommée : un rayon miroir puis une lecture floue, pas de rayons tirés dans
-    // le lobe (pas de bruit, mais le flou ignore ce qui est caché à l'écran)
-    // (seulement les surfaces brillantes, sous le seuil des miroirs : une flaque, lissé 0,60, recevait aussi ce flou en v99-v100 et son reflet devenait flou)
+    // glossy reflection: blur radius (render pixels) stored with the reflected point's distance, w = distance + 20,000 × radius (live_reflresolve
+    // reads it back). Lobe of a rough material: half-angle ~ alpha = roughness², footprint at the reflected point seen from the camera = distance × alpha / (eye
+    // distance + distance), like a mirror's virtual image. Named approximation: one mirror ray, then a blurred read, no rays drawn in
+    // the lobe (no noise, but the blur ignores what is hidden on screen)
+    // (glossy surfaces only, below the mirror threshold: a puddle, smoothness 0.60, also got this blur in v99-v100 and its reflection became blurry)
     if (glossOn && s < sMin && glossRamp > 0 && (flags & 24) == 0 && result.z > 0 && result.x >= -0.5 && result.w >= 0 && result.w < 2e4)
     {
         const float rough = 1.0 - saturate(s), alpha = rough * rough;

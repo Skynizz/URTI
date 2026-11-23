@@ -1,23 +1,23 @@
-// URTI en direct : cache de surfaces. À chaque image, un pixel de rendu par bloc 4×4 (à tour de rôle : tout
-// l'écran en 16 images) : le triangle de la scène RT que la caméra voit là est retrouvé (rayon depuis la
-// caméra, gardé s'il tombe à la profondeur de l'image) et la couleur que l'image montre à cet endroit y est
-// retenue (moyenne glissante). Un reflet qui touche ce triangle alors qu'il est caché ou hors de l'écran
-// prend cette couleur (live_reflect) au lieu de rester inconnu.
-// Par groupe de huit triangles consécutifs (voisins dans le maillage ; dans RDR2 la plupart des triangles sont
-// plus petits qu'un pixel), 8 octets : couleur linéaire (RGB9E5) ; identité de son objet (24 bits) et nombre de
-// mesures (8 bits). Les places fixes gardent un objet au même endroit du flux : ses triangles gardent leur numéro.
+// Live URTI: surface cache. Every frame, one render pixel per 4×4 block (in turn: the whole
+// screen in 16 frames): the RT-scene triangle the camera sees there is found (ray from the
+// camera, kept if it falls at the image's depth) and the colour the image shows at that place is
+// kept for it (running average). A reflection hitting that triangle while it is hidden or off screen
+// takes that colour (live_reflect) instead of staying unknown.
+// Per group of eight consecutive triangles (neighbours in the mesh; in RDR2 most triangles are
+// smaller than a pixel), 8 bytes: linear colour (RGB9E5); identity of its object (24 bits) and number of
+// measurements (8 bits). Fixed places keep an object at the same place in the stream: its triangles keep their number.
 
 RaytracingAccelerationStructure scene : register(t0);
-ByteAddressBuffer image : register(t1);         // image présentée (lignes alignées)
-ByteAddressBuffer depth : register(t2);         // profondeur de rendu (cette image)
-ByteAddressBuffer sunBuf : register(t3);        // loi de profondeur (36 à 47), décalage sous-pixel (1184)
-StructuredBuffer<uint4> regions : register(t4); // par dessin de l'écran : début (octets), taille, compteur, identité
+ByteAddressBuffer image : register(t1);         // presented image (aligned rows)
+ByteAddressBuffer depth : register(t2);         // render depth (this frame)
+ByteAddressBuffer sunBuf : register(t3);        // depth law (36 to 47), sub-pixel jitter (1184)
+StructuredBuffer<uint4> regions : register(t4); // per screen draw: start (bytes), size, counter, identity
 RWByteAddressBuffer cache : register(u0);
-RWByteAddressBuffer geoColors : register(u1);   // objets du cache de géométrie : 256 couleurs par place (RGB9E5), génération et mesures
+RWByteAddressBuffer geoColors : register(u1);   // geometry-cache objects: 256 colours per place (RGB9E5), generation and measurements
 
 cbuffer Constants : register(b0)
 {
-    uint width;        // image présentée
+    uint width;        // presented image
     uint height;
     uint pitch;
     uint format;       // 0 RGBA8, 1 BGRA8, 2 HDR10 PQ, 3 RGBA16F
@@ -29,10 +29,10 @@ cbuffer Constants : register(b0)
     float p11;
     uint regionCount;
     uint frameIndex;
-    uint triangles;    // triangles que le cache peut tenir
-    uint geoColorsOn;  // 1 : couleurs des objets du cache de géométrie apprises aussi
-    float uiX0;        // zone d'interface fixe (uv), sautée ; quatre nombres : un float4 ici serait déplacé à la
-    float uiY0;        // frontière de 16 octets suivante, plus loin que ce que l'add-on écrit
+    uint triangles;    // triangles the cache can hold
+    uint geoColorsOn;  // 1: colours of geometry-cache objects learned too
+    float uiX0;        // fixed UI zone (uv), skipped; four numbers: a float4 here would be moved to the
+    float uiY0;        // next 16-byte boundary, further than what the add-on writes
     float uiX1;
     float uiY1;
 };
@@ -68,7 +68,7 @@ float3 SampleLinear(float2 uv)
     return lerp(lerp(LoadLinear(b), LoadLinear(b + int2(1, 0)), f.x), lerp(LoadLinear(b + int2(0, 1)), LoadLinear(b + int2(1, 1)), f.x), f.y);
 }
 
-// couleur linéaire <-> RGB9E5 (exposant commun, comme DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+// linear colour <-> RGB9E5 (shared exponent, like DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
 uint PackRgb9e5(float3 c)
 {
     c = clamp(c, 0.0, 65408.0);
@@ -82,7 +82,7 @@ uint PackRgb9e5(float3 c)
 }
 float3 UnpackRgb9e5(uint x) { return float3(x & 511, (x >> 9) & 511, (x >> 18) & 511) * exp2(float(int(x >> 27) - 24)); }
 
-// décalage sous-pixel du jeu (même calcul que live_reflresolve) : la profondeur est décalée, pas l'image présentée
+// the game's sub-pixel jitter (same computation as live_reflresolve): the depth is jittered, not the presented image
 float2 JitterPixels(float2 ab, float2 size) { return float2(ab.x * p00, -ab.y * p11) * 0.5 * size; }
 
 static float gA, gB, gClear;
@@ -100,7 +100,7 @@ float3 PointAt(int2 t)
     return float3(ndc.x * w / p00, ndc.y * w / p11, w);
 }
 
-// dessin qui contient ce triangle (zones triées par début)
+// draw that holds this triangle (regions sorted by start)
 uint RegionIndex(uint prim)
 {
     const uint byte = prim * 48;
@@ -119,7 +119,7 @@ uint RegionIndex(uint prim)
 [numthreads(8, 8, 1)]
 void main(uint2 id : SV_DispatchThreadID)
 {
-    // un pixel par bloc 4×4, ordre de Bayer : seize images couvrent tout le bloc
+    // one pixel per 4×4 block, Bayer order: sixteen frames cover the whole block
     static const uint kOrder[16] = { 0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12 };
     const uint k = kOrder[frameIndex & 15];
     const int2 t = int2(id * 4 + uint2(k & 3, k >> 2));
@@ -133,7 +133,7 @@ void main(uint2 id : SV_DispatchThreadID)
     const float3 p = PointAt(t);
     if (p.z <= 0)
         return;
-    // bord d'objet : la couleur de l'image y mêle deux surfaces (mise à l'échelle, anticrénelage)
+    // object edge: the image's colour mixes two surfaces there (upscaling, anti-aliasing)
     for (uint j = 0; j < 4; j++)
     {
         const int2 o = j == 0 ? int2(1, 0) : j == 1 ? int2(-1, 0) : j == 2 ? int2(0, 1) : int2(0, -1);
@@ -154,11 +154,11 @@ void main(uint2 id : SV_DispatchThreadID)
     q.TraceRayInline(scene, RAY_FLAG_NONE, 0x01, eye);
     q.Proceed();
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT || abs(q.CommittedRayT() - length(p)) > 0.02 * length(p) + 0.05)
-        return; // la caméra voit autre chose que la scène RT ici (objet hors budget, trou d'une plaque découpée)
+        return; // the camera sees something other than the RT scene here (object out of budget, hole of a cut-out card)
     const uint inst = q.CommittedInstanceID();
     if (inst != 0)
     {
-        // objet du cache de géométrie (bit 23 : place, génération) : la couleur de son groupe de triangles (256 par objet, triangles voisins dans le maillage)
+        // geometry-cache object (bit 23: place, generation): the colour of its group of triangles (256 per object, neighbouring triangles in the mesh)
         if ((inst & 0x800000u) == 0 || geoColorsOn == 0)
             return;
         float3 cg = SampleLinear(uv);
@@ -184,7 +184,7 @@ void main(uint2 id : SV_DispatchThreadID)
     float3 c = SampleLinear(uv);
     if (any(!isfinite(c)))
         return;
-    // moyenne des premières mesures, puis glissante (0,2 : suit un changement de lumière en une dizaine de mesures)
+    // average of the first measurements, then running (0.2: follows a lighting change within about ten measurements)
     const uint ident = r.w & 0xFFFFFF;
     const uint entry = prim >> 3;
     const uint2 old = cache.Load2(entry * 8);

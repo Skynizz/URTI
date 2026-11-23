@@ -1,17 +1,17 @@
-// URTI en direct : loi de profondeur du jeu mesurée à chaque image (z de découpage = A w + B, d'où
-// profondeur = A + B / w), par moindres carrés sur des sommets de la géométrie de l'écran captée dans
-// cette image (zones par dessin, seulement leur partie remplie). Écrite dans le tampon du soleil
-// (octets 36 à 47 : A, B, validité) ; sans assez de sommets, la valeur précédente reste.
+// Live URTI: the game's depth law measured every frame (clip z = A w + B, hence
+// depth = A + B / w), by least squares on vertices of the screen geometry captured in
+// this frame (regions per draw, only their filled part). Written into the sun buffer
+// (bytes 36 to 47: A, B, validity); without enough vertices, the previous value stays.
 
-ByteAddressBuffer so : register(t0);            // flux de l'écran (début de son emplacement)
-ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
-StructuredBuffer<uint4> regions : register(t2); // par dessin : début (octets), taille, compteur
+ByteAddressBuffer so : register(t0);            // the screen's stream (start of its slot)
+ByteAddressBuffer counters : register(t1);      // bytes written per draw
+StructuredBuffer<uint4> regions : register(t2); // per draw: start (bytes), size, counter
 RWByteAddressBuffer sun : register(u0);
 
 cbuffer Constants : register(b0)
 {
     uint regionCount;
-    uint totalBytes; // octets des zones de l'image
+    uint totalBytes; // bytes of the frame's regions
     uint pad0;
     uint pad1;
 };

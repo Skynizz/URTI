@@ -1,21 +1,21 @@
-// URTI en direct : vote sur les directions des paires (live_sunfit). La direction sur laquelle
-// s'accorde le plus de poids (à 2°) devient le soleil de cette image. Le sens (vers le soleil ou à
-// l'opposé) dépend seulement de la convention de profondeur de la carte d'ombres du jeu : fixé une
-// fois à l'étalonnage (sunSign), jamais déduit de l'image précédente. Sans accord net, rien ne change.
+// Live URTI: vote over the pairs' directions (live_sunfit). The direction on which
+// the most weight agrees (within 2°) becomes this frame's sun. The orientation (toward the sun or
+// away) depends only on the depth convention of the game's shadow map: set once
+// at calibration (sunSign), never deduced from the previous frame. Without a clear agreement, nothing changes.
 
-ByteAddressBuffer dirs : register(t0); // par paire : direction, poids
-RWByteAddressBuffer sun : register(u0); // float4 soleil (vers le soleil, espace caméra), float4 bilan, uint nombre de
-                                        // cascades (à 32), puis par cascade (à 48 + 64 k) : application (3 float4), viewport ;
-                                        // à 560 : soleil en attente ; à 576 : rotation de la caméra depuis l'image
-                                        // précédente (3 lignes, validité à 624) ; à 640 : cascades de l'image précédente
+ByteAddressBuffer dirs : register(t0); // per pair: direction, weight
+RWByteAddressBuffer sun : register(u0); // float4 sun (toward the sun, camera space), float4 summary, uint number of
+                                        // cascades (at 32), then per cascade (at 48 + 64 k): mapping (3 float4), viewport;
+                                        // at 560: pending sun; at 576: camera rotation since the previous
+                                        // frame (3 rows, validity at 624); at 640: cascades of the previous frame
 
 cbuffer Constants : register(b0)
 {
     uint pairCount;
     float cosTol;
-    float minShare; // part minimale du poids total pour la direction gagnante
-    float sunSign; // +1 ou -1 : direction de profondeur décroissante de la carte -> vers le soleil
-    float2 jitterMode; // x : écart de décalage sous-pixel utilisé (1) ou non (0) ; y : décalage absolu
+    float minShare; // minimum share of the total weight for the winning direction
+    float sunSign; // +1 or -1: direction of decreasing map depth -> toward the sun
+    float2 jitterMode; // x: jitter difference used (1) or not (0); y: absolute jitter
     float2 pad;
 };
 
@@ -58,7 +58,7 @@ void main(uint t : SV_GroupThreadID)
             if (dk.w > 0 && dot(best, dk.xyz) > cosTol)
                 sum += dk.xyz * dk.w;
         }
-        // affinage : moyenne des seules directions à moins de 0,75° de la première moyenne (deux passes)
+        // refinement: average of only the directions within 0.75° of the first average (two passes)
         float share = sVote[0] / max(total, 1e-6);
         for (uint pass = 0; pass < 2 && dot(sum, sum) > 0; pass++)
         {
@@ -74,11 +74,11 @@ void main(uint t : SV_GroupThreadID)
             if (wTight > 0)
                 sum = tight, share = wTight / max(total, 1e-6);
         }
-        // saut brusque soutenu par peu de paires : mesure rejetée (le soleil de l'image précédente reste)
+        // sudden jump supported by few pairs: measurement rejected (the previous frame's sun stays)
         const float3 old = asfloat(sun.Load3(0));
         const bool jump = dot(old, old) > 0.5 && dot(normalize(sum) * sunSign, old) < 0.99863 && share < 0.6; // 3°
-        // grand écart (> 3°) même bien soutenu : accepté seulement s'il se confirme à l'image suivante
-        // (une fausse mesure isolée ferait pivoter toutes les ombres pendant une image)
+        // large difference (> 3°) even well supported: accepted only if it is confirmed on the next frame
+        // (an isolated wrong measurement would swing every shadow for a frame)
         bool confirmed = true;
         if (dot(sum, sum) > 0 && !jump && dot(old, old) > 0.5 && dot(normalize(sum) * sunSign, old) < 0.99863)
         {
@@ -92,7 +92,7 @@ void main(uint t : SV_GroupThreadID)
         {
             sun.Store4(0, asuint(float4(normalize(sum) * sunSign, 1)));
             accepted = 1;
-            // une application par cascade (même viewport) : la paire d'accord de plus grand poids
+            // one mapping per cascade (same viewport): the agreeing pair with the largest weight
             float4 cvp[8];
             uint cpair[8];
             float cw[8];
@@ -118,7 +118,7 @@ void main(uint t : SV_GroupThreadID)
                 else if (dq.w > cw[found])
                     cpair[found] = q, cw[found] = dq.w;
             }
-            // la plus fine d'abord (plus grande échelle caméra -> carte)
+            // the finest first (largest camera -> map scale)
             float scale[8];
             for (uint c2 = 0; c2 < cascades; c2++)
                 scale[c2] = length(asfloat(dirs.Load3(cpair[c2] * 80 + 16)));
@@ -137,9 +137,9 @@ void main(uint t : SV_GroupThreadID)
     sun.Store4(16, asuint(float4(float(pairCount), sVote[0], total, accepted)));
     sun.Store(32, cascades);
 
-    // rotation de la caméra : la carte d'ombres a des axes fixes dans le monde ; la partie linéaire des
-    // applications caméra -> carte d'une même cascade, à deux images, donne c_préc = Lpréc⁻¹ Lcour c
-    // (la translation des cascades, qui suivent la caméra, ne touche pas cette partie)
+    // camera rotation: the shadow map has fixed axes in the world; the linear part of the
+    // camera -> map mappings of one cascade, over two frames, gives c_prev = Lprev⁻¹ Lcur c
+    // (the translation of the cascades, which follow the camera, does not touch that part)
     const uint prevCount = sun.Load(640);
     float valid = 0;
     if (cascades > 0 && prevCount > 0)
@@ -156,7 +156,7 @@ void main(uint t : SV_GroupThreadID)
                 Mc[r2 * 4 + 0] = a.x, Mc[r2 * 4 + 1] = a.y, Mc[r2 * 4 + 2] = a.z, Mc[r2 * 4 + 3] = a.w;
                 Mp[r2 * 4 + 0] = b.x, Mp[r2 * 4 + 1] = b.y, Mp[r2 * 4 + 2] = b.z, Mp[r2 * 4 + 3] = b.w;
             }
-            // M[a*3 + c] : composante c de la carte par coordonnée caméra a ; L[c][a] = M[a*3 + c]
+            // M[a*3 + c]: map component c per camera coordinate a; L[c][a] = M[a*3 + c]
             float3x3 Lc, Lp;
             for (uint c = 0; c < 3; c++)
                 for (uint a2 = 0; a2 < 3; a2++)
@@ -176,18 +176,18 @@ void main(uint t : SV_GroupThreadID)
         }
     }
     sun.Store(624, asuint(valid));
-    // décalage sous-pixel du jeu (jitter) : la projection décalée ajoute à l'espace caméra un cisaillement
-    // (x' = x + a w, y' = y + b w), qui n'est pas une rotation ; A = K_préc R K_cour⁻¹ donne au premier ordre
-    // a_préc - a_cour = A[0][2] + A[2][0] et b_préc - b_cour = A[1][2] + A[2][1]. Suivi en absolu : somme
-    // des écarts moins sa moyenne glissante (la suite des décalages d'un jeu est centrée)
+    // the game's sub-pixel jitter: the jittered projection adds a shear to camera space
+    // (x' = x + a w, y' = y + b w), which is not a rotation; A = K_prev R K_cur⁻¹ gives to first order
+    // a_prev - a_cur = A[0][2] + A[2][0] and b_prev - b_cur = A[1][2] + A[2][1]. Tracked in absolute terms: sum
+    // of the differences minus its running mean (a game's jitter sequence is centred)
     //
-    // La projection supposée par URTI (champ de 50°) n'est pas celle du jeu : l'espace caméra d'URTI est
-    // l'espace vrai étiré de s (en x) et t (en y), et une rotation y devient S R S⁻¹ : A[0][2] = s r02,
-    // A[2][0] = -r02 / s. D'où a_préc - a_cour = A[0][2] + s² A[2][0] (et b avec t²). s² et t² sont mesurés
-    // par régression sur les images où la caméra tourne (la rotation fuyait sinon dans le décalage : dérive
-    // de plusieurs pixels en marchant). s = tan(champ vrai / 2) / tan(champ supposé / 2).
+    // The projection URTI assumes (50° field) is not the game's: URTI's camera space is
+    // the true space stretched by s (in x) and t (in y), and a rotation y becomes S R S⁻¹: A[0][2] = s r02,
+    // A[2][0] = -r02 / s. Hence a_prev - a_cur = A[0][2] + s² A[2][0] (and b with t²). s² and t² are measured
+    // by regression on frames where the camera turns (otherwise the rotation leaked into the jitter: drift
+    // of several pixels while walking). s = tan(true field / 2) / tan(assumed field / 2).
     float2 jitterDelta = 0;
-    float4 fit = asfloat(sun.Load4(1200)); // sommes décroissantes : A20², A02 A20, A21², A12 A21
+    float4 fit = asfloat(sun.Load4(1200)); // decaying sums: A20², A02 A20, A21², A12 A21
     if (valid > 0)
     {
         const float3 a0 = asfloat(sun.Load3(576)), a1 = asfloat(sun.Load3(592)), a2 = asfloat(sun.Load3(608));
@@ -198,7 +198,7 @@ void main(uint t : SV_GroupThreadID)
         sun.Store2(1216, asuint(float2(s2, t2)));
         jitterDelta = float2(a0.z + s2 * a2.x, a1.z + t2 * a2.y);
         if (any(abs(jitterDelta) > 0.01))
-            jitterDelta = 0; // pas un décalage sous-pixel (mesure aberrante)
+            jitterDelta = 0; // not a sub-pixel jitter (aberrant measurement)
     }
     sun.Store2(628, asuint(jitterDelta * jitterMode.x));
     float4 track = asfloat(sun.Load4(1168)); // somme (xy), moyenne glissante (zw)
@@ -206,7 +206,7 @@ void main(uint t : SV_GroupThreadID)
     track.zw = lerp(track.zw, track.xy, 1.0 / 32.0);
     sun.Store4(1168, asuint(track));
     sun.Store2(1184, asuint((track.xy - track.zw) * jitterMode.y));
-    // cascades de cette image gardées pour la suivante
+    // this frame's cascades kept for the next
     sun.Store(640, cascades);
     for (uint c4 = 0; c4 < cascades; c4++)
         for (uint r3 = 0; r3 < 4; r3++)

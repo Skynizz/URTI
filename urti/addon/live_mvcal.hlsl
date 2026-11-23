@@ -1,13 +1,13 @@
-// URTI en direct : convention des vecteurs de mouvement du jeu (ceux que reçoit DLSS), trouvée toute
-// seule. Pour 16 conventions candidates (unité : écran 0..1, NDC -1..1 ou pixels ; signe ; axe vertical
-// inversé ou non), la profondeur de l'image précédente lue à l'endroit indiqué doit être celle de ce pixel
-// (objets immobiles, petits mouvements). Erreur moyenne par candidate, cumulée par le processeur.
+// Live URTI: convention of the game's motion vectors (the ones DLSS receives), found on
+// its own. For 16 candidate conventions (unit: screen 0..1, NDC -1..1 or pixels; sign; vertical axis
+// flipped or not), the previous frame's depth read at the indicated place must be this pixel's
+// (still objects, small motions). Mean error per candidate, accumulated by the CPU.
 
-ByteAddressBuffer depth : register(t0);     // profondeur de cette image
-ByteAddressBuffer depthPrev : register(t1); // profondeur de l'image précédente
-ByteAddressBuffer motion : register(t2);    // vecteurs de mouvement (R16G16 flottants)
-ByteAddressBuffer sunBuf : register(t3);    // loi de profondeur (octets 36 à 47)
-RWByteAddressBuffer errors : register(u0);  // 16 × (somme des erreurs, nombre) en entiers, + mouvement moyen
+ByteAddressBuffer depth : register(t0);     // this frame's depth
+ByteAddressBuffer depthPrev : register(t1); // previous frame's depth
+ByteAddressBuffer motion : register(t2);    // motion vectors (R16G16 floats)
+ByteAddressBuffer sunBuf : register(t3);    // depth law (bytes 36 to 47)
+RWByteAddressBuffer errors : register(u0);  // 16 × (sum of errors, count) as integers, + mean motion
 
 cbuffer Constants : register(b0)
 {
@@ -31,7 +31,7 @@ float ViewDepth(ByteAddressBuffer b, int2 t, float A, float B)
 
 float2 Candidate(uint k, float2 mv)
 {
-    // unité : 0 écran, 1 NDC (moitié), 2 pixels ; puis signe, puis inversion verticale
+    // unit: 0 screen, 1 NDC (half), 2 pixels; then sign, then vertical flip
     const float2 size = float2(width, height);
     float2 m = (k & 3) == 0 ? mv : (k & 3) == 1 ? mv * 0.5 : (k & 3) == 2 ? mv / size : mv * 2.0;
     if (k & 4)
@@ -47,7 +47,7 @@ void main(uint id : SV_DispatchThreadID)
     const float3 law = asfloat(sunBuf.Load3(36));
     if (law.z <= 0)
         return;
-    // échantillons répartis sur l'image (grille 64 × 64 décalée)
+    // samples spread over the image (shifted 64 × 64 grid)
     const uint gx = id % 64, gy = id / 64;
     if (gy >= 64)
         return;
@@ -73,7 +73,7 @@ void main(uint id : SV_DispatchThreadID)
         errors.InterlockedAdd(k * 8, uint(e * 10000.0), dummy);
         errors.InterlockedAdd(k * 8 + 4, 1, dummy);
     }
-    // mouvement moyen (pour ne juger qu'en mouvement) : |mv| en millionièmes
+    // mean motion (to judge only in motion): |mv| in millionths
     uint dummy2;
     errors.InterlockedAdd(128, uint(min(length(mv), 1.0) * 1e6), dummy2);
     errors.InterlockedAdd(132, 1, dummy2);

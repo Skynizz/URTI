@@ -1,13 +1,13 @@
-// URTI en direct : mesure de chaque objet capté (un groupe par dessin) pour le budget de géométrie :
-// distance au plus près de la caméra et taille (diagonale de sa boîte, espace caméra). Le rapport des deux
-// (taille apparente) dit son importance : un gros objet proche compte, un petit objet lointain non.
-// Lu par le processeur trois images plus tard ; les dessins hors budget sont re-mesurés dans la zone de
-// mesure (fin de l'emplacement, hors de la structure d'accélération).
+// Live URTI: measurement of each captured object (one group per draw) for the geometry budget:
+// closest distance to the camera and size (diagonal of its box, camera space). The ratio of the two
+// (apparent size) tells its importance: a big close object counts, a small distant one does not.
+// Read by the CPU three frames later; out-of-budget draws are re-measured in the measurement
+// area (end of the slot, outside the acceleration structure).
 
-StructuredBuffer<float4> clip : register(t0);   // flux de l'écran (début de son emplacement)
-ByteAddressBuffer counters : register(t1);      // octets écrits par dessin
-StructuredBuffer<uint4> regions : register(t2); // par dessin : début (octets), taille, compteur, identité
-RWByteAddressBuffer stats : register(u0);       // float4 par dessin : distance minimale, taille, sommets, 0
+StructuredBuffer<float4> clip : register(t0);   // the screen's stream (start of its slot)
+ByteAddressBuffer counters : register(t1);      // bytes written per draw
+StructuredBuffer<uint4> regions : register(t2); // per draw: start (bytes), size, counter, identity
+RWByteAddressBuffer stats : register(u0);       // float4 per draw: minimum distance, size, vertices, 0
 
 cbuffer Constants : register(b0)
 {
@@ -29,7 +29,7 @@ void main(uint3 group : SV_GroupID, uint ti : SV_GroupIndex)
     const uint4 r = regions[k];
     const uint n = min(counters.Load(r.z * 8), r.y) / 16;
     const uint first = r.x / 16;
-    // très gros dessins : un sommet sur s suffit pour la boîte (au plus ~16 000 lus par dessin)
+    // very big draws: one vertex in s is enough for the box (at most ~16,000 read per draw)
     const uint stride = 64 * max(1u, n / 16384);
     float mz = 1e9;
     float3 lo = 1e9, hi = -1e9;

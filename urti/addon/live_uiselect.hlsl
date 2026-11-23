@@ -1,19 +1,19 @@
-// URTI en direct : image d'avant l'interface du jeu, choisie sur le GPU dans la même image (l'ordre des
-// photos change d'une image à l'autre quand le jeu enregistre ses commandes sur plusieurs fils). Photo de
-// cette image : identique à plus de 60 % à l'image finale, et plus proche d'elle que de l'image affichée
-// précédente. Parmi elles, la moins identique : la plus tôt, celle qui a le moins d'interface. Image
-// immobile (joueur qui regarde, menu ouvert) : chaque photo est aussi proche de l'image précédente que de la
-// courante, la règle ne tranche plus ; la photo choisie à l'image d'avant est alors gardée. Aucune (dans
-// RDR2 : photo prise avant que le jeu écrive son image, une fois sur deux environ) : preUi garde la dernière
-// photo sûre (live_composite reprend alors l'interface retenue de cette photo-là).
+// Live URTI: the image before the game's UI, chosen on the GPU in the same frame (the order of the
+// snapshots changes from one frame to the next when the game records its commands on several threads). Snapshot of
+// this frame: more than 60 % identical to the final image, and closer to it than to the previous displayed
+// image. Among those, the least identical: the earliest, the one with the least UI. Still
+// image (player looking, menu open): every snapshot is as close to the previous image as to the
+// current one, the rule no longer decides; the snapshot chosen on the previous frame is then kept. None (in
+// RDR2: snapshot taken before the game writes its image, about one time in two): preUi keeps the last
+// safe snapshot (live_composite then reuses the UI kept from that snapshot).
 
 ByteAddressBuffer finalImage : register(t0);
 ByteAddressBuffer snap0 : register(t1);
 ByteAddressBuffer snap1 : register(t2);
 ByteAddressBuffer snap2 : register(t3);
 ByteAddressBuffer snap3 : register(t4);
-RWByteAddressBuffer preUi : register(u0);   // même disposition que l'image
-RWByteAddressBuffer counts : register(u1);  // live_uicompare (0 à 35) ; choix + 1 des images paires / impaires (64, 68)
+RWByteAddressBuffer preUi : register(u0);   // same layout as the image
+RWByteAddressBuffer counts : register(u1);  // live_uicompare (0 to 35); choice + 1 of even / odd frames (64, 68)
 
 cbuffer Constants : register(b0)
 {
@@ -22,7 +22,7 @@ cbuffer Constants : register(b0)
     uint pitch;
     uint bytesPerPixel;
     uint count;
-    uint parity;       // image paire ou impaire : le choix de l'image précédente est dans l'autre case
+    uint parity;       // even or odd frame: the previous frame's choice is in the other cell
     uint pad1;
     uint pad2;
 };
@@ -43,8 +43,8 @@ int Choose()
     {
         const uint k = previous - 1;
         const float same = float(counts.Load(k * 4)) / total, old = float(counts.Load(16 + k * 4)) / total;
-        // encore assez proche de l'image finale (un menu peut en couvrir une grande part), et pas une copie de
-        // l'image affichée précédente (photo prise trop tôt : elle contiendrait l'ancienne image et ses menus)
+        // still close enough to the final image (a menu may cover a large part of it), and not a copy of
+        // the previous displayed image (snapshot taken too early: it would hold the old image and its menus)
         if (same >= 0.3 && (same >= old - 0.03 || old < 0.995))
             best = int(k);
     }
@@ -62,8 +62,8 @@ void main(uint2 id : SV_DispatchThreadID)
     const int k = Choose();
     if (id.x == 0 && id.y == 0)
         counts.Store(64 + parity * 4, uint(k + 1));
-    // aucune photo sûre : l'image finale elle-même (garder la dernière photo sûre donnait des couleurs de reflets
-    // prises dans une image ancienne, v58-v62)
+    // no safe snapshot: the final image itself (keeping the last safe snapshot gave reflection colours
+    // taken from an old image, v58-v62)
     const uint2 v = k == 0 ? Pixel(snap0, a) : k == 1 ? Pixel(snap1, a) : k == 2 ? Pixel(snap2, a) : k == 3 ? Pixel(snap3, a) : Pixel(finalImage, a);
     if (bytesPerPixel == 8)
         preUi.Store2(a, v);
