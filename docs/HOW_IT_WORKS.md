@@ -5,7 +5,7 @@ the game in advance: no source code, no shader replacement, no asset extraction.
 sun, materials) is observed or measured while the game runs, frame after frame. This document walks through the whole
 chain, from the game's draw calls to the final pixel.
 
-The detailed log of every experiment, measurement and dead end is [JOURNAL.md](JOURNAL.md) (in French).
+The detailed log of every experiment, measurement and dead end is [JOURNAL.md](JOURNAL.md).
 
 ```mermaid
 flowchart LR
