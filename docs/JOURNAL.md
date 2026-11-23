@@ -2271,3 +2271,16 @@ Demande : une occultation RT viable dans Red Dead, sans décalage, mesurée avec
   l'arrêt 0,39 / 0,66 / 0,40 %, en marchant 0,09-1,04 / 0,26-1,15 / 0,30-0,67 %.
 - Murs au soleil : seule la part du ciel retirée ; taches de soleil au sol intactes, ombre des arbres assombrie.
 - Horizon : scintillement ajouté par l'occultation 0,06 % à l'arrêt, 0,08 % en marchant ; 99 images par seconde.
+
+## v106 : les personnages ne font plus d'ombre d'ambiance, occultation en mouvement au damier (performances)
+
+- Retour du joueur (captures dans une ruelle de Saint-Denis) : des « dessins d'ombre » sombres et flous restent collés aux murs et suivent l'écran ; les
+  ombres ajoutées coûtent trop d'images par seconde.
+- Cause probable des taches : le personnage du joueur est dans la scène RT ; collé à un mur, il cache le « ciel » des rayons longs (16 m) à une grande zone
+  du mur, et cette tache le suit, donc suit l'écran. Corrigé : un point touché qui, projeté à l'écran, tombe sur un personnage (alpha des normales du
+  G-buffer de Red Dead) à peu près à la même profondeur est traversé, comme un trou de feuille (occultation, rayons longs, rayon vers le soleil).
+- Performances : en v104, un pixel en mouvement était calculé à chaque image ; quand la caméra bouge, presque tout l'écran l'est, coût de la passe
+  multiplié jusqu'à quatre. Maintenant une image sur deux, en damier (même coût par bloc 2 × 2 qu'à l'arrêt). Cible du régulateur d'occultation
+  `ao_ms` 4 -> 2,5 ms.
+- Installé dans Red Dead à la demande du joueur, qui teste lui-même ; pas encore mesuré par URTI. Champ de vision : pendant sa partie, mesuré 55-69° et
+  corrigé à 56,1° (garde-fous respectés : caméra immobile, mesure stable) ; Red Dead change probablement de champ selon la caméra (ruelle, mode).

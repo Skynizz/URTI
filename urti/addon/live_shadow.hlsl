@@ -290,6 +290,25 @@ int ScreenSees(float3 h)
     return (seen.z <= 0 || seen.z > h.z * 1.03 + 0.05) ? 1 : 0;
 }
 
+// point touché qui appartient à un personnage (Red Dead : repère des personnages dans l'alpha des normales du G-buffer) : il ne fait ni occultation ni
+// ombre d'ambiance. Le personnage du joueur, collé à un mur, cachait le « ciel » à une grande zone de ce mur (rayons longs de 16 m) : une tache sombre et
+// floue qui le suivait, donc suivait l'écran (signalé par le joueur). Projeté à l'écran : le pixel montre un personnage à peu près à cette profondeur
+// (son dos caché est à quelques dizaines de centimètres derrière ce que la caméra voit). Hors de l'écran : inconnu, gardé
+bool CharacterAt(float3 h)
+{
+    if ((gnMode & 3) != 2 || gnPitch == 0 || h.z <= 1e-3)
+        return false;
+    const float2 ndc = float2(h.x * p00 / h.z, h.y * p11 / h.z);
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv <= 0) || any(uv >= 1))
+        return false;
+    const int2 t = int2(uv * float2(width, height));
+    const float3 seen = PointAt(t);
+    if (seen.z <= 0 || abs(seen.z - h.z) > 0.1 * h.z + 0.6)
+        return false;
+    return float(gnormal.Load(t.y * gnPitch + t.x * 4) >> 24) / 255.0 > 0.25;
+}
+
 // trou d'une plaque découpée : la caméra le voit à travers ; hors de l'écran, le soleil (sa carte)
 bool Hole(float3 h, float3 receiver)
 {
@@ -394,7 +413,9 @@ void main(uint2 id : SV_DispatchThreadID)
         motionPxAo = all(isfinite(mvA)) ? length(mvA * float2(width, height)) : 0.0;
     }
     const bool movingHere = motionPxAo > 1.0;
-    const bool notThisFrame = (flags & 128) != 0 && any((id & 1u) != kQuarter[frameIndex & 3]) && !movingHere;
+    // (en mouvement : une image sur deux, en damier, plutôt qu'à chaque image comme en v104 : même coût par bloc 2×2 qu'à l'arrêt ; quand la caméra
+    // bouge, tout l'écran bouge, et le calcul à chaque image quadruplait le coût de la passe)
+    const bool notThisFrame = (flags & 128) != 0 && (movingHere ? ((id.x + id.y + frameIndex) & 1u) != 0 : any((id & 1u) != kQuarter[frameIndex & 3]));
     if (aoOnly && (d == gClear || !(w > 0) || w >= aoMaxDist || aoAmount <= 0 || notThisFrame))
     {
         const bool later = notThisFrame && d != gClear && w > 0 && w < aoMaxDist && aoAmount > 0; // calculé à une autre image : -1, reconstruit par live_shadowtemporal
@@ -609,7 +630,7 @@ void main(uint2 id : SV_DispatchThreadID)
                 if (!aoHit)
                     break;
                 aoT = qf.CommittedRayT(), aoInst = qf.CommittedInstanceID(), aoPrim = qf.CommittedPrimitiveIndex();
-                aoHole = (flags & 2048) && Hole(ray.Origin + ray.Direction * aoT, p3);
+                aoHole = ((flags & 2048) && Hole(ray.Origin + ray.Direction * aoT, p3)) || CharacterAt(ray.Origin + ray.Direction * aoT);
                 if (!aoHole)
                     break;
                 stepRay.TMin = aoT + max(1e-3, 1e-4 * aoT);
@@ -683,7 +704,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     if (!skyHit)
                         break;
                     skyT = qs.CommittedRayT();
-                    if (!((flags & 2048) && Hole(sr.Origin + sr.Direction * skyT, p3)))
+                    if (!(((flags & 2048) && Hole(sr.Origin + sr.Direction * skyT, p3)) || CharacterAt(sr.Origin + sr.Direction * skyT)))
                         break;
                     skyHit = false;
                     sr.TMin = skyT + max(1e-3, 1e-4 * skyT);
@@ -718,7 +739,7 @@ void main(uint2 id : SV_DispatchThreadID)
                     if (!sunBlocked)
                         break;
                     const float t3 = qs3.CommittedRayT();
-                    if (!((flags & 2048) && Hole(sr2.Origin + sr2.Direction * t3, p3)))
+                    if (!(((flags & 2048) && Hole(sr2.Origin + sr2.Direction * t3, p3)) || CharacterAt(sr2.Origin + sr2.Direction * t3)))
                         break;
                     sunBlocked = false;
                     sr2.TMin = t3 + max(1e-3, 1e-4 * t3);
