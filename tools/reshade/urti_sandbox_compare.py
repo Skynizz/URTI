@@ -1,18 +1,18 @@
-"""Bac à sable URTI : compare un lancement avec RT et un lancement natif, image par image.
+"""URTI sandbox: compares a launch with RT and a native launch, frame by frame.
 
-    python urti_sandbox_compare.py <dossier RT> <dossier natif> <dossier de sortie>
+    python urti_sandbox_compare.py <RT folder> <native folder> <output folder>
 
-Les deux dossiers contiennent urti_photo_<présentation>.ppm aux mêmes présentations (le bac à sable est
-déterministe : même caméra, même vent, mêmes passants). Mesures :
-  - effet : écart moyen entre RT et natif (ce que le RT change à l'image) ;
-  - scintillement : écart moyen d'une image à la suivante ; le natif donne celui de la scène elle-même
-    (vent, passants, caméra) ; « ajouté » = RT - natif, ce qui saute à cause d'URTI ;
-  - points qui sautent : part des pixels dont la variation d'une image à la suivante s'écarte de plus de
-    8 % de celle de la référence au même endroit (les ombres ou reflets qui clignotent). La référence est
-    le natif, ou la vérité terrain (urti_sandbox.sh --verite) : l'écart moyen est alors l'erreur des
-    reflets RT, et un reflet qui bouge normalement ne compte pas comme un saut.
-Sortie : comparaison.png (natif | RT | écart amplifié) pour la première image, scintillement.png (carte
-des sauts ajoutés, cumulée sur la série), mesures.txt.
+Both folders hold urti_photo_<present>.ppm at the same presents (the sandbox is
+deterministic: same camera, same wind, same passers-by). Measurements:
+  - effect: mean difference between RT and native (what RT changes in the image);
+  - flicker: mean difference from one frame to the next; the native launch gives the scene's own
+    (wind, passers-by, camera); "added" = RT - native, what jumps because of URTI;
+  - jumping points: share of pixels whose frame-to-frame change differs by more than
+    8 % from the reference's at the same place (shadows or reflections that blink). The reference is
+    the native launch, or the ground truth (urti_sandbox.sh --truth): the mean difference is then the error of
+    the RT reflections, and a reflection that moves normally does not count as a jump.
+Output: comparison.png (native | RT | amplified difference) for the first frame, flicker.png (map
+of added jumps, accumulated over the series), measurements.txt.
 """
 import os
 import re
@@ -25,7 +25,7 @@ from PIL import Image
 def load(path):
     with open(path, 'rb') as f:
         data = f.read()
-    # en-tête P6 : largeur hauteur maximum
+    # P6 header: width height maximum
     m = re.match(rb'P6\s+(\d+)\s+(\d+)\s+(\d+)\s', data)
     w, h = int(m.group(1)), int(m.group(2))
     return np.frombuffer(data[m.end():m.end() + w * h * 3], np.uint8).reshape(h, w, 3).astype(np.float32) / 255.0
@@ -46,7 +46,7 @@ def main():
     rt, native = frames(rt_dir), frames(native_dir)
     common = sorted(set(rt) & set(native))
     if not common:
-        print('aucune photo commune')
+        print('no common snapshot')
         return 1
     lines = []
     effect = []
@@ -59,20 +59,20 @@ def main():
         effect.append(float(np.abs(a - b).mean()))
         if i == 0:
             diff = np.clip(np.abs(a - b) * 4, 0, 1)
-            Image.fromarray((np.concatenate([b, a, diff], axis=1) * 255).astype(np.uint8)).save(os.path.join(out_dir, 'comparaison.png'))
+            Image.fromarray((np.concatenate([b, a, diff], axis=1) * 255).astype(np.uint8)).save(os.path.join(out_dir, 'comparison.png'))
             Image.fromarray((a * 255).astype(np.uint8)).save(os.path.join(out_dir, f'rt_{f}.png'))
-            Image.fromarray((b * 255).astype(np.uint8)).save(os.path.join(out_dir, f'natif_{f}.png'))
+            Image.fromarray((b * 255).astype(np.uint8)).save(os.path.join(out_dir, f'native_{f}.png'))
         if prev_rt is not None and f == common[i - 1] + 1:
             d_rt = np.abs(a - prev_rt).mean(axis=2)
             d_nat = np.abs(b - prev_nat).mean(axis=2)
             flick_rt.append(float(d_rt.mean()))
             flick_nat.append(float(d_nat.mean()))
-            # variation propre au RT : ce qui change d'une image à la suivante autrement que la référence
+            # change specific to RT: what changes from one frame to the next differently from the reference
             extra = np.abs((a - prev_rt) - (b - prev_nat)).mean(axis=2) > 0.08
             jumps.append(float(extra.mean()))
             jump_map = extra.astype(np.float32) if jump_map is None else jump_map + extra
-            # clignotement : l'écart propre au RT change de sens d'une image à la suivante (plus clair puis plus
-            # sombre, ou l'inverse) ; une erreur qui se déplace avec la scène garde le même sens
+            # blinking: the RT-specific difference changes sign from one frame to the next (brighter then
+            # darker, or the reverse); an error that moves with the scene keeps the same sign
             d = ((a - prev_rt) - (b - prev_nat)).mean(axis=2)
             if prev_d is not None:
                 blinks.append(float(((d * prev_d < 0) & (np.abs(d) > 0.04) & (np.abs(prev_d) > 0.04)).mean()))
@@ -80,21 +80,21 @@ def main():
         else:
             prev_d = None
         prev_rt, prev_nat = a, b
-    lines.append(f'photos comparées : {len(common)} ({common[0]} à {common[-1]})')
-    lines.append(f'effet du RT (écart moyen RT / référence) : {np.mean(effect) * 100:.2f} %')
+    lines.append(f'snapshots compared: {len(common)} ({common[0]} to {common[-1]})')
+    lines.append(f'RT effect (mean difference RT / reference): {np.mean(effect) * 100:.2f} %')
     if flick_rt:
         fr, fn = np.mean(flick_rt), np.mean(flick_nat)
-        lines.append(f'scintillement d\'une image à la suivante : RT {fr * 100:.3f} %, natif {fn * 100:.3f} %, ajouté {(fr - fn) * 100:+.3f} %')
-        lines.append(f'points qui sautent (variation écartée de la référence de plus de 8 %) : {np.mean(jumps) * 100:.3f} % des pixels, au pire {np.max(jumps) * 100:.3f} %')
+        lines.append(f'flicker from one frame to the next: RT {fr * 100:.3f} %, native {fn * 100:.3f} %, added {(fr - fn) * 100:+.3f} %')
+        lines.append(f'jumping points (change departing from the reference by more than 8 %): {np.mean(jumps) * 100:.3f} % of pixels, at worst {np.max(jumps) * 100:.3f} %')
         if blinks:
-            lines.append(f'points qui clignotent (écart qui change de sens, plus de 4 %) : {np.mean(blinks) * 100:.3f} % des pixels')
+            lines.append(f'blinking points (difference changing sign, more than 4 %): {np.mean(blinks) * 100:.3f} % of pixels')
         heat = np.clip(jump_map / max(1.0, len(jumps) * 0.25), 0, 1)
         base = load(rt[common[0]]) * 0.35
         base[..., 0] = np.maximum(base[..., 0], heat)
-        Image.fromarray((base * 255).astype(np.uint8)).save(os.path.join(out_dir, 'scintillement.png'))
+        Image.fromarray((base * 255).astype(np.uint8)).save(os.path.join(out_dir, 'flicker.png'))
     text = '\n'.join(lines)
     print(text)
-    with open(os.path.join(out_dir, 'mesures.txt'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out_dir, 'measurements.txt'), 'w', encoding='utf-8') as f:
         f.write(text + '\n')
     return 0
 

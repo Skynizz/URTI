@@ -1,19 +1,19 @@
-"""Bac à sable URTI : les ombres ajoutées par URTI ressemblent-elles à celles du jeu ?
+"""URTI sandbox: do the shadows URTI adds look like the game's?
 
-    python urti_sandbox_shadows.py <dossier RT> <dossier complet> <dossier partiel> <dossier de sortie>
+    python urti_sandbox_shadows.py <RT folder> <full folder> <partial folder> <output folder>
 
-Trois lancements identiques (mêmes images) :
-  - RT : la carte d'ombres du « jeu » oublie des objets (URTI_SANDBOX_GAMESHADOW=partiel), URTI les ombre ;
-  - complet : natif, le jeu ombre tout : la référence, ce qu'URTI devrait donner ;
-  - partiel : natif avec les ombres oubliées : ce qu'on aurait sans URTI.
-Zone mesurée : les pixels que l'ombre complète assombrit et que la partielle laisse éclairés (les ombres
-qu'URTI doit ajouter). Mesures :
-  - rattrapé : part de l'écart partiel / complet qu'URTI comble (100 % : ombres identiques à celles du jeu) ;
-  - noirceur : lumière moyenne de la zone avec URTI / avec le jeu, par canal (1 : pareil ; > 1 : trop
-    claire ; < 1 : trop sombre) ; un écart entre canaux est une mauvaise teinte ;
-  - ailleurs : écart moyen RT / complet hors de la zone (ombres RT en trop, bords) ;
-  - scintillement : variation d'une image à l'autre qui n'est pas dans la référence, dans la zone.
-Sortie : ombres.png (complet | partiel | RT | écart amplifié) pour la première image, mesures.txt.
+Three identical launches (same frames):
+  - RT: the "game's" shadow map forgets objects (URTI_SANDBOX_GAMESHADOW=partial), URTI shadows them;
+  - full: native, the game shadows everything: the reference, what URTI should give;
+  - partial: native with the forgotten shadows: what you would get without URTI.
+Measured area: pixels the full shadow darkens and the partial one leaves lit (the shadows
+URTI must add). Measurements:
+  - recovered: share of the partial / full difference that URTI fills (100 %: shadows identical to the game's);
+  - darkness: mean light of the area with URTI / with the game, per channel (1: the same; > 1: too
+    bright; < 1: too dark); a difference between channels is a wrong tint;
+  - elsewhere: mean difference RT / full outside the area (extra RT shadows, edges);
+  - flicker: frame-to-frame change that is not in the reference, inside the area.
+Output: shadows.png (full | partial | RT | amplified difference) for the first frame, measurements.txt.
 """
 import os
 import re
@@ -46,7 +46,7 @@ def main():
     rt, full, part = frames(rt_dir), frames(full_dir), frames(part_dir)
     keys = sorted(set(rt) & set(full) & set(part))
     if not keys:
-        sys.exit('aucune image commune')
+        sys.exit('no common frame')
     lum = np.array([0.2126, 0.7152, 0.0722], np.float32)
     gap_rt = gap_none = 0.0
     zone_pixels = 0
@@ -58,7 +58,7 @@ def main():
     prev = None
     for i, k in enumerate(keys):
         a, b, c = load(rt[k]), load(full[k]), load(part[k])
-        # lumière (photo en gamma 2,2)
+        # light (snapshot in gamma 2.2)
         la, lb, lc = a ** 2.2, b ** 2.2, c ** 2.2
         yb, yc = lb @ lum, lc @ lum
         zone = (yc - yb > 0.02) & (yc > 0.05)
@@ -83,22 +83,22 @@ def main():
         if i == 0:
             diff = np.clip(np.abs(a - b) * 4.0, 0, 1)
             row = np.concatenate([b, c, a, diff], axis=1)
-            Image.fromarray((row * 255).astype(np.uint8)).save(os.path.join(out_dir, 'ombres.png'))
-    lines = [f'images comparées : {len(keys)} ({keys[0]} à {keys[-1]})']
+            Image.fromarray((row * 255).astype(np.uint8)).save(os.path.join(out_dir, 'shadows.png'))
+    lines = [f'frames compared: {len(keys)} ({keys[0]} to {keys[-1]})']
     if zone_pixels:
         mean_full, mean_rt, mean_part = sum_full / zone_pixels, sum_rt / zone_pixels, sum_part / zone_pixels
         ratio = mean_rt / np.maximum(mean_full, 1e-6)
-        lines.append(f'zone des ombres à ajouter : {zone_pixels / len(keys):.0f} pixels par image')
-        lines.append(f'rattrapé (écart sans URTI comblé) : {100.0 * (1.0 - gap_rt / max(gap_none, 1e-9)):.1f} %')
-        lines.append('noirceur (lumière RT / jeu, rouge vert bleu) : ' + ' '.join(f'{v:.3f}' for v in ratio))
-        lines.append('sans URTI (partiel / jeu) : ' + ' '.join(f'{v:.3f}' for v in mean_part / np.maximum(mean_full, 1e-6)))
+        lines.append(f'area of the shadows to add: {zone_pixels / len(keys):.0f} pixels per frame')
+        lines.append(f'recovered (difference without URTI filled): {100.0 * (1.0 - gap_rt / max(gap_none, 1e-9)):.1f} %')
+        lines.append('darkness (light RT / game, red green blue): ' + ' '.join(f'{v:.3f}' for v in ratio))
+        lines.append('without URTI (partial / game): ' + ' '.join(f'{v:.3f}' for v in mean_part / np.maximum(mean_full, 1e-6)))
     else:
-        lines.append('zone des ombres à ajouter : vide')
-    lines.append(f'ailleurs (écart moyen RT / jeu hors de la zone) : {100.0 * elsewhere / max(elsewhere_n, 1):.3f} %')
-    lines.append(f'scintillement ajouté dans la zone : {100.0 * flicker / max(flicker_n, 1):.3f} %')
+        lines.append('area of the shadows to add: empty')
+    lines.append(f'elsewhere (mean difference RT / game outside the area): {100.0 * elsewhere / max(elsewhere_n, 1):.3f} %')
+    lines.append(f'flicker added inside the area: {100.0 * flicker / max(flicker_n, 1):.3f} %')
     text = '\n'.join(lines)
     print(text)
-    with open(os.path.join(out_dir, 'mesures.txt'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out_dir, 'measurements.txt'), 'w', encoding='utf-8') as f:
         f.write(text + '\n')
 
 
