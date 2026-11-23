@@ -211,11 +211,11 @@ cbuffer Frame : register(b0)
     row_major float4x4 viewProj;       // with sub-pixel jitter
     row_major float4x4 viewProjNJ;     // without jitter
     row_major float4x4 prevViewProjNJ; // previous frame, without jitter
-    row_major float4x4 invViewProj;    // inverse de viewProj
+    row_major float4x4 invViewProj;    // inverse of viewProj
     row_major float4x4 lightViewProj[4];
     float4 cameraPos;  // w : temps
     float4 sunDir;     // toward the sun; w: previous frame's time
-    float4 renderSize; // largeur, hauteur, 1 / largeur, 1 / hauteur
+    float4 renderSize; // width, height, 1 / width, 1 / height
     float4 splits;     // end distances of the cascades
     float4 camForward; // w : vent
     float4 output;     // x: 1 HDR10, 0 sRGB; y: exposure; zw: sub-pixel jitter (NDC)
@@ -535,7 +535,7 @@ ComPtr<ID3DBlob> Compile(const char* entry, const char* target, bool instanced)
     if (FAILED(D3DCompile(kShaders, std::strlen(kShaders), "urti_sandbox", instanced ? macros : macros + 1, nullptr, entry, target,
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)))
     {
-        std::fprintf(stderr, "%s : %s\n", entry, errors ? (const char*)errors->GetBufferPointer() : "erreur de compilation");
+        std::fprintf(stderr, "%s: %s\n", entry, errors ? (const char*)errors->GetBufferPointer() : "compilation error");
         std::exit(1);
     }
     return code;

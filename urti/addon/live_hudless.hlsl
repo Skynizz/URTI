@@ -109,7 +109,7 @@ void main(uint2 id : SV_DispatchThreadID)
             if (err < bestErr)
                 bestErr = err, best = c;
         }
-        // part de l'interface (journal)
+        // share of the UI (log)
         gain.InterlockedAdd(kCounts, 1, unused);
         if (((uiMask.Load((px.y * width + px.x) * 4) >> 8) & 255) >= 128)
             gain.InterlockedAdd(kCounts + 4, 1, unused);

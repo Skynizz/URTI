@@ -234,7 +234,7 @@ bool g_liveTessOn = false;                          // urti.ini tess=1: tessella
 // of its draws (right edge, bottom edge), this window. With DLSS and dynamic resolution, a game may
 // draw at 1280×720 to 1707×960 inside 2560×1440 targets; a few draws (3D markers)
 // keep the full area there
-std::unordered_map<uint32_t, uint32_t> g_liveViewCounts; // (largeur << 16 | hauteur) -> dessins
+std::unordered_map<uint32_t, uint32_t> g_liveViewCounts; // (width << 16 | height) -> draws
 // geometry budget (urti_live.inl updates it every frame): an object already measured and of little importance
 // (small, distant) does not enter the RT scene; those to re-measure are captured in the measurement area, at
 // the end of the slot, outside the acceleration structure
@@ -400,7 +400,7 @@ void ReadSettings(HMODULE module)
 }
 
 // ------------------------------------------------------------------------------------------------
-// signatures racines : ajout de ALLOW_STREAM_OUTPUT
+// root signatures: ALLOW_STREAM_OUTPUT added
 // ------------------------------------------------------------------------------------------------
 
 using PFN_CreateRootSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
@@ -690,7 +690,7 @@ struct CommandListState
 enum class Phase
 {
     Idle,
-    Capturing,    // frame en cours de capture
+    Capturing,    // frame being captured
     WaitingDepth, // next frame: depth copied at its clear
 };
 

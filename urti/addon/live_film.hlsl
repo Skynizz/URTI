@@ -8,8 +8,8 @@ RWByteAddressBuffer film : register(u0);
 
 cbuffer Constants : register(b0)
 {
-    uint width;     // demi-largeur
-    uint height;    // demi-hauteur
+    uint width;     // half width
+    uint height;    // half height
     uint srcPitch;
     uint dstOffset; // bytes, start of this image in the ring
     uint format;    // 0 RGBA8, 1 BGRA8, 2 RGB10A2

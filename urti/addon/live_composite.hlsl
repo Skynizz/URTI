@@ -33,7 +33,7 @@ cbuffer Constants : register(b0)
     uint maskPitch;
     float strength;     // darkening in shadow (0: nothing, 1: black)
     uint split;         // 1: left half without RT, line in the middle
-    uint showMask;      // 1 : masque d'ombres seul
+    uint showMask;      // 1: shadow mask only
     float reflStrength; // 0: no RT reflections
     uint debugReflect;  // 1 material smoothness, 2 reflection weight, 3 reflected colour only; bit 8: blend with prevMask;
                         // bit 9: stabilised reflections available (resolvedRefl); bit 10: snapshot before the UI (preUi)
@@ -447,7 +447,7 @@ void main(uint2 id : SV_DispatchThreadID)
     }
     else if (reflStrength > 0 && rf.z > 0 && rf.x != -0.25)
     {
-        const float3 reflected = rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy); // u < -0,5 : cache de surfaces
+        const float3 reflected = rf.x < -0.5 ? float3(-rf.x - 1.0, rf.y, rf.w) : SampleLinear(rf.xy); // u < -0.5: surface cache
         if ((debugReflect & 0xFF) == 3)
         {
             StoreLinear(px, reflected * rf.z);

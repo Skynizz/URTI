@@ -23,7 +23,7 @@ void main()
         for (uint j = 0; j < 3; j++)
             S[i][j] = float(int(stats.Load(64 + (i * 3 + j) * 4))) / 1000.0;
     const uint count = stats.Load(100);
-    // matrice de Horn (S[i][j] = somme a_i b_j)
+    // Horn's matrix (S[i][j] = sum a_i b_j)
     float N[4][4];
     N[0][0] = S[0][0] + S[1][1] + S[2][2];
     N[0][1] = S[1][2] - S[2][1];

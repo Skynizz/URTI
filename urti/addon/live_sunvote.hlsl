@@ -201,7 +201,7 @@ void main(uint t : SV_GroupThreadID)
             jitterDelta = 0; // not a sub-pixel jitter (aberrant measurement)
     }
     sun.Store2(628, asuint(jitterDelta * jitterMode.x));
-    float4 track = asfloat(sun.Load4(1168)); // somme (xy), moyenne glissante (zw)
+    float4 track = asfloat(sun.Load4(1168)); // sum (xy), running mean (zw)
     track.xy -= jitterDelta;
     track.zw = lerp(track.zw, track.xy, 1.0 / 32.0);
     sun.Store4(1168, asuint(track));

@@ -153,10 +153,10 @@ int main(int argc, char** argv)
         {
             const float d = depth[size_t(y) * width + x];
             if (d == clearDepth)
-                continue; // ciel
+                continue; // sky
             const double w = B / (double(d) - A);
             if (!(w > 0) || !(w < 1e7))
-                continue; // ciel
+                continue; // sky
             const float nx = (x + 0.5f) / width * 2.0f - 1.0f, ny = 1.0f - (y + 0.5f) / height * 2.0f;
             float* p = &positions[(size_t(y) * width + x) * 4];
             p[0] = float(nx * w / p00), p[1] = float(ny * w / p11), p[2] = float(w), p[3] = 1.0f;

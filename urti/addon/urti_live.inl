@@ -604,7 +604,7 @@ void LiveSaveCalibration()
         std::fprintf(f, "; URTI calibration for this game (read back at launch; F6 redoes it)\n");
         std::fprintf(f, "depth_a=%.9g\ndepth_b=%.9g\nsun_sign=%d\nsun_map=%ux%u:%u\nmotion=%u\nmotion_target=%u\nmotion_source=%s\n", live.A, live.B,
                      live.sunSign > 0 ? 1 : -1, live.sunMapWidth, live.sunMapHeight, live.sunMapFormat, live.mvSynthetic ? 255u : live.mvConvention,
-                     live.mvCandidate, live.mvSynthetic ? "camera" : "jeu");
+                     live.mvCandidate, live.mvSynthetic ? "camera" : "game");
         if (live.fovMeasured && live.p11 > 0 && !live.camLive)
             std::fprintf(f, "fov_v=%.2f\n", 2.0f * std::atan(1.0f / live.p11) * 57.2957795f); // measured vertical field of view (degrees)
         std::fclose(f);
@@ -2919,7 +2919,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                     live.statAoLevelSum / n, live.statAoMax, live.statAoSpikes, live.aoTarget, live.statReflLevelSum / n, live.statReflMax, live.statReflSpikes, live.reflTarget);
                 live.statAoMax = live.statReflMax = 0, live.statAoSpikes = live.statReflSpikes = live.statAoLevelSum = live.statReflLevelSum = 0;
                 Log("URTI live: GPU per frame: structure %.2f ms, sun and depth %.2f, game map copy %.2f, shadows (%u rays) %.2f, "
-                    "reflets %.2f, composition %.2f", live.timeSum[0] / n, live.timeSum[1] / n, live.timeSum[2] / n, live.shadowRays, live.timeSum[3] / n,
+                    "reflections %.2f, composite %.2f", live.timeSum[0] / n, live.timeSum[1] / n, live.timeSum[2] / n, live.shadowRays, live.timeSum[3] / n,
                     live.timeSum[4] / n, live.timeSum[5] / n);
                 const uint32_t builds = live.statRebuilds + live.statUpdates;
                 if (builds)

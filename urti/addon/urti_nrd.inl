@@ -25,7 +25,7 @@ struct NrdState
     nrd::Integration* integration = nullptr; // destroyed with the device (never at process exit)
     bool failed = false, restart = true;
     uint32_t width = 0, height = 0, frameIndex = 0, sigmaPitch = 0;
-    ComPtr<ID3D12Resource> mvTex, normalTex, viewZTex, penumbraTex, shadowTex; // textures de NRD
+    ComPtr<ID3D12Resource> mvTex, normalTex, viewZTex, penumbraTex, shadowTex; // NRD textures
     ComPtr<ID3D12Resource> viewZBuf, normalBuf, penumbraBuf, sigmaBuf;        // tampons d'URTI
     ComPtr<ID3D12CommandAllocator> allocators[3];
     ComPtr<ID3D12GraphicsCommandList> list;
@@ -109,10 +109,10 @@ bool NrdEnsure(effect_runtime* runtime)
     {
         for (auto& a : g_nrd.allocators)
             if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))))
-                return fail("liste de commandes");
+                return fail("command list");
         if (FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_nrd.allocators[0].Get(), nullptr, IID_PPV_ARGS(&g_nrd.list))) ||
             FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_nrd.fence))))
-            return fail("liste de commandes");
+            return fail("command list");
         g_nrd.list->Close();
         g_nrd.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     }
