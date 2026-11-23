@@ -4185,7 +4185,7 @@ void OnBeginEffects(effect_runtime* runtime, command_list* cmd, resource_view, r
                  motionOk && live.prevShadowBuf ? live.mvConvention : 255u, d24 ? 1u : 0u, live.debugView >= 1 && live.debugView <= 3 ? live.debugView : 0u,
                  // occultation ambiante seule (ombres du soleil coupées) : elle varie lentement, plus d'images
                  // accumulées et un bornage plus large (moins de grain qui tremble)
-                 live.sunShadows ? 0.1f : 0.06f, 0.5f, // (en mouvement : la moitié de neuf, les pixels qui bougent étant calculés à chaque image) live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
+                 live.sunShadows ? 0.1f : 0.06f, live.sunShadows || live.aoMotionFull ? 0.5f : 0.3f, // (en mouvement : la moitié de neuf, les pixels qui bougent calculés à chaque image) live.sunShadows ? 1.5f : 2.0f, (live.sunShadows ? 1u : 2u) | (lenNow ? 2048u : 0u),
                  live.p00, live.p11, live.sunShadows || !live.denoiseFarSkip ? 0.0f : live.aoDistNow * 1.02f + 0.5f };
         list->SetComputeRoot32BitConstants(9, 15, &dn, 0);
         list->Dispatch((live.width + 7) / 8, (live.height + 7) / 8, 1);

@@ -2229,3 +2229,6 @@ Vérifié : Red Dead cinq lancements (un plantage causé par l'ouverture du Soci
 - Mesures (Red Dead, Saint-Denis, même lancement, réglage changé à chaud) : en marchant, scintillement ajouté 0,10-0,21 % des pixels contre 0,88-1,85 %
   (une rafale à 1,79 %, la première marche, la plus agitée) ; en tournant, part de l'occultation qui ne suit pas 0,36-0,52 × l'assombrissement moyen
   contre 0,75. Passe d'occultation ~1,2 ms en mouvement (0,8 à l'arrêt).
+- Horizon : le calcul à chaque image en mouvement y est coupé (`ao_motion=0`) ; mesure à l'arrêt troublée par la météo (pluie puis soleil d'un lancement
+  à l'autre). Au soleil, l'occultation y scintillait sur le sol clair (0,57-2,6 %) : le soleil n'y est pas connu, elle retire toute la lumière, même au
+  soleil. `ao=0.5` dans Horizon : 0,16 % (0,14 % sans occultation). `ao_rough=0` : sans effet.
