@@ -19,7 +19,7 @@ function Draws {
 # « première image » n'en est pas un signe : elle s'écrit dès l'écran de démarrage
 function InGame { [bool](Fresh | Select-String -Pattern 'direct : soleil \(' -Quiet) }
 # pas de clic quand quelqu'un se sert du PC (souris ou clavier touchés dans la dernière minute)
-function Idle { $Force -or [int](& (Join-Path $PSScriptRoot 'inactif.ps1')) -ge 60 }
+function Idle { $Force -or [int](& (Join-Path $PSScriptRoot 'idle.ps1')) -ge 60 }
 
 $t0 = Get-Date
 if (-not (Get-Process RDR2 -ErrorAction SilentlyContinue)) { Start-Process -FilePath (Join-Path $game 'RDR2.exe') -WorkingDirectory $game }

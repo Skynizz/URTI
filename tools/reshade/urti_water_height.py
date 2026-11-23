@@ -1,6 +1,6 @@
 """URTI : hauteur des pixels d'eau (film : profondeur.bin, materiau.bin, ligne FILMCAM du journal).
 
-    python urti_eau_hauteur.py <dossier du film> <journal>
+    python urti_water_height.py <dossier du film> <journal>
 
 Le reflet part du point que donne la profondeur du jeu. Si la profondeur est la surface de l'eau, tous les pixels d'eau sont à la même
 hauteur (un plan). Si c'est le fond (eau transparente peu profonde), leur hauteur suit le fond : le miroir est trop bas et bosselé, le

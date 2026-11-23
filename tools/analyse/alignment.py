@@ -1,13 +1,13 @@
-"""Analyse précise de l'occultation d'URTI dans une rafale (avant_k / apres_k .ppm : la même image du jeu sans et avec URTI).
-Carte d'assombrissement D = 1 - apres / avant (ce qu'URTI retire), image du jeu A.
-Mesures, au dixième de pixel (corrélation de phase, sommet affiné par parabole) :
-  - mouvement de l'image d'une image à la suivante (A_k-1 -> A_k) et mouvement de la carte D (D_k-1 -> D_k) ;
-    suivi = composante du mouvement de D le long de celui de l'image / mouvement de l'image (1 : accrochée, 0 : figée) ;
-  - décalage fixe de D par rapport à l'image : corrélation des contours de D (gradient) avec ceux de A dans la même image
-    (l'occultation se pose sur les arêtes et les contacts : bien posée, ses contours tombent sur ceux de la géométrie) ;
-  - stabilité : écart moyen de D_k avec D_k-1 recalée sur le mouvement de l'image (sous-pixel), rapporté à D moyenne ;
-  - force : part des pixels assombris de plus de 5 % et de 15 %.
-decalage.py <dossier> [...]"""
+"""Precise analysis of URTI's darkening in a burst (before_k / after_k .ppm: the same game frame without and with URTI).
+Darkening map D = 1 - after / before (what URTI removes), game image A.
+Measurements, to a tenth of a pixel (phase correlation, peak refined by a parabola):
+  - motion of the image from one frame to the next (A_k-1 -> A_k) and motion of the map D (D_k-1 -> D_k);
+    follow = component of D's motion along the image's / the image's motion (1: attached, 0: frozen);
+  - fixed offset of D relative to the image: correlation of D's edges (gradient) with A's in the same frame
+    (occlusion sits on edges and contacts: when well placed, its edges fall on the geometry's);
+  - stability: mean difference of D_k from D_k-1 realigned on the image's motion (sub-pixel), relative to the mean D;
+  - strength: share of pixels darkened by more than 5 % and 15 %.
+alignment.py <folder> [...]"""
 import glob
 import os
 import sys
@@ -27,7 +27,7 @@ def window(shape):
 
 
 def phase_shift(a, b):
-    """décalage (dy, dx) tel que a(x) ~ b(x - d), sous-pixel"""
+    """offset (dy, dx) such that a(x) ~ b(x - d), sub-pixel"""
     win = window(a.shape)
     fa, fb = np.fft.fft2((a - a.mean()) * win), np.fft.fft2((b - b.mean()) * win)
     r = fa * np.conj(fb)
@@ -57,7 +57,7 @@ def grad(x):
 
 
 def shift_img(x, dy, dx):
-    """x décalée de (dy, dx) (sous-pixel, bilinéaire), bords répétés"""
+    """x shifted by (dy, dx) (sub-pixel, bilinear), edges repeated"""
     h, w = x.shape
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     sy, sx = np.clip(yy - dy, 0, h - 1), np.clip(xx - dx, 0, w - 1)
@@ -68,16 +68,16 @@ def shift_img(x, dy, dx):
 
 
 for d in sys.argv[1:]:
-    A, B = load(d, 'avant'), load(d, 'apres')
+    A, B = load(d, 'before'), load(d, 'after')
     if len(A) < 4:
-        print(d, ': pas assez d images')
+        print(d, ': not enough frames')
         continue
     D = [np.clip(1.0 - (b + 1.0) / (a + 1.0), 0, 1) for a, b in zip(A, B)]
-    m = 12  # marge (bords, mini-carte)
+    m = 12  # margin (edges, minimap)
     crop = (slice(m, -m), slice(m, -m))
     follow, offs, stab, img_mv = [], [], [], []
     for k in range(len(A)):
-        # décalage fixe : contours de D contre contours de A dans la même image
+        # fixed offset: D's edges against A's edges in the same frame
         ga, gd = grad(A[k])[crop], grad(D[k])[crop]
         if gd.std() > 1e-4:
             oy, ox, _ = phase_shift(gd, ga)
@@ -96,6 +96,6 @@ for d in sys.argv[1:]:
     s5 = np.mean([(Dk > 0.05).mean() for Dk in D]) * 100
     s15 = np.mean([(Dk > 0.15).mean() for Dk in D]) * 100
     o = np.median(np.array(offs), 0) if offs else (float('nan'), float('nan'))
-    print('%-22s mouvement image %5.1f px | suivi %s | décalage fixe (y, x) %+.2f %+.2f px | instabilité %.2f | assombri >5 %% : %.1f %%, >15 %% : %.1f %%'
+    print('%-22s image motion %5.1f px | follow %s | fixed offset (y, x) %+.2f %+.2f px | instability %.2f | darkened >5 %% : %.1f %%, >15 %% : %.1f %%'
           % (os.path.basename(d), float(np.median(img_mv)), ('%.2f' % float(np.median(follow))) if follow else '  - ', o[0], o[1],
              float(np.median(stab)), s5, s15))

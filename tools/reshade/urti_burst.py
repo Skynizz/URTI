@@ -1,19 +1,19 @@
-"""URTI : analyse d'une rafale prise dans le jeu (touche F8, ou fichier déclencheur urti_rafale
-dans le dossier du jeu).
+"""URTI: analysis of a burst taken in game (F8 key, or trigger file urti_burst
+in the game folder).
 
-    python urti_rafale.py <dossier urti_rafale_N> <dossier de sortie> [journal urti_log.txt]
+    python urti_burst.py <urti_burst_N folder> <output folder> [urti_log.txt log]
 
-La rafale contient, pour 30 images consécutives, l'image du jeu sans URTI (avant_N.ppm) et la même image avec
-URTI (apres_N.ppm). La contribution d'URTI est C = après - avant ; ce qui saute est la variation de C d'une
-image à la suivante, indépendante de ce que fait la scène (vent, personnage, caméra lente). Mesures :
-  - effet : part des pixels qu'URTI change de plus de 2 % (ombres : il assombrit ; reflets : le reste) ;
-  - tremble / saute : part des pixels dont C varie de plus de 3 % / 8 % d'une image à la suivante, en tout
-    et dans chaque zone (ombres, reflets) ;
-  - mouvement de la scène : variation moyenne de l'image sans URTI (caméra immobile : petite) ;
-  - par image : pixels qui sautent, objets entrés / sortis de la scène RT (lignes RAFALE du journal).
-Sortie : carte.png (image avec URTI assombrie, en rouge les pixels qui sautent, plus c'est rouge plus souvent),
-zone.png (la zone de 96 × 96 pixels qui saute le plus, sur six images consécutives : sans URTI en haut, avec
-en bas), mesures.txt.
+The burst holds, for 30 consecutive frames, the game's image without URTI (before_N.ppm) and the same image with
+URTI (after_N.ppm). URTI's contribution is C = after - before; what jumps is the change of C from one
+frame to the next, independent of what the scene does (wind, character, slow camera). Measurements:
+  - effect: share of pixels URTI changes by more than 2 % (shadows: it darkens; reflections: the rest);
+  - shake / jump: share of pixels whose C changes by more than 3 % / 8 % from one frame to the next, overall
+    and in each area (shadows, reflections);
+  - scene motion: mean change of the image without URTI (still camera: small);
+  - per frame: jumping pixels, objects entering / leaving the RT scene (BURST lines of the log).
+Output: map.png (image with URTI darkened, jumping pixels in red, the redder the more often),
+area.png (the 96 × 96 pixel area that jumps the most, over six consecutive frames: without URTI on top, with it
+at the bottom), measurements.txt.
 """
 import os
 import re
@@ -35,12 +35,12 @@ def main():
     folder, out = sys.argv[1], sys.argv[2]
     log = sys.argv[3] if len(sys.argv) > 3 else None
     os.makedirs(out, exist_ok=True)
-    idx = sorted(int(m.group(1)) for n in os.listdir(folder) if (m := re.match(r'apres_(\d+)\.ppm$', n)))
-    idx = [i for i in idx if os.path.exists(os.path.join(folder, f'avant_{i}.ppm'))]
+    idx = sorted(int(m.group(1)) for n in os.listdir(folder) if (m := re.match(r'after_(\d+)\.ppm$', n)))
+    idx = [i for i in idx if os.path.exists(os.path.join(folder, f'before_{i}.ppm'))]
     if len(idx) < 2:
-        sys.exit('rafale incomplète')
-    before = [load(os.path.join(folder, f'avant_{i}.ppm')) for i in idx]
-    after = [load(os.path.join(folder, f'apres_{i}.ppm')) for i in idx]
+        sys.exit('incomplete burst')
+    before = [load(os.path.join(folder, f'before_{i}.ppm')) for i in idx]
+    after = [load(os.path.join(folder, f'after_{i}.ppm')) for i in idx]
     contrib = [a - b for a, b in zip(after, before)]
     mean_c = np.mean(contrib, axis=0).mean(axis=2)
     strength = np.mean([np.abs(c).max(axis=2) for c in contrib], axis=0)
@@ -74,29 +74,29 @@ def main():
     if log and os.path.exists(log) and burst:
         with open(log, encoding='utf-8', errors='replace') as f:
             for line in f:
-                m = re.match(r'RAFALE (\d+) (\d+) image \d+ objets RT (\d+) entrés (\d+) sortis (\d+)', line)
+                m = re.match(r'BURST (\d+) (\d+) frame \d+ RT objects (\d+) in (\d+) out (\d+)', line)
                 if m and m.group(1) == burst.group(1):
                     churn[int(m.group(2))] = (int(m.group(3)), int(m.group(4)), int(m.group(5)))
     lines.append(f'images : {len(idx)} ({w}x{h})')
-    lines.append(f'mouvement de la scène (sans URTI) : {100.0 * scene / n:.2f} % par image')
-    lines.append(f'effet d\'URTI : {100.0 * (strength > 0.02).mean():.1f} % des pixels changés de plus de 2 % '
-                 f'(ombres {100.0 * shadow_zone.mean():.1f} %, reflets {100.0 * refl_zone.mean():.1f} %)')
-    lines.append(f'tremble (> 3 %) : {100.0 * trem_all / n:.2f} % des pixels ; ombres {100.0 * trem_s / n:.2f} %, reflets {100.0 * trem_r / n:.2f} % (de leur zone)')
-    lines.append(f'saute (> 8 %) : {100.0 * jump_all / n:.3f} % des pixels ; ombres {100.0 * jump_s / n:.2f} %, reflets {100.0 * jump_r / n:.2f} % (de leur zone)')
-    lines.append('par image : n°, saute % (tout, reflets, ombres), objets RT, entrés, sortis')
+    lines.append(f'scene motion (without URTI): {100.0 * scene / n:.2f} % per frame')
+    lines.append(f'URTI effect: {100.0 * (strength > 0.02).mean():.1f} % of pixels changed by more than 2 % '
+                 f'(shadows {100.0 * shadow_zone.mean():.1f} %, reflections {100.0 * refl_zone.mean():.1f} %)')
+    lines.append(f'shake (> 3 %): {100.0 * trem_all / n:.2f} % of pixels; shadows {100.0 * trem_s / n:.2f} %, reflections {100.0 * trem_r / n:.2f} % (of their area)')
+    lines.append(f'jump (> 8 %): {100.0 * jump_all / n:.3f} % of pixels; shadows {100.0 * jump_s / n:.2f} %, reflections {100.0 * jump_r / n:.2f} % (of their area)')
+    lines.append('per frame: no., jump % (all, reflections, shadows), RT objects, in, out')
     for i, a, r, s in rows:
         c = churn.get(i)
         lines.append(f'  {i:3d}  {a:6.3f} {r:6.2f} {s:6.2f}' + (f'   {c[0]:4d} {c[1]:4d} {c[2]:4d}' if c else ''))
     text = '\n'.join(lines)
     print(text)
-    with open(os.path.join(out, 'mesures.txt'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out, 'measurements.txt'), 'w', encoding='utf-8') as f:
         f.write(text + '\n')
-    # carte : image avec URTI assombrie, sauts en rouge
+    # map: image with URTI darkened, jumps in red
     base = after[-1] * 0.45
     heat = np.clip(jumps / max(1.0, n * 0.25), 0, 1)
     base[..., 0] = np.maximum(base[..., 0], heat)
-    Image.fromarray((np.clip(base, 0, 1) * 255).astype(np.uint8)).save(os.path.join(out, 'carte.png'))
-    # zone qui saute le plus : six images consécutives, sans URTI en haut, avec en bas
+    Image.fromarray((np.clip(base, 0, 1) * 255).astype(np.uint8)).save(os.path.join(out, 'map.png'))
+    # area that jumps the most: six consecutive frames, without URTI on top, with it below
     s = 96
     if h > s and w > s:
         acc = jumps.cumsum(0).cumsum(1)
@@ -112,9 +112,9 @@ def main():
         for c, k in enumerate(frames):
             strip[:s, c * s:(c + 1) * s] = before[k][by:by + s, bx:bx + s]
             strip[s:, c * s:(c + 1) * s] = after[k][by:by + s, bx:bx + s]
-        Image.fromarray((strip * 255).astype(np.uint8)).resize((len(frames) * s * 3, 2 * s * 3), Image.NEAREST).save(os.path.join(out, 'zone.png'))
-        with open(os.path.join(out, 'mesures.txt'), 'a', encoding='utf-8') as f:
-            f.write(f'zone qui saute le plus : x {bx}, y {by} (images {idx[frames[0]]} à {idx[frames[-1]]})\n')
+        Image.fromarray((strip * 255).astype(np.uint8)).resize((len(frames) * s * 3, 2 * s * 3), Image.NEAREST).save(os.path.join(out, 'area.png'))
+        with open(os.path.join(out, 'measurements.txt'), 'a', encoding='utf-8') as f:
+            f.write(f'area that jumps the most: x {bx}, y {by} (frames {idx[frames[0]]} to {idx[frames[-1]]})\n')
 
 
 if __name__ == '__main__':

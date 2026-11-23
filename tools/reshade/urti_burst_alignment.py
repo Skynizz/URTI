@@ -1,10 +1,10 @@
-"""URTI : l'effet suit-il le décor quand la caméra bouge ? (rafale prise pendant un mouvement de caméra)
+"""URTI: does the effect follow the scenery when the camera moves? (burst taken during a camera move)
 
-    python urti_rafale_decalage.py <dossier urti_rafale_N>
+    python urti_burst_alignment.py <urti_burst_N folder>
 
-Pour chaque paire d'images consécutives : glissement de l'image du jeu (corrélation de phase sur l'image sans
-URTI) et glissement de la contribution d'URTI (après - avant). Un effet collé à ses objets glisse autant que
-l'image (suivi 100 %) ; un effet qui traîne glisse moins (historique mal recalé) ; collé à l'écran : 0 %.
+For each pair of consecutive frames: shift of the game image (phase correlation on the image without
+URTI) and shift of URTI's contribution (after - before). An effect attached to its objects shifts as much as
+the image (follow 100 %); a trailing effect shifts less (history badly realigned); stuck to the screen: 0 %.
 """
 import os
 import re
@@ -22,7 +22,7 @@ def load(path):
 
 
 def shift(a, b):
-    """glissement (dx, dy) qui amène a sur b, au dixième de pixel (corrélation de phase, pic affiné)"""
+    """shift (dx, dy) that brings a onto b, to a tenth of a pixel (phase correlation, refined peak)"""
     win = np.outer(np.hanning(a.shape[0]), np.hanning(a.shape[1]))
     fa, fb = np.fft.fft2((a - a.mean()) * win), np.fft.fft2((b - b.mean()) * win)
     r = fb * np.conj(fa)
@@ -45,13 +45,13 @@ def shift(a, b):
 
 def main():
     folder = sys.argv[1]
-    idx = sorted(int(m.group(1)) for n in os.listdir(folder) if (m := re.match(r'apres_(\d+)\.ppm$', n)))
+    idx = sorted(int(m.group(1)) for n in os.listdir(folder) if (m := re.match(r'after_(\d+)\.ppm$', n)))
     lum = np.array([0.2126, 0.7152, 0.0722], np.float32)
     rows = []
     for k in range(1, len(idx)):
-        a0, a1 = load(os.path.join(folder, f'avant_{idx[k - 1]}.ppm')), load(os.path.join(folder, f'avant_{idx[k]}.ppm'))
-        b0, b1 = load(os.path.join(folder, f'apres_{idx[k - 1]}.ppm')), load(os.path.join(folder, f'apres_{idx[k]}.ppm'))
-        # moitié haute de l'image, hors interface : le décor lointain glisse d'un bloc quand la caméra tourne
+        a0, a1 = load(os.path.join(folder, f'before_{idx[k - 1]}.ppm')), load(os.path.join(folder, f'before_{idx[k]}.ppm'))
+        b0, b1 = load(os.path.join(folder, f'after_{idx[k - 1]}.ppm')), load(os.path.join(folder, f'after_{idx[k]}.ppm'))
+        # upper half of the image, outside the UI: distant scenery shifts as a block when the camera turns
         h = a0.shape[0]
         crop = slice(0, int(h * 0.6))
         g0, g1 = (a0 @ lum)[crop], (a1 @ lum)[crop]
@@ -64,10 +64,10 @@ def main():
         follow = (ex * sx + ey * sy) / (n * n)
         rows.append((idx[k], sx, sy, ex, ey, follow))
     if not rows:
-        sys.exit('pas assez de mouvement ou d\'effet pour mesurer')
+        sys.exit('not enough motion or effect to measure')
     for i, sx, sy, ex, ey, f in rows:
         print(f'{i:3d}  image {sx:6.1f} {sy:6.1f} px   effet {ex:6.1f} {ey:6.1f} px   suivi {100 * f:5.0f} %')
-    print(f'suivi médian : {100 * float(np.median([r[5] for r in rows])):.0f} % (100 % : l\'effet reste collé aux objets)')
+    print(f'median follow: {100 * float(np.median([r[5] for r in rows])):.0f} % (100 %: the effect stays attached to its objects)')
 
 
 if __name__ == '__main__':

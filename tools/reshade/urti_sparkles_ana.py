@@ -1,6 +1,6 @@
 """URTI : points brillants ajoutés par URTI, sur chaque rafale (urti_rafale_N, avant / après) d'un dossier.
 
-    python urti_eclats_ana.py <dossier contenant les rafales>
+    python urti_sparkles_ana.py <dossier contenant les rafales>
 
 Colonnes : part des pixels éclaircis de plus de 5, 10, 20 %, assombris de plus de 10 % ; points isolés plus clairs que leur voisinage ajoutés par URTI (nombre,
 pixels), ceux déjà dans l'image du jeu ; variation de l'effet d'une image à la suivante. Pour trouver quel effet les fabrique, couper reflect=, gi=, ao= dans

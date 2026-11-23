@@ -1,6 +1,6 @@
 """Bac à sable URTI : les ombres ajoutées par URTI ressemblent-elles à celles du jeu ?
 
-    python urti_sandbox_ombres.py <dossier RT> <dossier complet> <dossier partiel> <dossier de sortie>
+    python urti_sandbox_shadows.py <dossier RT> <dossier complet> <dossier partiel> <dossier de sortie>
 
 Trois lancements identiques (mêmes images) :
   - RT : la carte d'ombres du « jeu » oublie des objets (URTI_SANDBOX_GAMESHADOW=partiel), URTI les ombre ;

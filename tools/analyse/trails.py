@@ -1,8 +1,8 @@
-"""Traînées de l'occultation dans une rafale prise en tournant la caméra (avant_k / apres_k .ppm).
-Pour chaque paire d'images qui se suivent : décalage horizontal de l'image du jeu (avant) et décalage de la carte d'assombrissement d'URTI
-(1 - apres / avant) qui les recale le mieux. Une occultation bien accrochée bouge autant que l'image (retard 0) ; une qui traîne bouge moins.
-Aussi : écart résiduel de la carte d'assombrissement une fois recalée sur le mouvement de l'image (ce qui ne suit pas le mouvement).
-trainee.py <dossier> [<dossier> ...] [--png sortie.png]"""
+"""Trails of occlusion in a burst taken while turning the camera (before_k / after_k .ppm).
+For each pair of consecutive frames: horizontal shift of the game image (before) and shift of URTI's darkening map
+(1 - after / before) that realigns them best. Well-attached occlusion moves as much as the image (lag 0); trailing occlusion moves less.
+Also: residual difference of the darkening map once realigned on the image's motion (what does not follow the motion).
+trails.py <folder> [<folder> ...] [--png output.png]"""
 import glob
 import os
 import sys
@@ -24,7 +24,7 @@ def highpass(x):
 
 
 def best_shift(a, b, rng=60):
-    # décalage s tel que a[:, x] ~ b[:, x - s]
+    # shift s such that a[:, x] ~ b[:, x - s]
     h, w = a.shape
     best, bs = -1e30, 0
     for s in range(-rng, rng + 1):
@@ -46,9 +46,9 @@ png = sys.argv[sys.argv.index('--png') + 1] if '--png' in sys.argv else None
 for d in args:
     if png and d == png:
         continue
-    A, B = load(d, 'avant'), load(d, 'apres')
+    A, B = load(d, 'before'), load(d, 'after')
     if len(A) < 4:
-        print(d, 'pas assez d images')
+        print(d, 'not enough frames')
         continue
     D = [np.clip(1.0 - (b + 1.0) / (a + 1.0), 0, 1) for a, b in zip(A, B)]
     lags, resid, resid0 = [], [], []
@@ -58,7 +58,7 @@ for d in args:
             continue
         sd, cd = best_shift(D[k] - D[k].mean(), D[k - 1] - D[k - 1].mean())
         lags.append(1.0 - sd / si)
-        # carte précédente recalée sur le mouvement de l'image : ce qui reste est ce qui ne suit pas
+        # previous map realigned on the image's motion: what remains is what does not follow
         h, w = D[k].shape
         if si >= 0:
             r = np.abs(D[k][:, si:] - D[k - 1][:, :w - si])
@@ -67,10 +67,10 @@ for d in args:
         resid.append(r.mean() * 100)
         resid0.append(D[k].mean() * 100)
     if lags:
-        print('%-26s paires %2d | retard de l occultation %.2f (0 accrochée, 1 figée) | écart après recalage %.2f %% (assombrissement moyen %.2f %%)'
+        print('%-26s pairs %2d | occlusion lag %.2f (0 attached, 1 frozen) | difference after realignment %.2f %% (mean darkening %.2f %%)'
               % (os.path.basename(d), len(lags), float(np.median(lags)), float(np.mean(resid)), float(np.mean(resid0))))
     else:
-        print(os.path.basename(d), 'pas de mouvement mesurable')
+        print(os.path.basename(d), 'no measurable motion')
     if png:
         k = len(D) // 2
         strip = np.concatenate([np.concatenate([A[k] / 255.0, D[k] * 4], 1), np.concatenate([A[k + 1] / 255.0, D[k + 1] * 4], 1)], 0)
