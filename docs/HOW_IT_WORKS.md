@@ -67,12 +67,12 @@ Rays use DXR 1.1 inline ray queries in compute shaders. There is no ray-tracing 
 | Quantity | How it is obtained |
 |---|---|
 | Depth law (`z = A + B / w`) | fitted on captured vertices every frame |
-| Field of view | Red Dead Redemption 2: shadow-cascade pairs between two frames give the stretch of URTI's assumed projection (s², t²); corrected only when the camera is still and the measurement stable, then stored (`fov_v` in `urti_calib.ini`). Horizon Forbidden West: read from the game's camera |
+| Field of view | Red Dead Redemption 2: shadow-cascade pairs between two frames give the stretch of URTI's assumed projection (s², t²); corrected only when the camera is still and the measurement stable, then stored (`fov_v` in `urti_calib.ini`). Read from the game's camera when one is found |
 | Sun direction | each mesh drawn both on screen and in the sun's shadow map gives an affine map between the two; their vote gives the sun |
 | Sub-pixel jitter (DLSS / TAA) | the shear it adds to the frame-to-frame motion of the cascades |
 | Camera motion | measured on URTI's own geometry, or read from the game's camera when found |
 | Camera orientation in the world | Red Dead Redemption 2: world-space G-buffer normals against depth normals, solved every frame with Horn's method |
-| Game camera (Horizon Forbidden West) | found by scanning constant buffers for a matrix that matches the depth (`camera_cb=512`) |
+| Game camera (when available) | found by scanning constant buffers for a matrix that matches the depth (`camera_cb=`) |
 
 The field of view matters more than it looks. URTI's ray intersections stay correct in a stretched camera space,
 because the geometry and the pixels are stretched alike. But every angle is wrong: the floor's normal, the reflection's
@@ -84,12 +84,13 @@ reflections seemed to float. Version 105 fixed that.
 URTI reads the game's G-buffer. A pass survey lists every render target of a frame and identifies its layout once per
 game.
 
-| | Red Dead Redemption 2 | Horizon Forbidden West |
-|---|---|---|
-| Smoothness | material target, green channel | material slot 4 (inverted roughness) |
-| Normals | target 1, world space, alpha marks characters | target 2, octahedral, camera space |
-| Material type | material target, red channel (foliage, skin, common) | — |
-| Water | smooth, flat, horizontal | reflectance F0 = 0, flat, horizontal |
+| | Red Dead Redemption 2 |
+|---|---|
+| Smoothness | material target, green channel |
+| Normals | target 1, world space, alpha marks characters |
+| Material type | material target, red channel (foliage, skin, common) |
+| Metalness | material target, blue channel |
+| Water | smooth, flat, horizontal |
 
 A pixel receives a ray-traced reflection when all of these hold:
 
@@ -107,8 +108,8 @@ hit distance × α / (eye distance + hit distance), read with 8 taps on a Vogel 
 put reflections on 20 % of the screen, which was too much. Even sorted, a blurred sheen on dry pavement read as lower
 quality than sharp mirrors, so it stays off.
 
-**Water** (Horizon Forbidden West) uses the world's up vector as its normal: the depth-derived normal of a rippled
-surface changes every frame.
+**Water** can use the world's up vector as its normal: the depth-derived normal of a rippled surface changes every
+frame.
 
 ## 6. Tracing reflections
 
@@ -145,7 +146,7 @@ presented frame:
 - **Generated frames.** Effects are shifted by a fraction of the motion (`fg_shift`).
 - **Layer queue.** A queue of three effect layers, keyed by the game frame they belong to, lays the right layer on the
   right image (`lag=1`). Without it, the layer sat one frame off and the reflection jerked.
-- **Interface.** When the game provides an image without its UI (Horizon's DLSS-G input), a mask keeps the interface
+- **Interface.** When the game provides an image without its UI (the frame-generation input), a mask keeps the interface
   untouched. Otherwise a fixed screen zone is protected (Red Dead Redemption 2's minimap, `ui_zone`).
 - **HDR10.** It is decoded from PQ, blended in linear light, and encoded back.
 
@@ -172,7 +173,7 @@ Every change is judged in the game, at real pace, against the same frame without
   whether an effect follows the image (1: attached, 0: frozen), any fixed offset, and the residual instability after
   realignment.
 - **Trails.** `tools/analyse/trainee.py` measures, while the camera turns, how much of an effect lags behind.
-- **Films.** Kept in GPU memory at real pace (Horizon Forbidden West) and compared with NVIDIA's
+- **Films.** Kept in GPU memory at real pace and compared with NVIDIA's
   [FLIP](https://github.com/NVlabs/flip).
 - **Regressions.** The same session is replayed on old builds, so a change can be compared with what came before.
 

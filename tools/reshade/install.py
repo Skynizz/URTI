@@ -35,8 +35,8 @@ KeyOverlay=36,0,0,0
 TutorialProgress=4
 '''
 
-PRESET = '''Techniques=KRC_GI@KRC_GI.fx
-TechniqueSorting=KRC_GI@KRC_GI.fx
+PRESET = '''Techniques=URTI@urti.fx
+TechniqueSorting=URTI@urti.fx,URTI_Depth@urti_depth.fx
 '''
 
 

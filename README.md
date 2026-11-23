@@ -47,9 +47,6 @@ The log of every experiment and measurement: [docs/JOURNAL.md](docs/JOURNAL.md) 
 | Game | Effects | Settings (`urti.ini`) |
 |---|---|---|
 | Red Dead Redemption 2 | reflections on puddles, wet streets, windows, polished floors | `ui_photo=0`, `ui_zone=0.012,0.69,0.16,0.97`, `jitter=0`, `sun_measure=0` |
-| Horizon Forbidden West (Complete Edition) | water reflections | `camera_cb=512`, `material_slot=4`, `reflect_channel=0`, `reflect_invert=1`, `smooth_min=0.9`, `person_mask=0` |
-
-In Horizon Forbidden West, the in-game Reflections option must stay on: URTI reads the game's camera from that pass.
 
 **Single player only.** URTI injects itself into the game's rendering: never use it online.
 
@@ -120,34 +117,18 @@ Perceptual comparisons use NVIDIA's [FLIP](https://github.com/NVlabs/flip).
 | `urti/` | the add-on (C++, HLSL) and its test bench |
 | `reshade/` | the ReShade effects that carry the menu and the depth access |
 | `tools/` | installation, in-game automated tests, analysis |
-| `docs/` | how it works, journal, roadmap, results |
-| `src/`, `krc_sdk/` | KRC, the radiance cache studied first |
-| `third_party/` | SHaRC and patches for Quake II RTX, RTGL1 and RTXGI |
+| `docs/` | how it works, journal, first feasibility plan |
 | `results/` | measurements and captures |
 
-## KRC — Knowledge Radiance Cache
+## Related project
 
-The repository also contains the research prototype behind the project: a spatial radiance cache where each cell knows
-its own uncertainty, so that rays go where the doubt is. Protocol in [docs/HYPOTHESE.md](docs/HYPOTHESE.md),
-measurements in [docs/RESULTATS.md](docs/RESULTATS.md).
-
-```sh
-cargo run --release -- all      # references and every method
-cargo run --release -- sponza 480
-```
-
-## Limits
-
-- **Per-game profile.** Each game needs a small settings profile (material slots, and the camera's constant buffer
-  when one is found).
-- **Unsupported draws.** Mesh-shader draws are not captured.
-- **Colours of hidden points.** A reflected point never seen on screen has an approximate colour.
-- **UI protection.** Without a UI-free image from the game, only a fixed screen area is protected.
+URTI grew out of **[KRC](https://github.com/Skynizz/KRC)** (Knowledge Radiance Cache), a research prototype of a
+world-space radiance cache that tracks its own uncertainty and updates only what changed.
 
 ## License
 
 URTI and KRC code is under the [MIT](LICENSE) license. Third-party code keeps the license of its original project:
-`third_party/`, `urti/third_party/` (ReShade, Dear ImGui), `reshade/ReShade*.fxh`. NVIDIA's NRD, optionally compiled
+`urti/third_party/` (ReShade, Dear ImGui), `reshade/ReShade*.fxh`. NVIDIA's NRD, optionally compiled
 in, is not part of the repository.
 
-This project is not affiliated with Rockstar Games, Guerrilla Games, Sony, NVIDIA or ReShade.
+This project is not affiliated with Rockstar Games, NVIDIA or ReShade.
