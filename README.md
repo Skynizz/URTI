@@ -6,6 +6,7 @@ its side and casts real rays into it with DXR 1.1 inline ray queries.
 
 <p align="center">
   <a href="https://github.com/Skynizz/URTI/releases/latest/download/URTI.zip"><img alt="Download URTI for ReShade" src="https://img.shields.io/badge/Download-URTI%20for%20ReShade-2ea44f?style=for-the-badge&logo=github"></a>
+  <a href="https://www.nexusmods.com/reddeadredemption2/mods/11762?tab=files&file_id=34056"><img alt="Get URTI on Nexus Mods" src="https://img.shields.io/badge/Nexus%20Mods-URTI%20for%20RDR2-d98f40?style=for-the-badge"></a>
 </p>
 
 ![Red Dead Redemption 2 with URTI: a polished parquet hall mirroring the chandelier, the statues and the fireplace](docs/images/rdr2_hall.jpg)
@@ -60,7 +61,8 @@ You need a DXR 1.1 capable GPU (NVIDIA RTX 20 series or newer, AMD RX 6000 or ne
 [ReShade](https://reshade.me) 6.8 **with add-on support**.
 
 1. **[Download URTI.zip](https://github.com/Skynizz/URTI/releases/latest/download/URTI.zip)** (latest release: the
-   compiled add-on, its effects and the Red Dead Redemption 2 profile).
+   compiled add-on, its effects and the Red Dead Redemption 2 profile). The same files are on
+   [Nexus Mods](https://www.nexusmods.com/reddeadredemption2/mods/11762?tab=files&file_id=34056).
 2. Install ReShade with add-on support into the game folder, for DirectX 12.
 3. Copy `urti.addon64` and `urti.ini` next to the game executable, and the files of `reshade-shaders/Shaders` into the
    game's `reshade-shaders/Shaders` folder.
